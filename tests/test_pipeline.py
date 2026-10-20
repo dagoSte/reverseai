@@ -148,6 +148,33 @@ class ContainedToolWiringTests(unittest.TestCase):
                                               max_observations=64)}
         return ToolSpec(ToolRef("lief", "1.0.0-r2"), ops, contained=True, runtime={"image": "sha256:" + "1" * 64, "platform": "linux/arm64"})
 
+    @staticmethod
+    def fake_ghidra(observations):
+        args = {"max_functions": ArgSpec("int", 1, 128, default=64), "decompile": ArgSpec("int", 0, 16, default=8),
+                "max_chars": ArgSpec("int", 64, 2048, default=1024), "max_calls": ArgSpec("int", 0, 256, default=128)}
+        op = OperationSpec("ghidra.analyze", args, lambda data, checked: observations, max_observations=400, derived=True)
+        return ToolSpec(ToolRef("ghidra", "12.1.4-r1"), {"ghidra.analyze": op}, contained=True,
+                        runtime={"image": "sha256:" + "2" * 64, "platform": "linux/arm64"})
+
+    def test_ghidra_findings_are_reported_as_derived_and_get_the_ghidra_budget(self):
+        data = elf()[0]
+        function = Observation(Location(0, 16), {"kind": "function", "index": 0, "name": "entry", "entry": 0x400000, "size": 16})
+        tools = pipeline.TOOLS + (self.fake_ghidra([function]),)
+        self.assertEqual(pipeline._budget(tools), pipeline.GHIDRA_BUDGET)
+        analysis = pipeline.analyze_bytes(data, ref(data), tools=tools)
+        code = [r for r in analysis.results if r.role == "code"]
+        self.assertEqual(len(code), 1)
+        judged = verdicts(analysis)
+        self.assertEqual([(f.claim_key, f.value, judged[f.id].status) for f in code[0].findings],
+                         [("code.functions", ["entry"], "derived")])
+        self.assertIn("## Derived by analysis tools (not verified against the bytes)", report.to_markdown(analysis))
+
+    def test_without_ghidra_the_code_analyst_takes_no_part(self):
+        data = elf()[0]
+        analysis = pipeline.analyze_bytes(data, ref(data))
+        self.assertEqual([r.role for r in analysis.results], ["structural", "capability"])
+        self.assertEqual(pipeline._budget(pipeline.TOOLS), Budget())
+
     def test_contained_findings_agree_with_the_stdlib_parser_and_name_the_image(self):
         data, layout = pe()
         analysis = pipeline.analyze_bytes(data, ref(data), tools=pipeline.TOOLS + (self.fake_lief(data, layout),))
