@@ -1,7 +1,17 @@
 """Deterministic JSON and Markdown reports: no timestamps, host paths or raw input bytes."""
 
+from dataclasses import dataclass
+
 from reverseai import __version__
-from reverseai.contract import CONTRACT_VERSION, VERDICT_STATUS, canonical_json
+from reverseai.contract import CONTRACT_VERSION, VERDICT_STATUS, InputRef, canonical_json
+
+
+@dataclass(frozen=True)
+class Analysis:
+    input: InputRef
+    tools: tuple  # tuple[ToolRef, ...]
+    results: tuple  # tuple[AnalysisResult, ...]
+    verdicts: tuple  # tuple[ReviewVerdict, ...]
 
 
 def to_dict(analysis):

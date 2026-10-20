@@ -1,24 +1,16 @@
 """M1 pipeline: snapshot -> plan -> gateway -> conclude -> review."""
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 
 from reverseai import intake, review
 from reverseai.analysts import capability, structural
-from reverseai.contract import AnalysisResult, Budget, InputRef
+from reverseai.contract import AnalysisResult, Budget
 from reverseai.gateway import Gateway
+from reverseai.report import Analysis
 from reverseai.tools import strings, structure
 
 ANALYSTS = (structural, capability)
 TOOLS = (structure.TOOL, strings.TOOL)
-
-
-@dataclass(frozen=True)
-class Analysis:
-    input: InputRef
-    tools: tuple  # tuple[ToolRef, ...]
-    results: tuple  # tuple[AnalysisResult, ...]
-    verdicts: tuple  # tuple[ReviewVerdict, ...]
 
 
 def analyze_bytes(data, ref, *, budget=None, analysts=ANALYSTS, tools=TOOLS):
