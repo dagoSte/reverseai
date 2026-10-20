@@ -6,9 +6,26 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: project bootstrap and architecture planning.** The analysis engine and
-agent team are not implemented yet. No containment or platform verification of
-ReverseAI is claimed.
+**Status: M1 prototype.** Two deterministic analysts (file structure and string
+indicators) run through an allowlisting gateway, and an evidence reviewer checks
+every claim against the frozen input bytes. It uses only the Python standard
+library and synthetic test fixtures. No external analysis tools, model-driven
+agents, containers or platform containment are part of M1, and none is claimed.
+
+## Try the M1 prototype
+
+Python 3.12 or later, no dependencies:
+
+```sh
+python3 -m reverseai analyze path/to/approved-file --out new-report-dir
+python3 -B -m unittest discover -s tests -t . -v
+```
+
+The command reads one approved regular file without executing it and writes
+`report.json` and `report.md`: supported findings with their byte evidence, and
+rejected claims with the reviewer's reasons. Findings marked *inferred* are hints
+from names in the file, not proof of behaviour. The contract between components
+is in [docs/contract.md](docs/contract.md).
 
 ## Planned workflow
 
