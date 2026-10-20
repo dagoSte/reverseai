@@ -8,7 +8,8 @@ The same four hand-assembled functions are placed in each container:
     constant     mov eax, 42; ret
 
 with four direct `call rel32` instructions (5 bytes each) and int3 padding between functions. The
-ELF has a .symtab naming them (entry is `_start`); the PE has no symbols. elf_data_only() is a clean
+ELF has a .symtab naming them (entry is `_start`); the PE has no symbols; the thin x86_64 Mach-O
+names them in its LC_SYMTAB and enters at `_start` through LC_MAIN. elf_data_only() is a clean
 control with no executable section and no entry point. Each builder returns (data, layout): the
 bytes and the declared addresses, file offsets and sizes, so tests can state exact expectations.
 """
@@ -149,3 +150,39 @@ def elf_data_only():
     data += bytes(shoff - len(data)) + b"".join(sections)
     return bytes(data), {"format": "elf", "entry": 0, "functions": [], "calls": [], "shoff": shoff,
                          "data": {"offset": data_offset, "address": base + data_offset, "size": len(payload)}}
+
+
+def macho_code():
+    """Thin little-endian x86_64 MH_EXECUTE: __PAGEZERO, __TEXT (r-x) with one __text section holding the code,
+    __LINKEDIT with LC_SYMTAB (the four functions, N_SECT | N_EXT in section 1) and LC_DYSYMTAB, and LC_MAIN."""
+    text, functions, calls = _code()
+    base, text_offset = 0x100000000, 0x200
+    text_address = base + text_offset
+
+    def segment(name, vmaddr, vmsize, fileoff, filesize, prot, sections=b"", count=0):
+        return struct.pack("<II16sQQQQiiII", 0x19, 72 + len(sections), name, vmaddr, vmsize, fileoff, filesize,
+                           prot, prot, count, 0) + sections
+
+    names = [name.encode() for name, _, _ in functions]
+    strtab, offsets = _strtab(names)
+    symbols = b"".join(struct.pack("<IBBHQ", offsets[name.encode()], 0x0F, 1, 0, text_address + offset)
+                       for name, offset, _ in functions)
+    linkedit = text_offset + TEXT_SIZE + (-(text_offset + TEXT_SIZE) % 8)
+    section = struct.pack("<16s16sQQIIIIIIII", b"__text", b"__TEXT", text_address, TEXT_SIZE, text_offset, 4, 0, 0,
+                          0x80000400, 0, 0, 0)  # S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+    commands = [
+        segment(b"__PAGEZERO", 0, base, 0, 0, 0),
+        segment(b"__TEXT", base, 0x1000, 0, text_offset + TEXT_SIZE, 0x5, section, 1),
+        segment(b"__LINKEDIT", base + 0x1000, 0x1000, linkedit, len(symbols) + len(strtab), 0x1),
+        struct.pack("<IIIIII", 0x2, 24, linkedit, len(functions), linkedit + len(symbols), len(strtab)),  # LC_SYMTAB
+        struct.pack("<II18I", 0xB, 80, 0, 0, 0, len(functions), len(functions), 0, *([0] * 12)),  # LC_DYSYMTAB
+        struct.pack("<IIQQ", 0x80000028, 24, text_offset, 0),  # LC_MAIN: entry at __TEXT file offset text_offset
+    ]
+    header = struct.pack("<IiiIIIII", 0xFEEDFACF, 0x01000007, 3, 2, len(commands), sum(map(len, commands)), 0x1, 0)
+    data = bytearray(header + b"".join(commands))
+    assert len(data) <= text_offset
+    data += bytes(text_offset - len(data)) + text
+    data += bytes(linkedit - len(data)) + symbols + strtab
+    layout = _layout(text_offset, text_address, functions, calls, named=True)
+    layout.update(format="macho", image_base=base, section_names=["__TEXT,__text"], linkedit=linkedit)
+    return bytes(data), layout
