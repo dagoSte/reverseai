@@ -41,7 +41,10 @@ approved file
 3. **The gateway refuses** an operation that is not registered, arguments that
    `OperationSpec.validate_args` rejects, and any request beyond the task or global
    `Budget`. Hitting a budget returns status `budget_exceeded` with the evidence
-   gathered so far; it never raises past the pipeline.
+   gathered so far; it never raises past the pipeline. A task's `max_evidence`
+   bounds the evidence returned for that task; the global budget counts each
+   unique evidence item the run produces once, including items a task did not
+   receive because of its own limit.
 4. **De-duplication.** One `Gateway` instance is shared by all tasks of a run. An
    operation whose `operation_key` was already executed returns the stored
    evidence without calling the handler again. An execution cut short by a budget

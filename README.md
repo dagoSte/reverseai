@@ -27,6 +27,22 @@ rejected claims with the reviewer's reasons. Findings marked *inferred* are hint
 from names in the file, not proof of behaviour. The contract between components
 is in [docs/contract.md](docs/contract.md).
 
+Known limits of M1, by design:
+
+- Only ELF and PE headers are parsed; Mach-O and universal binaries are reported
+  as unrecognized. String indicators are lexical hints (an API name or a word such
+  as "connect"), never proof of behaviour.
+- The reviewer checks provenance and the claim rules in `reverseai/claims.py`; a
+  claim type without a rule is never supported.
+- Time budgets are soft: a Python handler that overruns is reported and its late
+  output discarded, but it cannot be killed. M1 has no process or container
+  isolation and claims none.
+- Reports are reproducible for a given input and budget unless a shared global
+  budget runs out; then which concurrent analyst received the last slots may vary,
+  and the run says `budget_exceeded`.
+- Reports contain bounded text taken from the sample. They are written with
+  private permissions, and Markdown shows that text only inside code spans.
+
 ## Planned workflow
 
 1. Select and approve input bytes.
