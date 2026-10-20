@@ -280,8 +280,9 @@ expanded bytes, per-member bytes and compression-ratio limits before extraction.
    new adapter version whenever hidden settings change, or extend the cache key
    contract explicitly. Do not silently reuse results across execution contexts.
 5. **Claim admission.** Extend [reverseai/claims.py](../reverseai/claims.py) before
-   accepting M2a findings: each `claim_key` maps to several explicitly allowed
-   operations, with a derive function per operation. Group citations by operation;
+   accepting M2a findings: `RULES[claim_key] = (confidence, {operation: derive})`
+   allows several operations, with a derive function per operation. The finding's
+   confidence must equal its rule's confidence. Group citations by operation;
    every group's derivation must yield the same canonical claimed value. Unknown
    operations, missing fields and failed derivations stay unsupported; all current
    provenance checks and M1 rules remain. Add a rule and trusted `STATEMENTS` entry
@@ -403,7 +404,8 @@ for format, and alongside `structure.headers` for machine/count, using a derive
 function per operation and the normalized observation fields above. Define
 `sections.writable_executable_indices` as sorted unique integer section indices
 from cited `lief.sections` observations whose writable/executable flags are both
-true; add its reviewer rule and trusted statement. Do not reuse M1's name-based
+true; its rule is `("inferred", {"lief.sections": derive_indices})` with a matching
+trusted statement. Do not reuse M1's name-based
 value without byte-backed names. Pin rule admission, normalization, exact citations
 and contradiction tests, including mixed-operation agreement and disagreement.
 Integration points: [structural analyst](../reverseai/analysts/structural.py),
