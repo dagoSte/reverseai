@@ -85,6 +85,26 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(verdicts, tuple(sorted((ReviewVerdict(elf_finding.id, "contradicted", reason),
                                                  ReviewVerdict(pe_finding.id, "contradicted", reason)), key=lambda v: v.finding_id)))
 
+    def test_an_unsupported_finding_never_contradicts_a_verified_one(self):
+        verified = self.finding("elf")
+        for label, bogus, reason in (
+                ("missing evidence", self.finding("pe", evidence_ids=["ev-0000000000000000"]), "ev-0000000000000000: evidence missing"),
+                ("no evidence", self.finding("pe", evidence_ids=[]), "finding cites no evidence")):
+            with self.subTest(label):
+                verdicts = review(self.data, self.input, [self.result([verified]), self.result([bogus])], TOOLS)
+                self.assertEqual(verdicts, tuple(sorted((ReviewVerdict(verified.id, "supported"),
+                                                         ReviewVerdict(bogus.id, "unsupported", (reason,))),
+                                                        key=lambda v: v.finding_id)))
+
+    def test_two_verified_findings_that_agree_are_contradicted_by_a_third_that_differs(self):
+        headers, section = self.evidence[1], self.evidence[2]
+        first, second, other = self.finding("elf"), self.finding("elf", [headers.id]), self.finding("pe", [section.id])
+        self.assertEqual(len({first.id, second.id, other.id}), 3)
+        verdicts = review(self.data, self.input, [self.result([first, second, other])], TOOLS)
+        reason = ("another finding gives format.container a different value",)
+        self.assertEqual(verdicts, tuple(ReviewVerdict(finding_id, "contradicted", reason)
+                                         for finding_id in sorted((first.id, second.id, other.id))))
+
     def test_changed_input_bytes_fail_every_item(self):
         changed = b"\x00" + self.data[1:]
         verdict = self.verdict(self.finding(), data=changed)
