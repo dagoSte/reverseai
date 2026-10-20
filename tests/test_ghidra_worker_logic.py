@@ -209,6 +209,76 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual((call["value"]["to"], call["value"]["to_name"]), (0x900000, "external"))
 
 
+class BoundTests(unittest.TestCase):
+    def test_an_anchor_stops_at_the_section_end_and_at_max_location(self):
+        data, layout = elf_code()
+        q = query(data, layout)
+        last = q["functions"][3]  # constant: 6 bytes left in .text
+        last.update(size=40, bytes=data[last["file_offset"]:last["file_offset"] + 40].hex())
+        result = {o["value"]["name"]: (o["location"]["length"], o["value"]["size"]) for o in observe(data, q)
+                  if o["value"]["kind"] == "function"}
+        self.assertEqual(result["constant"], (6, 40))
+        small = query(data, layout)
+        for function in small["functions"]:
+            function["bytes"] = function["bytes"][:16]  # the query sends at most MAX_LOCATION bytes
+        with patch.object(worker, "MAX_LOCATION", 8):
+            lengths = [o["location"]["length"] for o in observe(data, small) if o["value"]["kind"] == "function"]
+        self.assertEqual(lengths, [8, 8, 8, 6])
+
+    def test_a_sparse_body_keeps_the_calls_in_its_span(self):
+        """Decision m3a-function-span: size is entry to last body byte, so a call after a gap is still inside."""
+        data, layout = elf_code()
+        q = query(data, layout)
+        start = q["functions"][0]
+        start["size"] = 0x56  # _start's span reaching the end of .text, as if its body continued there
+        start["bytes"] = data[start["file_offset"]:start["file_offset"] + 0x56].hex()
+        late = dict(q["functions"][2]["calls"][1])  # compute's call at 0x142, now also inside _start's span
+        start["calls"].append(late)
+        froms = [(o["value"]["from"], o["location"]["offset"]) for o in observe(data, q) if o["value"]["kind"] == "call"]
+        self.assertIn((0x400100, 0x142), froms)
+
+    def test_the_native_sparse_body_shape_is_accepted_with_its_span(self):
+        """The shape Ghidra reported for the native sparse case: _start's body is [0x00, 0x17) and [0x2a, 0x30)."""
+        data, layout = elf_code()
+        patched, text = bytearray(data), layout["text"]["offset"]
+        code = (b"\xe8" + (0x20 - 0x05).to_bytes(4, "little") + b"\x85\xc0" + b"\x0f\x84" + (0x2a - 0x0d).to_bytes(4, "little")
+                + b"\xb8\x3c\x00\x00\x00\x31\xff\x0f\x05\xc3")
+        patched[text:text + 0x20] = code + b"\xcc" * (0x20 - len(code))
+        patched[text + 0x2a:text + 0x30] = b"\xe8" + (0x30 - 0x2f).to_bytes(4, "little") + b"\xc3"
+        data = bytes(patched)
+        q = query(data, layout)
+        start = q["functions"][0]
+        late = {"address": 0x40012a, "length": 5, "file_offset": text + 0x2a, "bytes": data[text + 0x2a:text + 0x2f].hex(),
+                "to": 0x400130, "to_file_offset": text + 0x30, "to_name": "compute"}
+        start.update(size=0x30, bytes=data[text:text + 0x30].hex(), calls=[start["calls"][0], late])
+        result = observe(data, q)
+        self.assertEqual([(o["location"]["offset"], o["location"]["length"], o["value"]["size"]) for o in result
+                          if o["value"]["kind"] == "function"][0], (text, 0x30, 0x30))
+        self.assertEqual([(o["value"]["from"], o["location"]["offset"]) for o in result if o["value"]["kind"] == "call"][:2],
+                         [(0x400100, text), (0x400100, text + 0x2a)])
+        start["size"] = 29  # the old byte count: the call after the gap falls outside and is dropped
+        start["bytes"] = start["bytes"][:58]
+        froms = [o["location"]["offset"] for o in observe(data, q) if o["value"]["kind"] == "call" and o["value"]["from"] == 0x400100]
+        self.assertEqual(froms, [text])
+
+    def test_a_call_whose_target_maps_below_zero_is_dropped(self):
+        data, layout = elf_code()
+        q = query(data, layout, delta=0x100000)
+        q["functions"][0]["calls"][0].update(to=0x1000, to_file_offset=-1)  # 0x1000 - delta < 0
+        calls = [o["location"]["offset"] for o in observe(data, q) if o["value"]["kind"] == "call"]
+        self.assertEqual(calls, [0x105, 0x13B, 0x142])
+
+    def test_a_too_large_input_is_refused_and_the_digest_covers_the_whole_file(self):
+        data, layout = elf_code()
+        with patch.object(worker, "MAX_INPUT_BYTES", len(data) - 1):
+            self.assertEqual(worker.reply(["ghidra.analyze", "{}"], data, lambda f, a, o: query(data, layout))["error"], "InputTooLarge")
+        with tempfile.TemporaryDirectory() as folder, patch.object(worker, "MAX_INPUT_BYTES", 16):
+            path = Path(folder, "input")
+            path.write_bytes(data)
+            kept, digest = worker.read_snapshot(path)
+        self.assertEqual((len(kept), digest), (17, hashlib.sha256(data).hexdigest()))
+
+
 class CrossCheckTests(unittest.TestCase):
     def refused(self, data, q, error=worker.InconsistentAnchor):
         with self.assertRaises(error):
@@ -291,6 +361,16 @@ class FileMapTests(unittest.TestCase):
         alloc[symtab + 8:symtab + 16] = (0x2).to_bytes(8, "little")  # an allocated .symtab is mapped
         self.assertEqual(worker.elf_map(bytes(nobits))[1], [(0x100, 0x156, 0x400100, True)])
         self.assertEqual(worker.elf_map(bytes(alloc))[1], [(0x100, 0x156, 0x400100, True), (0x158, 0x158 + 120, 0, False)])
+
+    def test_pe_sections_count_their_raw_bytes_when_virtual_size_is_zero(self):
+        """Decision m3a-function-span: PE extent is min(SizeOfRawData, VirtualSize), SizeOfRawData when VirtualSize is 0."""
+        data, layout = pe_code()
+        text_header = 0x40 + 4 + 20 + 240
+        patched = bytearray(data)
+        patched[text_header + 8:text_header + 12] = (0).to_bytes(4, "little")  # .text VirtualSize 0
+        self.assertEqual(worker.pe_map(bytes(patched))[1][0], (0x200, 0x400, 0x140001000, True))
+        patched[text_header + 8:text_header + 12] = (0x300).to_bytes(4, "little")  # larger than SizeOfRawData
+        self.assertEqual(worker.pe_map(bytes(patched))[1][0], (0x200, 0x400, 0x140001000, True))
 
     def test_only_elf_and_pe_are_accepted(self):
         for data in (b"", b"\xcf\xfa\xed\xfe" + bytes(60), b"PK\x03\x04" + bytes(60), b"MZ" + bytes(100), bytes(64)):
@@ -437,7 +517,7 @@ class BuildInputTests(unittest.TestCase):
     def test_scripts_lock_and_dockerfile_are_pinned_consistently(self):
         lock = json.loads((SOURCE / "image.lock.json").read_text(encoding="utf-8"))
         self.assertEqual(set(lock), {"adapter_version", "base_digest", "ghidra_sha256", "image_id", "jdk_sha256", "platform"})
-        self.assertEqual((lock["adapter_version"], lock["platform"], worker.ADAPTER_VERSION), ("12.1.4-r1", "linux/arm64", "12.1.4-r1"))
+        self.assertEqual((lock["adapter_version"], lock["platform"], worker.ADAPTER_VERSION), ("12.1.4-r2", "linux/arm64", "12.1.4-r2"))
         self.assertEqual(lock["ghidra_sha256"], "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db")
         self.assertEqual(lock["jdk_sha256"], "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223")
         self.assertEqual(lock["base_digest"], json.loads((ROOT / "containers" / "lief" / "image.lock.json").read_text())["base_digest"])

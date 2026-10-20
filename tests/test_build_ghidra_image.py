@@ -25,6 +25,9 @@ BASE = "FROM " + build.BASE
 def assets():
     return {key: dict(asset, sha256=hashlib.sha256(FAKE[key]).hexdigest()) for key, asset in build.ASSETS.items()}
 
+PREFIX = ("FROM " + build.BASE + " AS natives\nRUN apt-get update\nFROM " + build.BASE
+          + "\nCOPY --from=natives /opt/jdk /opt/jdk\nCOPY --from=natives /opt/ghidra /opt/ghidra\n").encode()
+
 
 class FakeDocker:
     def __init__(self, image_id="sha256:" + "a" * 64):
@@ -75,14 +78,14 @@ class BuildTests(unittest.TestCase):
         pull, built = self.docker.calls
         self.assertEqual(pull, ("pull", "--platform", "linux/arm64", build.BASE))
         self.assertEqual(built[:4], ("build", "--platform", "linux/arm64", "--pull=false"))
-        self.assertEqual(built[4:8], ("--iidfile", built[5], "--tag", "reverseai-ghidra:12.1.4-r1"))
+        self.assertEqual(built[4:8], ("--iidfile", built[5], "--tag", "reverseai-ghidra:12.1.4-r2"))
         self.assertEqual(len(built), 9)  # network is restricted by the Dockerfile itself (one natives RUN)
         self.assertEqual(self.docker.context, [
             "Dockerfile", "downloads", "downloads/" + build.ASSETS["jdk"]["name"], "downloads/" + build.ASSETS["ghidra"]["name"],
             "ghidra_scripts", "ghidra_scripts/ReverseAIOptions.java", "ghidra_scripts/ReverseAIQuery.java", "unpack.py", "worker.py"])
         self.assertEqual(self.docker.downloads, {build.ASSETS[key]["name"]: FAKE[key] for key in FAKE})
         self.assertEqual(json.loads(self.lock.read_text()), {
-            "adapter_version": "12.1.4-r1", "base_digest": build.BASE_DIGEST, "image_id": "sha256:" + "a" * 64,
+            "adapter_version": "12.1.4-r2", "base_digest": build.BASE_DIGEST, "image_id": "sha256:" + "a" * 64,
             "ghidra_sha256": hashlib.sha256(FAKE["ghidra"]).hexdigest(), "jdk_sha256": hashlib.sha256(FAKE["jdk"]).hexdigest(),
             "platform": "linux/arm64"})
 
@@ -122,14 +125,65 @@ class BuildTests(unittest.TestCase):
                     self.build()
                 self.assertFalse(self.lock.exists())
 
+    def test_control_bytes_and_escaped_backslashes_cannot_hide_an_instruction(self):
+        body = PREFIX
+        user = b"USER 65534:65534\n"
+        add = b"ADD https://example.invalid/x /x\n"
+        for label, content, reason in (
+                ("backslash and form feed, then ADD", body + b"RUN --network=none true \\\x0c" + add + user, "without control bytes"),
+                ("a continuation line of only 0x1f", body + b"RUN --network=none true \\\n\x1f\n" + add + user, "without control bytes"),
+                ("vertical tab", body + b"RUN --network=none true\x0b" + add + user, "without control bytes"),
+                ("a lone carriage return", body + b"RUN --network=none true\r" + add + user, "without control bytes"),
+                ("NUL", body + b"RUN --network=none true\x00\n" + user, "without control bytes"),
+                ("DEL", body + b"RUN --network=none true\x7f\n" + user, "without control bytes"),
+                ("ADD split across a CRLF continuation", (body + b"A\\\nDD https://example.invalid/x /x\n" + user).replace(b"\n", b"\r\n"),
+                 "ADD is refused"),
+                ("escaped trailing backslash before ADD", body + b"RUN --network=none true \\\\\n" + add + user, "ADD is refused")):
+            with self.subTest(label):
+                source = self.copy(label)
+                (source / "Dockerfile").write_bytes(content)
+                with self.assertRaisesRegex(SystemExit, reason):
+                    self.build(source=source)
+                self.assertEqual(self.docker.calls, [])
+        crlf = self.copy("CRLF line ends")
+        (crlf / "Dockerfile").write_bytes((body + b"RUN --network=none true \\\n    && true\n" + user).replace(b"\n", b"\r\n"))
+        self.assertEqual(self.build(source=crlf), 0)
+
     def test_the_real_dockerfile_is_accepted(self):
         build.check_dockerfile(build.SOURCE / "Dockerfile")
+
+    def test_the_dockerfile_content_is_pinned(self):
+        instructions = [" ".join(words) for words in build.logical_instructions((build.SOURCE / "Dockerfile").read_text())]
+        final = instructions[instructions.index("FROM " + build.BASE):]
+        self.assertEqual(final[:6], [
+            "FROM " + build.BASE, "COPY --from=natives /opt/jdk /opt/jdk", "COPY --from=natives /opt/ghidra /opt/ghidra",
+            "COPY worker.py /opt/reverseai/worker.py", "COPY ghidra_scripts/ /opt/reverseai/ghidra_scripts/", "USER 65534:65534"])
+        self.assertEqual(len(final), 8)
+        self.assertTrue(final[6].startswith('RUN --network=none ["python3", "-I", "-B", "-c", "import os, importlib.util as u;'))
+        for piece in ("'/opt/jdk/bin/java'", "'/opt/ghidra/support/analyzeHeadless'", "os/linux_arm_64/decompile'",
+                      "os/linux_arm_64/demangler_gnu_v2_41'", "['ReverseAIOptions.java', 'ReverseAIQuery.java']"):
+            self.assertIn(piece, final[6])
+        self.assertEqual(final[7], 'ENTRYPOINT ["python3", "-I", "-B", "/opt/reverseai/worker.py"]')
+        self.assertFalse([line for line in instructions if line.split()[0].upper() in ("ENV", "VOLUME", "ARG", "ONBUILD", "SHELL")])
+        natives = instructions[:instructions.index("FROM " + build.BASE)]
+        self.assertEqual(natives[1], "RUN apt-get update && apt-get install -y --no-install-recommends g++=4:14.2.0-1 make=4.4.1-2 "
+                                     "&& rm -rf /var/lib/apt/lists/*")
+        unpack = next(line for line in natives if "unpack.py ghidra" in line)
+        for key, mode in (("ghidra", "ghidra"), ("jdk", "check")):
+            asset = build.ASSETS[key]
+            with self.subTest(key):
+                checked = unpack.index(f"/tmp/unpack.py {mode} /tmp/{asset['name']} {asset['sha256']}")
+                uses = [i for i in range(len(unpack)) if unpack.startswith("/tmp/" + asset["name"], i)]
+                self.assertEqual(min(uses), checked + len(f"/tmp/unpack.py {mode} "))  # checked before any other use
+        self.assertIn("--strip-components=1 --no-same-owner", unpack)
+        self.assertIn("rm /tmp/" + build.ASSETS["jdk"]["name"], unpack)
+        self.assertIn("rm -rf /opt/ghidra/docs /tmp/" + build.ASSETS["ghidra"]["name"], unpack)
 
     def test_every_other_dockerfile_shape_is_refused_before_docker(self):
         natives, final = BASE + " AS natives", BASE
         apt = "RUN apt-get update && apt-get install -y g++ make"
         offline = "RUN --network=none true"
-        copy = "COPY --from=natives /opt/jdk /opt/jdk"
+        copy = ["COPY --from=natives /opt/jdk /opt/jdk", "COPY --from=natives /opt/ghidra /opt/ghidra"]
         user = "USER 65534:65534"
         cases = (
             ("one stage only", [final, offline, user], "FROM differs"),
@@ -147,21 +201,29 @@ class BuildTests(unittest.TestCase):
             ("ADD split", [natives, apt, final, "A\\", "DD x /x", user], "ADD is refused"),
             ("directive", ["# syntax=docker/dockerfile:1", natives, apt, final, user], "parser directives"),
             ("non-ASCII", [natives, apt, final, "# caf\u00e9", user], "must be ASCII"),
-            ("network in the image", [natives, apt, final, "RUN true", user], "network in one natives RUN only"),
-            ("network twice in the natives", [natives, apt, "RUN make", final, user], "network in one natives RUN only"),
-            ("no network step at all", [natives, offline, final, user], "network in one natives RUN only"),
-            ("the one network step in the image", [natives, offline, final, "RUN apt-get update", user], "network in one natives RUN only"),
-            ("network flag elsewhere", [natives, apt, final, "RUN true --network=none", user], "network in one natives RUN only"),
-            ("no USER", [natives, apt, final, copy], "exactly one USER"),
-            ("lower-case extra user", [natives, apt, final, user, "user root"], "exactly one USER"),
-            ("USER root", [natives, apt, final, "USER root"], "exactly one USER"),
+            ("lower-case add", [natives, apt, final, *copy, "add https://example.invalid/x /x", user], "ADD is refused"),
+            ("ADD after an escaped trailing backslash", [natives, apt, final, *copy, "RUN --network=none true \\\\",
+                                                         "ADD https://example.invalid/x /x", user], "ADD is refused"),
+            ("only the JDK copied", [natives, apt, final, copy[0], user], "copy only /opt/jdk and /opt/ghidra"),
+            ("another path copied", [natives, apt, final, *copy, "COPY --from=natives /usr/bin /usr/bin", user],
+             "copy only /opt/jdk and /opt/ghidra"),
+            ("copied to another place", [natives, apt, final, copy[0], "COPY --from=natives /opt/ghidra /usr/local/ghidra", user],
+             "copy only /opt/jdk and /opt/ghidra"),
+            ("network in the image", [natives, apt, final, *copy, "RUN true", user], "network in one natives RUN only"),
+            ("network twice in the natives", [natives, apt, "RUN make", final, *copy, user], "network in one natives RUN only"),
+            ("no network step at all", [natives, offline, final, *copy, user], "network in one natives RUN only"),
+            ("the one network step in the image", [natives, offline, final, *copy, "RUN apt-get update", user], "network in one natives RUN only"),
+            ("network flag elsewhere", [natives, apt, final, *copy, "RUN true --network=none", user], "network in one natives RUN only"),
+            ("no USER", [natives, apt, final, *copy], "exactly one USER"),
+            ("lower-case extra user", [natives, apt, final, *copy, user, "user root"], "exactly one USER"),
+            ("USER root", [natives, apt, final, *copy, "USER root"], "exactly one USER"),
         )
         for label, lines, reason in cases:
             with self.subTest(label):
                 with self.assertRaisesRegex(SystemExit, reason):
                     self.build(source=self.dockerfile(label, lines))
                 self.assertEqual(self.docker.calls, [])
-        allowed = self.dockerfile("smallest accepted", [natives, apt, offline, final, copy, offline, user])
+        allowed = self.dockerfile("smallest accepted", [natives, apt, offline, final, *copy, offline, user])
         self.assertEqual(self.build(source=allowed), 0)
 
 
@@ -185,10 +247,13 @@ class UnpackTests(unittest.TestCase):
     def test_members_are_unpacked_with_their_exec_bits(self):
         with tempfile.TemporaryDirectory() as folder:
             path, digest = self.archive(folder, [("g/support/analyzeHeadless", 0o100755, b"#!/bin/bash\n"),
-                                                 ("g/support/launch.properties", 0o100644, b"x=1\n")])
+                                                 ("g/support/launch.properties", 0o100644, b"x=1\n"),
+                                                 ("g/support/setuid", 0o104755, b"x"), ("g/support/sticky", 0o101666, b"y")])
             unpack.main(["ghidra", str(path), digest, str(Path(folder, "out"))])
             self.assertEqual(oct(Path(folder, "out/g/support/analyzeHeadless").stat().st_mode & 0o777), "0o755")
             self.assertEqual(oct(Path(folder, "out/g/support/launch.properties").stat().st_mode & 0o777), "0o644")
+            self.assertEqual(oct(Path(folder, "out/g/support/setuid").stat().st_mode & 0o7777), "0o755")
+            self.assertEqual(oct(Path(folder, "out/g/support/sticky").stat().st_mode & 0o7777), "0o644")
 
     def test_a_wrong_hash_or_an_escaping_member_is_refused(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -205,6 +270,11 @@ class UnpackTests(unittest.TestCase):
                     with self.assertRaisesRegex(SystemExit, "unsafe member"):
                         unpack.main(["ghidra", str(bad), bad_digest, str(Path(folder, label.replace(" ", "-")))])
             self.assertFalse(Path(folder, "escape").exists())
+            self.assertFalse(Path(folder, "out").exists())  # a wrong hash is refused before anything is unpacked
+            Path(folder, "dup").mkdir()
+            duplicate, duplicate_digest = self.archive(Path(folder, "dup"), [("g/a", 0o100644, b"one"), ("g/a", 0o100644, b"two")])
+            with self.assertRaisesRegex(SystemExit, "duplicate member"):
+                unpack.main(["ghidra", str(duplicate), duplicate_digest, str(Path(folder, "dup-out"))])
             with self.assertRaisesRegex(SystemExit, "usage"):
                 unpack.main(["ghidra", str(path)])
 

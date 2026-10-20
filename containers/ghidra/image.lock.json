@@ -1,8 +1,8 @@
 {
-  "adapter_version": "12.1.4-r1",
+  "adapter_version": "12.1.4-r2",
   "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
   "ghidra_sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",
-  "image_id": "sha256:94117d24943b3d1500cf7128a2f738049920e37f2bf2f72e385880c448acc274",
+  "image_id": "sha256:7a42763740af6bf4645e9d26a25fef9429e9770f9cff37c873d9b93c5b0fb371",
   "jdk_sha256": "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223",
   "platform": "linux/arm64"
 }
