@@ -126,6 +126,8 @@ def validate_probe(name, value):
             need(type(value.get(key)) is int and value[key] == expected, "RuntimeIdentity")
         return
     need(name in CONTROL_NAMES and value.get("attempted") is True and value.get("blocked") is True, "ProbeNotBlocked")
+    # These errors prove refusal, not its cause: permission or routing can fail first.
+    # Read-only/network policy is established separately by the stopped-container inspect.
     errno_values = {"network": (1, 13, 101, 113), "write_root": (1, 13, 30),
                     "write_snapshot": (1, 13, 30), "setuid": (1, 13), "capability": (1, 13)}
     if name in errno_values:
@@ -317,11 +319,15 @@ def derive_control_argv(argv, image_id, code=None):
          argv[:2] == ["docker", "run"] and argv.count(image_id) == 1, "BuilderArgv")
     need(code is None or isinstance(code, str), "ControlCodeType")
     at = argv.index(image_id)
+    options = argv[2:at]
+    pulls = [index for index, value in enumerate(options) if value == "--pull"]
+    need(len(pulls) == 1 and pulls[0] + 1 < len(options) and options[pulls[0] + 1] == "never" and
+         not any(value.startswith("--pull=") for value in options), "BuilderPullPolicy")
     result = list(argv)
     result[1] = "create"
     if code is not None:
         result = result[:at] + ["--entrypoint", "python3", image_id, "-I", "-B", "-c", code]
-    need(result[2:at] == argv[2:at], "ControlFlagsChanged")
+    # Flags are copied verbatim; exact-output tests cover both transformations.
     return result
 
 
@@ -374,11 +380,34 @@ class NativeVerifier:
         row["verified"] = self.absent(row["container_id"])
         need(row["verified"], "ContainerCleanupUnverified")
 
+    def reconcile_create(self, name, snapshot):
+        row = {"container_id": None, "container_name": name, "uncertain_create": True,
+               "verified": False, "staging_removed": False}
+        self.receipt["cleanup"].append(row)
+        self.last = (row, Path(snapshot))
+        try:
+            raw = self.docker(["ps", "--all", "--no-trunc", "--filter", "name=^/" + name + "$",
+                               "--format", "{{.ID}}"], cap=256)
+            ids = raw.decode("ascii").strip().splitlines()
+            need(len(ids) <= 1 and all(re.fullmatch(r"[0-9a-f]{64}", cid) for cid in ids), "CreateLookupID")
+            if ids:
+                cid = ids[0]
+                data = self.one_inspect(["inspect", cid])
+                need(data.get("Id") == cid and data.get("Name") == "/" + name and
+                     data.get("Image") == self.lock["image_id"], "CreateLookupOwnership")
+                row["container_id"] = cid
+                self.cleanup(row)
+            else:
+                row["verified"] = True  # Successful exact-name lookup proved absence.
+        except Exception:
+            raise VerificationError("CreateCleanupUnverified") from None
+
     def runner(self, argv, *, timeout, max_output):
         if argv[:2] != ["docker", "run"]:
             return self.boundary.run_bounded(argv, timeout=timeout, max_output=max_output)
         need(timeout == WALL_SECONDS and max_output == MAX_WORKER_REPLY_BYTES, "ExecutorLimitsChanged")
         name = argv[argv.index("--name") + 1]
+        need(bool(re.fullmatch(r"reverseai-[a-z0-9-]{1,64}", name)), "BuilderContainerName")
         mount = next(csv.reader(io.StringIO(argv[argv.index("--mount") + 1])))
         sources = [item.removeprefix("source=") for item in mount if item.startswith("source=")]
         need(len(sources) == 1, "BuilderSnapshot")
@@ -388,8 +417,14 @@ class NativeVerifier:
         need(argv == self.boundary.build_argv(self.lock["image_id"], name, snapshot, operation, args), "BuilderMismatch")
         code = probe_code(self.active) if self.active is not None else None
         created = derive_control_argv(argv, self.lock["image_id"], code)
-        cid = self.boundary.run_bounded(created, timeout=5, max_output=128).decode("ascii").strip()
-        need(bool(re.fullmatch(r"[0-9a-f]{64}", cid)), "CreatedContainerID")
+        try:
+            raw = self.boundary.run_bounded(created, timeout=5, max_output=128)
+            need(isinstance(raw, bytes), "CreatedContainerID")
+            cid = raw.decode("ascii", errors="replace").strip()
+            need(bool(re.fullmatch(r"[0-9a-f]{64}", cid)), "CreatedContainerID")
+        except BaseException:
+            self.reconcile_create(name, snapshot)
+            raise
         row = {"container_id": cid, "verified": False, "staging_removed": False}
         self.receipt["cleanup"].append(row)
         self.last = (row, Path(snapshot))
