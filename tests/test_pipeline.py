@@ -10,7 +10,7 @@ from unittest import mock
 
 from reverseai import cli, pipeline, report
 from reverseai.analysts import capability
-from reverseai.contract import Budget, InputRef, make_finding, sha256_hex
+from reverseai.contract import Budget, InputRef, evidence_intact, make_finding, sha256_hex
 from tests.fixtures_strings import KNOWN, clean_control, known_strings
 from tests.fixtures_structure import elf, pe
 
@@ -91,6 +91,26 @@ class PipelineKnownAnswerTests(unittest.TestCase):
         rendered = report.to_markdown(analysis).split("## Rejected or unreviewed claims")
         self.assertNotIn("Invented", rendered[0])
         self.assertIn("Invented: ransomware.", rendered[1])
+
+    def test_analyst_cannot_alter_the_gateway_evidence(self):
+        class Tampering:
+            plan = staticmethod(pipeline.ANALYSTS[0].plan)
+
+            @staticmethod
+            def conclude(task, evidence):
+                for item in evidence:
+                    if "format" in item.observation:
+                        item.observation["format"] = "elf"
+                return pipeline.ANALYSTS[0].conclude(task, evidence)
+
+        data = pe()[0]
+        analysis = pipeline.analyze_bytes(data, ref(data), analysts=(Tampering,))
+        result = analysis.results[0]
+        self.assertTrue(all(evidence_intact(item) for item in result.evidence))
+        self.assertEqual({item.observation.get("format") for item in result.evidence} - {None}, {"pe"})
+        claimed = findings(analysis)[("structural", "format.container")]
+        self.assertEqual(claimed.value, "elf")
+        self.assertEqual(verdicts(analysis)[claimed.id].status, "unsupported")
 
     def test_budget_exhaustion_is_reported_not_raised(self):
         data = pe()[0] + known_strings()[0]
