@@ -36,6 +36,12 @@ def _category(name):
     return derive
 
 
+def _writable_executable_indices(observations):
+    if not all(o.get("writable") is True and o.get("executable") is True and type(o.get("index")) is int for o in observations):
+        return None
+    return sorted({o["index"] for o in observations})
+
+
 def _urls(observations):
     if not all(o.get("rule") == "url" and isinstance(o.get("match"), str) for o in observations):
         return None
@@ -44,13 +50,28 @@ def _urls(observations):
 
 CATEGORIES = ("process_injection", "persistence", "network", "crypto", "anti_debug")
 
+
+def _field(name, convert=lambda value: value):
+    """One value from the observations that carry the field; observations without it (other physical headers) are ignored."""
+    def derive(observations):
+        carrying = [o for o in observations if name in o]
+        return _one(convert(o) for o in carrying) if carrying else None
+    return derive
+
+
+_format = _field("format", lambda o: o["format"])
+_machine = _field("machine_name", lambda o: o["machine_name"])
+_count = lambda obs: _one(_section_count(o) for o in obs if "shnum" in o or "number_of_sections" in o) \
+    if any("shnum" in o or "number_of_sections" in o for o in obs) else None
+
 # claim_key -> (confidence the claim must carry, {operation it may cite: derive(observations) -> expected value or None}).
 # A claim may cite several allowed operations; each operation's citations must yield the same value.
 RULES = {
-    "format.container": ("observed", {"structure.identify": lambda obs: _one(o.get("format") for o in obs)}),
-    "format.machine": ("observed", {"structure.headers": lambda obs: _one(o.get("machine_name") for o in obs)}),
-    "format.section_count": ("observed", {"structure.headers": lambda obs: _one(_section_count(o) for o in obs)}),
+    "format.container": ("observed", {"structure.identify": _format, "lief.headers": _format}),
+    "format.machine": ("observed", {"structure.headers": _machine, "lief.headers": _machine}),
+    "format.section_count": ("observed", {"structure.headers": _count, "lief.headers": _count}),
     "sections.writable_executable": ("inferred", {"structure.sections": _writable_executable}),
+    "sections.writable_executable_indices": ("inferred", {"lief.sections": _writable_executable_indices}),
     "strings.urls": ("observed", {"strings.indicators": _urls}),
     **{f"capability.{name}": ("inferred", {"strings.indicators": _category(name)}) for name in CATEGORIES},
 }
@@ -62,6 +83,7 @@ STATEMENTS = {
     "format.machine": "Machine named in the header",
     "format.section_count": "Number of sections declared in the header",
     "sections.writable_executable": "Sections that are both writable and executable",
+    "sections.writable_executable_indices": "Section indices that are both writable and executable",
     "strings.urls": "URL strings in the input",
     **{f"capability.{name}": f"String hints of {name.replace('_', ' ')} capability (names only, not behaviour)" for name in CATEGORIES},
 }

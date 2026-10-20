@@ -15,7 +15,7 @@ from tests.fixtures_structure import elf, structure_evidence
 TOOLS = {"structure": structure.TOOL}
 REASON = re.compile(r"(ev-[0-9a-f]{16}: [a-zA-Z ]+|finding cites no evidence|finding does not match its ID"
                     r"|finding ID reused for different content|no claim rule for this claim_key"
-                    r"|[a-z_.]+ may only cite [a-z_.]+ evidence|cited evidence does not yield the claimed value"
+                    r"|[a-z_.]+ may only cite [a-z_.]+(, [a-z_.]+)* evidence|[a-z_.]+ must be (observed|inferred)|cited evidence does not yield the claimed value"
                     r"|another finding gives [a-z_.]+ a different value)\Z")
 
 
@@ -161,7 +161,7 @@ class ReviewTests(unittest.TestCase):
         headers = [item for item in self.evidence if item.operation == "structure.headers"][0]
         cases = (
             (self.finding("pe"), "cited evidence does not yield the claimed value"),
-            (self.finding("elf", [headers.id]), "format.container may only cite structure.identify evidence"),
+            (self.finding("elf", [headers.id]), "format.container may only cite lief.headers, structure.identify evidence"),
             (self.finding("elf", claim_key="format.colour"), "no claim rule for this claim_key"),
         )
         for finding, reason in cases:

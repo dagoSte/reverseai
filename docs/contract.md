@@ -28,7 +28,10 @@ approved file
 | `reverseai/tools/strings.py` | lane B | `TOOL: ToolSpec` named `strings` |
 | `reverseai/analysts/capability.py` | lane B | `plan`, `conclude` as above |
 | `reverseai/gateway.py` | lane B | `Gateway(tools: Iterable[ToolSpec], budget: Budget)` with `run(task, data) -> AnalysisResult` |
-| `reverseai/claims.py` | coordinator (contract) | `RULES`, `check(finding, cited_evidence) -> tuple[str, ...]` reasons |
+| `reverseai/claims.py` | coordinator (contract) | `RULES` (confidence and allowed operations per claim_key), `STATEMENTS`, `check(finding, cited_evidence) -> tuple[str, ...]` reasons |
+| `reverseai/contained.py` | M2a | the only path from a contained handler to its worker: stages the snapshot, runs the pinned image with fixed limits, returns its bounded stdout |
+| `reverseai/tools/lief_tool.py` | M2a | `TOOL: ToolSpec` named `lief`, `contained=True`: `lief.headers`, `lief.sections` |
+| `containers/lief/` | M2a | worker image definition and in-container worker; never imported on the host |
 | `reverseai/pipeline.py`, `reverseai/cli.py`, `reverseai/report.py` | coordinator | integration |
 
 ## Rules every component keeps
@@ -36,6 +39,21 @@ approved file
 1. **Tools only observe.** A handler receives the frozen bytes and validated
    arguments and returns `Observation`s. It never opens files, runs processes,
    uses the network or reads the environment.
+   *Contained variant* (amendment to contract/1, decision `owner-m2-choices`): a
+   `ToolSpec` with `contained=True` has handlers that reach one fixed, pinned
+   worker image only through `reverseai/contained.py`. The worker sees one
+   read-only frozen snapshot of the input and a bounded private `/tmp`; it gets no
+   host path, network, Docker socket, credentials or agent input, runs as a
+   non-root user with every capability dropped on a read-only root, and is
+   stopped at its time, memory, CPU, process and output limits. Its stdout must
+   pass `parse_worker_reply` (protocol `reverseai.worker/1`): bounded
+   observations plus the digest of the snapshot it read, which must equal the
+   `InputRef` hash, or an error class name. The gateway then makes evidence from
+   the controller's own bytes with `make_evidence`; worker-supplied evidence IDs
+   or excerpt hashes are never accepted. The controller never parses with the
+   tool natively, and the sample itself is never executed. `ToolSpec.runtime`
+   records the image digest and platform; the `ToolRef` version changes whenever
+   the adapter, image or hidden settings change.
 2. **Only the gateway makes evidence**, with `make_evidence`, so the evidence ID,
    input hash and excerpt hash are always computed the same way.
 3. **The gateway refuses** an operation that is not registered, arguments that
@@ -47,8 +65,10 @@ approved file
    receive because of its own limit.
 4. **De-duplication.** One `Gateway` instance is shared by all tasks of a run. An
    operation whose `operation_key` was already executed returns the stored
-   evidence without calling the handler again. An execution cut short by a budget
-   is not stored as the result for later tasks.
+   evidence without calling the handler again. An execution cut short by time
+   may be retried after its worker stops. Fixed observation, global evidence and
+   output cuts are cached and replayed as `budget_exceeded` without invoking the
+   handler again. Retries do not charge the unique-operation budget twice.
 5. **Findings cite evidence.** `conclude` sees only evidence of its own task, as
    copies: the pipeline keeps the gateway's records for the result. It returns
    findings made with `make_finding`, whose ID binds every field. A finding with no evidence is

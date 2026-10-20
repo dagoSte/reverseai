@@ -20,6 +20,8 @@ MAX_OBSERVATION_BYTES = 4096
 MAX_CLAIM_CHARS = 280
 MAX_EVIDENCE_PER_FINDING = 64
 MAX_STRING_ARG_CHARS = 256
+MAX_WORKER_REPLY_BYTES = 262_144
+WORKER_PROTOCOL = "reverseai.worker/1"
 
 ROLES = ("structural", "capability")
 FINDING_CONFIDENCE = ("observed", "inferred")
@@ -275,11 +277,62 @@ class OperationSpec:
 class ToolSpec:
     ref: ToolRef
     operations: Mapping[str, OperationSpec]
+    contained: bool = False  # rule 1 contained variant: handlers reach a pinned worker only through reverseai.contained
+    runtime: Mapping[str, str] = field(default_factory=dict)  # e.g. image digest and platform, shown in reports
 
     def __post_init__(self):
         require(isinstance(self.ref, ToolRef), "ToolSpec ref must be a ToolRef")
         for name, op in self.operations.items():
             require(name == op.name and name.split(".", 1)[0] == self.ref.name, "Operation must be keyed by name and belong to its tool")
+        require(type(self.contained) is bool, "ToolSpec contained must be a bool")
+        require(isinstance(self.runtime, Mapping) and len(self.runtime) <= 8 and all(
+            isinstance(k, str) and _NAME.match(k) and isinstance(v, str) and 0 < len(v) <= 128 and v.isprintable()
+            for k, v in self.runtime.items()), "Invalid ToolSpec runtime")
+        require(self.contained or not self.runtime, "Only contained tools carry runtime identity")
+
+
+class WorkerError(ContractError):
+    """A contained worker reported a failure; the message is the worker's exception class name only."""
+
+
+def _unique_keys(pairs):
+    keys = [key for key, _ in pairs]
+    require(len(keys) == len(set(keys)), "Duplicate key in worker reply")
+    return dict(pairs)
+
+
+def parse_worker_reply(raw, *, input_sha256, max_observations):
+    """The only shape the gateway accepts from a contained worker (rule 1, contained variant).
+
+    stdout must be one UTF-8 JSON object: {"protocol": WORKER_PROTOCOL, "status": "ok", "snapshot_sha256": <hex>,
+    "observations": [{"location": {"offset", "length"}, "value": {...}}]} or the same with "status": "error" and
+    "error": <exception class name>. The worker never supplies evidence IDs or excerpt hashes: the gateway makes
+    evidence from the controller's own bytes after this check.
+    """
+    require(isinstance(raw, (bytes, bytearray)) and len(raw) <= MAX_WORKER_REPLY_BYTES, "Worker reply too large")
+    try:
+        reply = json.loads(bytes(raw).decode("utf-8"), object_pairs_hook=_unique_keys,
+                           parse_constant=lambda name: require(False, "Invalid number in worker reply"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ContractError("Worker reply is not UTF-8 JSON") from None
+    require(isinstance(reply, dict) and reply.get("protocol") == WORKER_PROTOCOL, "Unknown worker protocol")
+    require(reply.get("snapshot_sha256") == input_sha256, "Worker read a different snapshot")
+    if reply.get("status") == "error":
+        require(set(reply) == {"protocol", "status", "snapshot_sha256", "error"}, "Invalid worker error fields")
+        error = reply["error"]
+        require(isinstance(error, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", error), "Invalid worker error name")
+        raise WorkerError(error)
+    require(reply.get("status") == "ok" and set(reply) == {"protocol", "status", "snapshot_sha256", "observations"},
+            "Invalid worker reply fields")
+    items = reply["observations"]
+    require(isinstance(items, list) and len(items) <= max_observations, "Worker observations missing or over the cap")
+    observations = []
+    for item in items:
+        require(isinstance(item, dict) and set(item) == {"location", "value"}, "Invalid worker observation")
+        location = item["location"]
+        require(isinstance(location, dict) and set(location) == {"offset", "length"}, "Invalid worker location")
+        observations.append(Observation(Location(location["offset"], location["length"]), item["value"]))
+    return tuple(observations)
 
 
 @dataclass(frozen=True)

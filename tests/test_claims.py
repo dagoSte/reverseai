@@ -36,7 +36,7 @@ class ClaimRuleTests(unittest.TestCase):
     def test_claims_may_only_cite_their_operation(self):
         headers = evidence(STRUCTURE, "structure.headers", format="pe", machine_name="x86_64")
         reasons = claims.check(finding("format.container", "pe", [headers]), [headers])
-        self.assertEqual(reasons, ("format.container may only cite structure.identify evidence",))
+        self.assertEqual(reasons, ("format.container may only cite lief.headers, structure.identify evidence",))
 
     def test_disagreeing_citations_yield_nothing(self):
         a = evidence(STRUCTURE, "structure.identify", 0, format="pe")
@@ -80,6 +80,26 @@ class ClaimRuleTests(unittest.TestCase):
             self.assertEqual(claims.check(finding("format.container", "pe", [stdlib, evidence(STRUCTURE, "structure.headers", 12, format="pe")]),
                                           [stdlib, evidence(STRUCTURE, "structure.headers", 12, format="pe")]),
                              ("format.container may only cite lief.headers, structure.identify evidence",))
+
+    def test_lief_headers_support_format_claims_per_physical_header(self):
+        lief = ToolRef("lief", "1.0.0-r1")
+        dos = evidence(lief, "lief.headers", 0, structure="dos", e_lfanew=128)
+        coff = evidence(lief, "lief.headers", 128, structure="coff", format="pe", machine_name="x86_64", number_of_sections=3)
+        identify = evidence(STRUCTURE, "structure.identify", 4, format="pe")
+        self.assertEqual(claims.check(finding("format.container", "pe", [identify, coff]), [identify, coff]), ())
+        self.assertEqual(claims.check(finding("format.machine", "x86_64", [coff]), [coff]), ())
+        self.assertEqual(claims.check(finding("format.section_count", 3, [coff]), [coff]), ())
+        self.assertNotEqual(claims.check(finding("format.container", "pe", [dos]), [dos]), ())  # the DOS header carries no format
+        self.assertNotEqual(claims.check(finding("format.container", "elf", [identify, coff]), [identify, coff]), ())
+
+    def test_writable_executable_section_indices(self):
+        lief = ToolRef("lief", "1.0.0-r1")
+        rwx = evidence(lief, "lief.sections", 0, index=2, writable=True, executable=True)
+        rx = evidence(lief, "lief.sections", 4, index=0, writable=False, executable=True)
+        self.assertEqual(claims.check(finding("sections.writable_executable_indices", [2], [rwx]), [rwx]), ())
+        self.assertNotEqual(claims.check(finding("sections.writable_executable_indices", [0, 2], [rwx, rx]), [rwx, rx]), ())
+        self.assertNotEqual(claims.check(finding("sections.writable_executable", [".rwx"], [rwx]), [rwx]), ())
+        self.assertEqual(claims.statement("sections.writable_executable_indices"), "Section indices that are both writable and executable")
 
     def test_unknown_claims_and_empty_citations_are_never_supported(self):
         pe = evidence(STRUCTURE, "structure.identify", format="pe")
