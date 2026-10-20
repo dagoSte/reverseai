@@ -10,13 +10,16 @@ writes functions, calls and pseudocode as JSON), a fixed heap and timeouts below
 limit. Requests choose only the four bounded counts: never a script, loader or option.
 
 Ghidra's addresses may be rebased, so every anchor is mapped again here with this file's own
-section table (stdlib decoding): an observation's address is the file's virtual address of its
-anchor, and an anchor is kept only inside an executable section. Each anchor is cross-checked:
-Ghidra's bytes there equal the snapshot's, Ghidra's memory block maps its address back to the same
-file offset, and every anchor has the same Ghidra-to-file address delta; anything else is
-InconsistentAnchor. Observations follow the M3a seams: functions in address order, pseudocode for
-the entry-point function and then the largest, calls from emitted functions only, inside them.
-Errors are class names only. Nothing but the one JSON object is written, to stdout only.
+section table (stdlib decoding; only file-mapped bytes count: ELF SHF_ALLOC sections, PE
+min(SizeOfRawData, VirtualSize), decision m3a-function-span): an observation's address is the
+file's virtual address of its anchor, and an anchor is kept only inside an executable section.
+Each anchor is cross-checked: Ghidra's bytes there equal the snapshot's, Ghidra's memory block maps
+its address back to the same file offset, and every anchor has the same Ghidra-to-file address
+delta; anything else is InconsistentAnchor. What stays Ghidra's reading, reported as derived and
+never as verified: names, a function's size (its span from the entry to the last body byte), call
+targets and pseudocode. Observations follow the M3a seams: functions in address order, pseudocode
+for the entry-point function and then the largest, calls from emitted functions only, inside
+their span. Errors are class names only. Nothing but the one JSON object is written, to stdout only.
 """
 
 import hashlib
@@ -31,7 +34,7 @@ import subprocess
 import sys
 
 PROTOCOL = "reverseai.worker/1"
-ADAPTER_VERSION = "12.1.4-r1"
+ADAPTER_VERSION = "12.1.4-r2"
 SNAPSHOT = "/snapshot/input"
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 MAX_REPLY_BYTES = 262_144

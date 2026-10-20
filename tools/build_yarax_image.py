@@ -48,20 +48,23 @@ def wheel_sha256():
 
 
 def logical_instructions(text):
-    """Logical instructions as BuildKit reads them: a line ending in a backslash continues on the next one, comment
-    and empty lines inside a continuation are skipped, and nothing is inserted at the join (A\\ then DD is ADD)."""
+    """Logical instructions as BuildKit reads them: a line ending in an unescaped backslash (then only spaces or tabs)
+    continues on the next one, comment and empty lines inside a continuation are skipped, and nothing is inserted at
+    the join (A\\ then DD is ADD). A line ending in an escaped backslash (an even run) ends its instruction, so what
+    follows is checked as an instruction of its own under either reading. Lines are split on LF only: the caller has
+    refused every other control byte."""
     joined, current = [], None
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if current is None:
-            line = line.lstrip()
+            line = line.lstrip(" \t")
             if not line or line.startswith("#"):
                 continue
             current = ""
-        elif not line.strip() or line.lstrip().startswith("#"):
+        elif not line.strip(" \t") or line.lstrip(" \t").startswith("#"):
             continue
-        end = re.search(r"\\[ \t]*$", line)
-        if end:
-            current += line[:end.start()]
+        end = re.search(r"(\\+)[ \t]*$", line)
+        if end and len(end.group(1)) % 2:
+            current += line[:end.end(1) - 1]
         else:
             joined.append(current + line)
             current = None
@@ -71,15 +74,15 @@ def logical_instructions(text):
 
 
 def check_dockerfile(path):
-    """The lock records BASE_DIGEST, so the Dockerfile must build from exactly BASE and nothing else: ASCII only (a BOM
-    would hide a directive), one FROM line, no ADD (remote URLs, Git), no COPY --from or RUN --mount ...from= (another
+    """The lock records BASE_DIGEST, so the Dockerfile must build from exactly BASE and nothing else: ASCII without
+    control bytes (a BOM or a form feed would hide a directive or an instruction), one FROM line, no ADD (remote URLs, Git), no COPY --from or RUN --mount ...from= (another
     image or stage), no parser directive (# syntax=, # escape=) and exactly one line USER 65534:65534. Instructions
     are counted case-insensitively and continuations are joined first, so neither hides one."""
     raw = path.read_bytes()
-    if not raw.isascii():
-        raise SystemExit("Dockerfile must be ASCII")
-    text = raw.decode("ascii")
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not raw.isascii() or re.search(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\r(?!\n)", raw):
+        raise SystemExit("Dockerfile must be ASCII without control bytes (tab, LF and CRLF only)")
+    text = raw.decode("ascii").replace("\r\n", "\n")
+    lines = [line.strip(" \t") for line in text.split("\n") if line.strip(" \t")]
     instructions = logical_instructions(text)
     if [words for words in instructions if words[0].upper() == "FROM"] != [["FROM", BASE]]:
         raise SystemExit("Dockerfile FROM differs from the pinned base " + BASE)

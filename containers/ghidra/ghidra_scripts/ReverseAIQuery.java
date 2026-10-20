@@ -1,9 +1,11 @@
 // ReverseAI's fixed Ghidra query (reviewed code baked into the image; requests cannot choose scripts).
 // Arguments: <output JSON path> <max_functions> <decompile> <entry file offset or -1> <decompile seconds>.
-// Writes memory blocks, functions (address order, at most MAX_FUNCTIONS), the calls inside the first
-// max_functions file-backed executable functions, and pseudocode for the entry-point function and then the
-// largest of those, all as plain JSON. The Python worker re-checks and maps every value; this script decides
-// nothing that reaches the host unchecked.
+// Writes what Ghidra reports, as plain JSON: memory blocks, functions (address order, at most MAX_FUNCTIONS; size is
+// the span from the entry to the last body byte, decision m3a-function-span), the calls inside the first
+// max_functions file-backed executable functions, and pseudocode for the entry-point function and then the largest
+// of those. The Python worker checks what the bytes can confirm (each anchor's file offset, bytes and memory-block
+// mapping, one rebase delta, bounds and order) and drops or refuses the rest; names, sizes, call targets and
+// pseudocode remain Ghidra's interpretation, reported as derived and never as verified.
 //@category ReverseAI
 
 import java.io.FileOutputStream;
@@ -85,7 +87,7 @@ public class ReverseAIQuery extends GhidraScript {
 			}
 			count++;
 			Address entry = function.getEntryPoint();
-			long size = function.getBody().getNumAddresses();
+			long size = span(function);
 			long offset = fileOffset(entry);
 			MemoryBlock block = memory.getBlock(entry);
 			boolean anchored = offset >= 0 && block != null && block.isExecute() && block.isInitialized()
@@ -115,7 +117,7 @@ public class ReverseAIQuery extends GhidraScript {
 		List<Function> rest = new ArrayList<>(selected);
 		rest.removeAll(order);
 		rest.sort((a, b) -> {
-			int bySize = Long.compare(b.getBody().getNumAddresses(), a.getBody().getNumAddresses());
+			int bySize = Long.compare(span(b), span(a));
 			return bySize != 0 ? bySize : a.getEntryPoint().compareTo(b.getEntryPoint());
 		});
 		order.addAll(rest);
@@ -188,6 +190,13 @@ public class ReverseAIQuery extends GhidraScript {
 				.append(",\"to_name\":").append(quote(nameAt(target))).append("}");
 			first = false;
 		}
+	}
+
+	/** Entry to the last byte of the body: a body with gaps keeps the calls in its later ranges. */
+	private static long span(Function function) {
+		Address entry = function.getEntryPoint();
+		Address last = function.getBody().getMaxAddress();
+		return last == null || last.compareTo(entry) < 0 ? 1 : last.subtract(entry) + 1;
 	}
 
 	private String nameAt(Address address) {

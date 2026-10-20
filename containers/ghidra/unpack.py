@@ -3,7 +3,8 @@
     python3 -I -B unpack.py check <file> <sha256>
     python3 -I -B unpack.py ghidra <zip> <sha256> <destination>
 
-Members must stay inside the destination; links and absolute or parent paths are refused.
+Members must stay inside the destination; links, absolute or parent paths and duplicate names are refused, and
+modes become 0755 or 0644 (no setuid, setgid or sticky bit).
 """
 
 import hashlib
@@ -25,13 +26,16 @@ def check(path, expected):
 
 
 def unpack(archive, destination):
-    root = Path(destination).resolve()
+    root, seen = Path(destination).resolve(), set()
     with zipfile.ZipFile(archive) as bundle:
         for info in bundle.infolist():
             mode = info.external_attr >> 16
             target = (root / info.filename).resolve()
             if stat.S_ISLNK(mode) or root not in target.parents:
                 raise SystemExit("unsafe member in the archive")
+            if target in seen:
+                raise SystemExit("duplicate member in the archive")
+            seen.add(target)
             if info.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue

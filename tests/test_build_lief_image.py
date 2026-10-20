@@ -19,6 +19,8 @@ build = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(build)
 WHEEL_BYTES = b"stand-in wheel, never installed"
 
+PREFIX = ("FROM " + build.BASE + "\n").encode()
+
 
 class FakeDocker:
     def __init__(self):
@@ -166,6 +168,30 @@ class BuildTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "exactly one USER 65534:65534"):
                     self.build(source=source)
                 self.assertEqual(self.docker.calls, [])
+
+    def test_control_bytes_and_escaped_backslashes_cannot_hide_an_instruction(self):
+        body = PREFIX
+        user = b"USER 65534:65534\n"
+        add = b"ADD https://example.invalid/x /x\n"
+        for label, content, reason in (
+                ("backslash and form feed, then ADD", body + b"RUN true \\\x0c" + add + user, "without control bytes"),
+                ("a continuation line of only 0x1f", body + b"RUN true \\\n\x1f\n" + add + user, "without control bytes"),
+                ("vertical tab", body + b"RUN true\x0b" + add + user, "without control bytes"),
+                ("a lone carriage return", body + b"RUN true\r" + add + user, "without control bytes"),
+                ("NUL", body + b"RUN true\x00\n" + user, "without control bytes"),
+                ("DEL", body + b"RUN true\x7f\n" + user, "without control bytes"),
+                ("ADD split across a CRLF continuation", (body + b"A\\\nDD https://example.invalid/x /x\n" + user).replace(b"\n", b"\r\n"),
+                 "ADD is refused"),
+                ("escaped trailing backslash before ADD", body + b"RUN true \\\\\n" + add + user, "ADD is refused")):
+            with self.subTest(label):
+                source = self.copy(label)
+                (source / "Dockerfile").write_bytes(content)
+                with self.assertRaisesRegex(SystemExit, reason):
+                    self.build(source=source)
+                self.assertEqual(self.docker.calls, [])
+        crlf = self.copy("CRLF line ends")
+        (crlf / "Dockerfile").write_bytes((body + b"RUN true \\\n    && true\n" + user).replace(b"\n", b"\r\n"))
+        self.assertEqual(self.build(source=crlf), 0)
 
     def test_a_wheel_with_another_hash_is_refused_before_docker(self):
         (self.wheels / build.WHEEL).write_bytes(WHEEL_BYTES + b"!")

@@ -36,7 +36,7 @@ PLATFORM = "linux/arm64"
 BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
 BASE = "python:3.12-slim@" + BASE_DIGEST
 STAGE = "natives"
-ADAPTER_VERSION = "12.1.4-r1"
+ADAPTER_VERSION = "12.1.4-r2"
 CONTEXT_FILES = ("Dockerfile", "worker.py", "unpack.py", "ghidra_scripts")
 ASSETS = {
     "ghidra": {
@@ -61,20 +61,23 @@ CHUNK = 1024 * 1024
 
 
 def logical_instructions(text):
-    """Logical instructions as BuildKit reads them: a line ending in a backslash continues on the next one, comment
-    and empty lines inside a continuation are skipped, and nothing is inserted at the join (A\\ then DD is ADD)."""
+    """Logical instructions as BuildKit reads them: a line ending in an unescaped backslash (then only spaces or tabs)
+    continues on the next one, comment and empty lines inside a continuation are skipped, and nothing is inserted at
+    the join (A\\ then DD is ADD). A line ending in an escaped backslash (an even run) ends its instruction, so what
+    follows is checked as an instruction of its own under either reading. Lines are split on LF only: the caller has
+    refused every other control byte."""
     joined, current = [], None
-    for line in text.splitlines():
+    for line in text.split("\n"):
         if current is None:
-            line = line.lstrip()
+            line = line.lstrip(" \t")
             if not line or line.startswith("#"):
                 continue
             current = ""
-        elif not line.strip() or line.lstrip().startswith("#"):
+        elif not line.strip(" \t") or line.lstrip(" \t").startswith("#"):
             continue
-        end = re.search(r"\\[ \t]*$", line)
-        if end:
-            current += line[:end.start()]
+        end = re.search(r"(\\+)[ \t]*$", line)
+        if end and len(end.group(1)) % 2:
+            current += line[:end.end(1) - 1]
         else:
             joined.append(current + line)
             current = None
@@ -84,16 +87,16 @@ def logical_instructions(text):
 
 
 def check_dockerfile(path):
-    """The lock records BASE_DIGEST, so the Dockerfile must build from exactly BASE and nothing else: ASCII only,
-    FROM BASE AS natives then FROM BASE, COPY --from=natives as the only cross-stage read, no ADD, no RUN --mount
-    from another image or stage, no parser directive, network for one natives RUN only (every other RUN starts
-    --network=none) and exactly one line USER 65534:65534. Continuations are joined first and instructions are
-    counted case-insensitively, so neither hides one."""
+    """The lock records BASE_DIGEST, so the Dockerfile must build from exactly BASE and nothing else: ASCII without
+    control bytes, FROM BASE AS natives then FROM BASE, COPY --from=natives of /opt/jdk and /opt/ghidra as the only
+    cross-stage reads, no ADD, no RUN --mount from another image or stage, no parser directive, network for one
+    natives RUN only (every other RUN starts --network=none) and exactly one line USER 65534:65534. Continuations
+    are joined first and instructions are counted case-insensitively, so neither hides one."""
     raw = path.read_bytes()
-    if not raw.isascii():
-        raise SystemExit("Dockerfile must be ASCII")
-    text = raw.decode("ascii")
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not raw.isascii() or re.search(rb"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]|\r(?!\n)", raw):
+        raise SystemExit("Dockerfile must be ASCII without control bytes (tab, LF and CRLF only)")
+    text = raw.decode("ascii").replace("\r\n", "\n")
+    lines = [line.strip(" \t") for line in text.split("\n") if line.strip(" \t")]
     instructions = logical_instructions(text)
     if [words for words in instructions if words[0].upper() == "FROM"] != [["FROM", BASE, "AS", STAGE], ["FROM", BASE]]:
         raise SystemExit("Dockerfile FROM differs from the pinned base " + BASE + " (one natives stage, then the image)")
@@ -107,6 +110,9 @@ def check_dockerfile(path):
                 raise SystemExit("Dockerfile reads from another image or stage")
             if flag.startswith("--mount") and "from=" in flag:
                 raise SystemExit("Dockerfile reads from another image or stage")
+    copies = [words for words in instructions if any(word.lower().startswith("--from") for word in words)]
+    if copies != [["COPY", "--from=" + STAGE, path, path] for path in ("/opt/jdk", "/opt/ghidra")]:
+        raise SystemExit("Dockerfile may copy only /opt/jdk and /opt/ghidra from the natives stage")
     stage, networked = 0, []
     for words in instructions:
         if words[0].upper() == "FROM":
