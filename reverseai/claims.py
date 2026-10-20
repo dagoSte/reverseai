@@ -105,6 +105,10 @@ RULES = {
 }
 
 
+# contract/2: claims that are always a tool's reading; the reviewer reports them as derived whatever a ToolSpec says.
+DERIVED_CLAIMS = frozenset(key for key, (_, derivations) in RULES.items() if set(derivations) <= {"ghidra.analyze"})
+
+
 # claim_key -> the fixed statement a supported finding makes; the value column says what it found.
 STATEMENTS = {
     "format.container": "File format identified from its magic bytes",

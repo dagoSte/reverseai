@@ -2,7 +2,7 @@
 
 import unittest
 
-from reverseai import report
+from reverseai import claims, report
 from reverseai.contract import (
     AnalysisResult, ContractError, InputRef, Location, Observation, OperationSpec, ToolRef, ToolSpec,
     content_id, make_evidence, make_finding, sha256_hex,
@@ -40,9 +40,11 @@ class DerivedTests(unittest.TestCase):
         self.assertEqual(verdict.status, "derived")
         self.assertIn("not verified against the bytes", verdict.reasons[0])
 
-    def test_the_same_evidence_from_a_non_derived_operation_is_supported(self):
+    def test_code_claims_stay_derived_even_under_a_misregistered_spec(self):
+        # Decision m3a-derived-claims-by-key: the claim key, not only the spec flag, makes a finding derived.
+        self.assertEqual(claims.DERIVED_CLAIMS, {"code.functions", "code.pseudocode", "code.calls"})
         finding = make_finding("code", "Functions.", "code.functions", ["entry", "helper"], [e.id for e in FUNCTIONS], "inferred")
-        self.assertEqual(verdicts([finding], FUNCTIONS, tool(derived=False))[finding.id].status, "supported")
+        self.assertEqual(verdicts([finding], FUNCTIONS, tool(derived=False))[finding.id].status, "derived")
 
     def test_derived_claims_still_need_their_rule_confidence_and_value(self):
         overstated = make_finding("code", "Functions.", "code.functions", ["entry", "helper"], [e.id for e in FUNCTIONS], "observed")
