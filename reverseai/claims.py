@@ -61,6 +61,12 @@ _machine = _field("machine_name")
 _count = lambda obs: _one(_section_count(o) for o in obs if "shnum" in o or "number_of_sections" in o) \
     if any("shnum" in o or "number_of_sections" in o for o in obs) else None
 
+def _signature_rules(observations):
+    """Sorted unique reviewed rule IDs; every cited match must name one (the host verified its bytes)."""
+    rules = [o.get("rule") for o in observations]
+    return sorted(set(rules)) if rules and all(isinstance(r, str) and r for r in rules) else None
+
+
 # claim_key -> (confidence the claim must carry, {operation it may cite: derive(observations) -> expected value or None}).
 # A claim may cite several allowed operations; each operation's citations must yield the same value.
 RULES = {
@@ -70,6 +76,7 @@ RULES = {
     "sections.writable_executable": ("inferred", {"structure.sections": _writable_executable}),
     "sections.writable_executable_indices": ("inferred", {"lief.sections": _writable_executable_indices}),
     "strings.urls": ("observed", {"strings.indicators": _urls}),
+    "signatures.rule_matches": ("observed", {"yarax.matches": _signature_rules}),
     **{f"capability.{name}": ("inferred", {"strings.indicators": _category(name)}) for name in CATEGORIES},
 }
 
@@ -82,6 +89,7 @@ STATEMENTS = {
     "sections.writable_executable": "Sections that are both writable and executable",
     "sections.writable_executable_indices": "Section indices that are both writable and executable",
     "strings.urls": "URL strings in the input",
+    "signatures.rule_matches": "Reviewed signature rules whose exact byte patterns occur in the input",
     **{f"capability.{name}": f"String hints of {name.replace('_', ' ')} capability (names only, not behaviour)" for name in CATEGORIES},
 }
 

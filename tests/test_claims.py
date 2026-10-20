@@ -64,6 +64,21 @@ class ClaimRuleTests(unittest.TestCase):
         overstated = finding("sections.writable_executable", [".rwx"], [rwx], confidence="observed")
         self.assertEqual(claims.check(overstated, [rwx]), ("sections.writable_executable must be inferred",))
 
+    def test_signature_claims_name_exactly_the_matched_reviewed_rules(self):
+        yarax = ToolRef("yarax", "1.21.0-r1")
+        upx = evidence(yarax, "yarax.matches", 0, ruleset="m2_fixture_v1", rule="upx_packed", pattern="$a")
+        upx_again = evidence(yarax, "yarax.matches", 8, ruleset="m2_fixture_v1", rule="upx_packed", pattern="$b")
+        b64 = evidence(yarax, "yarax.matches", 4, ruleset="m2_fixture_v1", rule="base64_decode_api", pattern="$w")
+        cited = [upx, upx_again, b64]
+        self.assertEqual(claims.check(finding("signatures.rule_matches", ["base64_decode_api", "upx_packed"], cited), cited), ())
+        self.assertNotEqual(claims.check(finding("signatures.rule_matches", ["upx_packed"], cited), cited), ())
+        self.assertNotEqual(claims.check(finding("signatures.rule_matches", ["base64_decode_api", "upx_packed"], cited,
+                                                 confidence="inferred"), cited), ())
+        nameless = evidence(yarax, "yarax.matches", 12, ruleset="m2_fixture_v1", pattern="$a")
+        self.assertNotEqual(claims.check(finding("signatures.rule_matches", ["upx_packed"], [upx, nameless]), [upx, nameless]), ())
+        strings = evidence(STRINGS, "strings.indicators", 0, rule="url", match="http://x.invalid/")
+        self.assertNotEqual(claims.check(finding("signatures.rule_matches", ["url"], [strings]), [strings]), ())
+
     def test_observations_without_the_field_do_not_count_against_the_claim(self):
         lief = ToolRef("lief", "1.0.0-r2")
         dos = evidence(lief, "lief.headers", 0, structure="dos", e_lfanew=64)

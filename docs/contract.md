@@ -142,6 +142,42 @@ in parallel. Nothing in this interface comes from a sample, an analyst or a peer
   `writable`, `executable`), one observation per physical structure, each
   Location inside that structure and at most 4,096 bytes.
 
+## Contained YARA-X worker (M2b)
+
+Same container interface, run flags, environment, reply protocol and limits as
+M2a; only what differs is listed. Fixed by the coordinator before the lanes.
+
+- **Image**: `containers/yarax/`, built locally from the same digest-pinned
+  `python:3.12-slim` base and the hash-pinned wheel
+  `yara_x-1.21.0-cp38-abi3-manylinux_2_28_aarch64.whl` (SHA-256
+  `9bd9961b44b47dd747d526e61c703a2a8170426d003e789e7724bc7862de6d56`, owner
+  decision `owner-m2b-download`). `containers/yarax/image.lock.json` records the
+  M2a fields plus `ruleset_sha256`; adapter version `1.21.0-r1`; tool name `yarax`.
+- **Ruleset**: `containers/yarax/m2_fixture_v1.json` is the only rule source:
+  reviewed rules, each with an `id`, a `category` and literal byte patterns given
+  as hex (4 to 256 bytes, no wildcards, jumps, regexes, modules, includes or
+  external variables). The image copies this file; the worker generates YARA
+  source from it, every rule with condition `any of them`, and compiles it at
+  start. Compiled or serialized rules are never loaded. The host refuses to run
+  when the SHA-256 of its own copy differs from the lock's `ruleset_sha256`.
+- **Operation** `yarax.matches`: args `ruleset` enum `("m2_fixture_v1",)`,
+  default `m2_fixture_v1`; `max_matches` int 1..64, default 32; at most 64
+  observations. The worker sets a scan timeout below the 45 s wall limit and a
+  per-pattern match limit, and reports matches in ascending (offset, rule,
+  pattern) order, cut at `max_matches`.
+- **Observation**: one per match, value
+  `{"ruleset": <name>, "rule": <rule id>, "pattern": <pattern id>}` at
+  `Location(offset, len(pattern bytes))`.
+- **Host re-derivation** (rule 1 applied to M2b): the host looks the rule and
+  pattern up in its own copy of the ruleset and refuses the whole reply unless
+  the value has exactly those three fields, the ruleset is the requested one,
+  the Location length equals the pattern length and the input bytes at the
+  Location equal the pattern bytes. Observations must be distinct and in the
+  stated order. A compromised worker can hide matches but never add one.
+- **Claim**: `signatures.rule_matches`, confidence `observed`, cites only
+  `yarax.matches`; its value is the sorted unique rule IDs of the cited matches.
+  The capability analyst plans it when the YARA-X tool is available.
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under
