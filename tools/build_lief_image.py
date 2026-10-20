@@ -44,15 +44,40 @@ def wheel_sha256():
     return pinned[0]
 
 
+def logical_instructions(text):
+    """Logical instructions as BuildKit reads them: a line ending in a backslash continues on the next one, comment
+    and empty lines inside a continuation are skipped, and nothing is inserted at the join (A\\ then DD is ADD)."""
+    joined, current = [], None
+    for line in text.splitlines():
+        if current is None:
+            line = line.lstrip()
+            if not line or line.startswith("#"):
+                continue
+            current = ""
+        elif not line.strip() or line.lstrip().startswith("#"):
+            continue
+        end = re.search(r"\\[ \t]*$", line)
+        if end:
+            current += line[:end.start()]
+        else:
+            joined.append(current + line)
+            current = None
+    if current is not None:
+        joined.append(current)
+    return [words for words in (line.split() for line in joined) if words]
+
+
 def check_dockerfile(path):
     """The lock records BASE_DIGEST, so the Dockerfile must build from exactly BASE and nothing else: ASCII only (a BOM
     would hide a directive), one FROM line, no ADD (remote URLs, Git), no COPY --from or RUN --mount ...from= (another
-    image or stage), and no parser directive (# syntax=, # escape=)."""
+    image or stage), no parser directive (# syntax=, # escape=) and exactly one line USER 65534:65534. Instructions
+    are counted case-insensitively and continuations are joined first, so neither hides one."""
     raw = path.read_bytes()
     if not raw.isascii():
         raise SystemExit("Dockerfile must be ASCII")
-    lines = [line.strip() for line in raw.decode("ascii").splitlines() if line.strip()]
-    instructions = [line.split() for line in lines if not line.startswith("#")]
+    text = raw.decode("ascii")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    instructions = logical_instructions(text)
     if [words for words in instructions if words[0].upper() == "FROM"] != [["FROM", BASE]]:
         raise SystemExit("Dockerfile FROM differs from the pinned base " + BASE)
     if any(re.match(r"#\s*\w+\s*=", line) for line in lines):
@@ -62,6 +87,8 @@ def check_dockerfile(path):
     flags = [word.lower() for words in instructions for word in words if word.startswith("--")]
     if any(flag.startswith("--from") or (flag.startswith("--mount") and "from=" in flag) for flag in flags):
         raise SystemExit("Dockerfile reads from another image or stage")
+    if [words for words in instructions if words[0].upper() == "USER"] != [["USER", "65534:65534"]]:
+        raise SystemExit("Dockerfile must have exactly one USER 65534:65534")
 
 
 def file_sha256(path):

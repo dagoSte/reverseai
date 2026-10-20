@@ -422,7 +422,7 @@ class BuildInputTests(unittest.TestCase):
         dockerfile = (SOURCE / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("FROM python:3.12-slim@" + lock["base_digest"] + "\n", dockerfile)
         self.assertIn("COPY m2_fixture_v1.json /opt/reverseai/m2_fixture_v1.json\n", dockerfile)
-        self.assertEqual(re.findall(r"^USER .*$", dockerfile, re.M), ["USER 65534:65534"])
+        self.assertEqual(re.findall(r"^USER .*$", dockerfile, re.M | re.I), ["USER 65534:65534"])
         self.assertLess(dockerfile.index("USER 65534:65534"), dockerfile.index("w.compiled('m2_fixture_v1')"))
         self.assertEqual(worker.SNAPSHOT, "/snapshot/input")
         self.assertTrue(dockerfile.rstrip().endswith('ENTRYPOINT ["python3", "-I", "-B", "/opt/reverseai/worker.py"]'))

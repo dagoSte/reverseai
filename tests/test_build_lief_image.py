@@ -108,7 +108,7 @@ class BuildTests(unittest.TestCase):
                 self.assertEqual(self.docker.calls, [])
         mount = self.root / "cache-mount"
         shutil.copytree(build.SOURCE, mount, ignore=shutil.ignore_patterns("image.lock.json"))
-        (mount / "Dockerfile").write_text("# a comment = not a directive here\n" + base + "\nRUN --mount=type=tmpfs,target=/x true\n")
+        (mount / "Dockerfile").write_text("# a comment = not a directive here\n" + base + "\nRUN --mount=type=tmpfs,target=/x true\nUSER 65534:65534\n")
         self.assertEqual(self.build(source=mount), 0)
 
     def test_add_and_any_non_ascii_byte_are_refused_before_docker(self):
@@ -125,6 +125,45 @@ class BuildTests(unittest.TestCase):
                 shutil.copytree(build.SOURCE, source, ignore=shutil.ignore_patterns("image.lock.json"))
                 (source / "Dockerfile").write_bytes(content)
                 with self.assertRaisesRegex(SystemExit, reason):
+                    self.build(source=source)
+                self.assertEqual(self.docker.calls, [])
+
+    def copy(self, label):
+        source = self.root / label.replace(" ", "-")
+        shutil.copytree(build.SOURCE, source, ignore=shutil.ignore_patterns("image.lock.json"))
+        return source
+
+    def test_continued_lines_are_joined_before_any_check(self):
+        """BuildKit joins a line ending in a backslash with the next one, skipping comment and empty lines in between."""
+        base, user = "FROM " + build.BASE, "USER 65534:65534"
+        for label, lines, reason in (
+                ("ADD split inside its name", [base, "A\\", "DD https://example.invalid/x.bin /x.bin", user], "ADD is refused"),
+                ("ADD split before its last letter", [base, "AD\\", "D https://example.invalid/r.git /r", user], "ADD is refused"),
+                ("ADD split with a comment and an empty line", [base, "A\\", "# kept out of the join", "", "DD x /x", user],
+                 "ADD is refused"),
+                ("ADD split with spaces after the backslash", [base, "A\\  ", "DD x /x", user], "ADD is refused"),
+                ("ADD continued to the end of the file", [base, user, "ADD x /x \\"], "ADD is refused"),
+                ("second FROM split", [base, "FR\\", "OM busybox", user], "FROM differs"),
+                ("--from split", [base, "COPY --fr\\", "om=busybox /bin/sh /bin/sh", user], "another image or stage"),
+                ("mount from= split", [base, "RUN --mount=type=bind,fr\\", "om=busybox,target=/x true", user], "another image or stage")):
+            with self.subTest(label):
+                source = self.copy(label)
+                (source / "Dockerfile").write_text("\n".join(lines) + "\n")
+                with self.assertRaisesRegex(SystemExit, reason):
+                    self.build(source=source)
+                self.assertEqual(self.docker.calls, [])
+
+    def test_exactly_one_user_65534_in_any_case(self):
+        base = "FROM " + build.BASE
+        for label, lines in (("lower-case extra user", [base, "USER 65534:65534", "user root"]),
+                             ("root instead", [base, "USER root"]), ("no USER", [base]),
+                             ("USER twice", [base, "USER 65534:65534", "USER 65534:65534"]),
+                             ("USER split by a continuation", [base, "USER 65534:65534", "US\\", "ER root"]),
+                             ("lower-case USER keyword, written unlike the pinned line", [base, "user 65534:65534"])):
+            with self.subTest(label):
+                source = self.copy(label)
+                (source / "Dockerfile").write_text("\n".join(lines) + "\n")
+                with self.assertRaisesRegex(SystemExit, "exactly one USER 65534:65534"):
                     self.build(source=source)
                 self.assertEqual(self.docker.calls, [])
 
