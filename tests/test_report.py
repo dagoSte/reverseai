@@ -44,7 +44,8 @@ class ReportTests(unittest.TestCase):
     def test_markdown_separates_rejected_claims_and_escapes_cells(self):
         text = report.to_markdown(analysis())
         supported, rejected = text.split("## Rejected or unreviewed claims")
-        self.assertIn("The input contains a URL.", supported)
+        self.assertIn("URL strings in the input", supported)
+        self.assertNotIn("The input contains a URL.", supported)
         self.assertIn("strings.extract @ 64+27", supported)
         self.assertIn("Claim with no evidence.", rejected)
         self.assertNotIn("Claim with no evidence.", supported)
@@ -56,6 +57,12 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(report._cell("a|b`c"), "`a\\|b'c`")
         self.assertEqual(report._cell("\udcff\x00"), "`\ufffd\ufffd`")
         self.assertEqual(report._cell(""), "-")
+
+    def test_analyst_prose_is_never_shown_as_a_verified_statement(self):
+        data = report.to_dict(analysis())
+        urls = [f for f in data["results"][0]["findings"] if f["claim_key"] == "strings.urls"][0]
+        self.assertEqual((urls["claim"], urls["statement"]), ("The input contains a URL.", "URL strings in the input"))
+        self.assertEqual(report.claims.statement("capability.ransomware"), "No claim rule")
 
     def test_no_supported_findings(self):
         text = report.to_markdown(analysis("unsupported"))

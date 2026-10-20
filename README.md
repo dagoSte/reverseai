@@ -29,11 +29,14 @@ is in [docs/contract.md](docs/contract.md).
 
 Known limits of M1, by design:
 
-- Only ELF and PE headers are parsed; Mach-O and universal binaries are reported
-  as unrecognized. String indicators are lexical hints (an API name or a word such
+- Only ELF and PE headers and section tables are parsed. A Mach-O file is
+  recognized by its magic bytes only; universal (fat) binaries are reported as
+  unrecognized. String indicators are lexical hints (an API name or a word such
   as "connect"), never proof of behaviour.
 - The reviewer checks provenance and the claim rules in `reverseai/claims.py`; a
-  claim type without a rule is never supported.
+  claim type without a rule is never supported. The Markdown report states each
+  supported finding in the reviewer's own words; an analyst's free wording appears
+  only under rejected claims and in the JSON.
 - Time budgets are soft: a Python handler that overruns is reported and its late
   output discarded, but it cannot be killed. M1 has no process or container
   isolation and claims none.

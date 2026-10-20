@@ -58,7 +58,11 @@ def main(argv=None):
     analyze.add_argument("--out", type=Path, required=True, help="New or empty directory for report.json and report.md")
     args = parser.parse_args(argv)
 
-    if args.out.is_symlink() or (args.out.exists() and (not args.out.is_dir() or any(args.out.iterdir()))):
+    try:
+        unusable = args.out.is_symlink() or (args.out.exists() and (not args.out.is_dir() or any(args.out.iterdir())))
+    except OSError:
+        unusable = True
+    if unusable:
         parser.exit(1, "reverseai: --out must be a new or empty directory\n")
     try:
         data, ref = intake.snapshot(args.file)
@@ -70,7 +74,10 @@ def main(argv=None):
         parser.exit(1, f"reverseai: output refused: {error}\n")
     written = []
     try:
-        analysis = pipeline.analyze_bytes(data, ref)
+        try:
+            analysis = pipeline.analyze_bytes(data, ref)
+        except (ContractError, ValueError) as error:
+            parser.exit(1, f"reverseai: analysis failed: {type(error).__name__}\n")
         for name, render in zip(REPORTS, (report.to_json, report.to_markdown)):
             write_new(directory, name, render(analysis))
             written.append(name)

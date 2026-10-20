@@ -7,7 +7,7 @@ where HTML, links, images and autolinks do not render.
 
 from dataclasses import dataclass
 
-from reverseai import __version__
+from reverseai import __version__, claims
 from reverseai.contract import CONTRACT_VERSION, VERDICT_STATUS, InputRef, canonical_json
 
 
@@ -32,6 +32,7 @@ def to_dict(analysis):
             "findings": [{
                 "id": f.id,
                 "claim": f.claim,
+                "statement": claims.statement(f.claim_key),
                 "claim_key": f.claim_key,
                 "value": f.value,
                 "confidence": f.confidence,
@@ -85,19 +86,19 @@ def to_markdown(analysis):
     supported = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] == "supported"]
     rejected = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] != "supported"]
     if supported:
-        lines += ["| Analyst | Claim | Value | Confidence | Evidence (operation @ offset+length) |", "|---|---|---|---|---|"]
+        lines += ["| Analyst | Checked statement | Value | Confidence | Evidence (operation @ offset+length) |", "|---|---|---|---|---|"]
         for result, finding in supported:
             cited = "; ".join(
                 f"{evidence[i]['operation']} @ {evidence[i]['location']['offset']}+{evidence[i]['location']['length']}"
                 for i in finding["evidence_ids"][:6] if i in evidence)
             more = len(finding["evidence_ids"]) - 6
             cited += f"; +{more} more" if more > 0 else ""
-            lines.append(f"| {result['role']} | {_cell(finding['claim'])} | {_cell(finding['value'])} | {finding['confidence']} | {cited} |")
+            lines.append(f"| {result['role']} | {finding['statement']} | {_cell(finding['value'])} | {finding['confidence']} | {cited} |")
     else:
         lines.append("No finding was supported by the evidence.")
     lines += ["", "## Rejected or unreviewed claims", ""]
     if rejected:
-        lines += ["| Analyst | Claim | Verdict | Reasons |", "|---|---|---|---|"]
+        lines += ["| Analyst | Claim (analyst wording, unchecked) | Verdict | Reasons |", "|---|---|---|---|"]
         for result, finding in rejected:
             lines.append(f"| {result['role']} | {_cell(finding['claim'])} | {finding['verdict']} | {_cell('; '.join(finding['reasons']))} |")
     else:

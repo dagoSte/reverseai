@@ -25,6 +25,12 @@ class ClaimRuleTests(unittest.TestCase):
         self.assertEqual(claims.check(finding("format.section_count", 3, [headers]), [headers]), ())
         self.assertNotEqual(claims.check(finding("format.section_count", 4, [headers]), [headers]), ())
 
+    def test_extended_numbering_never_supports_a_zero_section_count(self):
+        extended = evidence(STRUCTURE, "structure.headers", 8, machine_name="x86_64", shnum=0, shoff=64)
+        self.assertNotEqual(claims.check(finding("format.section_count", 0, [extended]), [extended]), ())
+        empty = evidence(STRUCTURE, "structure.headers", 12, machine_name="x86_64", shnum=0, shoff=0)
+        self.assertEqual(claims.check(finding("format.section_count", 0, [empty]), [empty]), ())
+
     def test_claims_may_only_cite_their_operation(self):
         headers = evidence(STRUCTURE, "structure.headers", format="pe", machine_name="x86_64")
         reasons = claims.check(finding("format.container", "pe", [headers]), [headers])

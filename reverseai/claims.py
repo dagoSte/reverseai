@@ -17,6 +17,8 @@ def _one(values):
 
 def _section_count(observation):
     count = observation.get("shnum", observation.get("number_of_sections"))
+    if count == 0 and observation.get("shoff"):
+        return None  # ELF extended numbering: the real count is in section 0, not in the header
     return count if type(count) is int else None
 
 
@@ -51,6 +53,22 @@ RULES = {
     "strings.urls": ("strings.indicators", _urls),
     **{f"capability.{name}": ("strings.indicators", _category(name)) for name in CATEGORIES},
 }
+
+
+# claim_key -> the fixed statement a supported finding makes; the value column says what it found.
+STATEMENTS = {
+    "format.container": "File format identified from its magic bytes",
+    "format.machine": "Machine named in the header",
+    "format.section_count": "Number of sections declared in the header",
+    "sections.writable_executable": "Sections that are both writable and executable",
+    "strings.urls": "URL strings in the input",
+    **{f"capability.{name}": f"String hints of {name.replace('_', ' ')} capability (names only, not behaviour)" for name in CATEGORIES},
+}
+
+
+def statement(claim_key):
+    """The reviewer's own wording for a claim; analyst prose is never shown as a verified statement."""
+    return STATEMENTS.get(claim_key, "No claim rule")
 
 
 def check(finding, cited):

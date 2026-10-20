@@ -10,7 +10,7 @@ from unittest import mock
 
 from reverseai import cli, pipeline, report
 from reverseai.analysts import capability
-from reverseai.contract import Budget, InputRef, evidence_intact, make_finding, sha256_hex
+from reverseai.contract import Budget, ContractError, InputRef, evidence_intact, make_finding, sha256_hex
 from tests.fixtures_strings import KNOWN, clean_control, known_strings
 from tests.fixtures_structure import elf, pe
 
@@ -224,6 +224,29 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertEqual(err, "reverseai: output failed: ValueError; written: report.json\n")
             self.assertNotIn(temporary, err)
+
+    def test_unreadable_output_directory_is_refused_without_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sample, out = Path(temporary, "sample.bin"), Path(temporary, "locked", "report")
+            sample.write_bytes(elf()[0])
+            out.parent.mkdir()
+            out.parent.chmod(0)
+            try:
+                code, _, err = self.run_cli("analyze", str(sample), "--out", str(out))
+            finally:
+                out.parent.chmod(0o700)
+            self.assertEqual(code, 1)
+            self.assertTrue(err.startswith("reverseai: output refused:") or err.startswith("reverseai: --out must be"), err)
+            self.assertNotIn(temporary, err)
+            self.assertNotIn("Traceback", err)
+
+    def test_analysis_errors_are_not_reported_as_output_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sample, out = Path(temporary, "sample.bin"), Path(temporary, "report")
+            sample.write_bytes(elf()[0])
+            with mock.patch.object(pipeline, "analyze_bytes", side_effect=ContractError("detail")):
+                code, _, err = self.run_cli("analyze", str(sample), "--out", str(out))
+            self.assertEqual((code, err), (1, "reverseai: analysis failed: ContractError\n"))
 
     def test_uncreatable_output_is_refused_without_paths(self):
         with tempfile.TemporaryDirectory() as temporary:
