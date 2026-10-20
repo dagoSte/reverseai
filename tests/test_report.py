@@ -51,6 +51,10 @@ class ReportTests(unittest.TestCase):
         self.assertIn("a\\|b'c", supported)
         self.assertIn("The sample was not executed.", text)
 
+    def test_long_cells_are_visibly_truncated(self):
+        self.assertEqual(report._cell("x" * 300), "x" * 199 + "…")
+        self.assertEqual(report._cell("|" * 150), "\\|" * 99 + "…")
+
     def test_no_supported_findings(self):
         text = report.to_markdown(analysis("unsupported"))
         self.assertIn("No finding was supported by the evidence.", text)

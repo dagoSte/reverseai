@@ -56,7 +56,8 @@ def to_json(analysis):
 def _cell(value):
     text = value if isinstance(value, str) else canonical_json(value)
     text = "".join(c if c.isprintable() else "�" for c in text)
-    return text.replace("|", "\\|").replace("`", "'")[:200]
+    text = text.replace("|", "\\|").replace("`", "'")
+    return text if len(text) <= 200 else text[:199].rstrip("\\") + "…"
 
 
 def to_markdown(analysis):
