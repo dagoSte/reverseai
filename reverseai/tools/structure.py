@@ -145,7 +145,7 @@ def _elf_sections(data, limit):
     count = min(shnum, limit)
     _need(data, h["shoff"], entry * count, "ELF section header table")
     strtab = None
-    if shstrndx < shnum:
+    if 0 < shstrndx < shnum:  # SHN_UNDEF (0) means no name table
         index_offset = h["shoff"] + entry * shstrndx
         _need(data, index_offset, entry, "ELF section name table header")
         values = struct.unpack_from(layout, data, index_offset)

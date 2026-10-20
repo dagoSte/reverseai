@@ -133,6 +133,24 @@ class NameAndNumberingTests(unittest.TestCase):
             with self.subTest(index=index):
                 self.assertEqual([o.value["name"] for o in run("structure.sections", data)], [""] * 5)
 
+    def test_a_name_table_index_of_zero_means_no_names(self):
+        for label, data in (("extended numbering", elf(extended=True, shstrndx=0)[0]), ("plain", elf(shstrndx=0)[0])):
+            with self.subTest(label):
+                found = run("structure.sections", data)
+                self.assertEqual([o.value["name"] for o in found], [""] * 5)  # never the ELF header bytes
+
+    def test_only_the_name_table_index_can_live_in_section_zero(self):
+        data, _ = elf(extended="index")
+        self.assertEqual(run("structure.headers", data)[0].value["shnum"], 5)
+        self.assertEqual([o.value["name"] for o in run("structure.sections", data)], ["", ".text", ".data", ".rwx", ".shstrtab"])
+
+    def test_an_optional_header_of_exactly_twenty_bytes_is_accepted(self):
+        data, layout = pe(optional_size=20, entry_rva=0x1234)
+        self.assertEqual(layout["table_offset"], layout["lfanew"] + 4 + 20 + 20)
+        header = run("structure.headers", data)[0].value
+        self.assertEqual((header["optional_magic"], header["entry_rva"]), ("pe32+", 0x1234))
+        self.assertEqual([o.value["name"] for o in run("structure.sections", data)], [".text", ".data", ".rwx"])
+
     def test_no_section_table_means_no_sections(self):
         data, _ = elf()
         self.assertEqual(run("structure.sections", patched(patched(data, 40, "<Q", 0), 60, "<H", 0)), [])

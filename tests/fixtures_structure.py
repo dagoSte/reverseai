@@ -18,7 +18,8 @@ def elf(*, width=64, order="<", kind=2, machine=62, entry=0x401000, sections=ELF
     """An ELF header, section contents, .shstrtab and a section table (null entry first, .shstrtab last).
 
     extended uses ELF extended numbering: e_shnum 0 and e_shstrndx SHN_XINDEX, with the real values in
-    section 0's sh_size and sh_link. shstrndx overrides the header's name table index.
+    section 0's sh_size and sh_link; extended="index" moves only the name table index there.
+    shstrndx overrides the name table index.
     """
     header_size, entry_size = (64, 64) if width == 64 else (52, 40)
     contents, offsets, position = b"", [], header_size
@@ -39,27 +40,32 @@ def elf(*, width=64, order="<", kind=2, machine=62, entry=0x401000, sections=ELF
     word = "Q" if width == 64 else "I"
     layout = order + ("IIQQQQIIQQ" if width == 64 else "IIIIIIIIII")
     names_index = shnum - 1 if shstrndx is None else shstrndx
-    table = struct.pack(layout, 0, 0, 0, 0, 0, shnum if extended else 0, names_index if extended else 0, 0, 0, 0)
+    count_moved, index_moved = extended is True, bool(extended)
+    table = struct.pack(layout, 0, 0, 0, 0, 0, shnum if count_moved else 0, names_index if index_moved else 0, 0, 0, 0)
     for (name, sh_type, flags, size), name_offset, offset in zip(sections, name_offsets, offsets):
         table += struct.pack(layout, name_offset, sh_type, flags, 0, offset, size, 0, 0, 1, 0)
     table += struct.pack(layout, shstrtab_name, 3, 0, 0, strtab_offset, len(names), 0, 0, 1, 0)
     ident = b"\x7fELF" + bytes([2 if width == 64 else 1, 1 if order == "<" else 2, 1]) + bytes(9)
     header = ident + struct.pack(order + "HHI" + word * 3 + "IHHHHHH", kind, machine, 1, entry, 0, shoff, 0,
-                                 header_size, 0, 0, entry_size, 0 if extended else shnum, 0xFFFF if extended else names_index)
+                                 header_size, 0, 0, entry_size, 0 if count_moved else shnum, 0xFFFF if index_moved else names_index)
     data = header + contents + names
     data += bytes(shoff - len(data)) + table
     return data, {"header_size": header_size, "entry_size": entry_size, "shoff": shoff, "shnum": shnum,
                   "offsets": offsets, "name_offsets": name_offsets, "strtab_offset": strtab_offset}
 
 
-def pe(*, plus=True, machine=0x8664, entry_rva=0x1000, timestamp=0x5F5E1000, characteristics=0x22, sections=PE_SECTIONS):
-    """DOS header (e_lfanew 0x80), PE signature, COFF and optional headers, section table, raw data at 0x200 alignment."""
+def pe(*, plus=True, machine=0x8664, entry_rva=0x1000, timestamp=0x5F5E1000, characteristics=0x22, sections=PE_SECTIONS,
+       optional_size=None):
+    """DOS header (e_lfanew 0x80), PE signature, COFF and optional headers, section table, raw data at 0x200 alignment.
+
+    optional_size declares and lays out a shorter optional header (at least 20 bytes: magic through entry point).
+    """
     lfanew, alignment = 0x80, 0x200
-    optional_size = 240 if plus else 224
+    optional_size = optional_size or (240 if plus else 224)
     dos = b"MZ" + bytes(0x3A) + struct.pack("<I", lfanew) + bytes(lfanew - 0x40)
     coff = struct.pack("<HHIIIHH", machine, len(sections), timestamp, 0, 0, optional_size, characteristics)
     optional = struct.pack("<HBBIIIII", 0x20B if plus else 0x10B, 14, 0, 0x200, 0x400, 0, entry_rva, 0x1000)
-    optional += bytes(optional_size - len(optional))
+    optional = optional[:optional_size] + bytes(max(0, optional_size - len(optional)))
     table_offset = lfanew + 4 + 20 + optional_size
     headers_end = table_offset + 40 * len(sections)
     raw = (headers_end + alignment - 1) // alignment * alignment
