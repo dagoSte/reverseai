@@ -23,7 +23,7 @@ from reverseai.contract import (
 )
 from tests import verify_m2_runtime as verifier
 from tests.fixtures_structure import elf, pe
-from tests.fixtures_code import elf_code, pe_code, elf_data_only
+from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code
 
 
 IMAGE_ID = "sha256:" + "a" * 64
@@ -2643,7 +2643,7 @@ class YaraxKnownAnswerRegressionTests(unittest.TestCase):
                              max_matches=cap, ruleset=ruleset)
 
 
-GHIDRA_BUILDERS = {"elf_code": elf_code, "pe_code": pe_code, "elf_data_only": elf_data_only}
+GHIDRA_BUILDERS = {"elf_code": elf_code, "pe_code": pe_code, "elf_data_only": elf_data_only, "macho_code": macho_code}
 
 
 def ghidra_worker_records(layout, *, pseudocode=None, names=None, sizes=None):
@@ -2657,8 +2657,10 @@ def ghidra_worker_records(layout, *, pseudocode=None, names=None, sizes=None):
     default_pseudocode = pseudocode is None
     if default_pseudocode:
         pseudocode = (0,) if functions else ()
-    names = ([row["name"] or f"canned_function_{index}"
-              for index, row in enumerate(functions)] if names is None else names)
+    if names is None:
+        names = [row["name"] or f"canned_function_{index}" for index, row in enumerate(functions)]
+        if layout["format"] == "macho":
+            names[0] = "entry"
     sizes = [row["size"] for row in functions] if sizes is None else sizes
     name_at_entry = {row["entry"]: name for row, name in zip(functions, names)}
     records = [
@@ -2707,8 +2709,8 @@ class GhidraKnownAnswerTests(unittest.TestCase):
         with self.assertRaises(verifier.VerificationError):
             self.compare(name, records)
 
-    def test_both_code_fixtures_have_exactly_four_declared_entries_and_direct_calls(self):
-        for name in ("elf_code", "pe_code"):
+    def test_all_code_fixtures_have_exactly_four_declared_entries_and_direct_calls(self):
+        for name in ("elf_code", "pe_code", "macho_code"):
             data, layout = self.fixtures[name]
             records = ghidra_worker_records(layout)
             with self.subTest(name=name):
@@ -2727,7 +2729,7 @@ class GhidraKnownAnswerTests(unittest.TestCase):
                 self.assertIsNone(verifier.compare_ghidra_observations(data, parsed))
 
     def test_code_requires_pseudocode_and_any_emitted_function_can_be_cited(self):
-        for name in ("elf_code", "pe_code"):
+        for name in ("elf_code", "pe_code", "macho_code"):
             _, layout = self.fixtures[name]
             for indices in ((0,), (3,), (0, 1, 2, 3)):
                 with self.subTest(name=name, indices=indices):
@@ -2744,12 +2746,83 @@ class GhidraKnownAnswerTests(unittest.TestCase):
             with self.subTest(index=index):
                 self.assert_refuses("elf_code", ghidra_worker_records(layout, names=changed))
 
+    def test_macho_known_answer_pins_entries_calls_symbols_and_working_decompilation(self):
+        data, layout = self.fixtures["macho_code"]
+        records = ghidra_worker_records(layout)
+        self.assertIsNone(self.compare("macho_code", records))
+        self.assertEqual(len(layout["functions"]), 4)
+        self.assertEqual(len(layout["calls"]), 4)
+        self.assertEqual([row["value"]["name"] for row in records[:4]],
+                         ["entry", "add_numbers", "compute", "constant"])
+        self.assert_refuses("macho_code", ghidra_worker_records(layout, pseudocode=()))
+        wrong_entry = copy.deepcopy(records)
+        wrong_entry[0]["value"]["name"] = "_start"
+        self.assert_refuses("macho_code", wrong_entry)
+        for index in range(4):
+            changed = copy.deepcopy(records)
+            changed[index]["value"]["name"] = "invented_symbol"
+            with self.subTest(index=index), self.assertRaisesRegex(
+                    verifier.VerificationError, "KnownAnswerMachOName"):
+                verifier.compare_ghidra_observations(data, ghidra_observations(changed))
+
     def test_function_extent_is_derived_and_anchor_tracks_its_bounded_size(self):
-        for name in ("elf_code", "pe_code"):
+        for name in ("elf_code", "pe_code", "macho_code"):
             _, layout = self.fixtures[name]
             sizes = [row["size"] - 1 for row in layout["functions"]]
             with self.subTest(name=name):
                 self.assertIsNone(self.compare(name, ghidra_worker_records(layout, sizes=sizes)))
+
+    def test_pe_function_anchors_clamp_to_virtual_extent_before_raw_padding(self):
+        data, layout = self.fixtures["pe_code"]
+        self.assertLess(layout["text"]["size"], layout["text_raw_size"])
+        records = ghidra_worker_records(layout, pseudocode=(0, 1, 2, 3), sizes=[1024] * 4)
+        for index, expected in enumerate(layout["functions"]):
+            remaining = layout["text"]["size"] - (expected["offset"] - layout["text"]["offset"])
+            records[index]["location"]["length"] = remaining
+            records[4 + index]["location"] = dict(records[index]["location"])
+        self.assertIsNone(verifier.compare_ghidra_observations(data, ghidra_observations(records)))
+        for index in range(4):
+            changed = copy.deepcopy(records)
+            changed[index]["location"]["length"] += 1
+            changed[4 + index]["location"] = dict(changed[index]["location"])
+            with self.subTest(index=index), self.assertRaisesRegex(
+                    verifier.VerificationError, "KnownAnswerFunctionAnchor"):
+                verifier.compare_ghidra_observations(data, ghidra_observations(changed))
+
+    def test_pe_raw_padding_function_anchors_are_refused_after_valid_control(self):
+        data, layout = self.fixtures["pe_code"]
+        records = ghidra_worker_records(layout, pseudocode=(0, 1, 2, 3))
+        self.assertIsNone(verifier.compare_ghidra_observations(data, ghidra_observations(records)))
+        for index, expected in enumerate(layout["functions"]):
+            changed = copy.deepcopy(records)
+            changed[index]["value"]["size"] = 1024
+            changed[index]["location"]["length"] = (
+                layout["text_raw_size"] - (expected["offset"] - layout["text"]["offset"]))
+            changed[4 + index]["location"] = dict(changed[index]["location"])
+            with self.subTest(index=index), self.assertRaisesRegex(
+                    verifier.VerificationError, "KnownAnswerFunctionAnchor"):
+                verifier.compare_ghidra_observations(data, ghidra_observations(changed))
+
+    def test_pe_zero_virtual_extent_falls_back_to_raw_size(self):
+        data, original_layout = self.fixtures["pe_code"]
+        layout = copy.deepcopy(original_layout)
+        layout["text"]["size"] = 0
+        changed = bytearray(data)
+        pe_offset = struct.unpack_from("<I", changed, 0x3C)[0]
+        optional_size = struct.unpack_from("<H", changed, pe_offset + 20)[0]
+        text_header = pe_offset + 24 + optional_size
+        struct.pack_into("<I", changed, text_header + 8, 0)
+        records = ghidra_worker_records(layout, pseudocode=(0, 1, 2, 3), sizes=[1024] * 4)
+        for index, expected in enumerate(layout["functions"]):
+            records[index]["location"]["length"] = (
+                layout["text_raw_size"] - (expected["offset"] - layout["text"]["offset"]))
+            records[4 + index]["location"] = dict(records[index]["location"])
+        with mock.patch.object(verifier, "pe_code", return_value=(bytes(changed), layout)):
+            self.assertIsNone(verifier.compare_ghidra_observations(bytes(changed), ghidra_observations(records)))
+            records[0]["location"]["length"] += 1
+            records[4]["location"] = dict(records[0]["location"])
+            with self.assertRaisesRegex(verifier.VerificationError, "KnownAnswerFunctionAnchor"):
+                verifier.compare_ghidra_observations(bytes(changed), ghidra_observations(records))
 
     def test_data_only_has_no_functions_calls_or_pseudocode(self):
         name = "elf_data_only"
@@ -2766,7 +2839,7 @@ class GhidraKnownAnswerTests(unittest.TestCase):
                 self.assert_refuses(name, [row])
 
     def test_omitted_extra_duplicate_and_replaced_function_or_call_is_refused(self):
-        for name in ("elf_code", "pe_code"):
+        for name in ("elf_code", "pe_code", "macho_code"):
             _, layout = self.fixtures[name]
             for index in range(8):
                 base = ghidra_worker_records(layout)
@@ -2780,7 +2853,7 @@ class GhidraKnownAnswerTests(unittest.TestCase):
                         self.assert_refuses(name, records)
 
     def test_every_function_entry_and_index_are_checked(self):
-        for name in ("elf_code", "pe_code"):
+        for name in ("elf_code", "pe_code", "macho_code"):
             _, layout = self.fixtures[name]
             for index in range(4):
                 for field, value in (("entry", layout["functions"][index]["entry"] + 1),
@@ -2791,7 +2864,7 @@ class GhidraKnownAnswerTests(unittest.TestCase):
                         self.assert_refuses(name, records)
 
     def test_function_anchor_must_start_at_its_declared_file_offset(self):
-        for name in ("elf_code", "pe_code"):
+        for name in ("elf_code", "pe_code", "macho_code"):
             _, layout = self.fixtures[name]
             for index in range(4):
                 for field in ("offset", "length"):
@@ -2801,7 +2874,7 @@ class GhidraKnownAnswerTests(unittest.TestCase):
                         self.assert_refuses(name, records)
 
     def test_every_call_endpoint_and_exact_instruction_anchor_are_checked(self):
-        for name in ("elf_code", "pe_code"):
+        for name in ("elf_code", "pe_code", "macho_code"):
             _, layout = self.fixtures[name]
             for index in range(4):
                 for field in ("from", "to", "offset", "length"):
@@ -2813,7 +2886,7 @@ class GhidraKnownAnswerTests(unittest.TestCase):
                         self.assert_refuses(name, records)
 
     def test_wrong_types_for_function_and_call_addresses_are_refused(self):
-        for name in ("elf_code", "pe_code"):
+        for name in ("elf_code", "pe_code", "macho_code"):
             _, layout = self.fixtures[name]
             for index, field in ((0, "entry"), (0, "size"), (4, "from"), (4, "to")):
                 for value in (False, None, "address", 1.0):
@@ -2826,7 +2899,7 @@ class GhidraKnownAnswerTests(unittest.TestCase):
                         verifier.compare_ghidra_observations(self.fixtures[name][0], observations)
 
     def test_each_kind_requires_its_exact_schema(self):
-        for name in ("elf_code", "pe_code"):
+        for name in ("elf_code", "pe_code", "macho_code"):
             _, layout = self.fixtures[name]
             for index in (0, 4, 5):
                 base = ghidra_worker_records(layout, pseudocode=(0,))
@@ -2856,7 +2929,7 @@ class GhidraKnownAnswerTests(unittest.TestCase):
                     self.assert_refuses(name, records)
 
     def test_pseudocode_is_linked_by_entry_index_and_exact_function_anchor(self):
-        for name in ("elf_code", "pe_code"):
+        for name in ("elf_code", "pe_code", "macho_code"):
             _, layout = self.fixtures[name]
             for field, value in (("index", 1), ("index", False), ("entry", layout["functions"][1]["entry"])):
                 records = ghidra_worker_records(layout, pseudocode=(0,))
@@ -2870,7 +2943,7 @@ class GhidraKnownAnswerTests(unittest.TestCase):
                     self.assert_refuses(name, records)
 
     def test_duplicate_pseudocode_index_is_refused_directly_by_the_oracle(self):
-        for name in ("elf_code", "pe_code"):
+        for name in ("elf_code", "pe_code", "macho_code"):
             _, layout = self.fixtures[name]
             records = ghidra_worker_records(layout, pseudocode=(0,))
             self.assertIsNone(self.compare(name, records))
@@ -2892,7 +2965,7 @@ class GhidraKnownAnswerTests(unittest.TestCase):
                 self.assert_refuses(name, records)
 
     def test_records_outside_input_are_refused_even_when_values_are_unchanged(self):
-        for name in ("elf_code", "pe_code"):
+        for name in ("elf_code", "pe_code", "macho_code"):
             data, layout = self.fixtures[name]
             for index in range(8):
                 records = ghidra_worker_records(layout)
@@ -2928,7 +3001,7 @@ class GhidraKnownAnswerTests(unittest.TestCase):
 
 
 def ghidra_lock_fixture():
-    return {"adapter_version": "12.1.4-r2", "platform": "linux/arm64", "image_id": IMAGE_ID,
+    return {"adapter_version": "12.1.4-r3", "platform": "linux/arm64", "image_id": IMAGE_ID,
             "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
             "ghidra_sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",
             "jdk_sha256": "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223"}
@@ -2938,7 +3011,7 @@ def ghidra_receipt_fixture():
     receipt = receipt_fixture()
     receipt.update(tool="ghidra", lock=ghidra_lock_fixture(),
                    checks=[{"id": name, "status": "passed"} for name in verifier.GHIDRA_REQUIRED_CHECKS],
-                   cleanup=receipt["cleanup"][:13])
+                   cleanup=receipt["cleanup"][:14])
     return receipt
 
 
@@ -2987,14 +3060,15 @@ class GhidraFakeBoundary(FakeBoundary):
 
 
 class GhidraProfileAndReceiptTests(unittest.TestCase):
-    def test_r1_lock_and_receipt_cannot_impersonate_r2(self):
-        lock = ghidra_lock_fixture()
-        lock["adapter_version"] = "12.1.4-r1"
-        with self.assertRaises(verifier.VerificationError):
-            verifier.verify_ghidra_lock(lock)
-        receipt = ghidra_receipt_fixture()
-        receipt["lock"] = lock
-        self.assertFalse(verifier.receipt_passes(receipt))
+    def test_older_lock_and_receipt_cannot_impersonate_r3(self):
+        for version in ("12.1.4-r1", "12.1.4-r2"):
+            lock = ghidra_lock_fixture()
+            lock["adapter_version"] = version
+            with self.subTest(version=version), self.assertRaises(verifier.VerificationError):
+                verifier.verify_ghidra_lock(lock)
+            receipt = ghidra_receipt_fixture()
+            receipt["lock"] = lock
+            self.assertFalse(verifier.receipt_passes(receipt))
 
     def test_native_constructor_refuses_foreign_lock_and_drifted_profile_before_boundary_calls(self):
         boundary = GhidraFakeBoundary()
@@ -3006,13 +3080,15 @@ class GhidraProfileAndReceiptTests(unittest.TestCase):
             verifier.NativeVerifier(boundary, ghidra_lock_fixture(), {"checks": [], "cleanup": []}, tool="ghidra")
         self.assertEqual(boundary.calls, [])
 
-    def test_reviewed_lock_and_complete_receipt_have_six_keys_sixteen_checks_thirteen_runs(self):
+    def test_reviewed_lock_and_complete_receipt_have_six_keys_seventeen_checks_fourteen_runs(self):
         lock = ghidra_lock_fixture()
         verifier.verify_ghidra_lock(lock)
         receipt = ghidra_receipt_fixture()
         self.assertEqual(len(lock), 6)
-        self.assertEqual(len(receipt["checks"]), 16)
-        self.assertEqual(len(receipt["cleanup"]), 13)
+        self.assertEqual(len(receipt["checks"]), 17)
+        self.assertEqual(len(receipt["cleanup"]), 14)
+        self.assertEqual(verifier.GHIDRA_FIXTURE_NAMES, ("elf_code", "pe_code", "elf_data_only", "macho_code"))
+        self.assertIn("macho_code.analyze", {row["id"] for row in receipt["checks"]})
         self.assertTrue(verifier.receipt_passes(receipt))
 
     def test_every_ghidra_pin_and_key_is_required_before_native_work(self):
@@ -3031,14 +3107,18 @@ class GhidraProfileAndReceiptTests(unittest.TestCase):
             with self.subTest(extra=key), self.assertRaises(verifier.VerificationError):
                 verifier.verify_ghidra_lock(lock)
 
-    def test_cross_profile_locks_receipts_and_checks_cannot_be_substituted(self):
+    def test_cross_profile_provenance_refuses_substitution_and_identical_cleanup_is_shared(self):
         for tool in ("lief", "yarax"):
             foreign = receipt_fixture() if tool == "lief" else YaraxReceiptTests().receipt()
             for key in ("tool", "lock", "checks", "cleanup"):
                 receipt = ghidra_receipt_fixture()
                 receipt[key] = foreign[key]
                 with self.subTest(source=tool, field=key):
-                    self.assertFalse(verifier.receipt_passes(receipt))
+                    if tool == "yarax" and key == "cleanup":
+                        self.assertEqual(foreign[key], ghidra_receipt_fixture()[key])
+                        self.assertTrue(verifier.receipt_passes(receipt))
+                    else:
+                        self.assertFalse(verifier.receipt_passes(receipt))
             foreign["lock"] = ghidra_lock_fixture()
             self.assertFalse(verifier.receipt_passes(foreign))
         for key in ("ruleset_sha256", "wheel_sha256"):
@@ -3248,7 +3328,7 @@ class GhidraNativeProfileTests(unittest.TestCase):
             [mock.call(data, "ghidra.analyze") for data in verifier.ghidra_fixtures().values()])
         self.assertEqual({row["id"] for row in self.receipt["checks"]}, set(verifier.GHIDRA_REQUIRED_CHECKS))
         self.assertTrue(all(row["status"] == "passed" for row in self.receipt["checks"]))
-        self.assertEqual(self.native.native_runs, 13)
+        self.assertEqual(self.native.native_runs, 14)
 
     def test_controls_pass_only_fixed_ghidra_request_and_validate_ghidra_evidence(self):
         for name in verifier.CONTROL_NAMES:
@@ -3258,7 +3338,7 @@ class GhidraNativeProfileTests(unittest.TestCase):
             invoke.assert_called_once_with(elf_code()[0], "ghidra.analyze",
                 {"max_functions": 64, "decompile": 8, "max_chars": 1024, "max_calls": 128}, probe=name)
 
-    def test_known_answer_runs_all_three_exact_fixtures_and_refuses_forgery(self):
+    def test_known_answer_runs_all_four_exact_fixtures_and_refuses_forgery(self):
         for builder in GHIDRA_BUILDERS.values():
             data, layout = builder()
             rows = ghidra_worker_records(layout, pseudocode=(0,) if layout["functions"] else ())
@@ -3296,11 +3376,11 @@ class GhidraNativeProfileTests(unittest.TestCase):
             self.native.known_answer(data, "ghidra.analyze")
 
     def test_oracle_clamps_derived_extents_to_backed_section_and_refuses_address_overflow(self):
-        for builder in (elf_code, pe_code):
+        for builder in (elf_code, pe_code, macho_code):
             data, layout = builder()
             records = ghidra_worker_records(layout)
             records[0]["value"]["size"] = 1024
-            records[0]["location"]["length"] = layout.get("text_raw_size", layout["text"]["size"])
+            records[0]["location"]["length"] = layout["text"]["size"]
             records[-1]["location"] = dict(records[0]["location"])
             verifier.compare_ghidra_observations(data, ghidra_observations(records))
             records[0]["value"]["size"] = 2**64 - 1
@@ -3312,7 +3392,7 @@ class GhidraNativeProfileTests(unittest.TestCase):
             staging = Path(folder) / "snapshot"
             def factory(lock, *, runner, adapter_version):
                 self.assertEqual(lock, ghidra_lock_fixture())
-                self.assertEqual(adapter_version, "12.1.4-r2")
+                self.assertEqual(adapter_version, "12.1.4-r3")
                 def run(operation, args, data, digest):
                     staging.mkdir()
                     (staging / "input").write_bytes(data)
@@ -3377,11 +3457,11 @@ class GhidraMainTests(unittest.TestCase):
         self.assertEqual(run.receipt["lock_sha256"], sha256_hex(run.raw))
         self.assertEqual(run.receipt["executor_sha256"], sha256_hex(b"inert frozen source"))
         self.assertEqual(run.receipt["verifier_sha256"], sha256_hex(b"inert frozen source"))
-        run.boundary.load_lock.assert_called_once_with(run.lock, adapter_version="12.1.4-r2")
+        run.boundary.load_lock.assert_called_once_with(run.lock, adapter_version="12.1.4-r3")
         run.factory.assert_called_once()
         self.assertEqual(run.factory.call_args.kwargs, {"tool": "ghidra"})
-        self.assertEqual(len(run.receipt["checks"]), 16)
-        self.assertEqual(len(run.receipt["cleanup"]), 13)
+        self.assertEqual(len(run.receipt["checks"]), 17)
+        self.assertEqual(len(run.receipt["cleanup"]), 14)
         self.assertNotIn("ruleset_sha256", run.receipt)
 
     def test_cli_rejects_foreign_locks_and_profile_drift_before_native_creation(self):
