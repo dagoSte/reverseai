@@ -105,9 +105,11 @@ class Gateway:
             status = "budget_exceeded" if time.monotonic() >= execution.deadline else "ok"
             self._finish(execution, status, time_cut=status == "budget_exceeded")
         except Exception as exc:
-            status = "budget_exceeded" if time.monotonic() >= execution.deadline else "error"
+            # A contained worker that hit its own wall limit is a time cut, like the gateway's deadline.
+            timed_out = isinstance(exc, TimeoutError) or time.monotonic() >= execution.deadline
+            status = "budget_exceeded" if timed_out else "error"
             self._finish(execution, status, (_error(spec.name, exc),) if status == "error" else (),
-                         time_cut=status == "budget_exceeded")
+                         time_cut=timed_out)
         finally:
             self._slots.release()
             execution.stopped.set()

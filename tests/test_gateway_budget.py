@@ -148,5 +148,21 @@ class OperationChargeTests(unittest.TestCase):
         self.assertEqual(calls, ["observe", "observe", "other"])
 
 
+    def test_a_worker_timeout_is_a_retriable_time_cut(self):
+        calls = []
+
+        def worker(data, args):
+            calls.append(1)
+            if len(calls) == 1:
+                raise TimeoutError("worker wall limit")
+            return [observation()]
+
+        gateway = Gateway([tool(worker)], Budget())
+        first = gateway.run(task(), DATA)
+        self.assertEqual((first.status, first.errors), ("budget_exceeded", ()))
+        second = gateway.run(task(), DATA)
+        self.assertEqual((second.status, len(second.evidence), calls), ("ok", 1, [1, 1]))
+
+
 if __name__ == "__main__":
     unittest.main()
