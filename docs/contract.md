@@ -218,7 +218,7 @@ Same container interface and reply protocol as M2a; what differs:
   Ghidra 12.1.4 (`ddac49f9...d4db`), Temurin JDK 21.0.12.1+1 aarch64
   (`23e37e02...e223`) and, in a build stage only, Debian `g++`/`make` to
   build the arm64 decompiler and demangler natives. Lock keys: the M2a keys plus
-  `ghidra_sha256`, `jdk_sha256`; `wheel_sha256` is absent. Adapter `12.1.4-r1`.
+  `ghidra_sha256`, `jdk_sha256`; `wheel_sha256` is absent. Adapter `12.1.4-r2` (function span, decision `m3a-function-span`).
 - **Resource profile** (per tool, fixed in `reverseai/contained.py`; LIEF and
   YARA-X keep theirs): `--memory 2g --memory-swap 2g --pids-limit 256
   --cpus 2 --tmpfs /tmp:rw,noexec,nosuid,nodev,size=512m`, wall limit 240 s.
