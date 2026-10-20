@@ -4,8 +4,10 @@ For each cited evidence item the reviewer recomputes the input hash, checks the
 tool name and version against the registered tools, checks that the location is
 inside the input and that the excerpt hash matches the bytes. A finding is
 unsupported if any cited item is missing or fails, or if it cites none;
-contradicted if another finding has the same claim_key and a different value;
-otherwise supported. Reasons name evidence IDs only, never input bytes.
+contradicted if another finding whose cited evidence also all verifies has the
+same claim_key and a different value; otherwise supported. An unsupported
+finding never contradicts anything. Reasons name evidence IDs only, never
+input bytes.
 """
 
 from __future__ import annotations
@@ -39,12 +41,8 @@ def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tool
             evidence.setdefault(item.id, item)
         for finding in result.findings:
             findings.setdefault(finding.id, finding)  # the same ID means the same content
-    values = {}
-    for finding in findings.values():
-        values.setdefault(finding.claim_key, set()).add(canonical_json(finding.value))
-    verdicts = []
-    for finding_id in sorted(findings):
-        finding = findings[finding_id]
+    problems = {}
+    for finding_id, finding in findings.items():
         reasons = []
         if not finding.evidence_ids:
             reasons.append("finding cites no evidence")
@@ -54,6 +52,16 @@ def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tool
                 reasons.append(f"{evidence_id}: evidence missing")
                 continue
             reasons.extend(f"{evidence_id}: {problem}" for problem in _evidence_problems(item, data, data_sha256, input, tools))
+        problems[finding_id] = reasons
+    # Only verified findings can contradict: peer findings are untrusted, so an
+    # unsupported claim must not cancel a verified one.
+    values = {}
+    for finding_id, finding in findings.items():
+        if not problems[finding_id]:
+            values.setdefault(finding.claim_key, set()).add(canonical_json(finding.value))
+    verdicts = []
+    for finding_id in sorted(findings):
+        finding, reasons = findings[finding_id], problems[finding_id]
         if reasons:
             verdicts.append(ReviewVerdict(finding_id, "unsupported", tuple(reasons)))
         elif len(values[finding.claim_key]) > 1:
