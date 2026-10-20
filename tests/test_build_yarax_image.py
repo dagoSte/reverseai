@@ -67,13 +67,13 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(pull, ("pull", "--platform", "linux/arm64", build.BASE))
         self.assertEqual(built[:6], ("build", "--platform", "linux/arm64", "--network", "none", "--pull=false"))
         self.assertEqual(built[6:8], ("--iidfile", built[7]))
-        self.assertEqual(built[8:10], ("--tag", "reverseai-yarax:1.21.0-r1"))
+        self.assertEqual(built[8:10], ("--tag", "reverseai-yarax:1.21.0-r2"))
         self.assertEqual(len(built), 11)
         self.assertEqual(self.docker.context, ["Dockerfile", "m2_fixture_v1.json", "requirements.txt", "wheels",
                                                "wheels/" + build.WHEEL, "worker.py"])
         self.assertEqual(json.loads(self.lock.read_text()), {
             "image_id": "sha256:" + "e" * 64, "platform": "linux/arm64", "base_digest": build.BASE_DIGEST,
-            "wheel_sha256": hashlib.sha256(WHEEL_BYTES).hexdigest(), "adapter_version": "1.21.0-r1",
+            "wheel_sha256": hashlib.sha256(WHEEL_BYTES).hexdigest(), "adapter_version": "1.21.0-r2",
             "ruleset_sha256": hashlib.sha256((build.SOURCE / build.RULESET).read_bytes()).hexdigest()})
 
     def test_the_lock_records_the_hash_of_the_ruleset_copied_into_the_build(self):
@@ -125,11 +125,49 @@ class BuildTests(unittest.TestCase):
         (allowed / "Dockerfile").write_text("# a comment = not a directive here\n" + base + "\nRUN --mount=type=tmpfs,target=/x true\n")
         self.assertEqual(self.build(source=allowed), 0)
 
+    def test_add_and_any_non_ascii_byte_are_refused_before_docker(self):
+        base = ("FROM " + build.BASE).encode()
+        for label, content, reason in (
+                ("ADD of a URL", base + b"\nADD https://example.invalid/x.tar /x\n", "ADD is refused"),
+                ("ADD of a Git repository", base + b"\nADD https://example.invalid/r.git /r\n", "ADD is refused"),
+                ("local ADD", base + b"\nADD wheels/ /tmp/wheels/\n", "ADD is refused"),
+                ("lower-case add", base + b"\nadd wheels/ /tmp/wheels/\n", "ADD is refused"),
+                ("BOM before a syntax directive", b"\xef\xbb\xbf# syntax=docker/dockerfile:1\n" + base + b"\n", "must be ASCII"),
+                ("non-ASCII in a comment", b"# caf\xc3\xa9\n" + base + b"\n", "must be ASCII")):
+            with self.subTest(label):
+                source = self.copy(label)
+                (source / "Dockerfile").write_bytes(content)
+                with self.assertRaisesRegex(SystemExit, reason):
+                    self.build(source=source)
+                self.assertEqual(self.docker.calls, [])
+
     def test_a_wheel_with_another_hash_is_refused_before_docker(self):
         (self.wheels / build.WHEEL).write_bytes(WHEEL_BYTES + b"!")
         with self.assertRaisesRegex(SystemExit, "pinned SHA-256"):
             self.build()
         self.assertEqual(self.docker.calls, [])
+
+    def test_a_build_without_a_well_formed_image_id_writes_no_lock(self):
+        for written in ("", "d" * 64, "sha256:" + "D" * 64, "sha256:" + "d" * 63):
+            with self.subTest(image_id=written):
+                docker = FakeDocker()
+
+                def build_writes(*args, capture=False, written=written):
+                    docker(*args, capture=capture)
+                    if args[0] == "build":
+                        Path(args[args.index("--iidfile") + 1]).write_text(written + "\n")
+                with patch.object(self, "docker", build_writes), self.assertRaisesRegex(SystemExit, "no image ID"):
+                    self.build()
+                self.assertFalse(self.lock.exists())
+
+    def test_requirements_must_pin_exactly_one_hash(self):
+        line = "yara-x==1.21.0 --hash=sha256:" + "a" * 64 + "\n"
+        for label, text in (("no hash", "yara-x==1.21.0\n"), ("two hashes", line + line.replace("a" * 64, "b" * 64))):
+            with self.subTest(label):
+                source = self.copy(label)
+                (source / "requirements.txt").write_text(text)
+                with patch.object(build, "SOURCE", source), self.assertRaisesRegex(SystemExit, "exactly one SHA-256"):
+                    build.wheel_sha256()
 
     def test_requirements_pin_exactly_the_contract_wheel(self):
         self.assertEqual(build.wheel_sha256(), "9bd9961b44b47dd747d526e61c703a2a8170426d003e789e7724bc7862de6d56")
@@ -155,7 +193,7 @@ class Opener:
         self.body, self.urls = body, []
 
     def open(self, url, timeout):
-        self.urls.append(url)
+        self.urls.append((url, timeout))
         return io.BytesIO(self.body)
 
 
@@ -177,9 +215,12 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(RedirectHandler.requested, ["/" + build.WHEEL])
 
     def test_a_url_off_the_pinned_host_or_file_is_refused_before_any_request(self):
-        for url in ("https://example.invalid/packages/" + build.WHEEL, "http://files.pythonhosted.org/packages/" + build.WHEEL,
-                    build.WHEEL_HOST + "x/" + build.WHEEL + ".exe", build.WHEEL_HOST.rstrip("/") + ".evil.invalid/" + build.WHEEL):
-            with self.subTest(url), tempfile.TemporaryDirectory() as temporary, \
+        for label, url in (("another host", "https://example.invalid/packages/" + build.WHEEL),
+                           ("plain HTTP", "http://files.pythonhosted.org/packages/" + build.WHEEL),
+                           ("a host that only starts with the pinned one", "https://files.pythonhosted.org.evil.invalid/packages/" + build.WHEEL),
+                           ("the pinned host, another file", build.WHEEL_HOST + "x/" + build.WHEEL + ".exe"),
+                           ("the pinned host, outside /packages/", "https://files.pythonhosted.org/other/" + build.WHEEL)):
+            with self.subTest(label), tempfile.TemporaryDirectory() as temporary, \
                     patch.object(build, "WHEEL_URL", url), \
                     patch.object(build.urllib.request, "build_opener", side_effect=AssertionError("request made")):
                 with self.assertRaisesRegex(SystemExit, "not the pinned PyPI file"):
@@ -203,7 +244,7 @@ class DownloadTests(unittest.TestCase):
                     build.fetch_wheel(target, pinned)
                     self.assertEqual(target.read_bytes(), WHEEL_BYTES)
                 factory.assert_called_once_with(build.RefuseRedirects)
-                self.assertEqual(opener.urls, [build.WHEEL_URL])
+                self.assertEqual(opener.urls, [(build.WHEEL_URL, 60)])
         self.assertEqual(build.WHEEL_BYTES_LIMIT, 16 * 1024 * 1024)
 
 
