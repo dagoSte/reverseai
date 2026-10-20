@@ -79,6 +79,9 @@ FIXTURES = {
     "pe32+ e_lfanew 0x2000": far_pe(),
     "pe32+ 20-byte optional header": pe(optional_size=20)[0],
     "pe without optional header": patched(pe()[0], 0x80 + 4 + 16, "<H", 0),
+    "elf64 le unknown machine 0x3E00": elf(machine=0x3E00)[0],
+    "pe32+ unknown machine 0x3E00": pe(machine=0x3E00)[0],
+    **{f"pe32+ {size}-byte optional header": pe(optional_size=size)[0] for size in (1, 2, 18, 19)},
 }
 
 
@@ -236,7 +239,34 @@ class ForgedValueTests(unittest.TestCase):
             ("entry past NumberOfSections", "lief.sections", data, past_count),
             ("misaligned entry decoded from its bytes", "lief.sections", data, decoded_at(data, text.location.offset + 44, 1)),
             ("DOS header of an ELF", "lief.headers", elf()[0], dos),
+            ("DOS header under lief.sections", "lief.sections", data, dos),
+            ("COFF header under lief.sections", "lief.sections", data, coff),
+            ("optional header under lief.sections", "lief.sections", data, optional),
         ])
+
+    def test_an_unknown_machine_cannot_be_given_a_known_name(self):
+        elf_data, pe_data = elf(machine=0x3E00)[0], pe(machine=0x3E00)[0]
+        (header,), (_, coff, _) = honest("lief.headers", elf_data), honest("lief.headers", pe_data)
+        self.assertEqual((header.value["machine_name"], coff.value["machine_name"]), ("unknown", "unknown"))
+        self.assert_refused([
+            ("ELF 0x3E00 named x86_64", "lief.headers", elf_data, forged(header, machine_name="x86_64")),
+            ("PE 0x3E00 named x86_64", "lief.headers", pe_data, forged(coff, machine_name="x86_64")),
+        ])
+
+    def test_optional_header_fields_past_its_declared_size_are_refused(self):
+        """Each value below is what the bytes hold where the field would be; the declared size leaves it out."""
+        cases = []
+        for size in (1, 18, 19):
+            data = pe(optional_size=size)[0]
+            optional = honest("lief.headers", data)[2]
+            start = optional.location.offset
+            if size == 1:
+                magic = {0x10B: "pe32", 0x20B: "pe32+"}.get(int.from_bytes(data[start:start + 2], "little"), "unknown")
+                cases.append(("optional_magic at size 1", "lief.headers", data, forged(optional, optional_magic=magic)))
+            else:
+                entry = int.from_bytes(data[start + 16:start + 20], "little")
+                cases.append((f"entry_rva at size {size}", "lief.headers", data, forged(optional, entry_rva=entry)))
+        self.assert_refused(cases)
 
 
 class HandlerTests(unittest.TestCase):
@@ -251,6 +281,20 @@ class HandlerTests(unittest.TestCase):
             tool.operations["lief.sections"].handler(data, {})
         with self.assertRaisesRegex(ContractError, REFUSED):
             lief_tool.make_tool(WorkerExecutor(forge_machine)).operations["lief.headers"].handler(data, {})
+
+    def test_more_section_observations_than_max_sections_are_refused(self):
+        """Every row is honest, but the worker ignored the request's max_sections: the host enforces it."""
+        class Uncapped(WorkerExecutor):
+            def run(self, operation, args, data, digest):
+                return super().run(operation, {"max_sections": 64}, data, digest)
+
+        for data, declared in ((elf()[0], 5), (pe()[0], 3)):
+            handler = lief_tool.make_tool(Uncapped()).operations["lief.sections"].handler
+            self.assertEqual(len(handler(data, {"max_sections": declared})), declared)
+            for count in (1, declared - 1):
+                with self.subTest(declared=declared, max_sections=count), \
+                        self.assertRaisesRegex(ContractError, "over the cap"):
+                    handler(data, {"max_sections": count})
 
     def test_the_old_unconfirmed_dummy_observations_are_refused(self):
         """Before FIX-M2-G1, tests/test_lief_tool.py fed the handler these values and the host accepted them."""
