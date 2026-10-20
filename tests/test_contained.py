@@ -215,6 +215,54 @@ class ExecutorTests(unittest.TestCase):
 
 
 class LockAndArgvTests(unittest.TestCase):
+    def test_tool_supplied_version_and_extra_digest_are_validated_and_frozen(self):
+        value = dict(lock(), adapter_version="1.21.0-r1", ruleset_sha256="d" * 64)
+        kwargs = {"adapter_version": "1.21.0-r1", "extra_keys": ("ruleset_sha256",)}
+        self.assertEqual(load_lock(value, **kwargs), value)
+        executor = DockerExecutor(value, **kwargs)
+        value["ruleset_sha256"] = "e" * 64
+        self.assertEqual(executor.lock["ruleset_sha256"], "d" * 64)
+        with self.assertRaises(TypeError):
+            executor.lock["ruleset_sha256"] = "e" * 64
+        for bad in (dict(value, ruleset_sha256="sha256:" + "d" * 64), dict(value, ruleset_sha256=None),
+                    dict(value, adapter_version="1.0.0-r2"), dict(value, extra="ignored"),
+                    {key: val for key, val in value.items() if key != "ruleset_sha256"}):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ContainedError, "^InvalidImageLock$"):
+                load_lock(bad, **kwargs)
+        with self.assertRaises(ContainedError):
+            load_lock(value)
+
+    def test_yarax_defaults_and_limits_are_checked_before_building_argv(self):
+        for args in ({}, {"max_matches": 1}, {"ruleset": "m2_fixture_v1", "max_matches": 64}):
+            argv = build_argv(lock()["image_id"], "reverseai-abc", "/private/staging", "yarax.matches", args)
+            control = build_argv(lock()["image_id"], "reverseai-abc", "/private/staging", "lief.headers", {})
+            self.assertEqual(argv[:-2], control[:-2])
+            self.assertEqual(argv[-2], "yarax.matches")
+            self.assertEqual(json.loads(argv[-1]), {"ruleset": "m2_fixture_v1", "max_matches": args.get("max_matches", 32)})
+        for args in ({"max_matches": True}, {"max_matches": 0}, {"max_matches": 65}, {"max_matches": "64"},
+                     {"ruleset": "other"}, {"ruleset": "--privileged"}, {"path": "/host/input"}):
+            with self.subTest(args=args), self.assertRaisesRegex(ContainedError, "^InvalidWorkerArguments$"):
+                build_argv(lock()["image_id"], "reverseai-abc", "/private/staging", "yarax.matches", args)
+
+    def test_yarax_executor_uses_the_same_staging_limits_and_cleanup(self):
+        data, calls = b"inert UPX!", []
+        with tempfile.TemporaryDirectory() as folder:
+            def runner(argv, **kwargs):
+                calls.append((argv, kwargs))
+                mount = argv[argv.index("--mount") + 1]
+                staged = Path(mount.split("source=", 1)[1].split(",target=", 1)[0])
+                self.assertEqual((staged / "input").read_bytes(), data)
+                self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o555)
+                self.assertEqual(stat.S_IMODE((staged / "input").stat().st_mode), 0o444)
+                return b"reply"
+            executor = DockerExecutor(dict(lock(), adapter_version="1.21.0-r1", ruleset_sha256="d" * 64),
+                                      runner=runner, adapter_version="1.21.0-r1", extra_keys=("ruleset_sha256",),
+                                      inspect=lambda image: image, staging_root=folder)
+            self.assertEqual(executor.run("yarax.matches", {}, data, sha256_hex(data)), b"reply")
+            self.assertEqual(list(Path(folder).iterdir()), [])
+        self.assertEqual(calls[0][1], {"timeout": 45, "max_output": MAX_WORKER_REPLY_BYTES})
+        self.assertEqual(calls[0][0][-2:], ["yarax.matches", '{"max_matches":32,"ruleset":"m2_fixture_v1"}'])
+
     def test_lock_file_pins_are_validated_and_copied(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "lock.json"

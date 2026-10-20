@@ -1,18 +1,21 @@
 """Allowlisted LIEF operations, reached only through the contained executor."""
 
-from reverseai.contained import DEFAULT_LOCK, DockerExecutor, ContainedError, inspect_image
+from pathlib import Path
+
+from reverseai.contained import DockerExecutor, ContainedError, inspect_image
 from reverseai.contract import (
     ArgSpec, ContractError, OperationSpec, ToolRef, ToolSpec, parse_worker_reply, sha256_hex,
 )
 from reverseai.tools import lief_verify
 
 REF = ToolRef("lief", "1.0.0-r2")
+DEFAULT_LOCK = Path(__file__).resolve().parents[2] / "containers/lief/image.lock.json"
 
 
 def make_tool(executor=None):
     """Bind handlers and reported runtime identity to one frozen executor lock."""
     if executor is None:
-        executor = DockerExecutor(DEFAULT_LOCK)
+        executor = DockerExecutor(DEFAULT_LOCK, adapter_version=REF.version)
     operations = {}
 
     def handler(name, cap):
@@ -41,6 +44,7 @@ def available(lock=None, *, inspect=None):
     """A missing lock, image or Docker daemon leaves the optional tool disabled."""
     try:
         executor = DockerExecutor(DEFAULT_LOCK if lock is None else lock,
+                                  adapter_version=REF.version,
                                   inspect=inspect_image if inspect is None else inspect)
         return executor.available()
     except ContainedError:
