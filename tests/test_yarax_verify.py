@@ -7,7 +7,8 @@ import unittest
 from reverseai.contained import ContainedError
 from reverseai.contract import ContractError, Location, Observation, sha256_hex
 from reverseai.tools import yarax_verify
-from tests.fixtures_yarax import RULESET_SHA256, known_matches, match
+from tests.fixtures_yarax import RULESET_SHA256, known_matches, match, pattern_table
+from tests.test_yarax_worker_logic import worker
 
 RULESET_PATH = Path(__file__).resolve().parents[1] / "containers/yarax/m2_fixture_v1.json"
 ARGS = {"ruleset": "m2_fixture_v1", "max_matches": 64}
@@ -18,6 +19,66 @@ def observation(item):
 
 
 class RulesetTests(unittest.TestCase):
+    def test_pattern_budget_accepts_sixteen_and_refuses_seventeen(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rules.json"
+            for count in (16, 17):
+                raw, _, _ = pattern_table(count)
+                path.write_bytes(raw)
+                with self.subTest(count=count):
+                    if count == 16:
+                        self.assertEqual(len(yarax_verify.load_patterns(path, sha256_hex(raw))), 16)
+                    else:
+                        with self.assertRaisesRegex(ContainedError, "^InvalidRuleset$"):
+                            yarax_verify.load_patterns(path, sha256_hex(raw))
+
+    def test_host_and_worker_agree_on_identifier_category_and_hex_grammar(self):
+        original = {"ruleset": "m2_fixture_v1", "rules": [
+            {"id": "test_rule", "category": "packer", "patterns": [{"id": "$a", "hex": "55505821"}]}]}
+        cases = [("id", name, False) for name in sorted(worker.KEYWORDS)]
+        cases += [("id", "r" + "a" * 63, True), ("id", "r" + "a" * 64, False),
+                  ("id", "Bad", False), ("category", "c" * 64, True), ("category", "", False),
+                  ("category", "Bad", False), ("category", "c" * 65, False),
+                  ("pattern", "$0", True), ("pattern", "$" + "a" * 32, True),
+                  ("pattern", "$" + "a" * 33, False), ("pattern", "$A", False), ("pattern", "$", False),
+                  ("hex", "aabbccdd", True), ("hex", "AABBCCDD", False), ("hex", "aabbcc", False),
+                  ("hex", "aa" * 256, True), ("hex", "aa" * 257, False), ("hex", "aabbccd", False)]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rules.json"
+            for field, text, expected in cases:
+                value = copy.deepcopy(original)
+                if field in ("pattern", "hex"):
+                    value["rules"][0]["patterns"][0]["id" if field == "pattern" else "hex"] = text
+                else:
+                    value["rules"][0][field] = text
+                raw = json.dumps(value).encode()
+                path.write_bytes(raw)
+                try:
+                    yarax_verify.load_patterns(path, sha256_hex(raw))
+                    host_accepts = True
+                except ContainedError:
+                    host_accepts = False
+                try:
+                    worker.check_ruleset(value, "m2_fixture_v1")
+                    worker_accepts = True
+                except worker.RulesetInvalid:
+                    worker_accepts = False
+                with self.subTest(field=field, text=text):
+                    self.assertEqual(host_accepts, expected)
+                    self.assertEqual(worker_accepts, expected)
+
+    def test_duplicate_json_keys_are_refused_even_with_the_matching_test_hash(self):
+        raw = RULESET_PATH.read_bytes().replace(b'"ruleset": "m2_fixture_v1"',
+                                                b'"ruleset": "other", "ruleset": "m2_fixture_v1"')
+        self.assertNotEqual(raw, RULESET_PATH.read_bytes())
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "m2_fixture_v1.json"
+            path.write_bytes(raw)
+            with self.assertRaisesRegex(ContainedError, "^InvalidRuleset$"):
+                yarax_verify.load_patterns(path, sha256_hex(raw))
+            with self.assertRaises(worker.RulesetInvalid):
+                worker.load_ruleset("m2_fixture_v1", folder)
+
     def test_reviewed_hash_and_literal_patterns_are_frozen(self):
         patterns = yarax_verify.load_patterns(RULESET_PATH, RULESET_SHA256)
         self.assertEqual(len(patterns), 9)
@@ -117,3 +178,15 @@ class VerifyTests(unittest.TestCase):
         for args in (dict(ARGS, max_matches=1), dict(ARGS, ruleset="other")):
             with self.subTest(args=args), self.assertRaises(ContractError):
                 self.verify(self.items, args=args)
+
+    def test_four_matches_per_rule_pattern_are_allowed_but_the_fifth_is_refused(self):
+        data = b"UPX!" * 5
+        items = [match(4 * index) for index in range(5)]
+        self.verify(items[:4], data=data)
+        with self.assertRaisesRegex(ContractError, "^" + yarax_verify.REFUSED + "$"):
+            self.verify(items, data=data)
+
+    def test_same_pattern_id_under_different_rules_has_a_separate_cap(self):
+        patterns = {("one", "$a"): b"UPX!", ("two", "$a"): b"UPX!"}
+        items = [observation(match(offset, rule=rule)) for offset in range(0, 16, 4) for rule in ("one", "two")]
+        yarax_verify.verify(b"UPX!" * 4, items, ARGS, patterns)

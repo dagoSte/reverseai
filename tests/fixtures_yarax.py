@@ -10,7 +10,7 @@ RULESET_SHA256 = "e2217ff703858af17fe8eee8ac0d4cc44dfefd632e096bb4b527b89b08a062
 
 
 def yarax_lock():
-    return dict(lock(), adapter_version="1.21.0-r1", ruleset_sha256=RULESET_SHA256)
+    return dict(lock(), adapter_version="1.21.0-r2", ruleset_sha256=RULESET_SHA256)
 
 
 def match(offset, literal=b"UPX!", rule="upx_packed", pattern="$a"):
@@ -29,6 +29,19 @@ def known_matches():
         observations.append(match(len(data), literal, rule, pattern))
         data += literal
     return data + b"\x00", observations
+
+
+def pattern_table(count=16, repeats=4):
+    """A synthetic ruleset at the 64-observation budget, with declared disjoint four-byte literals."""
+    data, observations, patterns = b"", [], []
+    for index in range(count):
+        literal, pattern = bytes((0x55, index, 0x50, 0x58)), f"$p{index}"
+        patterns.append({"id": pattern, "hex": literal.hex()})
+        for _ in range(repeats):
+            observations.append(match(len(data), literal, "table", pattern))
+            data += literal
+    ruleset = {"ruleset": "m2_fixture_v1", "rules": [{"id": "table", "category": "packer", "patterns": patterns}]}
+    return json.dumps(ruleset).encode(), data, observations
 
 
 def reply(data, observations=()):

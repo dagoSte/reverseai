@@ -6,7 +6,7 @@ from reverseai.contained import ContainedError, DockerExecutor, inspect_image
 from reverseai.contract import ArgSpec, OperationSpec, ToolRef, ToolSpec, parse_worker_reply, sha256_hex
 from reverseai.tools import yarax_verify
 
-REF = ToolRef("yarax", "1.21.0-r1")
+REF = ToolRef("yarax", "1.21.0-r2")
 DEFAULT_LOCK = Path(__file__).resolve().parents[2] / "containers/yarax/image.lock.json"
 RULESET_PATH = DEFAULT_LOCK.with_name("m2_fixture_v1.json")
 EXTRA_KEYS = ("ruleset_sha256",)
