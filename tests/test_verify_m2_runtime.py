@@ -917,6 +917,9 @@ class FakeBoundary:
         self.inspect = container_fixture()
         self.inspect["Id"] = self.CID
         self.created_id = self.CID.encode() + b"\n"
+        self.create_error = None
+        self.lookup_output = self.created_id
+        self.lookup_error = None
         self.output = b"canned worker reply"
         self.start_error = None
         self.remove_error = None
@@ -928,7 +931,7 @@ class FakeBoundary:
     @staticmethod
     def build_argv(image_id, name, snapshot, operation, args):
         return [
-            "docker", "run", "--rm", "--init", "--name", name,
+            "docker", "run", "--rm", "--init", "--pull", "never", "--name", name,
             "--platform", "linux/arm64", "--network", "none", "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--user", "65534:65534", "--pids-limit", "64", "--memory", "512m",
@@ -942,10 +945,20 @@ class FakeBoundary:
         self.calls.append((list(argv), timeout, max_output))
         if argv[:2] == ["docker", "create"]:
             index = argv.index(IMAGE_ID)
+            self.inspect["Name"] = "/" + argv[argv.index("--name") + 1]
             self.inspect["Config"]["Cmd"] = argv[index + 1:]
             if "--entrypoint" in argv[:index]:
                 self.inspect["Config"]["Entrypoint"] = [argv[argv.index("--entrypoint") + 1]]
+            if self.create_error is not None:
+                raise self.create_error
             return self.created_id
+        if argv == ["docker", "ps", "--all", "--no-trunc", "--filter", "name=^" + self.inspect.get("Name", "") + "$",
+                    "--format", "{{.ID}}"]:
+            if self.lookup_error is not None:
+                raise self.lookup_error
+            return self.lookup_output
+        if argv == ["docker", "kill", self.inspect.get("Name", "").removeprefix("/")]:
+            return b""
         if argv == ["docker", "inspect", self.CID]:
             return json.dumps([self.inspect]).encode()
         if argv == ["docker", "inspect", "--format", "{{.State.Running}}", self.CID]:
@@ -1008,6 +1021,23 @@ class ControlArgvTests(unittest.TestCase):
         for code in (False, 7, [], {}):
             with self.subTest(code=code), self.assertRaises(verifier.VerificationError):
                 verifier.derive_control_argv(self.argv, IMAGE_ID, code)
+
+    def test_pull_policy_must_be_one_explicit_never_before_the_image(self):
+        at = self.argv.index("--pull")
+        missing = self.argv[:at] + self.argv[at + 2:]
+        malformed = [missing, missing + ["--pull", "never"],
+                     [*missing[:2], "--pull=never", *missing[2:]],
+                     [*self.argv[:2], "--pull", "always", *self.argv[2:]],
+                     [*self.argv[:2], "--pull=always", *self.argv[2:]]]
+        for policy in ("missing", "always"):
+            changed = list(self.argv)
+            changed[at + 1] = policy
+            malformed.append(changed)
+        for argv in malformed:
+            for code in (None, verifier.probe_code("network")):
+                with self.subTest(argv=argv, control=code is not None):
+                    with self.assertRaisesRegex(verifier.VerificationError, "^BuilderPullPolicy$"):
+                        verifier.derive_control_argv(argv, IMAGE_ID, code)
 
 
 class TrustedProbeSourceTests(unittest.TestCase):
@@ -1150,14 +1180,121 @@ class NativeRunnerBoundaryTests(unittest.TestCase):
         self.assertEqual(self.boundary.calls, [])
         self.assertEqual(self.receipt["cleanup"], [])
 
-    def test_bad_created_id_never_starts_or_cleans_an_unowned_name(self):
-        for value in (b"name\n", b"d" * 63, b"D" * 64, b"../container", b""):
+    def test_missing_or_malformed_create_reply_reconciles_only_the_owned_container(self):
+        for value in (b"name\n", b"d" * 63, b"D" * 64, b"../container", b"", b"\xff", None):
             self.setUp()
             self.boundary.created_id = value
-            with self.subTest(value=value), self.assertRaises(verifier.VerificationError):
-                self.run_worker()
-            self.assertEqual(len(self.boundary.calls), 1)
-            self.assertEqual(self.receipt["cleanup"], [])
+            with self.subTest(value=value):
+                with self.assertRaises(BaseException) as caught:
+                    self.run_worker()
+                self.assertIs(type(caught.exception), verifier.VerificationError)
+                self.assertEqual(str(caught.exception), "CreatedContainerID")
+                self.assertFalse(any(argv[:2] == ["docker", "start"] for argv in self.commands()))
+                self.assertGreaterEqual(len(self.commands()), 2)
+                self.assertEqual(self.commands()[1], [
+                    "docker", "ps", "--all", "--no-trunc", "--filter", "name=^/reverseai-unit-owned$",
+                    "--format", "{{.ID}}",
+                ])
+                self.assert_owned_cleanup()
+                self.assertTrue(self.receipt["cleanup"][0]["verified"])
+                self.assertTrue(self.receipt["cleanup"][0]["uncertain_create"])
+
+    def test_pull_policy_is_checked_independently_of_a_regressed_builder_before_create(self):
+        at = self.argv.index("--pull")
+        for policy in (None, "missing", "always"):
+            self.boundary.calls.clear()
+            changed = list(self.argv)
+            if policy is None:
+                del changed[at:at + 2]
+            else:
+                changed[at + 1] = policy
+            with self.subTest(policy=policy), mock.patch.object(self.boundary, "build_argv", return_value=changed):
+                with self.assertRaisesRegex(verifier.VerificationError, "^BuilderPullPolicy$"):
+                    self.native.runner(changed, timeout=45, max_output=262144)
+                self.assertEqual(self.commands(), [])
+                self.assertEqual(self.receipt["cleanup"], [])
+
+    def test_lost_create_reply_preserves_failure_after_verified_owned_cleanup(self):
+        for failure in (self.boundary.ContainedTimeout("WorkerTimeout"), OSError("create transport lost"),
+                        KeyboardInterrupt(), SystemExit(17)):
+            self.setUp()
+            self.boundary.create_error = failure
+            with self.subTest(failure=type(failure).__name__):
+                with self.assertRaises(BaseException) as caught:
+                    self.run_worker()
+                self.assertIs(caught.exception, failure)
+                self.assert_owned_cleanup()
+                self.assertTrue(self.receipt["cleanup"][0]["verified"])
+                self.assertEqual(self.receipt["cleanup"][0]["container_name"], "reverseai-unit-owned")
+                self.assertFalse(any(argv[:2] == ["docker", "start"] for argv in self.commands()))
+
+    def test_uncertain_create_with_no_match_records_verified_name_absence_without_removal(self):
+        self.boundary.created_id = b""
+        self.boundary.lookup_output = b""
+        with self.assertRaisesRegex(verifier.VerificationError, "^CreatedContainerID$"):
+            self.run_worker()
+        self.assertEqual([argv[:2] for argv in self.commands()], [["docker", "create"], ["docker", "ps"]])
+        self.assertEqual(self.receipt["cleanup"], [{
+            "container_id": None, "container_name": "reverseai-unit-owned", "uncertain_create": True,
+            "verified": True, "staging_removed": False,
+        }])
+        self.assertFalse(verifier.receipt_passes(self.receipt))
+
+    def test_uncertain_create_lookup_failure_or_bad_ids_cannot_prove_cleanup(self):
+        for output in (b"name", b"d" * 63, b"D" * 64, b"\xff", (FakeBoundary.CID + "\n" + "e" * 64).encode(), None):
+            self.setUp()
+            self.boundary.created_id = b""
+            self.boundary.lookup_output = output
+            with self.subTest(output=output):
+                with self.assertRaisesRegex(verifier.VerificationError, "^CreateCleanupUnverified$"):
+                    self.run_worker()
+                self.assertEqual(len(self.commands()), 2)
+                self.assertFalse(self.receipt["cleanup"][0]["verified"])
+        self.setUp()
+        self.boundary.created_id = b""
+        self.boundary.lookup_error = OSError("/private/lookup-failure")
+        with self.assertRaisesRegex(verifier.VerificationError, "^CreateCleanupUnverified$"):
+            self.run_worker()
+        self.assertFalse(self.receipt["cleanup"][0]["verified"])
+
+    def test_uncertain_create_rejects_inspect_identity_name_or_image_mismatch_without_removal(self):
+        for field, value in (("Id", "e" * 64), ("Name", "/unrelated"), ("Image", "sha256:" + "b" * 64)):
+            self.setUp()
+            self.boundary.created_id = b""
+            wrong = dict(self.boundary.inspect, Name="/reverseai-unit-owned")
+            wrong[field] = value
+            with self.subTest(field=field), mock.patch.object(self.native, "one_inspect", return_value=wrong):
+                with self.assertRaisesRegex(verifier.VerificationError, "^CreateCleanupUnverified$"):
+                    self.run_worker()
+                self.assertFalse(any(argv[:2] in (["docker", "start"], ["docker", "rm"]) for argv in self.commands()))
+                self.assertFalse(self.receipt["cleanup"][0]["verified"])
+
+    def test_uncertain_create_cleanup_failure_is_recorded_and_fails_closed(self):
+        self.boundary.created_id = b""
+        self.boundary.present_after_cleanup = True
+        self.assertFalse(self.native.record("runtime_identity", self.run_worker))
+        self.assertEqual(self.receipt["checks"][0]["reason"], "CreateCleanupUnverified")
+        self.assertFalse(self.receipt["cleanup"][0]["verified"])
+
+    def test_uncertain_create_through_executor_records_owned_cleanup_and_removed_snapshot(self):
+        from reverseai.contained import DockerExecutor, ContainedError
+
+        with tempfile.TemporaryDirectory() as folder:
+            self.boundary.create_error = OSError("/private/lost-create-reply")
+            self.boundary.DockerExecutor = lambda lock, runner: DockerExecutor(
+                lock, runner=runner, inspect=lambda image: image, staging_root=folder)
+            with self.assertRaisesRegex(ContainedError, "^WorkerProcessError$"):
+                self.native.invoke(b"inert snapshot", "lief.headers", {})
+            self.assertEqual(list(Path(folder).iterdir()), [])
+        self.assertEqual(len(self.receipt["cleanup"]), 1)
+        row = self.receipt["cleanup"][0]
+        self.assertTrue(row["verified"])
+        self.assertTrue(row["staging_removed"])
+        self.assertTrue(row["uncertain_create"])
+        self.assertEqual(row["container_id"], FakeBoundary.CID)
+        self.assertIsNone(self.native.active)
+        self.assertFalse(any(argv[:2] == ["docker", "start"] for argv in self.commands()))
+        self.assertIn(["docker", "rm", "--force", FakeBoundary.CID], self.commands())
 
     def test_correct_output_limit_error_is_recorded_as_the_stdout_control(self):
         self.native.active = "stdout"
@@ -1251,6 +1388,256 @@ class MainFailureReceiptTests(unittest.TestCase):
                                               "reason": "ExecutorWallLimit"})
         not_run = {row["id"] for row in receipt["checks"] if row["status"] == "not_run"}
         self.assertEqual(not_run, set(verifier.REQUIRED_CHECKS))
+
+
+class InvokeStagingCleanupGuardTests(unittest.TestCase):
+    def invoke_with_staging(self, snapshot, *, remove):
+        receipt = {"checks": [], "cleanup": []}
+        row = {"container_id": FakeBoundary.CID, "verified": True, "staging_removed": False}
+        executor = mock.Mock()
+        boundary = SimpleNamespace(DockerExecutor=mock.Mock(return_value=executor))
+        native = verifier.NativeVerifier(boundary, lock_fixture(), receipt)
+
+        def run(operation, args, data, digest):
+            native.last = (row, snapshot)
+            if remove:
+                snapshot.unlink()
+            return b"successful worker reply"
+
+        executor.run.side_effect = run
+        return native, row
+
+    def test_removed_staging_allows_the_worker_reply(self):
+        with tempfile.TemporaryDirectory() as folder:
+            snapshot = Path(folder) / "input"
+            snapshot.write_bytes(b"frozen input")
+            native, row = self.invoke_with_staging(snapshot, remove=True)
+            self.assertEqual(native.invoke(b"frozen input", "lief.headers", {}),
+                             b"successful worker reply")
+            self.assertTrue(row["staging_removed"])
+            self.assertFalse(snapshot.exists())
+            self.assertIsNone(native.active)
+
+    def test_surviving_staging_refuses_even_a_successful_worker_reply(self):
+        with tempfile.TemporaryDirectory() as folder:
+            snapshot = Path(folder) / "input"
+            snapshot.write_bytes(b"frozen input")
+            native, row = self.invoke_with_staging(snapshot, remove=False)
+            with self.assertRaisesRegex(verifier.VerificationError, "^SnapshotCleanupUnverified$"):
+                native.invoke(b"frozen input", "lief.headers", {})
+            self.assertFalse(row["staging_removed"])
+            self.assertTrue(snapshot.exists())
+
+
+class RunInspectionCountGuardTests(unittest.TestCase):
+    def run_with_count(self, count):
+        receipt = {"checks": [], "cleanup": []}
+        native = verifier.NativeVerifier(SimpleNamespace(), lock_fixture(), receipt)
+        native.inspected = count
+        values = {name: b"generated fixture" for name in verifier.FIXTURE_NAMES}
+        with mock.patch.object(native, "local_daemon", return_value={}), \
+                mock.patch.object(native, "image_check", return_value={}), \
+                mock.patch.object(native, "control", return_value={}) as control, \
+                mock.patch.object(native, "known_answer", return_value={}) as known_answer, \
+                mock.patch.object(verifier, "fixtures", return_value=values):
+            native.run()
+        self.assertEqual(control.call_count, 10)
+        self.assertEqual(known_answer.call_count, 8)
+        return next(row for row in receipt["checks"] if row["id"] == "container")
+
+    def test_every_expected_inspection_allows_the_container_check(self):
+        self.assertEqual(self.run_with_count(18),
+                         {"id": "container", "status": "passed", "evidence": None})
+
+    def test_missing_or_extra_inspections_fail_the_container_check(self):
+        for count in (0, 17, 19):
+            with self.subTest(inspected=count):
+                self.assertEqual(self.run_with_count(count),
+                                 {"id": "container", "status": "failed",
+                                  "reason": "ContainerInspectionMissing"})
+
+
+class OneInspectShapeGuardTests(unittest.TestCase):
+    def inspect_value(self, value):
+        boundary = SimpleNamespace(run_bounded=mock.Mock(return_value=json.dumps(value).encode()))
+        native = verifier.NativeVerifier(boundary, lock_fixture(), {"checks": [], "cleanup": []})
+        return native.one_inspect(["context", "inspect"])
+
+    def test_exactly_one_object_is_returned(self):
+        self.assertEqual(self.inspect_value([{"name": "owned object"}]), {"name": "owned object"})
+
+    def test_multiple_objects_cannot_be_silently_reduced_to_the_first(self):
+        with self.assertRaisesRegex(verifier.VerificationError, "^InspectShape$"):
+            self.inspect_value([{"name": "first"}, {"name": "second"}])
+
+    def test_empty_nonlist_and_nonobject_inspections_are_refused(self):
+        for value in ([], {}, None, "object", False, [None], [[]], ["object"], [False]):
+            with self.subTest(value=value), \
+                    self.assertRaisesRegex(verifier.VerificationError, "^InspectShape$"):
+                self.inspect_value(value)
+
+
+class LocalDaemonGuardTests(unittest.TestCase):
+    def native(self, *, endpoint="unix:///var/run/docker.sock", server=None):
+        context = [{"Endpoints": {"docker": {"Host": endpoint}}}]
+        if server is None:
+            server = {"Os": "linux", "Arch": "arm64", "Version": "test-version"}
+        boundary = SimpleNamespace(run_bounded=mock.Mock(side_effect=(
+            json.dumps(context).encode(), json.dumps(server).encode())))
+        native = verifier.NativeVerifier(boundary, lock_fixture(), {"checks": [], "cleanup": []})
+        return native, boundary
+
+    def test_unset_or_empty_overrides_allow_a_local_linux_arm64_daemon(self):
+        for environment in ({}, {"DOCKER_HOST": "", "DOCKER_CONTEXT": ""}):
+            native, boundary = self.native()
+            with self.subTest(environment=environment), \
+                    mock.patch.dict(verifier.os.environ, environment, clear=True):
+                self.assertEqual(native.local_daemon(),
+                                 {"os": "linux", "arch": "arm64", "version": "test-version"})
+            self.assertEqual(boundary.run_bounded.call_count, 2)
+
+    def test_environment_overrides_are_refused_before_contacting_the_daemon(self):
+        for key, value in (("DOCKER_HOST", "unix:///alternate.sock"),
+                           ("DOCKER_CONTEXT", "alternate-context")):
+            native, boundary = self.native()
+            with self.subTest(variable=key), \
+                    mock.patch.dict(verifier.os.environ, {key: value}, clear=True), \
+                    self.assertRaisesRegex(verifier.VerificationError, "^DockerEnvironmentOverride$"):
+                native.local_daemon()
+            boundary.run_bounded.assert_not_called()
+
+    def test_a_user_local_unix_socket_is_accepted(self):
+        native, _ = self.native(endpoint="unix:///Users/test/.docker/run/docker.sock")
+        with mock.patch.dict(verifier.os.environ, {}, clear=True):
+            self.assertEqual(native.local_daemon()["arch"], "arm64")
+
+    def test_remote_relative_or_nonstring_endpoints_are_refused(self):
+        for endpoint in ("tcp://127.0.0.1:2375", "ssh://remote", "npipe:////./pipe/docker_engine",
+                         "unix://relative.sock", "", None, False, 17, []):
+            native, boundary = self.native(endpoint=endpoint)
+            with self.subTest(endpoint=endpoint), \
+                    mock.patch.dict(verifier.os.environ, {}, clear=True), \
+                    self.assertRaisesRegex(verifier.VerificationError, "^NonlocalDockerDaemon$"):
+                native.local_daemon()
+            self.assertEqual(boundary.run_bounded.call_count, 1)
+
+    def test_a_non_linux_server_is_refused(self):
+        native, _ = self.native(server={"Os": "windows", "Arch": "arm64"})
+        with mock.patch.dict(verifier.os.environ, {}, clear=True), \
+                self.assertRaisesRegex(verifier.VerificationError, "^DaemonPlatform$"):
+            native.local_daemon()
+
+    def test_a_non_arm64_server_is_refused(self):
+        native, _ = self.native(server={"Os": "linux", "Arch": "amd64"})
+        with mock.patch.dict(verifier.os.environ, {}, clear=True), \
+                self.assertRaisesRegex(verifier.VerificationError, "^DaemonPlatform$"):
+            native.local_daemon()
+
+    def test_missing_server_platform_fields_are_refused(self):
+        for server in ({"Os": "linux"}, {"Arch": "arm64"}, {}):
+            native, _ = self.native(server=server)
+            with self.subTest(server=server), \
+                    mock.patch.dict(verifier.os.environ, {}, clear=True), \
+                    self.assertRaisesRegex(verifier.VerificationError, "^DaemonPlatform$"):
+                native.local_daemon()
+
+    def test_nonobject_server_metadata_is_refused(self):
+        for server in ([], "linux/arm64", False, 1):
+            native, _ = self.native(server=server)
+            with self.subTest(server=server), \
+                    mock.patch.dict(verifier.os.environ, {}, clear=True), \
+                    self.assertRaisesRegex(verifier.VerificationError, "^DaemonPlatform$"):
+                native.local_daemon()
+
+
+class WatcherCleanupGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.boundary = FakeBoundary()
+        self.receipt = {"checks": [], "cleanup": []}
+        self.native = verifier.NativeVerifier(self.boundary, lock_fixture(), self.receipt)
+        self.native.image = image_fixture()
+        self.native.active = "wall"
+        self.argv = self.boundary.build_argv(IMAGE_ID, "reverseai-unit-owned", str(SNAPSHOT),
+                                             "lief.headers", {})
+
+    def run_worker(self):
+        return self.native.runner(self.argv, timeout=45, max_output=262144)
+
+    def test_a_stopped_watcher_is_joined_before_success_returns(self):
+        watcher = mock.Mock()
+        watcher.is_alive.return_value = False
+        with mock.patch.object(verifier.threading, "Thread", return_value=watcher):
+            self.assertEqual(self.run_worker(), b"canned worker reply")
+        watcher.start.assert_called_once_with()
+        watcher.join.assert_called_once_with(timeout=2.5)
+        watcher.is_alive.assert_called_once_with()
+        self.assertTrue(self.receipt["cleanup"][0]["verified"])
+
+    def test_a_watcher_still_alive_after_join_refuses_successful_output(self):
+        watcher = mock.Mock()
+        watcher.is_alive.return_value = True
+        with mock.patch.object(verifier.threading, "Thread", return_value=watcher), \
+                self.assertRaisesRegex(verifier.VerificationError, "^MonitorCleanupUnverified$"):
+            self.run_worker()
+        watcher.join.assert_called_once_with(timeout=2.5)
+        self.assertTrue(self.receipt["cleanup"][0]["verified"])
+        self.assertEqual([call[0][:2] for call in self.boundary.calls][-2:],
+                         [["docker", "rm"], ["docker", "ps"]])
+
+
+class MainSourceChangeGuardTests(unittest.TestCase):
+    def run_with_source_change(self, change=None):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            sources = {"verifier": root / "verifier.py", "executor": root / "executor.py"}
+            initial = {"verifier": b"trusted verifier revision one", "executor": b"trusted executor revision one"}
+            for name, path in sources.items():
+                path.write_bytes(initial[name])
+            lock = root / "lock.json"
+            lock.write_text(json.dumps(lock_fixture()))
+            output = root / "receipt.json"
+            boundary = SimpleNamespace(WALL_SECONDS=45, __file__=str(sources["executor"]),
+                                       load_lock=mock.Mock(return_value=lock_fixture()))
+
+            def native_factory(boundary, lock, receipt):
+                def run():
+                    canned = receipt_fixture()
+                    for key in ("image_id", "checks", "cleanup"):
+                        receipt[key] = canned[key]
+                    if change is not None:
+                        sources[change].write_bytes(initial[change] + b" changed during verification")
+                return SimpleNamespace(run=run)
+
+            with mock.patch.object(reverseai, "contained", boundary, create=True), \
+                    mock.patch.object(verifier, "__file__", str(sources["verifier"])), \
+                    mock.patch.object(verifier, "NativeVerifier", side_effect=native_factory), \
+                    mock.patch.object(verifier.sys, "stderr", new=io.StringIO()):
+                result = verifier.main(["--tool", "lief", "--profile", "small", "--offline",
+                                        "--lock", str(lock), "--receipt", str(output)])
+            receipt = json.loads(output.read_bytes())
+            for name in sources:
+                self.assertEqual(receipt[name + "_sha256"], sha256_hex(initial[name]))
+            return result, receipt
+
+    def test_unchanged_sources_allow_a_complete_canned_receipt(self):
+        result, receipt = self.run_with_source_change()
+        self.assertEqual(result, 0)
+        self.assertTrue(receipt["passed"])
+        self.assertEqual(len(receipt["checks"]), 21)
+        self.assertTrue(all(row["status"] == "passed" for row in receipt["checks"]))
+
+    def assert_source_change_refused(self, source):
+        result, receipt = self.run_with_source_change(source)
+        self.assertEqual(result, 1)
+        self.assertFalse(receipt["passed"])
+        self.assertIn({"id": "controller", "status": "failed", "reason": "SourceChangedDuringVerification"},
+                      receipt["checks"])
+
+    def test_verifier_source_changed_during_the_run_refuses_the_receipt(self):
+        self.assert_source_change_refused("verifier")
+
+    def test_executor_source_changed_during_the_run_refuses_the_receipt(self):
+        self.assert_source_change_refused("executor")
 
 
 if __name__ == "__main__":
