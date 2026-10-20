@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from reverseai.contract import (
-    AnalysisTask, InputRef, OperationRequest, canonical_json, content_id, make_finding,
+    AnalysisTask, Budget, InputRef, OperationRequest, canonical_json, content_id, make_finding,
 )
 
 ROLE = "structural"
@@ -15,14 +15,17 @@ def plan(input: InputRef, *, tools=()) -> AnalysisTask:
     operations = (OperationRequest("structure.identify"), OperationRequest("structure.headers"),
                   OperationRequest("structure.sections", {"max_sections": MAX_SECTIONS}))
     identity = {"input": input.sha256, "role": ROLE}
+    budget = Budget(max_concurrency=1)
     if any(tool.ref.name == "lief" for tool in tools):
         operations += (OperationRequest("lief.headers"), OperationRequest("lief.sections", {"max_sections": MAX_SECTIONS}))
         identity["operations"] = [op.operation for op in operations]
+        budget = Budget(max_concurrency=1, max_wall_seconds=120)  # two contained runs, 45 s limit each
     return AnalysisTask(
         id=content_id("tk", identity),
         role=ROLE,
         input=input,
         operations=operations,
+        budget=budget,
     )
 
 

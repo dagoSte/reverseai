@@ -55,6 +55,7 @@ def main(argv=None):
     analyze = commands.add_parser("analyze", help="Analyse one approved file without executing it")
     analyze.add_argument("file", type=Path)
     analyze.add_argument("--out", type=Path, required=True, help="New or empty directory for report.json and report.md")
+    analyze.add_argument("--with-lief", action="store_true", help="Also run the pinned LIEF worker in its container (M2a)")
     args = parser.parse_args(argv)
 
     try:
@@ -63,6 +64,12 @@ def main(argv=None):
         unusable = True
     if unusable:
         parser.exit(1, "reverseai: --out must be a new or empty directory\n")
+    tools = pipeline.TOOLS
+    if args.with_lief:
+        from reverseai.tools import lief_tool
+        if not lief_tool.available():
+            parser.exit(1, "reverseai: the LIEF worker is unavailable (image lock, image or Docker missing)\n")
+        tools = tools + (lief_tool.make_tool(),)
     try:
         data, ref = intake.snapshot(args.file)
     except (OSError, ValueError) as error:  # ContractError is a ValueError
@@ -74,7 +81,7 @@ def main(argv=None):
     written = []
     try:
         try:
-            analysis = pipeline.analyze_bytes(data, ref)
+            analysis = pipeline.analyze_bytes(data, ref, tools=tools)
         except ValueError as error:
             parser.exit(1, f"reverseai: analysis failed: {type(error).__name__}\n")
         for name, render in zip(REPORTS, (report.to_json, report.to_markdown)):

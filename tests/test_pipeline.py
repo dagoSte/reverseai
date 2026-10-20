@@ -10,7 +10,10 @@ from unittest import mock
 
 from reverseai import cli, pipeline, report
 from reverseai.analysts import capability
-from reverseai.contract import Budget, ContractError, InputRef, evidence_intact, make_finding, sha256_hex
+from reverseai.contract import (
+    ArgSpec, Budget, ContractError, InputRef, Location, Observation, OperationSpec, ToolRef, ToolSpec, evidence_intact,
+    make_finding, sha256_hex,
+)
 from tests.fixtures_strings import KNOWN, clean_control, known_strings
 from tests.fixtures_structure import elf, pe
 
@@ -118,6 +121,56 @@ class PipelineKnownAnswerTests(unittest.TestCase):
         self.assertIn("budget_exceeded", {r.status for r in analysis.results})
         self.assertNotIn("contradicted", {v.status for v in analysis.verdicts})
         self.assertIn("budget_exceeded", report.to_markdown(analysis))
+
+
+class ContainedToolWiringTests(unittest.TestCase):
+    def fake_lief(self, data, layout):
+        """A contained ToolSpec whose handlers return what the worker would report for the pe() fixture; no Docker."""
+        lfanew = layout["lfanew"]
+
+        def headers(_, args):
+            return [Observation(Location(0, 64), {"structure": "dos", "e_lfanew": lfanew}),
+                    Observation(Location(lfanew, 24), {"structure": "coff", "format": "pe", "machine_name": "x86_64",
+                                                       "number_of_sections": 3})]
+
+        def sections(_, args):
+            return [Observation(Location(layout["table_offset"] + 40 * i, 40),
+                                {"index": i, "offset": 0, "size": 0, "writable": i == 2 or i == 1, "executable": i in (0, 2)})
+                    for i in range(3)]
+
+        ops = {"lief.headers": OperationSpec("lief.headers", {}, headers, max_observations=3),
+               "lief.sections": OperationSpec("lief.sections", {"max_sections": ArgSpec("int", 1, 64, default=32)}, sections,
+                                              max_observations=64)}
+        return ToolSpec(ToolRef("lief", "1.0.0-r1"), ops, contained=True, runtime={"image": "sha256:" + "1" * 64, "platform": "linux/arm64"})
+
+    def test_contained_findings_agree_with_the_stdlib_parser_and_name_the_image(self):
+        data, layout = pe()
+        analysis = pipeline.analyze_bytes(data, ref(data), tools=pipeline.TOOLS + (self.fake_lief(data, layout),))
+        structural = [r for r in analysis.results if r.role == "structural"][0]
+        self.assertEqual(structural.status, "ok")
+        self.assertTrue({"lief.headers", "lief.sections"} <= {e.operation for e in structural.evidence})
+        found, judged = findings(analysis), verdicts(analysis)
+        self.assertEqual(found[("structural", "sections.writable_executable_indices")].value, [2])
+        for key in ("format.container", "format.machine", "format.section_count", "sections.writable_executable_indices"):
+            self.assertEqual(judged[found[("structural", key)].id].status, "supported", key)
+        cited = {e.id: e.operation for e in structural.evidence}
+        operations = {cited[i] for i in found[("structural", "format.machine")].evidence_ids}
+        self.assertEqual(operations, {"structure.headers", "lief.headers"})
+        tools = report.to_dict(analysis)["tools"]
+        self.assertEqual([t.get("runtime", {}).get("platform") for t in tools if t["name"] == "lief"], ["linux/arm64"])
+        self.assertIn("lief 1.0.0-r1 (contained, image sha256:111111111111, linux/arm64)", report.to_markdown(analysis))
+
+    def test_with_lief_refuses_cleanly_when_the_worker_is_unavailable(self):
+        from reverseai.tools import lief_tool
+        with tempfile.TemporaryDirectory() as temporary, mock.patch.object(lief_tool, "available", return_value=False):
+            sample = Path(temporary, "sample.bin")
+            sample.write_bytes(pe()[0])
+            out = io.StringIO()
+            with contextlib.redirect_stderr(out), self.assertRaises(SystemExit) as stopped:
+                cli.main(["analyze", str(sample), "--out", str(Path(temporary, "r")), "--with-lief"])
+            self.assertEqual(stopped.exception.code, 1)
+            self.assertIn("LIEF worker is unavailable", out.getvalue())
+            self.assertFalse(Path(temporary, "r").exists())
 
 
 class HostileTextTests(unittest.TestCase):

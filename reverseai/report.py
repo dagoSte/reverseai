@@ -17,6 +17,7 @@ class Analysis:
     tools: tuple  # tuple[ToolRef, ...]
     results: tuple  # tuple[AnalysisResult, ...]
     verdicts: tuple  # tuple[ReviewVerdict, ...]
+    runtimes: tuple = ()  # ((tool name, {"image": ..., "platform": ...}), ...) for contained tools
 
 
 def to_dict(analysis):
@@ -49,7 +50,8 @@ def to_dict(analysis):
         "contract": CONTRACT_VERSION,
         "reverseai": __version__,
         "input": {"sha256": analysis.input.sha256, "size": analysis.input.size, "name": analysis.input.name},
-        "tools": [{"name": t.name, "version": t.version} for t in analysis.tools],
+        "tools": [{"name": t.name, "version": t.version, **({"runtime": dict(analysis.runtimes)[t.name]} if t.name in dict(analysis.runtimes) else {})}
+                  for t in analysis.tools],
         "results": results,
         "summary": summary,
     }
@@ -77,7 +79,8 @@ def to_markdown(analysis):
         f"- Input: {_cell(report['input']['name'])}, {report['input']['size']} bytes",
         f"- SHA-256: `{report['input']['sha256']}`",
         f"- Contract: {report['contract']}; ReverseAI {report['reverseai']}",
-        "- Tools: " + ", ".join(f"{t['name']} {t['version']}" for t in report["tools"]),
+        "- Tools: " + ", ".join(f"{t['name']} {t['version']}" + (f" (contained, image {t['runtime'].get('image', '?')[:19]}, {t['runtime'].get('platform', '?')})"
+                                 if "runtime" in t else "") for t in report["tools"]),
         "- The sample was not executed. Findings marked inferred are hints, not proof of behaviour.",
         "",
         "## Supported findings",
