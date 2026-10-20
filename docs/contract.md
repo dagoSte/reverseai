@@ -24,7 +24,7 @@ approved file
 | `reverseai/intake.py` | lane A | `snapshot(path) -> tuple[bytes, InputRef]` |
 | `reverseai/tools/structure.py` | lane A | `TOOL: ToolSpec` named `structure` |
 | `reverseai/analysts/structural.py` | lane A | `plan(InputRef) -> AnalysisTask`, `conclude(AnalysisTask, tuple[Evidence, ...]) -> tuple[Finding, ...]` |
-| `reverseai/review.py` | lane A | `review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tools: Mapping[str, ToolRef]) -> tuple[ReviewVerdict, ...]` |
+| `reverseai/review.py` | lane A | `review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tools: Mapping[str, ToolSpec]) -> tuple[ReviewVerdict, ...]` (tools keyed by tool name) |
 | `reverseai/tools/strings.py` | lane B | `TOOL: ToolSpec` named `strings` |
 | `reverseai/analysts/capability.py` | lane B | `plan`, `conclude` as above |
 | `reverseai/gateway.py` | lane B | `Gateway(tools: Iterable[ToolSpec], budget: Budget)` with `run(task, data) -> AnalysisResult` |
@@ -43,20 +43,32 @@ approved file
    gathered so far; it never raises past the pipeline.
 4. **De-duplication.** One `Gateway` instance is shared by all tasks of a run. An
    operation whose `operation_key` was already executed returns the stored
-   evidence without calling the handler again.
-5. **Findings cite evidence.** `conclude` sees only evidence of its own task and
-   returns findings made with `make_finding`. A finding with no evidence is
+   evidence without calling the handler again. An execution cut short by a budget
+   is not stored as the result for later tasks.
+5. **Findings cite evidence.** `conclude` sees only evidence of its own task, as
+   copies: the pipeline keeps the gateway's records for the result. It returns
+   findings made with `make_finding`, whose ID binds every field. A finding with no evidence is
    allowed to exist, so the reviewer can reject it.
-6. **The reviewer re-checks bytes.** For each cited evidence item it recomputes
-   the input hash, checks the tool name and version against the registered tools,
-   checks that the location is inside the input and that the excerpt hash matches
-   the frozen bytes. A finding is `unsupported` if any cited item is missing or
-   fails, or if it cites none; `contradicted` if another finding whose cited
+6. **The reviewer re-checks bytes.** Analyst output is untrusted. The reviewer
+   checks that `len(data)` and the input hash match the `InputRef`. It resolves a
+   finding's evidence IDs only inside the finding's own `AnalysisResult`. For each
+   cited item it checks that the record still matches its content-bound ID
+   (`evidence_intact`), recomputes the input hash, checks the tool name and version
+   and that the operation is registered for that tool, checks that the location is
+   inside the input and that the excerpt hash matches the frozen bytes. A finding
+   that no longer matches its own ID (`finding_intact`), or that shares its ID with
+   different content, is `unsupported`. A finding is also `unsupported` if any cited
+   item is missing or fails, or if it cites none; `contradicted` if another finding whose cited
    evidence also all verifies has the same `claim_key` and a different `value`;
    otherwise `supported`. An unsupported finding never contradicts anything, so
    a claim without valid evidence cannot cancel a verified one.
 7. **Errors are short and inert.** Error and reason strings never contain input
-   bytes or host paths.
+   bytes or host paths. Reports do contain bounded text taken from the sample
+   (strings, URLs, section names); it stays untrusted, and the Markdown report
+   escapes it so it cannot render as HTML, links or images.
+   Reports are deterministic for a given input and budget unless a shared global
+   budget is exhausted; then which concurrent task received the last slots may
+   vary, and the result says `budget_exceeded`.
 8. **No execution.** Nothing in M1 runs the sample, installs software, opens a
    network connection or calls a model.
 

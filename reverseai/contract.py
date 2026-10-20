@@ -169,14 +169,18 @@ def evidence_id(input_sha256, tool, operation, location, excerpt_sha256, observa
     })
 
 
-def make_evidence(data: bytes, tool: ToolRef, operation: str, observation: Observation) -> Evidence:
-    """The only constructor the gateway uses: binds an observation to the frozen bytes."""
+def make_evidence(data: bytes, tool: ToolRef, operation: str, observation: Observation, *, input_sha256=None) -> Evidence:
+    """The only constructor the gateway uses: binds an observation to the frozen bytes.
+
+    A caller that already hashed the input once per run passes input_sha256; the
+    reviewer recomputes it from the bytes either way.
+    """
     require(isinstance(data, (bytes, bytearray)), "Evidence needs the frozen input bytes")
     require(isinstance(observation, Observation), "Evidence needs an Observation")
     location = observation.location
     require(location.within(len(data)), "Observation location is outside the input")
     fields = {
-        "input_sha256": sha256_hex(bytes(data)),
+        "input_sha256": input_sha256 or sha256_hex(bytes(data)),
         "tool": tool,
         "operation": operation,
         "location": location,
@@ -184,6 +188,14 @@ def make_evidence(data: bytes, tool: ToolRef, operation: str, observation: Obser
         "observation": observation.value,
     }
     return Evidence(id=evidence_id(**fields), **fields)
+
+
+def evidence_intact(evidence) -> bool:
+    """True if the record still matches its content-bound ID: analysts may hold mutable views of it."""
+    try:
+        return isinstance(evidence, Evidence) and evidence_from_dict(evidence.to_dict()) == evidence
+    except (ContractError, TypeError, ValueError):
+        return False
 
 
 def evidence_from_dict(raw) -> Evidence:
@@ -336,16 +348,28 @@ class Finding:
         require(isinstance(self.evidence_ids, tuple) and len(self.evidence_ids) <= MAX_EVIDENCE_PER_FINDING
                 and all(isinstance(e, str) and _ID.match(e) and e.startswith("ev-") for e in self.evidence_ids), "Invalid evidence IDs")
         require(self.confidence in FINDING_CONFIDENCE, "Invalid finding confidence")
-        require(self.id == finding_id(self.role, self.claim_key, self.value, self.evidence_ids), "Finding ID does not match its content")
+        require(self.id == finding_id(self.role, self.claim, self.claim_key, self.value, self.evidence_ids, self.confidence),
+                "Finding ID does not match its content")
 
 
-def finding_id(role, claim_key, value, evidence_ids) -> str:
-    return content_id("fi", {"role": role, "claim_key": claim_key, "value": value, "evidence": sorted(evidence_ids)})
+def finding_id(role, claim, claim_key, value, evidence_ids, confidence) -> str:
+    """Every field is bound, so one ID can never stand for two different claims."""
+    return content_id("fi", {"role": role, "claim": claim, "claim_key": claim_key, "value": value,
+                             "evidence": sorted(evidence_ids), "confidence": confidence})
+
+
+def finding_intact(finding) -> bool:
+    """True if the finding still matches its ID (its value may be a mutable list or dict)."""
+    try:
+        return isinstance(finding, Finding) and finding == Finding(finding.id, finding.role, finding.claim, finding.claim_key,
+                                                                   finding.value, finding.evidence_ids, finding.confidence)
+    except (ContractError, TypeError, ValueError):
+        return False
 
 
 def make_finding(role, claim, claim_key, value, evidence_ids, confidence="observed") -> Finding:
     ids = tuple(sorted(set(evidence_ids)))
-    return Finding(finding_id(role, claim_key, value, ids), role, claim, claim_key, value, ids, confidence)
+    return Finding(finding_id(role, claim, claim_key, value, ids, confidence), role, claim, claim_key, value, ids, confidence)
 
 
 @dataclass(frozen=True)

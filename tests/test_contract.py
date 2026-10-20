@@ -3,7 +3,7 @@ import unittest
 from reverseai.contract import (
     ArgSpec, AnalysisTask, Budget, ContractError, Evidence, InputRef, Location, Observation,
     OperationRequest, OperationSpec, ReviewVerdict, ToolRef, ToolSpec, evidence_from_dict,
-    make_evidence, make_finding, operation_key, sha256_hex,
+    evidence_intact, finding_intact, make_evidence, make_finding, operation_key, sha256_hex,
 )
 
 DATA = b"\x7fELF" + bytes(60) + b"hello world\x00"
@@ -102,6 +102,28 @@ class TaskFindingVerdictTests(unittest.TestCase):
         self.assertEqual(finding.evidence_ids, (evidence.id,))
         with self.assertRaises(ContractError):
             type(finding)(finding.id, "structural", finding.claim, finding.claim_key, "pe", finding.evidence_ids)
+
+    def test_finding_id_binds_claim_text_and_confidence(self):
+        evidence = make_evidence(DATA, TOOL, "structure.identify", observation())
+        plain = make_finding("structural", "The input is an ELF file.", "format.container", "elf", [evidence.id])
+        louder = make_finding("structural", "The input is definitely malware.", "format.container", "elf", [evidence.id])
+        inferred = make_finding("structural", "The input is an ELF file.", "format.container", "elf", [evidence.id], "inferred")
+        self.assertEqual(len({plain.id, louder.id, inferred.id}), 3)
+
+    def test_in_place_mutation_is_detected(self):
+        evidence = make_evidence(DATA, TOOL, "structure.identify", observation(magic="7f454c46", nested={"list": [1]}))
+        finding = make_finding("structural", "Sections.", "sections.names", [".text"], [evidence.id])
+        self.assertTrue(evidence_intact(evidence) and finding_intact(finding))
+        evidence.observation["nested"]["list"].append(2)
+        finding.value.append(".rwx")
+        self.assertFalse(evidence_intact(evidence))
+        self.assertFalse(finding_intact(finding))
+        self.assertFalse(evidence_intact({"id": evidence.id}))
+
+    def test_precomputed_input_hash(self):
+        digest = sha256_hex(DATA)
+        self.assertEqual(make_evidence(DATA, TOOL, "structure.identify", observation(), input_sha256=digest),
+                         make_evidence(DATA, TOOL, "structure.identify", observation()))
 
     def test_rejected_verdict_needs_reason(self):
         ReviewVerdict("fi-0123456789abcdef", "supported")
