@@ -36,7 +36,7 @@ PLATFORM = "linux/arm64"
 BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
 BASE = "python:3.12-slim@" + BASE_DIGEST
 STAGE = "natives"
-ADAPTER_VERSION = "12.1.4-r3"
+ADAPTER_VERSION = "12.1.4-r4"
 CONTEXT_FILES = ("Dockerfile", "worker.py", "unpack.py", "ghidra_scripts")
 ASSETS = {
     "ghidra": {

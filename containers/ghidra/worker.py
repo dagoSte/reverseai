@@ -13,9 +13,11 @@ limit. Requests choose only the four bounded counts: never a script, loader or o
 Ghidra's addresses may be rebased, so every anchor is mapped again here with this file's own
 section table (stdlib decoding; only file-mapped bytes count: ELF SHF_ALLOC sections, PE
 min(SizeOfRawData, VirtualSize), decision m3a-function-span; Mach-O LC_SEGMENT(_64) sections with
-file bytes, executable by the segment's initprot or an instruction attribute, as the host's
-macho_sections): an observation's address is the
-file's virtual address of its anchor, and an anchor is kept only inside an executable section.
+file bytes inside their segment's file range, executable by the segment's initprot or an instruction
+attribute, as the host's macho_sections, decision m3b-macho-zerofill): an observation's address is the
+file's virtual address of its anchor, and an anchor is kept only inside an executable section. The
+entry point that leads the pseudocode is the one the host checks (Mach-O: structure.macho_entry's rule,
+decision m3b-macho-entry).
 Each anchor is cross-checked: Ghidra's bytes there equal the snapshot's, Ghidra's memory block maps
 its address back to the same file offset, and every anchor has the same Ghidra-to-file address
 delta; anything else is InconsistentAnchor. What stays Ghidra's reading, reported as derived and
@@ -37,7 +39,7 @@ import subprocess
 import sys
 
 PROTOCOL = "reverseai.worker/1"
-ADAPTER_VERSION = "12.1.4-r3"
+ADAPTER_VERSION = "12.1.4-r4"
 SNAPSHOT = "/snapshot/input"
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 MAX_REPLY_BYTES = 262_144
@@ -55,6 +57,7 @@ GHIDRA_SECONDS = 210  # the whole headless run, below the 240 s wall limit
 LOADERS = {"elf": "ElfLoader", "pe": "PeLoader", "macho": "MachoLoader"}
 MACHO_MAGICS = {b"\xce\xfa\xed\xfe": 32, b"\xcf\xfa\xed\xfe": 64}  # thin little-endian only
 MACHO_ZEROFILL = (0x1, 0xC, 0x12)  # S_ZEROFILL, S_GB_ZEROFILL, S_THREAD_LOCAL_ZEROFILL: no file bytes
+MACHO_THREADS = {0x1000007: (4, 42, 128), 0x100000C: (6, 68, 256)}  # cputype: (flavor, count, pc offset) x86_64 rip, arm64 pc
 
 
 class WorkerFailure(Exception):
@@ -182,17 +185,38 @@ def pe_map(data):
     return image_base + entry_rva, sections
 
 
+def _thread_pcs(data, start, end, expected):
+    """Program counters of the expected (flavor, count, pc offset) states in one LC_UNIXTHREAD, None if malformed."""
+    pcs = []
+    while start < end:
+        if start + 8 > end:
+            return None
+        flavor, count = struct.unpack_from("<II", data, start)
+        state = start + 8
+        if count > (end - state) // 4:
+            return None
+        if expected and flavor == expected[0]:
+            if count != expected[1]:
+                return None
+            pcs.append(struct.unpack_from("<Q", data, state + expected[2])[0])
+        start = state + count * 4
+    return pcs
+
+
 def macho_map(data):
     """(entry VA or 0, [(file start, file end, VA start, executable)]) from the LC_SEGMENT(_64) sections of a thin
-    little-endian Mach-O; executable is the segment's initprot execute bit or a section instruction attribute."""
+    little-endian Mach-O. A section counts only with file bytes inside its segment's file range; executable is the
+    segment's initprot execute bit or a section instruction attribute. The entry follows the host's macho_entry: one
+    LC_MAIN through the one segment whose file bytes hold entryoff, else one x86_64 or arm64 LC_UNIXTHREAD pc, else 0."""
     width = MACHO_MAGICS[data[:4]]
     header = 32 if width == 64 else 28
     need(data, 0, header)
+    cputype = struct.unpack_from("<I", data, 4)[0]
     ncmds, sizeofcmds = struct.unpack_from("<II", data, 16)
     need(data, header, sizeofcmds)
     segment_cmd, segment_size, section_size = (0x19, 72, 80) if width == 64 else (0x1, 56, 68)
     segment_row, section_row = ("<16sQQQQiiII", "<16s16sQQIIIIIIII") if width == 64 else ("<16sIIIIiiII", "<16s16sIIIIIIIII")
-    at, end, sections, segments, entry_offset = header, header + sizeofcmds, [], [], None
+    at, end, sections, segments, mains, threads, valid = header, header + sizeofcmds, [], [], [], [], True
     for _ in range(ncmds):
         if at + 8 > end:
             raise TruncatedStructure()
@@ -205,21 +229,31 @@ def macho_map(data):
             _, vmaddr, vmsize, fileoff, filesize, _, initprot, nsects, _ = struct.unpack_from(segment_row, data, at + 8)
             if segment_size + nsects * section_size > cmdsize:
                 raise TruncatedStructure()
-            segments.append((fileoff, filesize, vmaddr))
+            segments.append((fileoff, filesize, vmaddr, vmsize))
             for index in range(nsects):
                 row = struct.unpack_from(section_row, data, at + segment_size + index * section_size)
                 address, size, offset, flags = row[2], row[3], row[4], row[8]
-                if size and offset and (flags & 0xFF) not in MACHO_ZEROFILL:
+                inside = fileoff <= offset and offset + size <= fileoff + filesize
+                if size and offset and inside and (flags & 0xFF) not in MACHO_ZEROFILL:
                     need(data, offset, size)
                     sections.append((offset, offset + size, address, bool(initprot & 0x4) or bool(flags & 0x80000400)))
-        elif cmd == 0x80000028 and cmdsize >= 24:  # LC_MAIN: entryoff is a file offset inside __TEXT
-            entry_offset = struct.unpack_from("<Q", data, at + 8)[0]
+        elif cmd == 0x80000028:  # LC_MAIN: entryoff is a file offset inside __TEXT
+            valid = valid and cmdsize >= 24
+            if cmdsize >= 24:
+                mains.append(struct.unpack_from("<Q", data, at + 8)[0])
+        elif cmd == 0x5:  # LC_UNIXTHREAD: (flavor, count, state) records
+            pcs = _thread_pcs(data, at + 8, at + cmdsize, MACHO_THREADS.get(cputype))
+            valid = valid and pcs is not None
+            threads += pcs or []
         at += cmdsize
-    entry = 0
-    if entry_offset is not None:
-        found = [s for s in segments if s[0] <= entry_offset < s[0] + s[1]]
-        entry = found[0][2] + (entry_offset - found[0][0]) if len(found) == 1 else 0
-    return entry, sections
+    if not valid or len(mains) > 1:
+        return 0, sections
+    if mains:
+        found = [vmaddr + mains[0] - fileoff for fileoff, filesize, vmaddr, vmsize in segments
+                 if fileoff + filesize <= len(data) and 0 <= mains[0] - fileoff < min(filesize, vmsize)
+                 and vmaddr + vmsize <= 2**width]
+        return (found[0] if len(found) == 1 else 0), sections
+    return (threads[0] if len(threads) == 1 else 0), sections
 
 
 FILE_MAPS = {"elf": elf_map, "pe": pe_map, "macho": macho_map}
