@@ -3,8 +3,9 @@
     python3 -I -B unpack.py check <file> <sha256>
     python3 -I -B unpack.py ghidra <zip> <sha256> <destination>
 
-Members must stay inside the destination; links, absolute or parent paths and duplicate names are refused, and
-modes become 0755 or 0644 (no setuid, setgid or sticky bit).
+Every member must resolve inside the destination: a link, a member whose resolved path leaves it (an absolute
+path, or a parent step that climbs out) and a duplicate name are refused; a ".." that stays inside is not. Modes
+become 0755 or 0644 (no setuid, setgid or sticky bit).
 """
 
 import hashlib

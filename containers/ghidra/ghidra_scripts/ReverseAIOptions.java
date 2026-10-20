@@ -13,7 +13,8 @@ import ghidra.app.script.GhidraScript;
 
 public class ReverseAIOptions extends GhidraScript {
 	static final Pattern OFF = Pattern.compile("(?i).*(pdb|dwarf|swift).*");
-	private static final Set<String> FORMATS = Set.of("Executable and Linking Format (ELF)", "Portable Executable (PE)");
+	private static final Set<String> FORMATS = Set.of("Executable and Linking Format (ELF)", "Portable Executable (PE)",
+		"Mac OS X Mach-O");
 
 	@Override
 	public void run() throws Exception {

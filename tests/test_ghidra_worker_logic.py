@@ -14,13 +14,14 @@ import json
 from pathlib import Path
 import re
 import signal
+import struct
 import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
 from reverseai.contract import WorkerError, parse_worker_reply, sha256_hex
-from tests.fixtures_code import TEXT_SIZE, elf_code, elf_data_only, pe_code
+from tests.fixtures_code import TEXT_SIZE, elf_code, elf_data_only, macho_code, pe_code
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "containers" / "ghidra"
@@ -35,7 +36,7 @@ def query(data, layout, *, delta=0, names=None, texts=None, options=None):
     """What a correct ReverseAIQuery writes for a fixture, from its declared layout; Ghidra addresses = VA + delta."""
     text = layout["text"]
     names = names or [f["name"] for f in layout["functions"]]
-    block_size = TEXT_SIZE if layout["format"] == "elf" else layout["text_raw_size"]
+    block_size = layout.get("text_raw_size", TEXT_SIZE)
     blocks = [{"name": ".text", "start": text["address"] + delta, "size": block_size, "execute": True,
                "initialized": True, "file_offset": text["offset"]}]
     if "data" in layout:
@@ -87,14 +88,14 @@ def observe(data, q, **args):
 
 class KnownAnswerTests(unittest.TestCase):
     def test_elf_and_pe_observations_equal_the_declared_layout(self):
-        for label, (data, layout), names in (("elf", elf_code(), None), ("pe", pe_code(), PE_NAMES)):
+        for label, (data, layout), names in (("elf", elf_code(), None), ("pe", pe_code(), PE_NAMES), ("macho", macho_code(), None)):
             with self.subTest(label):
                 self.assertEqual(observe(data, query(data, layout, names=names)), expected(layout, names))
 
     def test_a_rebased_program_still_reports_the_files_own_addresses(self):
-        for delta in (0x100000, -0x400000 + 0x1000):
-            data, layout = elf_code()
-            with self.subTest(delta=hex(delta)):
+        for build, delta in ((elf_code, 0x100000), (elf_code, -0x400000 + 0x1000), (macho_code, -0x100000000 + 0x4000)):
+            data, layout = build()
+            with self.subTest(build.__name__, delta=hex(delta)):
                 self.assertEqual(observe(data, query(data, layout, delta=delta)), expected(layout))
 
     def test_known_values(self):
@@ -372,11 +373,65 @@ class FileMapTests(unittest.TestCase):
         patched[text_header + 8:text_header + 12] = (0x300).to_bytes(4, "little")  # larger than SizeOfRawData
         self.assertEqual(worker.pe_map(bytes(patched))[1][0], (0x200, 0x400, 0x140001000, True))
 
-    def test_only_elf_and_pe_are_accepted(self):
-        for data in (b"", b"\xcf\xfa\xed\xfe" + bytes(60), b"PK\x03\x04" + bytes(60), b"MZ" + bytes(100), bytes(64)):
+    def test_the_macho_map_follows_its_segments_sections_and_lc_main(self):
+        data, layout = macho_code()
+        self.assertEqual(worker.macho_map(data), (0x100000200, [(0x200, 0x256, 0x100000200, True)]))
+        text = 32 + 72 + 72  # mach header, __PAGEZERO, then __TEXT's first section header
+        section_flags, initprot = text + 64, 32 + 72 + 8 + 52
+        plain = bytearray(data)
+        plain[section_flags:section_flags + 4] = (0).to_bytes(4, "little")  # no instruction attribute ...
+        self.assertEqual(worker.macho_map(bytes(plain))[1], [(0x200, 0x256, 0x100000200, True)])  # ... __TEXT is r-x
+        plain[initprot:initprot + 4] = (0x1).to_bytes(4, "little")  # ... and r-- only
+        self.assertEqual(worker.macho_map(bytes(plain))[1], [(0x200, 0x256, 0x100000200, False)])
+        zerofill = bytearray(data)
+        zerofill[section_flags:section_flags + 4] = (0x80000401).to_bytes(4, "little")  # S_ZEROFILL: no file bytes
+        self.assertEqual(worker.macho_map(bytes(zerofill))[1], [])
+        no_main = bytearray(data)
+        main = data.index((0x80000028).to_bytes(4, "little") + (24).to_bytes(4, "little"))
+        no_main[main:main + 4] = (0x7FFFFFFF).to_bytes(4, "little")  # an unknown command instead of LC_MAIN
+        self.assertEqual(worker.macho_map(bytes(no_main))[0], 0)
+        for label, cut in (("header", data[:20]), ("commands", data[:100])):
+            with self.subTest(label), self.assertRaises(worker.TruncatedStructure):
+                worker.macho_map(cut)
+        overrun = bytearray(data)
+        overrun[16:20] = (40).to_bytes(4, "little")  # ncmds past sizeofcmds
+        with self.assertRaises(worker.TruncatedStructure):
+            worker.macho_map(bytes(overrun))
+
+    def test_macho_instruction_attributes_bounds_and_32_bit_headers(self):
+        data, layout = macho_code()
+        text = 32 + 72 + 72  # mach header, __PAGEZERO, then __TEXT's first section header
+        section_flags, section_size, initprot, nsects = text + 64, text + 40, 32 + 72 + 60, 32 + 72 + 64
+        for flags in (0x80000400, 0x80000000, 0x400):
+            attributes = bytearray(data)
+            attributes[initprot:initprot + 4] = (0x1).to_bytes(4, "little")  # r-- ...
+            attributes[section_flags:section_flags + 4] = flags.to_bytes(4, "little")  # ... with an instruction attribute
+            with self.subTest(flags=hex(flags)):
+                self.assertEqual(worker.macho_map(bytes(attributes))[1], [(0x200, 0x256, 0x100000200, True)])
+        main = data.index((0x80000028).to_bytes(4, "little") + (24).to_bytes(4, "little"))
+        cases = {"the last command past sizeofcmds": (main + 4, 32), "more sections than the command holds": (nsects, 2),
+                 "section bytes past the end": (section_size, 0x1000)}
+        for label, (at, value) in cases.items():
+            broken = bytearray(data)
+            broken[at:at + 4] = value.to_bytes(4, "little")
+            with self.subTest(label), self.assertRaises(worker.TruncatedStructure):
+                worker.macho_map(bytes(broken))
+        vmaddr = 0x1000  # a 32-bit header: LC_SEGMENT with its 56-byte command and 68-byte sections
+        section = struct.pack("<16s16sIIIIIIIII", b"__text", b"__TEXT", vmaddr + 0x100, 0x10, 0x100, 4, 0, 0, 0x80000400, 0, 0)
+        segment = struct.pack("<II16sIIIIiiII", 0x1, 56 + 68, b"__TEXT", vmaddr, 0x1000, 0, 0x110, 0x5, 0x5, 1, 0) + section
+        lc_main = struct.pack("<IIQQ", 0x80000028, 24, 0x100, 0)
+        thin32 = struct.pack("<IiiIIII", 0xFEEDFACE, 7, 3, 2, 2, len(segment) + len(lc_main), 0) + segment + lc_main
+        thin32 += bytes(0x100 - len(thin32)) + bytes(0x10)
+        self.assertEqual(worker.kind(thin32), "macho")
+        self.assertEqual(worker.macho_map(thin32), (vmaddr + 0x100, [(0x100, 0x110, vmaddr + 0x100, True)]))
+
+    def test_only_elf_pe_and_thin_little_endian_macho_are_accepted(self):
+        for data in (b"", b"\xca\xfe\xba\xbe" + bytes(60), b"\xfe\xed\xfa\xcf" + bytes(60), b"PK\x03\x04" + bytes(60),
+                     b"MZ" + bytes(100), bytes(64)):
             with self.subTest(data=data[:4]), self.assertRaises(worker.UnsupportedFormat):
                 worker.kind(data)
-        self.assertEqual((worker.kind(elf_code()[0]), worker.kind(pe_code()[0])), ("elf", "pe"))
+        self.assertEqual((worker.kind(elf_code()[0]), worker.kind(pe_code()[0]), worker.kind(macho_code()[0]), worker.kind(b"\xce\xfa\xed\xfe")),
+                         ("elf", "pe", "macho", "macho"))
 
     def test_truncated_tables_are_refused(self):
         data, layout = elf_code()
@@ -412,6 +467,7 @@ class RequestAndCommandTests(unittest.TestCase):
         self.assertEqual(argv[argv.index("-loader") + 1:argv.index("-loader") + 6],
                          ["ElfLoader", "-loader-loadLibraries", "false", "-loader-linkExistingProjectLibraries", "false"])
         self.assertEqual(worker.ghidra_argv("pe", "q", DEFAULTS, 1)[argv.index("-loader") + 1], "PeLoader")
+        self.assertEqual(worker.ghidra_argv("macho", "q", DEFAULTS, 1)[argv.index("-loader") + 1], "MachoLoader")
         self.assertEqual(argv[argv.index("-preScript") + 1], "ReverseAIOptions.java")
         post = argv.index("-postScript")
         self.assertEqual(argv[post + 1:post + 7], ["ReverseAIQuery.java", "/tmp/reverseai-ghidra/query.json", "7", "3", "256", "40"])
@@ -488,10 +544,10 @@ class ReplyTests(unittest.TestCase):
 
     def test_the_query_receives_the_format_the_args_and_the_entry_file_offset(self):
         seen = []
-        for build in (elf_code, pe_code):
+        for build in (elf_code, pe_code, macho_code):
             data, layout = build()
             worker.reply(["ghidra.analyze", '{"decompile": 2}'], data, lambda f, a, o: seen.append((f, a["decompile"], o)) or {})
-        self.assertEqual(seen, [("elf", 2, 0x100), ("pe", 2, 0x200)])
+        self.assertEqual(seen, [("elf", 2, 0x100), ("pe", 2, 0x200), ("macho", 2, 0x200)])
 
     def test_unexpected_failures_become_short_error_names_and_large_replies_are_refused(self):
         def broken(f, a, o):
@@ -517,12 +573,20 @@ class BuildInputTests(unittest.TestCase):
     def test_scripts_lock_and_dockerfile_are_pinned_consistently(self):
         lock = json.loads((SOURCE / "image.lock.json").read_text(encoding="utf-8"))
         self.assertEqual(set(lock), {"adapter_version", "base_digest", "ghidra_sha256", "image_id", "jdk_sha256", "platform"})
-        self.assertEqual((lock["adapter_version"], lock["platform"], worker.ADAPTER_VERSION), ("12.1.4-r2", "linux/arm64", "12.1.4-r2"))
+        self.assertEqual((lock["adapter_version"], lock["platform"], worker.ADAPTER_VERSION), ("12.1.4-r3", "linux/arm64", "12.1.4-r3"))
         self.assertEqual(lock["ghidra_sha256"], "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db")
         self.assertEqual(lock["jdk_sha256"], "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223")
         self.assertEqual(lock["base_digest"], json.loads((ROOT / "containers" / "lief" / "image.lock.json").read_text())["base_digest"])
         self.assertRegex(lock["image_id"], r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(sorted(p.name for p in (SOURCE / "ghidra_scripts").iterdir()), ["ReverseAIOptions.java", "ReverseAIQuery.java"])
+        query_source = (SOURCE / "ghidra_scripts" / "ReverseAIQuery.java").read_text()
+        # Decision m3a-function-span: size is the span; reverting to the body's address count must fail here.
+        self.assertIn("long size = span(function);", query_source)
+        self.assertIn("int bySize = Long.compare(span(b), span(a));", query_source)
+        self.assertIn("Address last = function.getBody().getMaxAddress();", query_source)
+        self.assertIn("last.subtract(entry) + 1", query_source)
+        self.assertNotIn("getNumAddresses", query_source)
+        self.assertIn('"Mac OS X Mach-O"', (SOURCE / "ghidra_scripts" / "ReverseAIOptions.java").read_text())
         rule = re.compile(r'Pattern\.compile\("\(\?i\)\.\*\(pdb\|dwarf\|swift\)\.\*"\)')
         for name in ("ReverseAIOptions.java", "ReverseAIQuery.java"):
             self.assertRegex((SOURCE / "ghidra_scripts" / name).read_text(), rule)

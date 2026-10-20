@@ -78,14 +78,14 @@ class BuildTests(unittest.TestCase):
         pull, built = self.docker.calls
         self.assertEqual(pull, ("pull", "--platform", "linux/arm64", build.BASE))
         self.assertEqual(built[:4], ("build", "--platform", "linux/arm64", "--pull=false"))
-        self.assertEqual(built[4:8], ("--iidfile", built[5], "--tag", "reverseai-ghidra:12.1.4-r2"))
+        self.assertEqual(built[4:8], ("--iidfile", built[5], "--tag", "reverseai-ghidra:12.1.4-r3"))
         self.assertEqual(len(built), 9)  # network is restricted by the Dockerfile itself (one natives RUN)
         self.assertEqual(self.docker.context, [
             "Dockerfile", "downloads", "downloads/" + build.ASSETS["jdk"]["name"], "downloads/" + build.ASSETS["ghidra"]["name"],
             "ghidra_scripts", "ghidra_scripts/ReverseAIOptions.java", "ghidra_scripts/ReverseAIQuery.java", "unpack.py", "worker.py"])
         self.assertEqual(self.docker.downloads, {build.ASSETS[key]["name"]: FAKE[key] for key in FAKE})
         self.assertEqual(json.loads(self.lock.read_text()), {
-            "adapter_version": "12.1.4-r2", "base_digest": build.BASE_DIGEST, "image_id": "sha256:" + "a" * 64,
+            "adapter_version": "12.1.4-r3", "base_digest": build.BASE_DIGEST, "image_id": "sha256:" + "a" * 64,
             "ghidra_sha256": hashlib.sha256(FAKE["ghidra"]).hexdigest(), "jdk_sha256": hashlib.sha256(FAKE["jdk"]).hexdigest(),
             "platform": "linux/arm64"})
 
@@ -124,6 +124,25 @@ class BuildTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "no image ID"):
                     self.build()
                 self.assertFalse(self.lock.exists())
+
+    def test_trailing_backslash_runs_match_a_native_buildkit_parse(self):
+        """Measured with buildx v0.37.2 (cache-only builds, M3B-W): only a single trailing backslash, with or without
+        spaces after it, joins the next line; runs of 2 to 5 end the instruction."""
+        joins = {1: True, 2: False, 3: False, 4: False, 5: False}
+        for run, joined in joins.items():
+            for tail in ("", "  "):
+                with self.subTest(run=run, tail=tail):
+                    lines = build.logical_instructions("RUN echo first " + "\\" * run + tail + "\nRUN echo SECOND\n")
+                    self.assertEqual(len(lines), 1 if joined else 2)
+                    source = self.copy(f"run-{run}{'-spaces' if tail else ''}")
+                    (source / "Dockerfile").write_bytes(PREFIX + ("RUN --network=none true " + "\\" * run + tail + "\n").encode()
+                                                        + b"ADD https://example.invalid/x /x\nUSER 65534:65534\n")
+                    if joined:  # BuildKit reads ADD as words of the RUN command, and so does the guard
+                        self.assertEqual(self.build(source=source), 0)
+                    else:
+                        with self.assertRaisesRegex(SystemExit, "ADD is refused"):
+                            self.build(source=source)
+                    self.docker.calls.clear()
 
     def test_control_bytes_and_escaped_backslashes_cannot_hide_an_instruction(self):
         body = PREFIX
@@ -263,6 +282,10 @@ class UnpackTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "pinned SHA-256"):
                 unpack.main(["check", str(path), "0" * 64])
             unpack.main(["check", str(path), digest])
+            Path(folder, "inside-src").mkdir()
+            inside, inside_digest = self.archive(Path(folder, "inside-src"), [("g/sub/../kept", 0o100644, b"k")])
+            unpack.main(["ghidra", str(inside), inside_digest, str(Path(folder, "inside"))])  # a ".." that stays inside is accepted
+            self.assertEqual(Path(folder, "inside/g/kept").read_bytes(), b"k")
             for label, member in (("parent path", ("../escape", 0o100644, b"x")), ("absolute", ("/tmp/abs", 0o100644, b"x")),
                                   ("link", ("g/link", 0o120777, b"/etc/passwd"))):
                 with self.subTest(label):

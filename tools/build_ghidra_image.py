@@ -36,7 +36,7 @@ PLATFORM = "linux/arm64"
 BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
 BASE = "python:3.12-slim@" + BASE_DIGEST
 STAGE = "natives"
-ADAPTER_VERSION = "12.1.4-r2"
+ADAPTER_VERSION = "12.1.4-r3"
 CONTEXT_FILES = ("Dockerfile", "worker.py", "unpack.py", "ghidra_scripts")
 ASSETS = {
     "ghidra": {
@@ -61,11 +61,11 @@ CHUNK = 1024 * 1024
 
 
 def logical_instructions(text):
-    """Logical instructions as BuildKit reads them: a line ending in an unescaped backslash (then only spaces or tabs)
+    """Logical instructions as BuildKit reads them: a line ending in exactly one backslash (then only spaces or tabs)
     continues on the next one, comment and empty lines inside a continuation are skipped, and nothing is inserted at
-    the join (A\\ then DD is ADD). A line ending in an escaped backslash (an even run) ends its instruction, so what
-    follows is checked as an instruction of its own under either reading. Lines are split on LF only: the caller has
-    refused every other control byte."""
+    the join (A\\ then DD is ADD). A run of two or more trailing backslashes ends its instruction: measured natively
+    with buildx v0.37.2 for runs of 1 to 5 (M3B-W). Lines are split on LF only: the caller has refused every other
+    control byte."""
     joined, current = [], None
     for line in text.split("\n"):
         if current is None:
@@ -76,7 +76,7 @@ def logical_instructions(text):
         elif not line.strip(" \t") or line.lstrip(" \t").startswith("#"):
             continue
         end = re.search(r"(\\+)[ \t]*$", line)
-        if end and len(end.group(1)) % 2:
+        if end and len(end.group(1)) == 1:
             current += line[:end.end(1) - 1]
         else:
             joined.append(current + line)

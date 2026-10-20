@@ -3,15 +3,18 @@
 Entrypoint (docs/contract.md, "Contained Ghidra worker (M3a)"):
     python3 -I -B /opt/reverseai/worker.py ghidra.analyze <canonical JSON of validated args>
 
-The worker accepts ELF and PE only and runs one headless Ghidra import of the snapshot into a
-project under /tmp, with a fixed loader (libraries never loaded), the reviewed scripts baked into
+The worker accepts ELF, PE and thin little-endian Mach-O only and runs one headless Ghidra import of
+the snapshot into a project under /tmp, with a fixed loader per format (libraries never loaded), the
+reviewed scripts baked into
 the image (ReverseAIOptions turns off the analyzers that could look outside the input; ReverseAIQuery
 writes functions, calls and pseudocode as JSON), a fixed heap and timeouts below the 240 s wall
 limit. Requests choose only the four bounded counts: never a script, loader or option.
 
 Ghidra's addresses may be rebased, so every anchor is mapped again here with this file's own
 section table (stdlib decoding; only file-mapped bytes count: ELF SHF_ALLOC sections, PE
-min(SizeOfRawData, VirtualSize), decision m3a-function-span): an observation's address is the
+min(SizeOfRawData, VirtualSize), decision m3a-function-span; Mach-O LC_SEGMENT(_64) sections with
+file bytes, executable by the segment's initprot or an instruction attribute, as the host's
+macho_sections): an observation's address is the
 file's virtual address of its anchor, and an anchor is kept only inside an executable section.
 Each anchor is cross-checked: Ghidra's bytes there equal the snapshot's, Ghidra's memory block maps
 its address back to the same file offset, and every anchor has the same Ghidra-to-file address
@@ -34,7 +37,7 @@ import subprocess
 import sys
 
 PROTOCOL = "reverseai.worker/1"
-ADAPTER_VERSION = "12.1.4-r2"
+ADAPTER_VERSION = "12.1.4-r3"
 SNAPSHOT = "/snapshot/input"
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 MAX_REPLY_BYTES = 262_144
@@ -49,7 +52,9 @@ HEAP = "1G"
 ANALYSIS_SECONDS = 120  # Ghidra's own per-file analysis timeout
 DECOMPILE_SECONDS = 40  # all decompilation together
 GHIDRA_SECONDS = 210  # the whole headless run, below the 240 s wall limit
-LOADERS = {"elf": "ElfLoader", "pe": "PeLoader"}
+LOADERS = {"elf": "ElfLoader", "pe": "PeLoader", "macho": "MachoLoader"}
+MACHO_MAGICS = {b"\xce\xfa\xed\xfe": 32, b"\xcf\xfa\xed\xfe": 64}  # thin little-endian only
+MACHO_ZEROFILL = (0x1, 0xC, 0x12)  # S_ZEROFILL, S_GB_ZEROFILL, S_THREAD_LOCAL_ZEROFILL: no file bytes
 
 
 class WorkerFailure(Exception):
@@ -114,6 +119,8 @@ def kind(data):
         e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
         if e_lfanew + 4 <= len(data) and data[e_lfanew:e_lfanew + 4] == b"PE\0\0":
             return "pe"
+    if data[:4] in MACHO_MAGICS:
+        return "macho"
     raise UnsupportedFormat()
 
 
@@ -173,6 +180,49 @@ def pe_map(data):
             need(data, raw, length)
             sections.append((raw, raw + length, image_base + rva, bool(characteristics & 0x20000000)))
     return image_base + entry_rva, sections
+
+
+def macho_map(data):
+    """(entry VA or 0, [(file start, file end, VA start, executable)]) from the LC_SEGMENT(_64) sections of a thin
+    little-endian Mach-O; executable is the segment's initprot execute bit or a section instruction attribute."""
+    width = MACHO_MAGICS[data[:4]]
+    header = 32 if width == 64 else 28
+    need(data, 0, header)
+    ncmds, sizeofcmds = struct.unpack_from("<II", data, 16)
+    need(data, header, sizeofcmds)
+    segment_cmd, segment_size, section_size = (0x19, 72, 80) if width == 64 else (0x1, 56, 68)
+    segment_row, section_row = ("<16sQQQQiiII", "<16s16sQQIIIIIIII") if width == 64 else ("<16sIIIIiiII", "<16s16sIIIIIIIII")
+    at, end, sections, segments, entry_offset = header, header + sizeofcmds, [], [], None
+    for _ in range(ncmds):
+        if at + 8 > end:
+            raise TruncatedStructure()
+        cmd, cmdsize = struct.unpack_from("<II", data, at)
+        if cmdsize < 8 or at + cmdsize > end:
+            raise TruncatedStructure()
+        if cmd == segment_cmd:
+            if cmdsize < segment_size:
+                raise TruncatedStructure()
+            _, vmaddr, vmsize, fileoff, filesize, _, initprot, nsects, _ = struct.unpack_from(segment_row, data, at + 8)
+            if segment_size + nsects * section_size > cmdsize:
+                raise TruncatedStructure()
+            segments.append((fileoff, filesize, vmaddr))
+            for index in range(nsects):
+                row = struct.unpack_from(section_row, data, at + segment_size + index * section_size)
+                address, size, offset, flags = row[2], row[3], row[4], row[8]
+                if size and offset and (flags & 0xFF) not in MACHO_ZEROFILL:
+                    need(data, offset, size)
+                    sections.append((offset, offset + size, address, bool(initprot & 0x4) or bool(flags & 0x80000400)))
+        elif cmd == 0x80000028 and cmdsize >= 24:  # LC_MAIN: entryoff is a file offset inside __TEXT
+            entry_offset = struct.unpack_from("<Q", data, at + 8)[0]
+        at += cmdsize
+    entry = 0
+    if entry_offset is not None:
+        found = [s for s in segments if s[0] <= entry_offset < s[0] + s[1]]
+        entry = found[0][2] + (entry_offset - found[0][0]) if len(found) == 1 else 0
+    return entry, sections
+
+
+FILE_MAPS = {"elf": elf_map, "pe": pe_map, "macho": macho_map}
 
 
 def section_at(sections, offset, length=1):
@@ -317,7 +367,7 @@ class Anchors:
 def observations(data, query, args):
     """The reply's observations from the query output, after every check; pure and testable without Ghidra."""
     format_ = kind(data)
-    entry_va, sections = (elf_map if format_ == "elf" else pe_map)(data)
+    entry_va, sections = FILE_MAPS[format_](data)
     if not isinstance(query, dict) or not isinstance(query.get("blocks"), list) or not isinstance(query.get("functions"), list):
         raise InvalidQueryOutput()
     options = query.get("options_off")
@@ -409,7 +459,7 @@ def calls(functions, anchors, args):
 def run(operation, args, data, query_of=None):
     """Observations for ghidra.analyze; query_of(format, args, entry offset) defaults to the headless Ghidra run."""
     format_ = kind(data)
-    entry_va, sections = (elf_map if format_ == "elf" else pe_map)(data)
+    entry_va, sections = FILE_MAPS[format_](data)
     entry_offset = offset_of(sections, entry_va)
     query = (query_of or run_ghidra)(format_, args, -1 if entry_offset is None else entry_offset)
     return observations(data, query, args)
