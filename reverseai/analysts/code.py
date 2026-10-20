@@ -6,7 +6,7 @@ from reverseai.contract import (
 )
 
 ROLE = "code"
-REF = ToolRef("ghidra", "12.1.4-r1")
+REF = ToolRef("ghidra", "12.1.4-r2")
 OPERATION = "ghidra.analyze"
 
 

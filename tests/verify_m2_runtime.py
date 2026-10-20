@@ -52,7 +52,7 @@ YARAX_FIXTURE_NAMES = ("upx_markers", "utf16_markers", "clean", "repeated_marker
 YARAX_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                          *(f"{name}.matches" for name in YARAX_FIXTURE_NAMES))
 YARAX_NATIVE_RUNS = len(CONTROL_NAMES) + len(YARAX_FIXTURE_NAMES)
-GHIDRA_ADAPTER_VERSION = "12.1.4-r1"
+GHIDRA_ADAPTER_VERSION = "12.1.4-r2"
 GHIDRA_BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
 GHIDRA_SHA256 = "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db"
 GHIDRA_JDK_SHA256 = "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223"
@@ -266,7 +266,7 @@ def ghidra_args():
 
 
 def compare_ghidra_observations(data, observations):
-    """Check declared entries/call instructions, without guessing derived names or C."""
+    """Check fixture entries/calls/ELF symbols and require working decompilation."""
     need(type(data) is bytes and isinstance(observations, (list, tuple)), "KnownAnswerShape")
     layout = next((layout for sample, layout in (elf_code(), pe_code(), elf_data_only()) if sample == data), None)
     need(layout is not None, "KnownAnswerFixture")
@@ -282,6 +282,7 @@ def compare_ghidra_observations(data, observations):
         groups[kind].append(item)
     functions, calls = groups["function"], groups["call"]
     need(len(functions) == len(layout["functions"]) and len(calls) == len(layout["calls"]), "KnownAnswerCount")
+    need(not layout["functions"] or groups["pseudocode"], "KnownAnswerPseudocodeMissing")
     for index, (item, expected) in enumerate(zip(functions, layout["functions"])):
         value = item.value
         remaining = layout.get("text_raw_size", layout["text"]["size"]) - (expected["offset"] - layout["text"]["offset"])
@@ -293,6 +294,8 @@ def compare_ghidra_observations(data, observations):
              item.location.length == min(value["size"], 4096, remaining), "KnownAnswerFunctionAnchor")
         need(type(value["name"]) is str and 1 <= len(value["name"]) <= 128 and
              value["name"].isprintable(), "KnownAnswerName")
+        if layout["format"] == "elf":
+            need(value["name"] == expected["name"], "KnownAnswerELFName")
     names = {item.value["entry"]: item.value["name"] for item in functions}
     for item, expected in zip(calls, layout["calls"]):
         value = item.value
