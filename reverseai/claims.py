@@ -92,7 +92,12 @@ def _import_names(kind):
     def derive(observations):
         if not observations or any(o.get("kind") != kind for o in observations):
             return None
-        names = [o.get("name") for o in observations] if kind == "library" else [n for o in observations for n in o.get("names") or [None]]
+        if kind == "library":
+            names = [o.get("name") for o in observations]
+        elif all(isinstance(o.get("names"), list) and o["names"] for o in observations):
+            names = [n for o in observations for n in o["names"]]
+        else:
+            return None  # a symbols group must carry a non-empty list of names
         return sorted(set(names)) if all(isinstance(n, str) and n for n in names) else None
     return derive
 

@@ -74,6 +74,9 @@ class ClaimRuleTests(unittest.TestCase):
         self.assertNotEqual(claims.check(finding("imports.symbols", ["exit", "printf"], [group, libc]), [group, libc]), ())
         empty = evidence(STRUCTURE, "structure.imports", 24, kind="symbols", library=None, names=[])
         self.assertNotEqual(claims.check(finding("imports.symbols", [], [empty]), [empty]), ())
+        for bad in ("printf", {"printf": 1}, 7, None, ["printf", 7]):
+            odd = evidence(STRUCTURE, "structure.imports", 32, kind="symbols", library=None, names=bad)
+            self.assertNotEqual(claims.check(finding("imports.symbols", ["printf"], [odd]), [odd]), ())
         lief = evidence(ToolRef("lief", "1.0.0-r2"), "lief.headers", 0, kind="library", name="libc.so.6")
         self.assertNotEqual(claims.check(finding("imports.libraries", ["libc.so.6"], [lief]), [lief]), ())
 
