@@ -87,6 +87,16 @@ def _calls(observations):
     return [list(pair) for pair in sorted({(o["from"], o["to_name"]) for o in calls})] if calls else None
 
 
+def _import_names(kind):
+    """Sorted unique names from cited import observations of one kind (library names or symbol groups)."""
+    def derive(observations):
+        if not observations or any(o.get("kind") != kind for o in observations):
+            return None
+        names = [o.get("name") for o in observations] if kind == "library" else [n for o in observations for n in o.get("names") or [None]]
+        return sorted(set(names)) if all(isinstance(n, str) and n for n in names) else None
+    return derive
+
+
 # claim_key -> (confidence the claim must carry, {operation it may cite: derive(observations) -> expected value or None}).
 # A claim may cite several allowed operations; each operation's citations must yield the same value.
 RULES = {
@@ -97,6 +107,8 @@ RULES = {
     "sections.writable_executable_indices": ("inferred", {"lief.sections": _writable_executable_indices}),
     "strings.urls": ("observed", {"strings.indicators": _urls}),
     "signatures.rule_matches": ("observed", {"yarax.matches": _signature_rules}),
+    "imports.libraries": ("observed", {"structure.imports": _import_names("library")}),
+    "imports.symbols": ("observed", {"structure.imports": _import_names("symbols")}),
     # contract/2 derived claims: the tool's reading, always inferred, reviewed as "derived"
     "code.functions": ("inferred", {"ghidra.analyze": _function_names}),
     "code.pseudocode": ("inferred", {"ghidra.analyze": _pseudocode}),
@@ -118,6 +130,8 @@ STATEMENTS = {
     "sections.writable_executable_indices": "Section indices that are both writable and executable",
     "strings.urls": "URL strings in the input",
     "signatures.rule_matches": "Reviewed signature rules whose exact byte patterns occur in the input",
+    "imports.libraries": "Libraries the file declares it imports",
+    "imports.symbols": "Symbols the file declares it imports",
     "code.functions": "Functions the analysis tool identified, in address order",
     "code.pseudocode": "Pseudocode the analysis tool decompiled for one function",
     "code.calls": "Calls between functions the analysis tool identified",

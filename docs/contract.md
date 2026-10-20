@@ -252,6 +252,44 @@ Same container interface and reply protocol as M2a; what differs:
   (one finding per decompiled function); `code.calls` = sorted unique
   `[from, to_name]` pairs.
 
+## Mach-O and imports on the host (M3b)
+
+Host tools stay in-process and standard-library only; their observations are
+verified evidence (not derived), as in M1.
+
+- **Mach-O decoding** in `reverseai/tools/structure.py`: thin 32- and 64-bit
+  little-endian Mach-O (`0xfeedface`, `0xfeedfacf`) is decoded; big-endian thin
+  files and universal (fat) files (`0xcafebabe`, `0xcafebabf`) are identified
+  only: `structure.identify` reports `format` `macho` or `macho-universal`, and
+  for universal files an `architectures` list of at most 8 machine names.
+  `structure.headers` gives `{"structure": "macho", "format": "macho",
+  "machine_name", "filetype", "ncmds", "number_of_sections"}` at the Mach-O header
+  (28 or 32 bytes); `structure.sections` gives one observation per section of
+  every `LC_SEGMENT`/`LC_SEGMENT_64`, `{"index", "name" ("<segname>,<sectname>"),
+  "offset", "size", "writable", "executable"}` at the section header (68 or 80
+  bytes); `executable` is the segment's `initprot` execute bit or a section
+  instruction attribute (`S_ATTR_PURE_INSTRUCTIONS`, `S_ATTR_SOME_INSTRUCTIONS`),
+  `writable` the segment's `initprot` write bit. The existing format, machine,
+  section-count and writable-executable claims apply unchanged. A public helper
+  `macho_sections(data)` returns the same section rows plus `addr` for other host
+  code (the Ghidra anchor check).
+- **Imports**: new operation `structure.imports`, arg `max_imports` int 1..256
+  default 128, at most 256 observations, for ELF (`DT_NEEDED` libraries and
+  undefined dynamic symbols), PE (import directory: DLL names and imported names or
+  ordinals as `#<n>`) and thin Mach-O (`LC_LOAD_DYLIB`/`LC_LOAD_WEAK_DYLIB` paths
+  and undefined symbols from `LC_SYMTAB`). Observations:
+  `{"kind": "library", "name"}` at the bytes of that name, and
+  `{"kind": "symbols", "library": <name or null>, "names": [at most 32]}` at the
+  bytes of the first name in the group. Names are at most 128 printable
+  characters, escaped as section names are. Malformed tables are cut, never read
+  past the input.
+- **Claims** (observed, verified): `imports.libraries` = sorted unique library
+  names of the cited `library` observations; `imports.symbols` = sorted unique
+  names of the cited `symbols` observations. One finding each.
+- **Ghidra on Mach-O (M3b)**: the worker accepts thin Mach-O; the host maps
+  Ghidra anchors through `macho_sections` (an anchor must lie inside an executable
+  section's file bytes). Adapter `12.1.4-r3`.
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under

@@ -64,6 +64,19 @@ class ClaimRuleTests(unittest.TestCase):
         overstated = finding("sections.writable_executable", [".rwx"], [rwx], confidence="observed")
         self.assertEqual(claims.check(overstated, [rwx]), ("sections.writable_executable must be inferred",))
 
+    def test_import_claims_name_exactly_the_cited_libraries_and_symbols(self):
+        libc = evidence(STRUCTURE, "structure.imports", 0, kind="library", name="libc.so.6")
+        libm = evidence(STRUCTURE, "structure.imports", 8, kind="library", name="libm.so.6")
+        group = evidence(STRUCTURE, "structure.imports", 16, kind="symbols", library=None, names=["printf", "exit", "printf"])
+        self.assertEqual(claims.check(finding("imports.libraries", ["libc.so.6", "libm.so.6"], [libc, libm]), [libc, libm]), ())
+        self.assertNotEqual(claims.check(finding("imports.libraries", ["libc.so.6"], [libc, libm]), [libc, libm]), ())
+        self.assertEqual(claims.check(finding("imports.symbols", ["exit", "printf"], [group]), [group]), ())
+        self.assertNotEqual(claims.check(finding("imports.symbols", ["exit", "printf"], [group, libc]), [group, libc]), ())
+        empty = evidence(STRUCTURE, "structure.imports", 24, kind="symbols", library=None, names=[])
+        self.assertNotEqual(claims.check(finding("imports.symbols", [], [empty]), [empty]), ())
+        lief = evidence(ToolRef("lief", "1.0.0-r2"), "lief.headers", 0, kind="library", name="libc.so.6")
+        self.assertNotEqual(claims.check(finding("imports.libraries", ["libc.so.6"], [lief]), [lief]), ())
+
     def test_signature_claims_name_exactly_the_matched_reviewed_rules(self):
         yarax = ToolRef("yarax", "1.21.0-r2")
         upx = evidence(yarax, "yarax.matches", 0, ruleset="m2_fixture_v1", rule="upx_packed", pattern="$a")
