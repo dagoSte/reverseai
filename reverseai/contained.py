@@ -21,7 +21,7 @@ STAGING_ROOT = Path("/Users/Shared/rea-safe-staging-501")
 DEFAULT_LOCK = Path(__file__).resolve().parents[1] / "containers/lief/image.lock.json"
 WALL_SECONDS = 45
 PLATFORM = "linux/arm64"
-ADAPTER_VERSION = "1.0.0-r1"
+ADAPTER_VERSION = "1.0.0-r2"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 

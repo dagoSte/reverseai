@@ -8,4 +8,6 @@ RUN python3 -m pip install --no-index --find-links /tmp/wheels --only-binary=:al
     && rm -rf /tmp/wheels
 COPY worker.py /opt/reverseai/worker.py
 USER 65534:65534
+# The worker's fixed parser options must be exactly this LIEF's: an unknown or new option fails the build.
+RUN ["python3", "-I", "-B", "-c", "import importlib.util as u; s = u.spec_from_file_location('worker', '/opt/reverseai/worker.py'); w = u.module_from_spec(s); s.loader.exec_module(w); w.parser_configs()"]
 ENTRYPOINT ["python3", "-I", "-B", "/opt/reverseai/worker.py"]

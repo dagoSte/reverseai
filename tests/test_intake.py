@@ -122,6 +122,15 @@ class IntakeTests(unittest.TestCase):
                 self.assertEqual(shown, expected)
                 self.assertLessEqual(len(shown), 255)
 
+    def test_a_final_ellipsis_always_means_truncation(self):
+        whole = intake.display_name(Path("n" * 240 + "\u2026"))  # 252 characters once escaped: not truncated
+        self.assertEqual(whole, "n" * 240 + "\\xe2\\x80\\xa6")
+        self.assertEqual(intake.display_name(Path("n" * 300)), "n" * 254 + "\u2026")
+        self.assertEqual(intake.display_name(Path("n" * 250 + "\u2026")), "n" * 250 + "\\xe2\u2026")  # whole escapes kept
+
+    def test_escapes_start_at_byte_0x80(self):
+        self.assertEqual(intake.display_name(Path(os.fsdecode(b"/any/a\x7fb\x80c\xffd"))), "a\x7fb\\x80c\\xffd")
+
     def test_the_input_ref_uses_the_display_name(self):
         with patch.object(intake, "display_name", return_value="shown.bin") as shown:
             self.assertEqual(intake.snapshot(self.sample)[1].name, "shown.bin")

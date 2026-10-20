@@ -3,11 +3,12 @@
 Usage (from the repository root):
     python3 -B tools/build_lief_image.py --wheel-dir DIR [--download] [--tag TAG] [--lock PATH]
 
-The base image is pulled by its linux/arm64 manifest digest. The LIEF wheel must be
-in DIR (or, with --download, is fetched from the single PyPI URL below) and must
-match the SHA-256 in containers/lief/requirements.txt. The build itself runs with
---network none and installs only from that local wheel. Every docker call is an
-argv list; nothing goes through a shell.
+The base image is pulled by its linux/arm64 manifest digest, and the Dockerfile must
+build FROM exactly that reference. The LIEF wheel must be in DIR (or, with
+--download, is fetched from the single PyPI URL below, refusing any redirect) and
+must match the SHA-256 in containers/lief/requirements.txt. The build itself runs
+with --network none and installs only from that local wheel. Every docker call is
+an argv list; nothing goes through a shell.
 """
 
 from __future__ import annotations
@@ -21,7 +22,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.parse
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,7 +29,7 @@ SOURCE = ROOT / "containers" / "lief"
 PLATFORM = "linux/arm64"
 BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
 BASE = "python:3.12-slim@" + BASE_DIGEST
-ADAPTER_VERSION = "1.0.0-r1"
+ADAPTER_VERSION = "1.0.0-r2"
 WHEEL = "lief-1.0.0-cp312-abi3-manylinux_2_28_aarch64.whl"
 WHEEL_URL = ("https://files.pythonhosted.org/packages/5a/f8/3aba2989bd9f48e796de5260a19acb2af1e6562b147e32a2a26e418a9b58/"
              + WHEEL)
@@ -44,14 +44,25 @@ def wheel_sha256():
     return pinned[0]
 
 
+def check_dockerfile(path):
+    """The lock records BASE_DIGEST, so the Dockerfile must have one FROM line naming exactly BASE."""
+    instructions = [line.split() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if [words for words in instructions if words[0].upper() == "FROM"] != [["FROM", BASE]]:
+        raise SystemExit("Dockerfile FROM differs from the pinned base " + BASE)
+
+
 def file_sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+class RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise SystemExit("the wheel URL redirected; refusing to follow it")
+
+
 def fetch_wheel(target, expected):
-    with urllib.request.urlopen(WHEEL_URL, timeout=60) as response:  # fixed HTTPS URL; redirects stay on PyPI's host
-        if urllib.parse.urlsplit(response.geturl()).hostname != "files.pythonhosted.org":
-            raise SystemExit("unexpected wheel host")
+    # The one fixed HTTPS URL on PyPI's file host; any redirect is refused, so no other URL or host is ever requested.
+    with urllib.request.build_opener(RefuseRedirects).open(WHEEL_URL, timeout=60) as response:
         data = response.read(WHEEL_BYTES_LIMIT + 1)
     if len(data) > WHEEL_BYTES_LIMIT or hashlib.sha256(data).hexdigest() != expected:
         raise SystemExit("downloaded wheel does not match the pinned SHA-256")
@@ -71,6 +82,7 @@ def main(argv=None):
     parser.add_argument("--lock", type=Path, default=SOURCE / "image.lock.json")
     args = parser.parse_args(argv)
 
+    check_dockerfile(SOURCE / "Dockerfile")
     expected = wheel_sha256()
     wheel = args.wheel_dir / WHEEL
     if not wheel.is_file():

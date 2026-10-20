@@ -34,14 +34,17 @@ def _require(condition, message):
 def display_name(path: Path) -> str:
     """The file name for reports, unambiguous and at most 255 characters.
 
-    Host names are bytes: non-UTF-8 bytes and the backslash itself become \\xNN
-    escapes, so the text "\\xff" and the byte 0xFF never look alike. Truncation
-    keeps whole escapes and ends with an ellipsis.
+    Host names are bytes: non-UTF-8 bytes, the backslash itself and the ellipsis
+    character become \\xNN escapes (the ellipsis as its three UTF-8 bytes), so the
+    text "\\xff" and the byte 0xFF never look alike, and a final ellipsis always
+    means truncation. Truncation keeps whole escapes.
     """
     units = []
     for character in os.fsencode(path.name).decode("utf-8", "surrogateescape"):
         if character == "\\":
             units.append("\\x5c")
+        elif character == "\u2026":  # reserved for truncation
+            units.extend("\\x{:02x}".format(byte) for byte in character.encode())
         elif "\udc80" <= character <= "\udcff":
             units.append("\\x{:02x}".format(ord(character) - 0xDC00))
         else:

@@ -6,7 +6,7 @@ from reverseai.contract import (
 )
 from reverseai.tools import lief_verify
 
-REF = ToolRef("lief", "1.0.0-r1")
+REF = ToolRef("lief", "1.0.0-r2")
 
 
 def make_tool(executor=None):

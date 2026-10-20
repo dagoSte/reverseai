@@ -1,11 +1,17 @@
 """The LIEF worker's pure logic, without LIEF: byte decoding, observations, cross-checks and the reply protocol."""
 
+import contextlib
+import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import re
+import sys
 import tempfile
+import types
 import unittest
+from unittest.mock import patch
 
 from reverseai.contract import WorkerError, parse_worker_reply, sha256_hex
 from reverseai.tools import structure
@@ -18,18 +24,41 @@ SPEC.loader.exec_module(worker)
 
 
 def faithful(data, format_):
-    """What a correct LIEF parse reports: the byte decode, with the whole section list when the table is readable."""
-    facts = dict(worker.elf_raw(data) if format_ == "elf" else worker.pe_raw(data))
-    try:
-        if format_ == "elf":
-            rows = worker.elf_section_rows(data, facts, facts["shnum"])
-            facts["sections"] = [(r["offset"], r["size"], r["flags"]) for r in rows]
-        else:
-            rows = worker.pe_section_rows(data, facts, 65535)
-            facts["sections"] = [(r["offset"], r["size"], r["characteristics"]) for r in rows]
-    except worker.WorkerFailure:
-        facts["sections"] = None  # a header-only answer, as LIEF gives for a broken table
+    """What a correct LIEF parse reports, read at the ELF and PE specifications' fixed offsets, not with the worker's decoder.
+
+    Sections are (offset, size, flags) for every declared entry when the whole table is inside the input, and None
+    otherwise: a header-only answer, as LIEF gives for a broken table.
+    """
+    if format_ == "elf":
+        word, order = (8 if data[4] == 2 else 4), ("little" if data[5] == 1 else "big")
+
+        def at(offset, size):
+            return int.from_bytes(data[offset:offset + size], order)
+        facts = {"type": at(16, 2), "machine": at(18, 2), "entry": at(24, word), "shoff": at(24 + 2 * word, word),
+                 "shentsize": at(34 + 3 * word, 2), "shnum": at(36 + 3 * word, 2)}
+        table, entry, count = facts["shoff"], 16 + 6 * word, facts["shnum"]  # sh_flags at 8, sh_offset at 8+2w, sh_size at 8+3w
+        row = lambda start: (at(start + 8 + 2 * word, word), at(start + 8 + 3 * word, word), at(start + 8, word))
+    else:
+        def at(offset, size):
+            return int.from_bytes(data[offset:offset + size], "little")
+        coff = at(0x3C, 4) + 4
+        facts = {"e_lfanew": coff - 4, "machine": at(coff, 2), "number_of_sections": at(coff + 2, 2),
+                 "timestamp": at(coff + 4, 4), "sizeof_optional_header": at(coff + 16, 2), "characteristics": at(coff + 18, 2),
+                 "optional_magic": at(coff + 20, 2), "entry_rva": at(coff + 36, 4)}
+        table, entry, count = coff + 20 + facts["sizeof_optional_header"], 40, facts["number_of_sections"]
+        row = lambda start: (at(start + 20, 4), at(start + 16, 4), at(start + 36, 4))  # PointerToRawData, SizeOfRawData
+    inside = table + entry * count <= len(data)
+    facts["sections"] = [row(table + entry * index) for index in range(count)] if inside else None
     return facts
+
+
+def changed(update):
+    """faithful facts after update(facts): one LIEF value that disagrees with the bytes."""
+    def facts_of(data, format_):
+        facts = faithful(data, format_)
+        update(facts)
+        return facts
+    return facts_of
 
 
 def far_pe(e_lfanew=0x2000):
@@ -85,12 +114,34 @@ class HeaderTests(unittest.TestCase):
         coff = layout["lfanew"] + 4
         cases = ((pe(optional_size=20)[0], {"structure": "optional", "optional_magic": "pe32+", "entry_rva": 0x1000}),
                  (patched(data, coff + 16, "<H", 8), {"structure": "optional", "optional_magic": "pe32+"}),
+                 (patched(data, coff + 16, "<H", 2), {"structure": "optional", "optional_magic": "pe32+"}),
+                 (patched(data, coff + 16, "<H", 1), {"structure": "optional"}),
                  (patched(data, coff + 16, "<H", 0), None))
         for data_, expected in cases:
             with self.subTest(expected=expected):
                 found = [v for v in values(run("lief.headers", data_)) if v["structure"] == "optional"]
                 self.assertEqual(found, [expected] if expected else [])
         self.assertEqual(run("lief.headers", patched(data, coff + 16, "<H", 5000))["error"], "StructureTooLarge")
+
+    def test_an_unknown_machine_is_named_unknown(self):
+        for data in (elf(machine=0x3E00)[0], pe(machine=0x3E00)[0]):
+            with self.subTest(format=data[:2]):
+                (value,) = [v for v in values(run("lief.headers", data)) if "machine" in v]
+                self.assertEqual((value["machine"], value["machine_name"]), (0x3E00, "unknown"))
+
+    def test_a_location_is_at_most_4096_bytes(self):
+        data, _ = pe(optional_size=4096)
+        optional = run("lief.headers", data)["observations"][2]["location"]
+        self.assertEqual(optional, {"offset": 0x98, "length": 4096})
+        self.assertEqual(run("lief.sections", data)["status"], "ok")
+        too_large, _ = pe(optional_size=4097)
+        for operation in ("lief.headers", "lief.sections"):
+            self.assertEqual(run(operation, too_large)["error"], "StructureTooLarge")
+        self.assertEqual(worker.location(0, 4096, 4096), {"offset": 0, "length": 4096})
+        with self.assertRaises(worker.TruncatedStructure):
+            worker.location(1, 4096, 4096)  # one byte past the input
+        with self.assertRaises(worker.StructureTooLarge):
+            worker.location(0, 4097, 5000)
 
     def test_machine_names_are_m1_names(self):
         self.assertEqual(worker.ELF_MACHINES, structure.ELF_MACHINES)
@@ -111,6 +162,43 @@ class SectionTests(unittest.TestCase):
         for mine, theirs in zip(values(reply), m1):
             for field in ("index", "offset", "size", "flags", "writable", "executable"):
                 self.assertEqual(mine[field], theirs[field], field)
+
+    def test_elf_rows_equal_m1_and_known_answers_for_every_width_and_byte_order(self):
+        for label, (data, layout) in (("elf64 le", elf()), ("elf32 le", elf(width=32)),
+                                      ("elf32 be", elf(width=32, order=">", kind=3, machine=8)), ("elf64 be", elf(order=">", machine=21))):
+            with self.subTest(label):
+                reply = run("lief.sections", data)
+                m1 = structure.sections(data, {"max_sections": 64})
+                self.assertEqual([item["location"] for item in reply["observations"]],
+                                 [{"offset": o.location.offset, "length": o.location.length} for o in m1])
+                for mine, theirs in zip(values(reply), m1):
+                    self.assertEqual({k: mine[k] for k in ("index", "offset", "size", "flags", "writable", "executable")},
+                                     {k: theirs.value[k] for k in ("index", "offset", "size", "flags", "writable", "executable")})
+                self.assertEqual([(v["offset"], v["size"], v["flags"]) for v in values(reply)[1:4]],
+                                 [(layout["offsets"][0], 32, 0x6), (layout["offsets"][1], 16, 0x3), (layout["offsets"][2], 8, 0x7)])
+
+    def test_pe_rows_report_the_raw_size_not_the_virtual_size(self):
+        data, layout = pe()
+        for index in range(3):
+            data = patched(data, layout["table_offset"] + 40 * index + 8, "<I", 0x123 + index)  # VirtualSize
+        rows, m1 = values(run("lief.sections", data)), [o.value for o in structure.sections(data, {"max_sections": 64})]
+        self.assertEqual([v["virtual_size"] for v in m1], [0x123, 0x124, 0x125])
+        self.assertEqual([(r["offset"], r["size"]) for r in rows], [(offset, 0x200) for offset in layout["raw_offsets"]])
+        self.assertEqual([(r["offset"], r["size"], r["characteristics"]) for r in rows],
+                         [(v["offset"], v["size"], v["characteristics"]) for v in m1])
+
+    def test_a_20_byte_optional_header_moves_the_section_table(self):
+        data, layout = pe(optional_size=20)
+        self.assertEqual(layout["table_offset"], 0x80 + 24 + 20)
+        self.assertEqual(run("lief.headers", data)["observations"][2],
+                         {"location": {"offset": 0x98, "length": 20},
+                          "value": {"structure": "optional", "optional_magic": "pe32+", "entry_rva": 0x1000}})
+        reply = run("lief.sections", data)
+        self.assertEqual([item["location"] for item in reply["observations"]],
+                         [{"offset": 0xAC + 40 * i, "length": 40} for i in range(3)])
+        m1 = [o.value for o in structure.sections(data, {"max_sections": 64})]
+        self.assertEqual([(v["offset"], v["size"], v["characteristics"]) for v in values(reply)],
+                         [(v["offset"], v["size"], v["characteristics"]) for v in m1])
 
     def test_pe_sections(self):
         data, layout = pe()
@@ -170,24 +258,45 @@ class RefusalTests(unittest.TestCase):
         for data in (b"", b"PK\x03\x04" + bytes(40), b"\xcf\xfa\xed\xfe" + bytes(40), b"MZ" + bytes(100)):
             with self.subTest(data=data[:4]):
                 self.assertEqual(run("lief.headers", data)["error"], "UnsupportedFormat")
+        # A 64-byte DOS header is the smallest PE candidate: here the signature fits, the COFF header does not.
+        smallest = patched(b"MZ" + bytes(0x2E) + b"PE\0\0" + bytes(0x0C), 0x3C, "<I", 0x30)
+        self.assertEqual(run("lief.headers", smallest)["error"], "TruncatedStructure")
+        self.assertEqual(run("lief.headers", smallest[:0x3F])["error"], "UnsupportedFormat")
 
-    def test_a_lief_parse_that_disagrees_with_the_bytes_is_refused(self):
-        def changed(field, value):
-            def facts_of(data, format_):
-                facts = faithful(data, format_)
-                facts[field] = value
-                return facts
-            return facts_of
-        for operation, data, field, value in (
-                ("lief.headers", elf()[0], "machine", 0x3E00),  # LIEF 1.0.0 reads x86_64 ELF as little-endian whatever EI_DATA says
-                ("lief.headers", elf()[0], "endianness", "big"),
-                ("lief.headers", pe()[0], "entry_rva", 0),
-                ("lief.headers", pe()[0], "optional_magic", 0x10B),
-                ("lief.sections", elf()[0], "sections", [(0, 0, 0)] * 4),
-                ("lief.sections", pe()[0], "sections", [(512, 512, 0), (1024, 512, 0), (1536, 512, 0)]),
-                ("lief.sections", pe()[0], "number_of_sections", 41)):
-            with self.subTest(operation=operation, field=field):
-                self.assertEqual(run(operation, data, facts_of=changed(field, value))["error"], "InconsistentParse")
+    # Every field LIEF must confirm, listed here rather than read from the worker, so a dropped check fails.
+    ELF_FIELDS = ("type", "machine", "entry", "shoff", "shentsize", "shnum")
+    PE_FIELDS = ("e_lfanew", "machine", "number_of_sections", "timestamp", "characteristics", "sizeof_optional_header")
+
+    def test_every_checked_header_field_must_agree_with_lief(self):
+        cases = [(operation, data, field) for operation in ("lief.headers", "lief.sections")
+                 for data, fields in ((elf()[0], self.ELF_FIELDS), (elf(width=32, order=">")[0], self.ELF_FIELDS),
+                                      (pe()[0], self.PE_FIELDS))
+                 for field in fields]
+        cases += [("lief.headers", pe()[0], field) for field in ("optional_magic", "entry_rva")]
+        for operation, data, field in cases:
+            with self.subTest(operation=operation, field=field, size=len(data)):
+                self.assertEqual(run(operation, data)["status"], "ok")
+                bumped = changed(lambda facts: facts.update({field: facts[field] + 1}))
+                self.assertEqual(run(operation, data, facts_of=bumped)["error"], "InconsistentParse")
+
+    def test_every_reported_section_row_must_agree_with_lief(self):
+        for label, data in (("elf64", elf()[0]), ("elf32 be", elf(width=32, order=">")[0]), ("pe", pe()[0])):
+            declared = len(faithful(data, "elf" if label.startswith("elf") else "pe")["sections"])
+            for index in range(declared):
+                for position, name in enumerate(("offset", "size", "flags")):
+                    def bump(facts):
+                        row = list(facts["sections"][index])
+                        row[position] += 1
+                        facts["sections"][index] = tuple(row)
+                    with self.subTest(label, index=index, field=name):
+                        self.assertEqual(run("lief.sections", data, facts_of=changed(bump))["error"], "InconsistentParse")
+
+    def test_class_and_byte_order_come_from_the_bytes_alone(self):
+        # LIEF only echoes e_ident; a byte order it does not follow shows up in the multi-byte fields it confirms.
+        self.assertNotIn("class", worker.ELF_CHECKED)
+        self.assertNotIn("endianness", worker.ELF_CHECKED)
+        little_reading = changed(lambda facts: facts.update(machine=int.from_bytes(facts["machine"].to_bytes(2, "big"), "little")))
+        self.assertEqual(run("lief.headers", elf(order=">", machine=21)[0], facts_of=little_reading)["error"], "InconsistentParse")
 
     def test_lief_must_list_exactly_the_declared_sections(self):
         def listing(change):
@@ -225,6 +334,69 @@ class RefusalTests(unittest.TestCase):
                                  "error": "RuntimeError"})
 
 
+def config_class(names, ignored=()):
+    """A stand-in ParserConfig: each named option defaults to True; setting an ignored one silently does nothing."""
+    class Config:
+        def __setattr__(self, name, value):
+            if name not in ignored:
+                object.__setattr__(self, name, value)
+    for name in names:
+        setattr(Config, name, True)
+    return Config
+
+
+class ParserConfigTests(unittest.TestCase):
+    def test_every_option_is_turned_off(self):
+        for names in (worker.ELF_PARSER_OFF, worker.PE_PARSER_OFF):
+            config = worker.parser_config(config_class((*names, "page_size", "rebase")), names)
+            self.assertEqual({name: getattr(config, name) for name in names}, dict.fromkeys(names, False))
+
+    def test_a_missing_new_or_ignored_option_is_an_error(self):
+        names = worker.ELF_PARSER_OFF
+        for label, config in (("missing", config_class(names[1:])), ("new", config_class((*names, "parse_new_table"))),
+                              ("ignored", config_class(names, ignored=(names[0],)))):
+            with self.subTest(label), self.assertRaises(worker.ParserOptionsChanged):
+                worker.parser_config(config, names)
+
+    def test_lief_parses_with_the_fixed_configs(self):
+        parsed = []
+
+        def parse(data, config):
+            parsed.append(config)
+
+        fake = types.SimpleNamespace(logging=types.SimpleNamespace(disable=lambda: None),
+                                     ELF=types.SimpleNamespace(ParserConfig=config_class(worker.ELF_PARSER_OFF), parse=parse),
+                                     PE=types.SimpleNamespace(ParserConfig=config_class(worker.PE_PARSER_OFF), parse=parse))
+        with patch.dict(sys.modules, {"lief": fake}):
+            for data, format_, names in ((elf()[0], "elf", worker.ELF_PARSER_OFF), (pe()[0], "pe", worker.PE_PARSER_OFF)):
+                with self.subTest(format_), self.assertRaises(worker.ParserRefused):  # the stand-in parse returns None
+                    worker.lief_facts(data, format_)
+                self.assertTrue(all(getattr(parsed[-1], name) is False for name in names))
+
+
+class SnapshotTests(unittest.TestCase):
+    def main(self, snapshot, request=("lief.headers", "{}")):
+        out = io.StringIO()
+        with patch.object(worker, "lief_facts", faithful), contextlib.redirect_stdout(out):
+            self.assertEqual(worker.main(list(request), snapshot=str(snapshot)), 0)
+        return json.loads(out.getvalue())
+
+    def test_an_unreadable_snapshot_has_its_own_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            for path in (Path(temporary, "missing"), Path(temporary)):
+                with self.subTest(path=path.name):
+                    self.assertEqual(self.main(path)["error"], "SnapshotUnreadable")
+
+    def test_a_too_large_snapshot_reports_the_digest_of_the_whole_file(self):
+        data = bytes(range(256)) * 12_000  # about 3 MiB: several read chunks
+        with tempfile.TemporaryDirectory() as temporary, patch.object(worker, "MAX_INPUT_BYTES", 1_500_000):
+            snapshot = Path(temporary, "input")
+            snapshot.write_bytes(data)
+            self.assertEqual(worker.read_snapshot(snapshot), (data[:1_500_001], hashlib.sha256(data).hexdigest()))
+            reply = self.main(snapshot)
+        self.assertEqual((reply["error"], reply["snapshot_sha256"]), ("InputTooLarge", hashlib.sha256(data).hexdigest()))
+
+
 class ProtocolTests(unittest.TestCase):
     def test_replies_pass_the_hosts_parser(self):
         for operation, data in (("lief.headers", elf()[0]), ("lief.headers", pe()[0]), ("lief.sections", pe()[0])):
@@ -241,16 +413,9 @@ class ProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             snapshot = Path(temporary, "input")
             snapshot.write_bytes(data)
-            import contextlib
-            import io
             out = io.StringIO()
-            original = worker.lief_facts
-            worker.lief_facts = faithful
-            try:
-                with contextlib.redirect_stdout(out):
-                    self.assertEqual(worker.main(["lief.headers", "{}"], snapshot=str(snapshot)), 0)
-            finally:
-                worker.lief_facts = original
+            with patch.object(worker, "lief_facts", faithful), contextlib.redirect_stdout(out):
+                self.assertEqual(worker.main(["lief.headers", "{}"], snapshot=str(snapshot)), 0)
         text = out.getvalue()
         self.assertTrue(text.endswith("\n") and text.count("\n") == 1)
         self.assertEqual(json.loads(text)["snapshot_sha256"], sha256_hex(data))
