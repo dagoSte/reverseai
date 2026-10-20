@@ -118,12 +118,14 @@ in parallel. Nothing in this interface comes from a sample, an analyst or a peer
   read-only bind mount of a private per-run folder under
   `/Users/Shared/rea-safe-staging-501`, removed after the run. No other mount.
 - **Run flags** (exact, built by `reverseai/contained.py` as an argv list):
-  `docker run --rm --name reverseai-<random> --platform linux/arm64
+  `docker run --rm --init --name reverseai-<random> --platform linux/arm64
   --network none --read-only --cap-drop ALL --security-opt no-new-privileges
   --user 65534:65534 --pids-limit 64 --memory 512m --memory-swap 512m --cpus 1
   --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --log-driver none
   --mount type=bind,source=<run folder>,target=/snapshot,readonly
   <image_id> <operation> <args>`.
+- **Environment**: the container's environment must equal the image's; the
+  verifier refuses any variable the engine injects (for example proxy settings).
 - **Output**: one `reverseai.worker/1` JSON object on stdout, at most
   `MAX_WORKER_REPLY_BYTES`; stderr is discarded. Wall limit per run 45 s; on
   timeout the host kills the named container and reports `budget_exceeded`.
