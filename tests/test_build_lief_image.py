@@ -111,6 +111,23 @@ class BuildTests(unittest.TestCase):
         (mount / "Dockerfile").write_text("# a comment = not a directive here\n" + base + "\nRUN --mount=type=tmpfs,target=/x true\n")
         self.assertEqual(self.build(source=mount), 0)
 
+    def test_add_and_any_non_ascii_byte_are_refused_before_docker(self):
+        base = ("FROM " + build.BASE).encode()
+        for label, content, reason in (
+                ("ADD of a URL", base + b"\nADD https://example.invalid/x.tar /x\n", "ADD is refused"),
+                ("ADD of a Git repository", base + b"\nADD https://example.invalid/r.git /r\n", "ADD is refused"),
+                ("local ADD", base + b"\nADD wheels/ /tmp/wheels/\n", "ADD is refused"),
+                ("lower-case add", base + b"\nadd wheels/ /tmp/wheels/\n", "ADD is refused"),
+                ("BOM before a syntax directive", b"\xef\xbb\xbf# syntax=docker/dockerfile:1\n" + base + b"\n", "must be ASCII"),
+                ("non-ASCII in a comment", b"# caf\xc3\xa9\n" + base + b"\n", "must be ASCII")):
+            with self.subTest(label):
+                source = self.root / label.replace(" ", "-")
+                shutil.copytree(build.SOURCE, source, ignore=shutil.ignore_patterns("image.lock.json"))
+                (source / "Dockerfile").write_bytes(content)
+                with self.assertRaisesRegex(SystemExit, reason):
+                    self.build(source=source)
+                self.assertEqual(self.docker.calls, [])
+
     def test_a_wheel_with_another_hash_is_refused_before_docker(self):
         (self.wheels / build.WHEEL).write_bytes(WHEEL_BYTES + b"!")
         with self.assertRaisesRegex(SystemExit, "pinned SHA-256"):

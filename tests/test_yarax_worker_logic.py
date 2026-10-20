@@ -30,13 +30,14 @@ PATTERNS = [(rule["id"], pattern["id"], bytes.fromhex(pattern["hex"])) for rule 
 
 
 def oracle(data, limit=32):
-    """Every occurrence of every pattern, as (offset, rule, pattern, length), ascending and cut at limit."""
+    """The first 4 occurrences of every pattern (decision m2b-per-pattern-cap), as (offset, rule, pattern, length),
+    ascending and cut at limit."""
     found = set()
     for rule, pattern, needle in PATTERNS:
-        at = data.find(needle)
-        while at != -1:
+        at, kept = data.find(needle), 0
+        while at != -1 and kept < 4:
             found.add((at, rule, pattern, len(needle)))
-            at = data.find(needle, at + 1)
+            at, kept = data.find(needle, at + 1), kept + 1
     return sorted(found)[:limit]
 
 
@@ -50,6 +51,8 @@ FIXTURES = {
                         + bytes(4) + u16("sekurlsa::logonpasswords") + b"FromBase64String" + b"-EncodedCommand" + b"sekurlsa::"),
     "clean control": b"ReverseAI clean control: UPX UPX? -Encoded FromBase64 sekurlsa: " * 32 + bytes(range(256)),
     "flood of repeats": b"UPX!" * 300 + b"sekurlsa::" + b"UPX0" * 100,
+    "flood then a later rule": b"UPX!" * 64 + b"sekurlsa::",
+    "every pattern four times": b"|".join(needle * 4 for _, _, needle in PATTERNS),
     "rules interleaved": b"sekurlsa::" + b"UPX1" + u16("-EncodedCommand") + b"UPX!",
     "empty": b"",
 }
@@ -162,7 +165,7 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(fake.compiler_options, {"relaxed_re_syntax": False, "error_on_slow_pattern": True,
                                                  "includes_enabled": False})
         self.assertEqual(fake.sources, [(worker.yara_source(worker.load_ruleset("m2_fixture_v1")), "m2_fixture_v1")])
-        self.assertEqual(fake.scanner_settings, {"timeout": 30, "per_pattern": 64, "fast_scan": False})
+        self.assertEqual(fake.scanner_settings, {"timeout": 30, "per_pattern": 4, "fast_scan": False})
         self.assertLess(worker.SCAN_TIMEOUT, 45)
 
     def test_compile_errors_other_warnings_and_module_imports_refuse_the_ruleset(self):
@@ -185,6 +188,19 @@ class RulesetTests(unittest.TestCase):
     def test_the_reviewed_file_is_accepted(self):
         self.assertEqual(worker.load_ruleset("m2_fixture_v1"),
                          {rule: {p: b for r, p, b in PATTERNS if r == rule} for rule in dict.fromkeys(r for r, _, _ in PATTERNS)})
+
+    def test_a_pattern_id_may_have_32_characters_after_the_dollar(self):
+        self.check(lambda v: v["rules"][0]["patterns"][0].update(id="$" + "a" * 32))
+
+    def test_at_most_16_patterns_so_every_one_fits_max_matches_at_4_each(self):
+        def patterns(count):
+            return [{"id": f"$p{i}", "hex": f"{i:08x}"} for i in range(count)]
+        self.check(lambda v: v.update(rules=[{"id": "many", "category": "packer", "patterns": patterns(16)}]))
+        for rules in ([{"id": "many", "category": "packer", "patterns": patterns(17)}],
+                      [{"id": "first", "category": "packer", "patterns": patterns(9)},
+                       {"id": "second", "category": "packer", "patterns": patterns(8)}]):
+            with self.subTest(patterns=sum(len(r["patterns"]) for r in rules)), self.assertRaises(worker.RulesetInvalid):
+                self.check(lambda v, rules=rules: v.update(rules=rules))
 
     def test_pattern_length_bounds_are_4_and_256_bytes(self):
         for size in (4, 256):
@@ -209,6 +225,10 @@ class RulesetTests(unittest.TestCase):
             "no patterns": lambda v: first(v).update(patterns=[]),
             "pattern extra key": lambda v: pattern(v).update(modifiers="nocase"),
             "pattern id without $": lambda v: pattern(v).update(id="a"),
+            "pattern id with a space": lambda v: pattern(v).update(id="$a b"),
+            "pattern id with an assignment": lambda v: pattern(v).update(id='$a = "x"'),
+            "upper-case pattern id": lambda v: pattern(v).update(id="$A"),
+            "pattern id of 33 characters after $": lambda v: pattern(v).update(id="$" + "a" * 33),
             "duplicate pattern id": lambda v: first(v)["patterns"].append(dict(pattern(v), hex="00000000")),
             "odd hex": lambda v: pattern(v).update(hex="5550582"),
             "upper-case hex": lambda v: pattern(v).update(hex="5550582A"),
@@ -257,11 +277,20 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(rows(run(FIXTURES["rules interleaved"])), [(0, "credential_dump_marker", "$a", 10), (10, "upx_packed", "$c", 4),
                                                                    (14, "powershell_encoded_command", "$w", 30), (44, "upx_packed", "$a", 4)])
         self.assertEqual(rows(run(FIXTURES["clean control"])), [])
-        flood = rows(run(FIXTURES["flood of repeats"], max_matches=64))
-        self.assertEqual(flood, [(4 * i, "upx_packed", "$a", 4) for i in range(64)])
+        upx_a = [(4 * i, "upx_packed", "$a", 4) for i in range(4)]
+        self.assertEqual(rows(run(FIXTURES["flood of repeats"], max_matches=64)),
+                         upx_a + [(1200, "credential_dump_marker", "$a", 10)] + [(1210 + 4 * i, "upx_packed", "$b", 4) for i in range(4)])
 
-    def test_the_default_cut_is_32(self):
-        self.assertEqual(len(run(FIXTURES["flood of repeats"])["observations"]), 32)
+    def test_a_flood_of_one_pattern_cannot_hide_a_later_rule(self):
+        """Decision m2b-per-pattern-cap: 64 early repeats used to fill max_matches and drop credential_dump_marker."""
+        reply = run(FIXTURES["flood then a later rule"], max_matches=64)
+        self.assertEqual(rows(reply), [(4 * i, "upx_packed", "$a", 4) for i in range(4)] + [(256, "credential_dump_marker", "$a", 10)])
+
+    def test_the_default_cut_is_32_and_the_cap_leaves_every_pattern_room(self):
+        data = FIXTURES["every pattern four times"]
+        self.assertEqual(len(run(data)["observations"]), 32)
+        self.assertEqual(len(run(data, max_matches=64)["observations"]), 4 * len(PATTERNS))
+        self.assertLessEqual(4 * len(PATTERNS), worker.MATCHES[1])
 
     def test_reported_order_and_repeats_do_not_change_the_reply(self):
         data = FIXTURES["utf16le strings"]
@@ -289,6 +318,12 @@ class MatchTests(unittest.TestCase):
                 fake = FakeYaraX(report=lambda data_, source, bad=bad: good + [bad])
                 self.assertEqual(run(data, fake)["error"], "InconsistentMatch")
         self.assertEqual(run(data, FakeYaraX(namespace="other"))["error"], "InconsistentMatch")
+        ends, tail = b"x" * 8 + b"UPX!", b"x" * 8 + b"UPX!yy"
+        for label, data_, bad in (("length past the end, bytes still equal", ends, ("upx_packed", "$a", len(ends) - 4, 100)),
+                                  ("negative offset whose slice holds the pattern", tail, ("upx_packed", "$a", -6, 4))):
+            with self.subTest(label):
+                self.assertEqual(data_[bad[2]:bad[2] + bad[3]], b"UPX!")  # only the length or offset check can refuse it
+                self.assertEqual(run(data_, FakeYaraX(report=lambda d, s, bad=bad: [bad]))["error"], "InconsistentMatch")
         self.assertEqual(rows(run(data, FakeYaraX(report=lambda data_, source: good))), [(5, "upx_packed", "$a", 4)])
 
     def test_scan_failures_have_their_own_errors(self):
@@ -377,7 +412,7 @@ class BuildInputTests(unittest.TestCase):
         lock = json.loads((SOURCE / "image.lock.json").read_text(encoding="utf-8"))
         self.assertEqual(set(lock), {"adapter_version", "base_digest", "image_id", "platform", "ruleset_sha256", "wheel_sha256"})
         self.assertEqual((lock["adapter_version"], lock["platform"], lock["base_digest"]),
-                         ("1.21.0-r1", "linux/arm64", lief_lock["base_digest"]))
+                         ("1.21.0-r2", "linux/arm64", lief_lock["base_digest"]))
         self.assertEqual(lock["wheel_sha256"], "9bd9961b44b47dd747d526e61c703a2a8170426d003e789e7724bc7862de6d56")
         self.assertEqual(lock["ruleset_sha256"], hashlib.sha256((SOURCE / "m2_fixture_v1.json").read_bytes()).hexdigest())
         self.assertRegex(lock["image_id"], r"^sha256:[0-9a-f]{64}$")
@@ -387,7 +422,9 @@ class BuildInputTests(unittest.TestCase):
         dockerfile = (SOURCE / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("FROM python:3.12-slim@" + lock["base_digest"] + "\n", dockerfile)
         self.assertIn("COPY m2_fixture_v1.json /opt/reverseai/m2_fixture_v1.json\n", dockerfile)
+        self.assertEqual(re.findall(r"^USER .*$", dockerfile, re.M), ["USER 65534:65534"])
         self.assertLess(dockerfile.index("USER 65534:65534"), dockerfile.index("w.compiled('m2_fixture_v1')"))
+        self.assertEqual(worker.SNAPSHOT, "/snapshot/input")
         self.assertTrue(dockerfile.rstrip().endswith('ENTRYPOINT ["python3", "-I", "-B", "/opt/reverseai/worker.py"]'))
 
 

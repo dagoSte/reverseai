@@ -9,8 +9,10 @@ pattern, every rule with condition `any of them`) and compiles that source with
 yara_x on every run: includes are off, no module may be imported, no external
 variable is defined, and compiled or serialized rules are never loaded. The scan
 has an explicit timeout below the 45 s wall limit, fast scan off (every match is
-tracked) and a per-pattern match limit equal to the largest max_matches, which
-keeps the cut exact because a literal pattern's matches are found in offset order.
+tracked) and a per-pattern match limit of 4 (decision m2b-per-pattern-cap): a ruleset
+whose pattern count times 4 exceeds the largest max_matches is refused, so a flood of
+one pattern can never hide another rule's match. A literal pattern's matches are found
+in offset order, so each pattern reports its first 4.
 Every match is checked against the bytes: its rule and pattern must be in the
 ruleset, its length the pattern's length and the input at its offset the pattern's
 bytes, else InconsistentMatch. Matches are reported once each, in ascending
@@ -26,14 +28,14 @@ import re
 import sys
 
 PROTOCOL = "reverseai.worker/1"
-ADAPTER_VERSION = "1.21.0-r1"
+ADAPTER_VERSION = "1.21.0-r2"
 SNAPSHOT = "/snapshot/input"
 RULESETS = ("m2_fixture_v1",)  # each is <name>.json next to this file
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 MAX_RULESET_BYTES = 64 * 1024
 MATCHES = (1, 64, 32)  # max_matches: minimum, maximum, default
 SCAN_TIMEOUT = 30  # seconds, below the executor's 45 s wall limit
-MATCHES_PER_PATTERN = MATCHES[1]
+MATCHES_PER_PATTERN = 4  # pattern count x 4 must stay within MATCHES[1]
 PATTERN_BYTES = (4, 256)
 ALLOWED_WARNING = "text_as_hex"
 RULE_ID = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -109,6 +111,8 @@ def check_ruleset(value, name):
                 raise RulesetInvalid()
             literal[pattern_id] = bytes.fromhex(text)
         checked.append((rule_id, literal))
+    if sum(len(literal) for _, literal in checked) * MATCHES_PER_PATTERN > MATCHES[1]:
+        raise RulesetInvalid()  # max_matches 64 must hold every pattern's capped matches
     return checked
 
 

@@ -31,7 +31,7 @@ SOURCE = ROOT / "containers" / "yarax"
 PLATFORM = "linux/arm64"
 BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
 BASE = "python:3.12-slim@" + BASE_DIGEST
-ADAPTER_VERSION = "1.21.0-r1"
+ADAPTER_VERSION = "1.21.0-r2"
 RULESET = "m2_fixture_v1.json"
 WHEEL = "yara_x-1.21.0-cp38-abi3-manylinux_2_28_aarch64.whl"
 WHEEL_HOST = "https://files.pythonhosted.org/packages/"
@@ -48,14 +48,20 @@ def wheel_sha256():
 
 
 def check_dockerfile(path):
-    """The lock records BASE_DIGEST, so the Dockerfile must build from exactly BASE and nothing else: one FROM line,
-    no COPY --from or RUN --mount ...from= (another image or stage), and no parser directive (# syntax=, # escape=)."""
-    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    """The lock records BASE_DIGEST, so the Dockerfile must build from exactly BASE and nothing else: ASCII only (a BOM
+    would hide a directive), one FROM line, no ADD (remote URLs, Git), no COPY --from or RUN --mount ...from= (another
+    image or stage), and no parser directive (# syntax=, # escape=)."""
+    raw = path.read_bytes()
+    if not raw.isascii():
+        raise SystemExit("Dockerfile must be ASCII")
+    lines = [line.strip() for line in raw.decode("ascii").splitlines() if line.strip()]
     instructions = [line.split() for line in lines if not line.startswith("#")]
     if [words for words in instructions if words[0].upper() == "FROM"] != [["FROM", BASE]]:
         raise SystemExit("Dockerfile FROM differs from the pinned base " + BASE)
     if any(re.match(r"#\s*\w+\s*=", line) for line in lines):
         raise SystemExit("Dockerfile parser directives are refused")
+    if any(words[0].upper() == "ADD" for words in instructions):
+        raise SystemExit("Dockerfile ADD is refused")
     flags = [word.lower() for words in instructions for word in words if word.startswith("--")]
     if any(flag.startswith("--from") or (flag.startswith("--mount") and "from=" in flag) for flag in flags):
         raise SystemExit("Dockerfile reads from another image or stage")
