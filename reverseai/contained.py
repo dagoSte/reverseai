@@ -9,6 +9,7 @@ import selectors
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from types import MappingProxyType
@@ -165,9 +166,10 @@ class DockerExecutor:
             raise ContainedError("SnapshotMismatch")
         if not self.available():
             raise ContainedError("ImageUnavailable")
-        folder, started = None, False
+        folder, started, succeeded = None, False, False
         name = "reverseai-" + uuid.uuid4().hex
         try:
+            # Caller-owned private root (0700); same-user lstat/mkdtemp swaps are out of scope.
             root = self.staging_root.lstat()
             if not stat.S_ISDIR(root.st_mode) or root.st_uid != os.geteuid() or root.st_mode & 0o077:
                 raise ContainedError("UnsafeStagingFolder")
@@ -183,6 +185,7 @@ class DockerExecutor:
             if not isinstance(raw, bytes) or len(raw) > MAX_WORKER_REPLY_BYTES:
                 raise ContainedError("WorkerOutputLimit")
             started = False  # --rm has removed the successfully completed container.
+            succeeded = True
             return raw
         except (ContainedError, KeyboardInterrupt, SystemExit):
             raise
@@ -191,6 +194,7 @@ class DockerExecutor:
         except Exception:
             raise ContainedError("WorkerProcessError") from None
         finally:
+            failure = None if succeeded else sys.exception()
             if started:
                 try:
                     self.runner(["docker", "kill", name], timeout=5, max_output=256)
@@ -201,4 +205,6 @@ class DockerExecutor:
                     os.chmod(folder, 0o700)
                     shutil.rmtree(folder)
                 except OSError:
-                    raise ContainedError("StagingCleanupError") from None
+                    if failure is None:
+                        raise ContainedError("StagingCleanupError") from None
+                    failure.add_note("StagingCleanupError")
