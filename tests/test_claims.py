@@ -64,6 +64,13 @@ class ClaimRuleTests(unittest.TestCase):
         overstated = finding("sections.writable_executable", [".rwx"], [rwx], confidence="observed")
         self.assertEqual(claims.check(overstated, [rwx]), ("sections.writable_executable must be inferred",))
 
+    def test_observations_without_the_field_do_not_count_against_the_claim(self):
+        lief = ToolRef("lief", "1.0.0-r2")
+        dos = evidence(lief, "lief.headers", 0, structure="dos", e_lfanew=64)
+        coff = evidence(lief, "lief.headers", 64, structure="coff", format="pe", machine_name="x86_64")
+        self.assertEqual(claims.check(finding("format.container", "pe", [dos, coff]), [dos, coff]), ())
+        self.assertEqual(claims.check(finding("format.machine", "x86_64", [dos, coff]), [dos, coff]), ())
+
     def test_every_cited_operation_group_must_yield_the_value(self):
         lief = ToolRef("lief", "1.0.0")
         two_operations = ("observed", {
@@ -95,7 +102,7 @@ class ClaimRuleTests(unittest.TestCase):
                              ("format.container may only cite lief.headers, structure.identify evidence",))
 
     def test_lief_headers_support_format_claims_per_physical_header(self):
-        lief = ToolRef("lief", "1.0.0-r1")
+        lief = ToolRef("lief", "1.0.0-r2")
         dos = evidence(lief, "lief.headers", 0, structure="dos", e_lfanew=128)
         coff = evidence(lief, "lief.headers", 128, structure="coff", format="pe", machine_name="x86_64", number_of_sections=3)
         identify = evidence(STRUCTURE, "structure.identify", 4, format="pe")
@@ -106,7 +113,7 @@ class ClaimRuleTests(unittest.TestCase):
         self.assertNotEqual(claims.check(finding("format.container", "elf", [identify, coff]), [identify, coff]), ())
 
     def test_writable_executable_section_indices(self):
-        lief = ToolRef("lief", "1.0.0-r1")
+        lief = ToolRef("lief", "1.0.0-r2")
         rwx = evidence(lief, "lief.sections", 0, index=2, writable=True, executable=True)
         rx = evidence(lief, "lief.sections", 4, index=0, writable=False, executable=True)
         self.assertEqual(claims.check(finding("sections.writable_executable_indices", [2], [rwx]), [rwx]), ())

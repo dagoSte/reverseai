@@ -48,7 +48,10 @@ approved file
    stopped at its time, memory, CPU, process and output limits. Its stdout must
    pass `parse_worker_reply` (protocol `reverseai.worker/1`): bounded
    observations plus the digest of the snapshot it read, which must equal the
-   `InputRef` hash, or an error class name. Worker replies are untrusted beyond
+   `InputRef` hash, or an error class name. The digest is checked first, so a
+   worker that could not read its snapshot (it reports the digest of no bytes)
+   is refused as a snapshot mismatch, not by its error name; it still fails
+   closed. Worker replies are untrusted beyond
    their schema: before any evidence is made, the host re-derives every value of
    every observation from the controller's own bytes at that observation's
    Location, with in-process decoding, and refuses the whole reply when a value

@@ -53,11 +53,11 @@ class WorkerReplyTests(unittest.TestCase):
                 self.parse(raw)
 
     def test_runtime_identity_belongs_to_contained_tools_only(self):
-        ToolSpec(ToolRef("lief", "1.0.0-r1"), {}, contained=True, runtime={"image": "sha256:" + "0" * 64, "platform": "linux/arm64"})
+        ToolSpec(ToolRef("lief", "1.0.0-r2"), {}, contained=True, runtime={"image": "sha256:" + "0" * 64, "platform": "linux/arm64"})
         with self.assertRaises(ContractError):
             ToolSpec(ToolRef("structure", "0.1.0"), {}, runtime={"image": "x"})
         with self.assertRaises(ContractError):
-            ToolSpec(ToolRef("lief", "1.0.0-r1"), {}, contained=True, runtime={"image": "bad\nvalue"})
+            ToolSpec(ToolRef("lief", "1.0.0-r2"), {}, contained=True, runtime={"image": "bad\nvalue"})
 
 
 if __name__ == "__main__":

@@ -146,7 +146,7 @@ class ContainedToolWiringTests(unittest.TestCase):
         ops = {"lief.headers": OperationSpec("lief.headers", {}, headers, max_observations=3),
                "lief.sections": OperationSpec("lief.sections", {"max_sections": ArgSpec("int", 1, 64, default=32)}, sections,
                                               max_observations=64)}
-        return ToolSpec(ToolRef("lief", "1.0.0-r1"), ops, contained=True, runtime={"image": "sha256:" + "1" * 64, "platform": "linux/arm64"})
+        return ToolSpec(ToolRef("lief", "1.0.0-r2"), ops, contained=True, runtime={"image": "sha256:" + "1" * 64, "platform": "linux/arm64"})
 
     def test_contained_findings_agree_with_the_stdlib_parser_and_name_the_image(self):
         data, layout = pe()
@@ -163,7 +163,7 @@ class ContainedToolWiringTests(unittest.TestCase):
         self.assertEqual(operations, {"structure.headers", "lief.headers"})
         tools = report.to_dict(analysis)["tools"]
         self.assertEqual([t.get("runtime", {}).get("platform") for t in tools if t["name"] == "lief"], ["linux/arm64"])
-        self.assertIn("lief 1.0.0-r1 (contained, image sha256:111111111111, linux/arm64)", report.to_markdown(analysis))
+        self.assertIn("lief 1.0.0-r2 (contained, image sha256:111111111111, linux/arm64)", report.to_markdown(analysis))
 
     def test_with_lief_refuses_cleanly_when_the_worker_is_unavailable(self):
         from reverseai.tools import lief_tool
