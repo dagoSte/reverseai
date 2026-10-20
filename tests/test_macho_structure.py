@@ -98,6 +98,11 @@ class MachoStructureTests(unittest.TestCase):
             # The whole segment must be in the input.
             segment_filesize = layout["header_size"] + (48 if width == 64 else 36)
             self.assertIsNone(structure.macho_entry(patched(data, segment_filesize, "<Q" if width == 64 else "<I", len(data))))
+            # A second segment claiming the same file range makes LC_MAIN ambiguous.
+            second = layout["section_offsets"][1] - (72 if width == 64 else 56)
+            fileoff = second + (40 if width == 64 else 32)
+            ambiguous = patched(data, fileoff, "<Q" if width == 64 else "<I", layout["content_start"])
+            self.assertIsNone(structure.macho_entry(ambiguous))
 
     def test_unixthread_x86_64_and_arm64_states_and_bad_flavors_counts(self):
         for kind, machine in (("x86_thread", 0x1000007), ("arm_thread", 0x100000C)):

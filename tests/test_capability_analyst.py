@@ -9,9 +9,10 @@ from reverseai.gateway import Gateway
 from reverseai.tools.strings import TOOL
 from tests.fixtures_strings import clean_control, known_strings
 from tests.fixtures_yarax import FakeExecutor, known_matches, match, reply
+from tests.fixtures_structure import elf_imports, macho, pe_imports
 from reverseai import pipeline
 from reverseai.contained import ContainedTimeout
-from reverseai.tools import yarax_tool
+from reverseai.tools import structure, yarax_tool
 
 
 def input_ref(data):
@@ -23,8 +24,9 @@ class CapabilityTests(unittest.TestCase):
         data, _, _ = known_strings()
         task = capability.plan(input_ref(data))
         self.assertEqual(task.role, "capability")
-        self.assertEqual(task.id, content_id("tk", {"input": sha256_hex(data), "role": "capability"}))
-        self.assertEqual([request.operation for request in task.operations], ["strings.extract", "strings.indicators"])
+        self.assertEqual(task.id, content_id("tk", {"input": sha256_hex(data), "role": "capability",
+                         "operations": ["strings.extract", "strings.indicators", "structure.imports"]}))
+        self.assertEqual([request.operation for request in task.operations], ["strings.extract", "strings.indicators", "structure.imports"])
         self.assertEqual(task, capability.plan(input_ref(data)))
         self.assertEqual(task.id, capability.plan(InputRef(sha256_hex(data), len(data), "alias.bin")).id)
         self.assertNotEqual(task.id, capability.plan(input_ref(data + b"\x00")).id)
@@ -32,7 +34,7 @@ class CapabilityTests(unittest.TestCase):
     def test_exact_findings_and_exact_supporting_evidence(self):
         data, _, _ = known_strings()
         task = capability.plan(input_ref(data))
-        result = Gateway([TOOL], Budget()).run(task, data)
+        result = Gateway([TOOL, structure.TOOL], Budget()).run(task, data)
         self.assertEqual(result.status, "ok")
         findings = capability.conclude(task, result.evidence)
         self.assertEqual({finding.claim_key: finding.value for finding in findings}, {
@@ -61,7 +63,7 @@ class CapabilityTests(unittest.TestCase):
 
     def test_all_gateway_evidence_has_exact_input_and_excerpt_hashes(self):
         data, _, _ = known_strings()
-        result = Gateway([TOOL], Budget()).run(capability.plan(input_ref(data)), data)
+        result = Gateway([TOOL, structure.TOOL], Budget()).run(capability.plan(input_ref(data)), data)
         for item in result.evidence:
             self.assertEqual(item.input_sha256, sha256_hex(data))
             self.assertEqual(item.tool, ToolRef("strings", "0.1.0"))
@@ -70,7 +72,7 @@ class CapabilityTests(unittest.TestCase):
     def test_no_indicators_produces_no_findings(self):
         data = clean_control()
         task = capability.plan(input_ref(data))
-        result = Gateway([TOOL], Budget()).run(task, data)
+        result = Gateway([TOOL, structure.TOOL], Budget()).run(task, data)
         self.assertEqual(result.status, "ok")
         self.assertTrue(result.evidence)
         self.assertEqual(capability.conclude(task, result.evidence), ())
@@ -102,7 +104,7 @@ class CapabilityTests(unittest.TestCase):
     def test_repeated_indicators_need_only_one_representative_per_rule(self):
         data = b"OpenProcess " * 70
         task = capability.plan(input_ref(data))
-        result = Gateway([TOOL], Budget()).run(task, data)
+        result = Gateway([TOOL, structure.TOOL], Budget()).run(task, data)
         findings = capability.conclude(task, result.evidence)
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].value, ["open_process"])
@@ -112,7 +114,7 @@ class CapabilityTests(unittest.TestCase):
         urls = [f"https://host{index:03d}.example.invalid" for index in range(70)]
         data = " ".join(urls).encode()
         task = capability.plan(input_ref(data))
-        result = Gateway([TOOL], Budget()).run(task, data)
+        result = Gateway([TOOL, structure.TOOL], Budget()).run(task, data)
         url_finding = next(finding for finding in capability.conclude(task, result.evidence)
                            if finding.claim_key == "strings.urls")
         self.assertEqual(url_finding.value, urls[:64])
@@ -122,7 +124,7 @@ class CapabilityTests(unittest.TestCase):
     def test_partial_budget_result_only_concludes_from_retained_evidence(self):
         data = b"OpenProcess WinHttpOpen"
         task = capability.plan(input_ref(data))
-        result = Gateway([TOOL], Budget(max_evidence=2)).run(task, data)
+        result = Gateway([TOOL, structure.TOOL], Budget(max_evidence=2)).run(task, data)
         self.assertEqual(result.status, "budget_exceeded")
         findings = capability.conclude(task, result.evidence)
         self.assertEqual([(finding.claim_key, finding.value) for finding in findings], [
@@ -135,11 +137,11 @@ class CapabilityTests(unittest.TestCase):
         tool = yarax_tool.make_tool(FakeExecutor(reply(data, matches)))
         plain, planned = capability.plan(input_ref(data)), capability.plan(input_ref(data), tools=(tool,))
         self.assertEqual([request.operation for request in planned.operations],
-                         ["strings.extract", "strings.indicators", "yarax.matches"])
+                         ["strings.extract", "strings.indicators", "structure.imports", "yarax.matches"])
         self.assertEqual(planned.operations[-1].args, {"max_matches": 64})
         self.assertNotEqual(plain.id, planned.id)
         self.assertEqual(planned, capability.plan(input_ref(data), tools=(tool,)))
-        self.assertEqual(planned.budget.max_operations, 3)
+        self.assertEqual(planned.budget.max_operations, 4)
         self.assertGreater(planned.budget.max_wall_seconds, 45)
         self.assertEqual(plain, capability.plan(input_ref(data), tools=(TOOL,)))
 
@@ -147,7 +149,7 @@ class CapabilityTests(unittest.TestCase):
         data, matches = known_matches()
         tool = yarax_tool.make_tool(FakeExecutor(reply(data, matches)))
         task = capability.plan(input_ref(data), tools=(tool,))
-        result = Gateway([TOOL, tool], Budget(max_wall_seconds=60)).run(task, data)
+        result = Gateway([TOOL, structure.TOOL, tool], Budget(max_wall_seconds=60)).run(task, data)
         self.assertEqual(result.status, "ok")
         signatures = [f for f in capability.conclude(task, result.evidence) if f.claim_key == "signatures.rule_matches"]
         self.assertEqual(len(signatures), 1)
@@ -221,6 +223,58 @@ class CapabilityTests(unittest.TestCase):
                    make_evidence(data, ToolRef("yarax", "1.21.0-r1"), "yarax.matches", value),
                    make_evidence(data, yarax_tool.REF, "yarax.other", value))
         self.assertEqual(capability.conclude(task, foreign), ())
+
+    def test_import_planning_and_exact_single_supported_finding_of_each_kind(self):
+        for data, _ in (elf_imports(), pe_imports(), macho(libraries=(b"lib.dylib",), symbols=(b"_foo", b"_bar"))):
+            task = capability.plan(input_ref(data))
+            self.assertEqual(task.operations[-1].operation, "structure.imports")
+            self.assertEqual(task.budget.max_operations, 3)
+            analysis = pipeline.analyze_bytes(data, input_ref(data))
+            result = next(r for r in analysis.results if r.role == "capability")
+            self.assertEqual(result.status, "ok")
+            imports = [f for f in result.findings if f.claim_key.startswith("imports.")]
+            self.assertEqual([f.claim_key for f in imports], ["imports.libraries", "imports.symbols"])
+            by_id = {e.id: e for e in result.evidence}
+            for finding in imports:
+                citations = [by_id[i] for i in finding.evidence_ids]
+                self.assertEqual(finding.confidence, "observed")
+                self.assertTrue(all(e.operation == "structure.imports" and e.tool == structure.REF for e in citations))
+                names = [e.observation["name"] for e in citations] if finding.claim_key.endswith("libraries") else [
+                    name for e in citations for name in e.observation["names"]]
+                self.assertEqual(finding.value, sorted(set(names)))
+                self.assertEqual(next(v.status for v in analysis.verdicts if v.finding_id == finding.id), "supported")
+            self.assertEqual(capability.conclude(task, result.evidence), capability.conclude(task, tuple(reversed(result.evidence))))
+
+    def test_import_conclusions_refuse_foreign_provenance_and_malformed_names(self):
+        data = b"synthetic inert bytes"
+        task = capability.plan(input_ref(data))
+        observation = Observation(Location(0, 4), {"kind": "library", "name": "lib"})
+        foreign = (make_evidence(b"x" * len(data), structure.REF, "structure.imports", observation),
+                   make_evidence(data, ToolRef("structure", "0.2.0"), "structure.imports", observation),
+                   make_evidence(data, structure.REF, "structure.identify", observation))
+        self.assertEqual(capability.conclude(task, foreign), ())
+        for value in ({"kind": "other", "name": "lib"}, {"kind": "library", "name": ""},
+                      {"kind": "library", "name": "\x1b[31m"}, {"kind": "library", "name": "x" * 129},
+                      {"kind": "symbols", "names": []}, {"kind": "symbols", "names": "fake"},
+                      {"kind": "symbols", "names": [None]}, {"kind": "symbols", "names": ["f"] * 33}):
+            with self.subTest(value=value):
+                evidence = make_evidence(data, structure.REF, "structure.imports", Observation(Location(0, 4), value))
+                self.assertEqual(capability.conclude(task, (evidence,)), ())
+
+    def test_import_finding_evidence_cap_keeps_full_values_of_exactly_the_cited_groups(self):
+        data = bytes(256)
+        task = capability.plan(input_ref(data))
+        evidence = tuple(make_evidence(data, structure.REF, "structure.imports", Observation(Location(i, 1), value))
+                         for i in range(80) for value in ({"kind": "library", "name": f"lib{i}"},
+                           {"kind": "symbols", "library": None, "names": [f"sym{i}", f"other{i}"]}))
+        findings = capability.conclude(task, evidence)
+        self.assertEqual(len(findings), 2)
+        by_id = {e.id: e.observation for e in evidence}
+        for finding in findings:
+            self.assertEqual(len(finding.evidence_ids), 64)
+            cited = [by_id[i] for i in finding.evidence_ids]
+            values = [o["name"] for o in cited] if finding.claim_key.endswith("libraries") else [name for o in cited for name in o["names"]]
+            self.assertEqual(finding.value, sorted(set(values)))
 
 
 if __name__ == "__main__":

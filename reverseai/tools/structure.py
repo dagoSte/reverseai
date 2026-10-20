@@ -113,7 +113,7 @@ def _macho_commands(data, h):
         if position + 8 > end:
             raise StructureError("Truncated Mach-O load command")
         command, length = struct.unpack_from("<II", data, position)
-        if length < 8 or length % 4 or position + length > end:
+        if length < 8 or length % (8 if h[0] == 64 else 4) or position + length > end:
             raise StructureError("Invalid Mach-O load command size")
         yield command, position, length
         position += length
@@ -376,7 +376,10 @@ def _import_name(data, start, end):
 def _elf_import_records(data):
     width, order, _, h = _elf_layout(data)
     entry = 40 if width == 32 else 64
-    if h["shoff"] == 0 or h["shentsize"] != entry:
+    if h["shoff"] == 0:
+        yield from _elf_dynamic_import_records(data, width, order, h)
+        return
+    if h["shentsize"] != entry:
         return
     layout = order + ("IIIIIIIIII" if width == 32 else "IIQQQQIIQQ")
     _need(data, h["shoff"], entry, "ELF section header 0")
@@ -419,8 +422,102 @@ def _elf_import_records(data):
                 yield ("library" if kind == 6 else "symbols"), None, value
 
 
+def _elf_dynamic_import_records(data, width, order, h):
+    """Sectionless executables use PT_DYNAMIC and file-backed PT_LOAD address mappings."""
+    entry = 56 if width == 64 else 32
+    if h["phentsize"] != entry:
+        return
+    count = min(h["phnum"], max(0, (len(data) - h["phoff"]) // entry), MAX_TABLE_ENTRIES)
+    loads, dynamics = [], []
+    for index in range(count):
+        values = struct.unpack_from(order + ("IIQQQQQQ" if width == 64 else "8I"), data, h["phoff"] + index * entry)
+        kind = values[0]
+        offset, address, size = (values[2], values[3], values[5]) if width == 64 else (values[1], values[2], values[4])
+        if offset + size > len(data):
+            continue
+        if kind == 1:
+            loads.append((address, offset, size))
+        elif kind == 2:
+            dynamics.append((offset, size))
+
+    def mapped(address, length):
+        spans = [(offset + address - base, offset + size) for base, offset, size in loads
+                 if base <= address and address + length <= base + size and address + length <= 2**width]
+        return spans[0] if len(spans) == 1 else None
+
+    remaining = MAX_TABLE_ENTRIES
+    for offset, size in dynamics:
+        dynamic_size = 16 if width == 64 else 8
+        tags, needed = {}, []
+        count = min(size // dynamic_size, remaining)
+        remaining -= count
+        for index in range(count):
+            tag, value = struct.unpack_from(order + ("QQ" if width == 64 else "II"), data, offset + index * dynamic_size)
+            if tag == 0:
+                break
+            if tag == 1:
+                needed.append(value)
+            elif tag in (4, 5, 6, 10, 11, 0x6FFFFEF5):
+                if tag in tags:
+                    return  # Conflicting address/size declarations have no unique interpretation.
+                tags[tag] = value
+        strings = mapped(tags.get(5, 0), tags.get(10, 0)) if tags.get(10) else None
+        if strings is None:
+            continue
+        for name in needed:
+            value = _import_name(data, strings[0] + name, strings[0] + tags[10]) if name < tags[10] else None
+            if value:
+                yield "library", None, value
+        symbol_size = 24 if width == 64 else 16
+        if tags.get(11) != symbol_size or not tags.get(6):
+            continue
+        symbol_count = 0
+        hashed = mapped(tags[4], 8) if tags.get(4) else None
+        if hashed:
+            buckets, symbol_count = struct.unpack_from(order + "II", data, hashed[0])
+            if not mapped(tags[4], 4 * (2 + buckets + symbol_count)):
+                continue
+        elif tags.get(0x6FFFFEF5):
+            hashed = mapped(tags[0x6FFFFEF5], 16)
+            if hashed is None:
+                continue
+            buckets, first, bloom, _ = struct.unpack_from(order + "4I", data, hashed[0])
+            bucket_offset = 16 + bloom * (width // 8)
+            table = mapped(tags[0x6FFFFEF5], bucket_offset + buckets * 4)
+            if table is None or buckets > MAX_TABLE_ENTRIES or first > MAX_TABLE_ENTRIES:
+                continue
+            starts = [struct.unpack_from(order + "I", data, table[0] + bucket_offset + 4 * i)[0] for i in range(buckets)]
+            last = max(starts, default=0)
+            symbol_count = first
+            if last:
+                if not first <= last < MAX_TABLE_ENTRIES:
+                    continue
+                chains = table[0] + bucket_offset + buckets * 4
+                while last < MAX_TABLE_ENTRIES and chains + (last - first + 1) * 4 <= table[1]:
+                    value = struct.unpack_from(order + "I", data, chains + (last - first) * 4)[0]
+                    last += 1
+                    if value & 1:
+                        symbol_count = last
+                        break
+        symbols = mapped(tags[6], symbol_count * symbol_size) if symbol_count else None
+        if symbols is None:
+            continue
+        count = min(symbol_count, remaining)
+        remaining -= count
+        for index in range(count):
+            position = symbols[0] + index * symbol_size
+            name = struct.unpack_from(order + "I", data, position)[0]
+            section = struct.unpack_from(order + "H", data, position + (6 if width == 64 else 14))[0]
+            if section == 0 and 0 < name < tags[10]:
+                value = _import_name(data, strings[0] + name, strings[0] + tags[10])
+                if value:
+                    yield "symbols", None, value
+
+
 def _pe_import_records(data, pe):
     h = _pe_layout(data, pe)
+    if h["sections"] > MAX_SECTIONS:
+        return
     optional, plus = h["optional"], h["magic"] == 0x20B
     if h["magic"] not in (0x10B, 0x20B):
         return

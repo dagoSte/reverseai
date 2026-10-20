@@ -3,11 +3,21 @@ import unittest
 
 from reverseai.contract import MAX_OBSERVATION_BYTES, ContractError, Location, Observation, canonical_json, make_evidence
 from reverseai.tools import structure
-from tests.fixtures_structure import elf_imports, macho, patched, pe_imports
+from tests.fixtures_structure import elf_dynamic_imports, elf_imports, macho, patched, pe_imports
 from tests.test_structure import run
 
 
 class ImportTests(unittest.TestCase):
+    def test_sectionless_elf_uses_dynamic_program_header_and_both_hash_formats(self):
+        for width in (32, 64):
+            for order in ("<", ">"):
+                for gnu in (True, False):
+                    data, layout = elf_dynamic_imports(width=width, order=order, gnu_hash=gnu)
+                    with self.subTest(width=width, order=order, gnu=gnu):
+                        self.assertEqual(run("structure.imports", data), [
+                            Observation(Location(layout["library_names"][0], 11), {"kind": "library", "name": "libalpha.so"}),
+                            Observation(Location(layout["symbol_names"][0], 5), {"kind": "symbols", "library": None, "names": ["alpha", "beta"]})])
+
     def test_elf_libraries_and_only_undefined_dynamic_symbols_in_both_widths_and_orders(self):
         for width in (32, 64):
             for order in ("<", ">"):
@@ -44,7 +54,9 @@ class ImportTests(unittest.TestCase):
                 start, size = layout["symbols_offset"] + (16 if width == 64 else 12), 16 if width == 64 else 12
                 debug = patched(data, start + 4, "B", 0xE1)
                 common = patched(data, start + 8, "<Q" if width == 64 else "<I", 12)
-                for control in (debug, common):
+                defined_type = patched(data, start + 4, "B", 0xF)
+                defined_section = patched(data, start + 5, "B", 1)
+                for control in (debug, common, defined_type, defined_section):
                     self.assertEqual(run("structure.imports", control)[-1].value["names"], ["_beta"])
 
     def test_groups_cut_at_32_and_observation_cap_including_json_escaping(self):
@@ -102,10 +114,18 @@ class ImportTests(unittest.TestCase):
         self.assertFalse(any("ExitProcess" in o.value.get("names", []) for o in run("structure.imports", invalid_thunk)))
         invalid_ordinal = patched(data, layout["thunks"][0] + 8, "<Q", (1 << 63) | (1 << 30) | 7)
         self.assertEqual(run("structure.imports", invalid_ordinal)[1].value["names"], ["ExitProcess"])
+        # Two section headers mapping the same RVA cannot select a unique import table.
+        ambiguous = bytearray(patched(data, layout["lfanew"] + 6, "<H", 2))
+        table = layout["table_offset"]
+        ambiguous[table + 40:table + 80] = ambiguous[table:table + 40]
+        self.assertEqual(run("structure.imports", bytes(ambiguous)), [])
+        padding = patched(data, table + 8, "<I", 21)
+        self.assertEqual(run("structure.imports", padding), [])
 
     def test_every_truncation_and_seeded_corruption_produces_only_bounded_observations(self):
         generator = random.Random(7317)
-        for data, _ in (elf_imports(), elf_imports(width=32, order=">"), pe_imports(), pe_imports(plus=False),
+        for data, _ in (elf_imports(), elf_imports(width=32, order=">"), elf_dynamic_imports(), elf_dynamic_imports(gnu_hash=True),
+                        pe_imports(), pe_imports(plus=False),
                         macho(libraries=(b"lib",), symbols=(b"func",))):
             corruptions = [data[:i] for i in range(len(data) + 1)]
             corruptions += [patched(data, generator.randrange(len(data)), "B", generator.randrange(256)) for _ in range(200)]
