@@ -65,7 +65,7 @@ class ClaimRuleTests(unittest.TestCase):
         self.assertEqual(claims.check(overstated, [rwx]), ("sections.writable_executable must be inferred",))
 
     def test_signature_claims_name_exactly_the_matched_reviewed_rules(self):
-        yarax = ToolRef("yarax", "1.21.0-r1")
+        yarax = ToolRef("yarax", "1.21.0-r2")
         upx = evidence(yarax, "yarax.matches", 0, ruleset="m2_fixture_v1", rule="upx_packed", pattern="$a")
         upx_again = evidence(yarax, "yarax.matches", 8, ruleset="m2_fixture_v1", rule="upx_packed", pattern="$b")
         b64 = evidence(yarax, "yarax.matches", 4, ruleset="m2_fixture_v1", rule="base64_decode_api", pattern="$w")

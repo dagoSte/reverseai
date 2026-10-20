@@ -152,7 +152,7 @@ M2a; only what differs is listed. Fixed by the coordinator before the lanes.
   `yara_x-1.21.0-cp38-abi3-manylinux_2_28_aarch64.whl` (SHA-256
   `9bd9961b44b47dd747d526e61c703a2a8170426d003e789e7724bc7862de6d56`, owner
   decision `owner-m2b-download`). `containers/yarax/image.lock.json` records the
-  M2a fields plus `ruleset_sha256`; adapter version `1.21.0-r1`; tool name `yarax`.
+  M2a fields plus `ruleset_sha256`; adapter version `1.21.0-r2` (rebuilt for the 4-per-pattern cap); tool name `yarax`.
 - **Ruleset**: `containers/yarax/m2_fixture_v1.json` is the only rule source:
   reviewed rules, each with an `id`, a `category` and literal byte patterns given
   as hex (4 to 256 bytes, no wildcards, jumps, regexes, modules, includes or
