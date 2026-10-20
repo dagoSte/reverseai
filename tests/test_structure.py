@@ -112,6 +112,32 @@ class SectionTests(unittest.TestCase):
         self.assertEqual(run("structure.sections", long_name)[1].value["name"], "n" * 64)
 
 
+class NameAndNumberingTests(unittest.TestCase):
+    def test_backslashes_are_escaped_so_names_stay_unambiguous(self):
+        literal, _ = elf(sections=((b"a\\xff", 1, 0x6, 4),))
+        raw, _ = elf(sections=((b"a\xff", 1, 0x6, 4),))
+        self.assertEqual(run("structure.sections", literal)[1].value["name"], "a\\x5cxff")
+        self.assertEqual(run("structure.sections", raw)[1].value["name"], "a\\xff")
+
+    def test_elf_extended_numbering_reads_the_count_and_name_table_from_section_zero(self):
+        data, layout = elf(extended=True)
+        header = run("structure.headers", data)[0].value
+        self.assertEqual((header["shnum"], header["shoff"]), (0, layout["shoff"]))
+        found = run("structure.sections", data)
+        self.assertEqual([o.value["name"] for o in found], ["", ".text", ".data", ".rwx", ".shstrtab"])
+        self.assertEqual(found[0].value["size"], 5)  # section 0 carries the real count
+
+    def test_an_out_of_range_name_table_index_gives_empty_names(self):
+        for index in (5, 0xFFFE):
+            data, _ = elf(shstrndx=index)
+            with self.subTest(index=index):
+                self.assertEqual([o.value["name"] for o in run("structure.sections", data)], [""] * 5)
+
+    def test_no_section_table_means_no_sections(self):
+        data, _ = elf()
+        self.assertEqual(run("structure.sections", patched(patched(data, 40, "<Q", 0), 60, "<H", 0)), [])
+
+
 class MalformedInputTests(unittest.TestCase):
     OPERATIONS = ("structure.identify", "structure.headers", "structure.sections")
 

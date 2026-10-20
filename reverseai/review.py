@@ -1,29 +1,31 @@
 """Evidence reviewer: rule 6 of docs/contract.md, re-checked against the frozen bytes.
 
-For each cited evidence item the reviewer recomputes the input hash, checks the
-tool name and version against the registered tools, checks that the location is
-inside the input and that the excerpt hash matches the bytes. A finding is
-unsupported if any cited item is missing or fails, or if it cites none;
-contradicted if another finding whose cited evidence also all verifies has the
-same claim_key and a different value; otherwise supported. An unsupported
-finding never contradicts anything. Reasons name evidence IDs only, never
-input bytes.
+Analyst output is untrusted. Reasons name evidence IDs only, never input bytes.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 
-from reverseai.contract import AnalysisResult, InputRef, ReviewVerdict, ToolRef, canonical_json, sha256_hex
+from reverseai import claims
+from reverseai.contract import (
+    AnalysisResult, InputRef, ReviewVerdict, ToolSpec, canonical_json, evidence_intact, finding_intact, sha256_hex,
+)
 
 
 def _evidence_problems(evidence, data, data_sha256, input, tools):
+    if not evidence_intact(evidence):
+        return ["record does not match its ID"]
     problems = []
+    if len(data) != input.size:
+        problems.append("input size mismatch")
     if evidence.input_sha256 != data_sha256 or evidence.input_sha256 != input.sha256:
         problems.append("input hash mismatch")
-    registered = tools.get(evidence.tool.name)
-    if not isinstance(registered, ToolRef) or registered != evidence.tool:
+    spec = tools.get(evidence.tool.name)
+    if not isinstance(spec, ToolSpec) or spec.ref != evidence.tool:
         problems.append("tool name or version not registered")
+    elif evidence.operation not in spec.operations:
+        problems.append("operation not registered")
     location = evidence.location
     if not location.within(len(data)):
         problems.append("location outside the input")
@@ -32,38 +34,47 @@ def _evidence_problems(evidence, data, data_sha256, input, tools):
     return problems
 
 
-def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tools: Mapping[str, ToolRef]) -> tuple:
+def _content(finding):
+    return (finding.role, finding.claim, finding.claim_key, canonical_json(finding.value), finding.evidence_ids, finding.confidence)
+
+
+def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tools: Mapping[str, ToolSpec]) -> tuple:
+    """One verdict per finding ID, sorted; tools are ToolSpecs keyed by tool name."""
     data = bytes(data)
     data_sha256 = sha256_hex(data)
-    evidence, findings = {}, {}
+    findings, problems = {}, {}
     for result in results:
+        own = {}  # citations resolve only inside the finding's own result
         for item in result.evidence:
-            evidence.setdefault(item.id, item)
+            own.setdefault(item.id, item)
         for finding in result.findings:
-            findings.setdefault(finding.id, finding)  # the same ID means the same content
-    problems = {}
-    for finding_id, finding in findings.items():
-        reasons = []
-        if not finding.evidence_ids:
-            reasons.append("finding cites no evidence")
-        for evidence_id in finding.evidence_ids:
-            item = evidence.get(evidence_id)
-            if item is None:
-                reasons.append(f"{evidence_id}: evidence missing")
+            first = findings.setdefault(finding.id, finding)
+            reasons = problems.setdefault(finding.id, [])
+            if not finding_intact(finding):
+                reasons.append("finding does not match its ID")
                 continue
-            reasons.extend(f"{evidence_id}: {problem}" for problem in _evidence_problems(item, data, data_sha256, input, tools))
-        problems[finding_id] = reasons
-    # Only verified findings can contradict: peer findings are untrusted, so an
-    # unsupported claim must not cancel a verified one.
+            if first is not finding and finding_intact(first) and _content(finding) != _content(first):
+                reasons.append("finding ID reused for different content")
+            local, cited = [] if finding.evidence_ids else ["finding cites no evidence"], []
+            for evidence_id in finding.evidence_ids:
+                item = own.get(evidence_id)
+                if item is None:
+                    local.append(f"{evidence_id}: evidence missing")
+                    continue
+                local.extend(f"{evidence_id}: {problem}" for problem in _evidence_problems(item, data, data_sha256, input, tools))
+                cited.append(item)
+            # Provenance first; then the claim must follow from what it cites.
+            reasons.extend(local or claims.check(finding, cited))
+    # Only findings that pass both checks can contradict: an unsupported claim must not cancel a verified one.
     values = {}
     for finding_id, finding in findings.items():
         if not problems[finding_id]:
             values.setdefault(finding.claim_key, set()).add(canonical_json(finding.value))
     verdicts = []
     for finding_id in sorted(findings):
-        finding, reasons = findings[finding_id], problems[finding_id]
+        finding, reasons = findings[finding_id], tuple(dict.fromkeys(problems[finding_id]))
         if reasons:
-            verdicts.append(ReviewVerdict(finding_id, "unsupported", tuple(reasons)))
+            verdicts.append(ReviewVerdict(finding_id, "unsupported", reasons))
         elif len(values[finding.claim_key]) > 1:
             verdicts.append(ReviewVerdict(finding_id, "contradicted", (f"another finding gives {finding.claim_key} a different value",)))
         else:

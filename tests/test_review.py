@@ -1,16 +1,22 @@
 import re
 import unittest
+from unittest.mock import patch
 
 from reverseai.analysts import structural
 from reverseai.contract import (
-    AnalysisResult, Evidence, InputRef, Location, ReviewVerdict, ToolRef, evidence_id, make_evidence, make_finding, sha256_hex,
+    AnalysisResult, Evidence, InputRef, Location, Observation, ReviewVerdict, ToolRef, evidence_id, make_evidence, make_finding,
+    sha256_hex,
 )
+from reverseai import review as review_module
 from reverseai.review import review
 from reverseai.tools import structure
 from tests.fixtures_structure import elf, structure_evidence
 
-TOOLS = {"structure": structure.REF}
-REASON = re.compile(r"(ev-[0-9a-f]{16}: [a-z ]+|finding cites no evidence|another finding gives [a-z_.]+ a different value)\Z")
+TOOLS = {"structure": structure.TOOL}
+REASON = re.compile(r"(ev-[0-9a-f]{16}: [a-zA-Z ]+|finding cites no evidence|finding does not match its ID"
+                    r"|finding ID reused for different content|no claim rule for this claim_key"
+                    r"|[a-z_.]+ may only cite [a-z_.]+ evidence|cited evidence does not yield the claimed value"
+                    r"|another finding gives [a-z_.]+ a different value)\Z")
 
 
 def forged(evidence, **changes):
@@ -78,9 +84,15 @@ class ReviewTests(unittest.TestCase):
         finding = self.finding(evidence_ids=[])
         self.assertEqual(self.verdict(finding), ReviewVerdict(finding.id, "unsupported", ("finding cites no evidence",)))
 
+    def identify_as(self, kind, length=4):
+        """Intact identify evidence over the input's first bytes that says `kind`: two tools that disagree."""
+        return make_evidence(self.data, structure.REF, "structure.identify",
+                             Observation(Location(0, length), {"format": kind, "magic": self.data[:length].hex()}))
+
     def test_contradiction_by_claim_key(self):
-        elf_finding, pe_finding = self.finding("elf"), self.finding("pe")
-        verdicts = review(self.data, self.input, [self.result([elf_finding]), self.result([pe_finding])], TOOLS)
+        pe_evidence = self.identify_as("pe")
+        elf_finding, pe_finding = self.finding("elf"), self.finding("pe", [pe_evidence.id])
+        verdicts = review(self.data, self.input, [self.result([elf_finding]), self.result([pe_finding], [pe_evidence])], TOOLS)
         reason = ("another finding gives format.container a different value",)
         self.assertEqual(verdicts, tuple(sorted((ReviewVerdict(elf_finding.id, "contradicted", reason),
                                                  ReviewVerdict(pe_finding.id, "contradicted", reason)), key=lambda v: v.finding_id)))
@@ -97,13 +109,64 @@ class ReviewTests(unittest.TestCase):
                                                         key=lambda v: v.finding_id)))
 
     def test_two_verified_findings_that_agree_are_contradicted_by_a_third_that_differs(self):
-        headers, section = self.evidence[1], self.evidence[2]
-        first, second, other = self.finding("elf"), self.finding("elf", [headers.id]), self.finding("pe", [section.id])
+        elf_again, pe_evidence = self.identify_as("elf", length=2), self.identify_as("pe")
+        first, second, other = self.finding("elf"), self.finding("elf", [elf_again.id]), self.finding("pe", [pe_evidence.id])
         self.assertEqual(len({first.id, second.id, other.id}), 3)
-        verdicts = review(self.data, self.input, [self.result([first, second, other])], TOOLS)
+        evidence = [*self.evidence, elf_again, pe_evidence]
+        verdicts = review(self.data, self.input, [self.result([first, second, other], evidence)], TOOLS)
         reason = ("another finding gives format.container a different value",)
         self.assertEqual(verdicts, tuple(ReviewVerdict(finding_id, "contradicted", reason)
                                          for finding_id in sorted((first.id, second.id, other.id))))
+
+    def test_citations_resolve_only_inside_the_findings_own_result(self):
+        finding = self.finding("elf")
+        elsewhere = self.result([], task_id="tk-0000000000000001")
+        verdicts = review(self.data, self.input, [self.result([finding], evidence=[]), elsewhere], TOOLS)
+        self.assertEqual(verdicts, (ReviewVerdict(finding.id, "unsupported", (f"{self.identify.id}: evidence missing",)),))
+
+    def test_a_mutating_analyst_cannot_get_altered_evidence_or_values_supported(self):
+        evidence = make_evidence(self.data, structure.REF, "structure.identify", structure.identify(self.data, {})[0])
+        finding = self.finding("elf", [evidence.id])
+        evidence.observation["format"] = "pe"  # an analyst edits the record it was handed
+        self.assertEqual(self.verdict(finding, [evidence]),
+                         ReviewVerdict(finding.id, "unsupported", (f"{evidence.id}: record does not match its ID",)))
+        sections = [item for item in self.evidence if item.operation == "structure.sections" and item.observation["name"] == ".rwx"]
+        listed = make_finding("structural", "Writable and executable.", "sections.writable_executable", [".rwx"], [sections[0].id])
+        listed.value.append(".text")  # a mutable value changed after the ID was bound
+        self.assertEqual(self.verdict(listed), ReviewVerdict(listed.id, "unsupported", ("finding does not match its ID",)))
+
+    def test_one_finding_id_with_different_content_is_unsupported(self):
+        original = self.finding("elf")
+        changed = self.finding("elf")
+        object.__setattr__(changed, "claim", "A different claim.")  # as a 64-bit ID collision would look
+        with patch.object(review_module, "finding_intact", return_value=True):
+            verdicts = review(self.data, self.input, [self.result([original]), self.result([changed])], TOOLS)
+        self.assertEqual(verdicts, (ReviewVerdict(original.id, "unsupported", ("finding ID reused for different content",)),))
+
+    def test_evidence_from_an_unregistered_operation(self):
+        bogus = make_evidence(self.data, structure.REF, "structure.bogus", structure.identify(self.data, {})[0])
+        finding = self.finding(evidence_ids=[bogus.id])
+        self.assertEqual(self.verdict(finding, [bogus]),
+                         ReviewVerdict(finding.id, "unsupported", (f"{bogus.id}: operation not registered",)))
+
+    def test_the_input_reference_must_describe_the_bytes(self):
+        finding = self.finding("elf")
+        for label, other, reason in (("size", InputRef(self.input.sha256, self.input.size + 1, "sample"), "input size mismatch"),
+                                     ("hash", InputRef("0" * 64, self.input.size, "sample"), "input hash mismatch")):
+            with self.subTest(label):
+                verdicts = review(self.data, other, [self.result([finding])], TOOLS)
+                self.assertEqual(verdicts, (ReviewVerdict(finding.id, "unsupported", (f"{self.identify.id}: {reason}",)),))
+
+    def test_a_claim_must_follow_from_the_evidence_it_cites(self):
+        headers = [item for item in self.evidence if item.operation == "structure.headers"][0]
+        cases = (
+            (self.finding("pe"), "cited evidence does not yield the claimed value"),
+            (self.finding("elf", [headers.id]), "format.container may only cite structure.identify evidence"),
+            (self.finding("elf", claim_key="format.colour"), "no claim rule for this claim_key"),
+        )
+        for finding, reason in cases:
+            with self.subTest(reason=reason):
+                self.assertEqual(self.verdict(finding), ReviewVerdict(finding.id, "unsupported", (reason,)))
 
     def test_changed_input_bytes_fail_every_item(self):
         changed = b"\x00" + self.data[1:]

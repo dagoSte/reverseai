@@ -26,6 +26,7 @@ ELF_MACHINES = {3: "x86", 8: "mips", 20: "powerpc", 21: "powerpc64", 40: "arm", 
 PE_MACHINES = {0x14C: "x86", 0x1C4: "arm", 0x8664: "x86_64", 0xAA64: "aarch64"}
 PE_OPTIONAL = {0x10B: "pe32", 0x20B: "pe32+"}
 SHF_WRITE, SHF_EXECINSTR = 0x1, 0x4
+SHN_XINDEX = 0xFFFF
 SCN_MEM_EXECUTE, SCN_MEM_WRITE = 0x20000000, 0x80000000
 
 
@@ -39,9 +40,8 @@ def _need(data, offset, length, what):
 
 
 def _name(raw: bytes) -> str:
-    """Printable ASCII for an untrusted name; other bytes become escapes."""
-    text = raw[:MAX_NAME_BYTES].decode("ascii", errors="backslashreplace")
-    return "".join(c if 0x20 <= ord(c) < 0x7F else "\\x{:02x}".format(ord(c)) for c in text)
+    """Printable ASCII for an untrusted name; other bytes and the backslash itself become \\xNN escapes."""
+    return "".join(chr(b) if 0x20 <= b < 0x7F and b != 0x5C else "\\x{:02x}".format(b) for b in raw[:MAX_NAME_BYTES])
 
 
 def _pe_offset(data):
@@ -94,6 +94,8 @@ def _pe_layout(data, pe):
     coff = pe + 4
     _need(data, coff, 20, "COFF header")
     machine, sections, timestamp, _, _, optional_size, characteristics = struct.unpack_from("<HHIIIHH", data, coff)
+    if optional_size < 20:
+        raise StructureError("PE optional header is smaller than the fields read")
     optional = coff + 20
     _need(data, optional, 20, "Optional header")
     magic = struct.unpack_from("<H", data, optional)[0]
@@ -126,16 +128,25 @@ def headers(data, args):
 def _elf_sections(data, limit):
     width, order, _, h = _elf_layout(data)
     entry = 40 if width == 32 else 64
-    if h["shnum"] == 0:
-        return []
+    if h["shnum"] == 0 and h["shoff"] == 0:
+        return []  # no section header table
     if h["shentsize"] != entry:
         raise StructureError("Unexpected ELF section header size")
-    count = min(h["shnum"], limit)
-    _need(data, h["shoff"], entry * count, "ELF section header table")
     layout = order + ("IIIIIIIIII" if width == 32 else "IIQQQQIIQQ")
+    shnum, shstrndx = h["shnum"], h["shstrndx"]
+    if shnum == 0 or shstrndx == SHN_XINDEX:
+        # Extended numbering: section 0 holds the real count (sh_size) and name table index (sh_link).
+        _need(data, h["shoff"], entry, "ELF section header 0")
+        first = struct.unpack_from(layout, data, h["shoff"])
+        shnum = shnum or first[5]
+        shstrndx = first[6] if shstrndx == SHN_XINDEX else shstrndx
+    if shnum == 0:
+        return []
+    count = min(shnum, limit)
+    _need(data, h["shoff"], entry * count, "ELF section header table")
     strtab = None
-    if h["shstrndx"] < h["shnum"]:
-        index_offset = h["shoff"] + entry * h["shstrndx"]
+    if shstrndx < shnum:
+        index_offset = h["shoff"] + entry * shstrndx
         _need(data, index_offset, entry, "ELF section name table header")
         values = struct.unpack_from(layout, data, index_offset)
         _need(data, values[4], values[5], "ELF section name table")

@@ -46,11 +46,13 @@ def conclude(task: AnalysisTask, evidence) -> tuple:
                                      "format.container", value, ids))
     headers = by_operation.get("structure.headers", ())
     for value, ids in _grouped((item.observation.get("machine_name"), item) for item in headers
-                                if _label(item.observation.get("machine_name"))):
+                                if _label(item.observation.get("machine_name")) and item.observation.get("machine_name") != "unknown"):
         findings.append(make_finding(ROLE, f"The header names the {value} machine.", "format.machine", value, ids))
     counts = []
     for item in headers:
         count = item.observation.get("shnum", item.observation.get("number_of_sections"))
+        if count == 0 and item.observation.get("shoff"):
+            continue  # ELF extended numbering: the header does not hold the count
         if type(count) is int:
             counts.append((count, item))
     for value, ids in _grouped(counts):

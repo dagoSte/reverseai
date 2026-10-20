@@ -65,6 +65,14 @@ class ConcludeTests(unittest.TestCase):
         self.assertEqual(findings, (make_finding("structural", "The input is an unrecognized file.", "format.container", "unknown",
                                                  [evidence[0].id]),))
 
+    def test_no_claim_for_an_unknown_machine_or_an_extended_section_count(self):
+        _, _, findings = self.conclude(elf(machine=0x1234)[0])
+        self.assertNotIn("format.machine", [finding.claim_key for finding in findings])
+        _, _, findings = self.conclude(elf(extended=True)[0])
+        values = {finding.claim_key: finding.value for finding in findings}
+        self.assertNotIn("format.section_count", values)  # the header holds 0, not the count
+        self.assertEqual(values["sections.writable_executable"], [".rwx"])
+
     def test_no_finding_without_evidence_and_foreign_evidence_is_ignored(self):
         data, _ = elf()
         task = structural.plan(ref(data))
