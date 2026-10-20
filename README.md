@@ -6,7 +6,7 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M3b release candidate: Mach-O and verified imports.** Deterministic
+**Status: M3b released: Mach-O and verified imports.** Deterministic
 analysts read file structure (ELF, PE and Mach-O), imports and string indicators in-process, and three pinned
 open-source tools, LIEF, YARA-X and Ghidra, run in locked containers. Every value
 LIEF and YARA-X report is re-derived by the host from the input bytes before it can
@@ -41,7 +41,7 @@ What this buys, and how each point is checked:
 | M2a | LIEF 1.0.0 in a container, host re-derivation of every worker value | released |
 | M2b | YARA-X 1.21.0 in a container, reviewed literal ruleset, verified signature matches | released |
 | M3a | Ghidra 12.1.4 headless on ELF and PE: functions, pseudocode, calls as derived evidence (contract/2) | released |
-| M3b | Mach-O host decoder, verified imports for ELF, PE and Mach-O, Ghidra on Mach-O | release candidate |
+| M3b | Mach-O host decoder, verified imports for ELF, PE and Mach-O, Ghidra on Mach-O | released |
 | M3c | More Ghidra queries: cross-references, strings by reference, assembly | planned |
 | M4 | JADX for Android packages | planned |
 | M5 | JavaScript application analysis | planned |
