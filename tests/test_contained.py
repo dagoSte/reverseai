@@ -96,6 +96,66 @@ class ExecutorTests(unittest.TestCase):
             self.run_executor(self.executor(runner=fail))
         self.assertEqual(list(self.root.iterdir()), [])
 
+    def _run_with_failed_cleanup(self, failure=None, *, kill_fails=False):
+        def runner(argv, **kwargs):
+            result = self.runner(argv, **kwargs)
+            if argv[1] == "run" and failure is not None:
+                raise failure
+            if argv[1] == "kill" and kill_fails:
+                raise OSError("/private/kill-failure")
+            return result
+
+        with patch("reverseai.contained.shutil.rmtree", side_effect=OSError("/private/cleanup-failure")):
+            return self.run_executor(self.executor(runner=runner))
+
+    def test_cleanup_failure_preserves_each_primary_exception_and_adds_only_a_safe_note(self):
+        class OtherFailure(BaseException):
+            pass
+
+        for failure in (ContainedTimeout("WorkerTimeout"), ContainedError("WorkerOutputLimit"),
+                        KeyboardInterrupt(), SystemExit(17), OtherFailure("Stopped")):
+            with self.subTest(failure=type(failure).__name__):
+                failure.add_note("ExistingNotice")
+                with self.assertRaises(BaseException) as caught:
+                    self._run_with_failed_cleanup(failure)
+                self.assertIs(caught.exception, failure)
+                self.assertEqual(caught.exception.__notes__, ["ExistingNotice", "StagingCleanupError"])
+                self.assertNotIn("/", str(caught.exception))
+                self.assertNotIn("/", " ".join(caught.exception.__notes__))
+
+    def test_cleanup_failure_keeps_plain_runner_errors_sanitized(self):
+        with self.assertRaisesRegex(ContainedError, "^WorkerProcessError$") as caught:
+            self._run_with_failed_cleanup(OSError("/private/runner-failure"))
+        self.assertIs(type(caught.exception), ContainedError)
+        self.assertEqual(caught.exception.__notes__, ["StagingCleanupError"])
+
+    def test_cleanup_and_kill_failures_keep_the_original_timeout_retriable(self):
+        failure = ContainedTimeout("WorkerTimeout")
+        with self.assertRaises(BaseException) as caught:
+            self._run_with_failed_cleanup(failure, kill_fails=True)
+        self.assertIs(caught.exception, failure)
+        self.assertIsInstance(caught.exception, TimeoutError)
+        self.assertEqual(caught.exception.__notes__, ["StagingCleanupError"])
+        self.assertEqual([argv[1] for argv, _ in self.calls], ["run", "kill"])
+
+    def test_cleanup_failure_preserves_a_staging_error_before_the_runner_starts(self):
+        with patch("reverseai.contained.build_argv", side_effect=OSError("/private/staging-failure")):
+            with self.assertRaisesRegex(ContainedError, "^WorkerProcessError$") as caught:
+                self._run_with_failed_cleanup()
+        self.assertEqual(caught.exception.__notes__, ["StagingCleanupError"])
+        self.assertEqual(self.calls, [])
+
+    def test_successful_run_fails_closed_on_cleanup_error_even_inside_an_outer_handler(self):
+        with self.assertRaisesRegex(ContainedError, "^StagingCleanupError$") as caught:
+            self._run_with_failed_cleanup()
+        self.assertFalse(getattr(caught.exception, "__notes__", []))
+        try:
+            raise ValueError("/private/caller-failure")
+        except ValueError:
+            with self.assertRaisesRegex(ContainedError, "^StagingCleanupError$") as caught:
+                self._run_with_failed_cleanup()
+            self.assertFalse(getattr(caught.exception, "__notes__", []))
+
     def test_stdout_cap_is_also_checked_for_an_injected_runner(self):
         def oversized(argv, **kwargs):
             self.runner(argv, **kwargs)
