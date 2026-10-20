@@ -8,7 +8,8 @@ from reverseai.contract import (
 
 ROLE = "structural"
 MAX_SECTIONS = 64
-FORMAT_NAMES = {"elf": "an ELF", "pe": "a PE", "macho": "a Mach-O", "zip": "a ZIP", "unknown": "an unrecognized"}
+FORMAT_NAMES = {"elf": "an ELF", "pe": "a PE", "macho": "a Mach-O", "macho-universal": "a universal Mach-O",
+                "zip": "a ZIP", "unknown": "an unrecognized"}
 
 
 def plan(input: InputRef, *, tools=()) -> AnalysisTask:

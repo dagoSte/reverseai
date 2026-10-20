@@ -66,7 +66,7 @@ def conclude(task, evidence):
             sorted({item.observation["rule"] for item in matches}), (item.id for item in matches), confidence="observed",
         ))
     imported = {"library": [], "symbols": []}
-    for item in sorted(evidence, key=lambda item: item.id):
+    for item in sorted(evidence, key=lambda item: (item.location.offset, item.location.length, item.id)):
         if (item.input_sha256 != task.input.sha256 or item.tool != STRUCTURE_REF
                 or item.operation != "structure.imports" or not item.location.within(task.input.size)):
             continue

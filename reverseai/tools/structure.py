@@ -21,6 +21,7 @@ UNKNOWN_PREFIX = 16
 MAX_IMPORTS = 256
 MAX_IMPORT_NAME = 128
 MAX_TABLE_ENTRIES = 65536
+MAX_ELF_MAPPING_WORK = 65536
 
 ELF_MAGIC = b"\x7fELF"
 ZIP_MAGICS = (b"PK\x03\x04", b"PK\x05\x06")
@@ -71,8 +72,11 @@ def _format(data):
         return "pe", pe, 4
     if data[:4] in MACHO_MAGICS:
         return "macho", 0, 4
-    if data[:4] in FAT_MAGICS:
-        return "macho-universal", 0, 4
+    if data[:4] in FAT_MAGICS and len(data) >= 8:
+        order, entry_size = FAT_MAGICS[data[:4]]
+        count = struct.unpack_from(order + "I", data, 4)[0]
+        if 1 <= count <= 20 and 8 + count * entry_size <= len(data):
+            return "macho-universal", 0, 4
     if data[:4] in ZIP_MAGICS:
         return "zip", 0, 4
     return "unknown", 0, min(UNKNOWN_PREFIX, len(data))
@@ -428,7 +432,7 @@ def _elf_dynamic_import_records(data, width, order, h):
     if h["phentsize"] != entry:
         return
     count = min(h["phnum"], max(0, (len(data) - h["phoff"]) // entry), MAX_TABLE_ENTRIES)
-    loads, dynamics = [], []
+    loads, dynamics = [], {}
     for index in range(count):
         values = struct.unpack_from(order + ("IIQQQQQQ" if width == 64 else "8I"), data, h["phoff"] + index * entry)
         kind = values[0]
@@ -438,12 +442,21 @@ def _elf_dynamic_import_records(data, width, order, h):
         if kind == 1:
             loads.append((address, offset, size))
         elif kind == 2:
-            dynamics.append((offset, size))
+            dynamics[offset, size] = None
 
+    mapping_left = MAX_ELF_MAPPING_WORK
     def mapped(address, length):
-        spans = [(offset + address - base, offset + size) for base, offset, size in loads
-                 if base <= address and address + length <= base + size and address + length <= 2**width]
-        return spans[0] if len(spans) == 1 else None
+        nonlocal mapping_left
+        span = None
+        for base, offset, size in loads:
+            if mapping_left == 0:
+                raise StructureError("ELF import mapping work limit exceeded")
+            mapping_left -= 1
+            if base <= address and address + length <= base + size and address + length <= 2**width:
+                if span is not None:
+                    return None
+                span = (offset + address - base, offset + size)
+        return span
 
     remaining = MAX_TABLE_ENTRIES
     for offset, size in dynamics:
@@ -486,6 +499,9 @@ def _elf_dynamic_import_records(data, width, order, h):
             table = mapped(tags[0x6FFFFEF5], bucket_offset + buckets * 4)
             if table is None or buckets > MAX_TABLE_ENTRIES or first > MAX_TABLE_ENTRIES:
                 continue
+            if buckets > remaining:
+                return
+            remaining -= buckets
             starts = [struct.unpack_from(order + "I", data, table[0] + bucket_offset + 4 * i)[0] for i in range(buckets)]
             last = max(starts, default=0)
             symbol_count = first
@@ -494,6 +510,9 @@ def _elf_dynamic_import_records(data, width, order, h):
                     continue
                 chains = table[0] + bucket_offset + buckets * 4
                 while last < MAX_TABLE_ENTRIES and chains + (last - first + 1) * 4 <= table[1]:
+                    if remaining == 0:
+                        return
+                    remaining -= 1
                     value = struct.unpack_from(order + "I", data, chains + (last - first) * 4)[0]
                     last += 1
                     if value & 1:
@@ -607,7 +626,7 @@ def _macho_import_records(data):
         for index in range(count):
             position = offset + entry * index
             name, kind, section, _, value = struct.unpack_from("<IBBHQ" if h[0] == 64 else "<IBBHI", data, position)
-            if kind & 0xE0 or kind & 0x0E or section or value or not name or name >= strings_size:
+            if kind & 0xE0 or not kind & 1 or kind & 0x0E or section or value or not name or name >= strings_size:
                 continue
             imported = _import_name(data, strings + name, strings + strings_size)
             if imported:

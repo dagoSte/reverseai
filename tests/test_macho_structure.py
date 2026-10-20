@@ -50,7 +50,7 @@ class MachoStructureTests(unittest.TestCase):
                     "architectures": ["x86", "x86_64", "aarch64", "unknown"] * 2})
                 for operation in ("structure.headers", "structure.sections", "structure.imports"):
                     self.assertEqual(run(operation, fat), [])
-                self.assertEqual(run("structure.identify", fat[:7])[0].value["architectures"], [])
+                self.assertEqual(run("structure.identify", fat[:7])[0].value["format"], "unknown")
 
     def test_names_escape_controls_backslashes_and_non_ascii(self):
         data, _ = macho(sections=((b"a\x1b\xff\\", b"S\x00ignored", 0, 0, 1),))
