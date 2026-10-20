@@ -205,8 +205,15 @@ class ContainedToolWiringTests(unittest.TestCase):
             self.assertFalse(Path(temporary, "r").exists())
 
     def test_with_yarax_refuses_cleanly_when_the_worker_is_unavailable(self):
+        self.check_contained_refusal("yarax_tool", "--with-yarax", "YARA-X")
+
+    def test_with_ghidra_refuses_cleanly_when_the_worker_is_unavailable(self):
+        self.check_contained_refusal("ghidra_tool", "--with-ghidra", "Ghidra")
+
+    def check_contained_refusal(self, module, flag, label):
+        from importlib import import_module
         from reverseai.contained import ContainedError
-        from reverseai.tools import yarax_tool
+        yarax_tool = import_module(f"reverseai.tools.{module}")
         for patch in ({"available": mock.DEFAULT}, {"make_tool": ContainedError("InvalidImageLock")}):
             with self.subTest(patch=sorted(patch)), tempfile.TemporaryDirectory() as temporary, \
                     mock.patch.object(yarax_tool, "available", return_value="make_tool" in patch), \
@@ -215,9 +222,9 @@ class ContainedToolWiringTests(unittest.TestCase):
                 sample.write_bytes(pe()[0])
                 out = io.StringIO()
                 with contextlib.redirect_stderr(out), self.assertRaises(SystemExit) as stopped:
-                    cli.main(["analyze", str(sample), "--out", str(Path(temporary, "r")), "--with-yarax"])
+                    cli.main(["analyze", str(sample), "--out", str(Path(temporary, "r")), flag])
                 self.assertEqual(stopped.exception.code, 1)
-                self.assertIn("YARA-X worker is unavailable", out.getvalue())
+                self.assertIn(f"{label} worker is unavailable", out.getvalue())
                 self.assertNotIn("Traceback", out.getvalue())
                 self.assertFalse(Path(temporary, "r").exists())
 
