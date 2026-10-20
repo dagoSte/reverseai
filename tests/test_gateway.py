@@ -204,7 +204,7 @@ class GatewayTests(unittest.TestCase):
         gateway = Gateway([tool(lambda data, args: {"not": "observations"})], Budget())
         self.assertEqual(gateway.run(task(), DATA).errors, ("fake.observe: TypeError",))
 
-    def test_budget_retry_preserves_prefix_without_charging_global_limits_twice(self):
+    def test_fixed_cut_replay_preserves_prefix_without_charging_global_limits_twice(self):
         calls = []
         limit = sum(len(canonical_json(make_evidence(DATA, REF, "fake.observe", observation(i)).to_dict()).encode())
                     for i in range(2))
@@ -214,7 +214,7 @@ class GatewayTests(unittest.TestCase):
             result = gateway.run(task(), DATA)
             self.assertEqual(result.status, "budget_exceeded")
             self.assertEqual([e.location.offset for e in result.evidence], [0, 1])
-        self.assertEqual(calls, [1, 1])
+        self.assertEqual(calls, [1])
 
     def test_task_evidence_cap_applies_also_to_replay(self):
         gateway = Gateway([tool(lambda data, args: [observation(i) for i in range(3)])], Budget())
