@@ -66,10 +66,16 @@ def main(argv=None):
         parser.exit(1, "reverseai: --out must be a new or empty directory\n")
     tools = pipeline.TOOLS
     if args.with_lief:
+        from reverseai.contained import ContainedError
         from reverseai.tools import lief_tool
-        if not lief_tool.available():
+        try:
+            # The lock can change between the check and the build of the tool.
+            worker = lief_tool.make_tool() if lief_tool.available() else None
+        except ContainedError:
+            worker = None
+        if worker is None:
             parser.exit(1, "reverseai: the LIEF worker is unavailable (image lock, image or Docker missing)\n")
-        tools = tools + (lief_tool.make_tool(),)
+        tools = tools + (worker,)
     try:
         data, ref = intake.snapshot(args.file)
     except (OSError, ValueError) as error:  # ContractError is a ValueError

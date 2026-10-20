@@ -84,6 +84,11 @@ class PipelineKnownAnswerTests(unittest.TestCase):
         first = report.to_json(pipeline.analyze_bytes(data, ref(data)))
         self.assertEqual(first, report.to_json(pipeline.analyze_bytes(data, ref(data))))
 
+    def test_the_capped_input_name_is_not_cut_again_in_markdown(self):
+        data = pe()[0]
+        name = "n" * 251 + "\\x80"  # 255 characters, the intake cap, ending in an escape
+        self.assertIn("`" + name + "`", report.to_markdown(pipeline.analyze_bytes(data, ref(data, name))))
+
     def test_fabricated_claims_are_rejected_and_cannot_cancel_verified_ones(self):
         data = pe()[0] + known_strings()[0]
         analysis = pipeline.analyze_bytes(data, ref(data), analysts=(pipeline.ANALYSTS[0], Fabricating))
@@ -170,6 +175,22 @@ class ContainedToolWiringTests(unittest.TestCase):
                 cli.main(["analyze", str(sample), "--out", str(Path(temporary, "r")), "--with-lief"])
             self.assertEqual(stopped.exception.code, 1)
             self.assertIn("LIEF worker is unavailable", out.getvalue())
+            self.assertFalse(Path(temporary, "r").exists())
+
+    def test_with_lief_refuses_cleanly_when_the_lock_breaks_after_the_check(self):
+        from reverseai.contained import ContainedError
+        from reverseai.tools import lief_tool
+        with tempfile.TemporaryDirectory() as temporary, \
+                mock.patch.object(lief_tool, "available", return_value=True), \
+                mock.patch.object(lief_tool, "make_tool", side_effect=ContainedError("InvalidImageLock")):
+            sample = Path(temporary, "sample.bin")
+            sample.write_bytes(pe()[0])
+            out = io.StringIO()
+            with contextlib.redirect_stderr(out), self.assertRaises(SystemExit) as stopped:
+                cli.main(["analyze", str(sample), "--out", str(Path(temporary, "r")), "--with-lief"])
+            self.assertEqual(stopped.exception.code, 1)
+            self.assertIn("LIEF worker is unavailable", out.getvalue())
+            self.assertNotIn("Traceback", out.getvalue())
             self.assertFalse(Path(temporary, "r").exists())
 
 

@@ -51,16 +51,13 @@ def _urls(observations):
 CATEGORIES = ("process_injection", "persistence", "network", "crypto", "anti_debug")
 
 
-def _field(name, convert=lambda value: value):
+def _field(name):
     """One value from the observations that carry the field; observations without it (other physical headers) are ignored."""
-    def derive(observations):
-        carrying = [o for o in observations if name in o]
-        return _one(convert(o) for o in carrying) if carrying else None
-    return derive
+    return lambda observations: _one(o[name] for o in observations if name in o)
 
 
-_format = _field("format", lambda o: o["format"])
-_machine = _field("machine_name", lambda o: o["machine_name"])
+_format = _field("format")
+_machine = _field("machine_name")
 _count = lambda obs: _one(_section_count(o) for o in obs if "shnum" in o or "number_of_sections" in o) \
     if any("shnum" in o or "number_of_sections" in o for o in obs) else None
 

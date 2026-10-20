@@ -64,6 +64,19 @@ class ClaimRuleTests(unittest.TestCase):
         overstated = finding("sections.writable_executable", [".rwx"], [rwx], confidence="observed")
         self.assertEqual(claims.check(overstated, [rwx]), ("sections.writable_executable must be inferred",))
 
+    def test_every_cited_operation_group_must_yield_the_value(self):
+        lief = ToolRef("lief", "1.0.0")
+        two_operations = ("observed", {
+            "structure.identify": lambda obs: claims._one(o.get("format") for o in obs),
+            "lief.headers": lambda obs: claims._one(o.get("format") for o in obs),
+        })
+        for wrong in ("structure.identify", "lief.headers"):
+            with self.subTest(disagreeing=wrong), mock.patch.dict(claims.RULES, {"format.container": two_operations}):
+                stdlib = evidence(STRUCTURE, "structure.identify", 0, format="elf" if wrong == "structure.identify" else "pe")
+                worker = evidence(lief, "lief.headers", 4, format="elf" if wrong == "lief.headers" else "pe")
+                self.assertEqual(claims.check(finding("format.container", "pe", [stdlib, worker]), [stdlib, worker]),
+                                 ("cited evidence does not yield the claimed value",))
+
     def test_a_claim_may_cite_every_operation_its_rule_allows_if_they_agree(self):
         lief = ToolRef("lief", "1.0.0")
         two_operations = ("observed", {

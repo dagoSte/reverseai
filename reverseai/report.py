@@ -61,12 +61,12 @@ def to_json(analysis):
     return canonical_json(to_dict(analysis)) + "\n"
 
 
-def _cell(value):
+def _cell(value, limit=200):
     """Untrusted text as one inert code span; "-" when empty."""
     text = value if isinstance(value, str) else canonical_json(value)
     text = "".join(c if c.isprintable() else "�" for c in text).replace("`", "'")
-    if len(text) > 200:
-        text = text[:199] + "…"
+    if len(text) > limit:
+        text = text[:limit - 1] + "…"
     return "`" + text.replace("|", "\\|") + "`" if text.strip() else "-"
 
 
@@ -76,7 +76,7 @@ def to_markdown(analysis):
     lines = [
         "# ReverseAI static analysis report",
         "",
-        f"- Input: {_cell(report['input']['name'])}, {report['input']['size']} bytes",
+        f"- Input: {_cell(report['input']['name'], limit=255)}, {report['input']['size']} bytes",
         f"- SHA-256: `{report['input']['sha256']}`",
         f"- Contract: {report['contract']}; ReverseAI {report['reverseai']}",
         "- Tools: " + ", ".join(f"{t['name']} {t['version']}" + (f" (contained, image {t['runtime'].get('image', '?')[:19]}, {t['runtime'].get('platform', '?')})"
