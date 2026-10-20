@@ -45,7 +45,8 @@ YARAX_RULESET_PATH = Path(__file__).resolve().parents[1] / "containers/yarax/m2_
 YARAX_RULESET_SHA256 = "e2217ff703858af17fe8eee8ac0d4cc44dfefd632e096bb4b527b89b08a062a7"
 YARAX_WHEEL_SHA256 = "9bd9961b44b47dd747d526e61c703a2a8170426d003e789e7724bc7862de6d56"
 YARAX_BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
-YARAX_ADAPTER_VERSION = "1.21.0-r1"
+YARAX_ADAPTER_VERSION = "1.21.0-r2"
+YARAX_MATCHES_PER_PATTERN = 4
 YARAX_FIXTURE_NAMES = ("upx_markers", "utf16_markers", "clean", "repeated_markers")
 YARAX_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                          *(f"{name}.matches" for name in YARAX_FIXTURE_NAMES))
@@ -92,6 +93,14 @@ def verify_image(image, lock):
     need(isinstance(config.get("Env"), list) and all(isinstance(v, str) for v in config["Env"]), "ImageEnvironment")
 
 
+def verify_snapshot_mount(data, snapshot):
+    mounts = data.get("Mounts")
+    need(isinstance(mounts, list) and len(mounts) == 1 and isinstance(mounts[0], dict), "ContainerMountCount")
+    mount = mounts[0]
+    need(mount.get("Type") == "bind" and mount.get("Destination") == "/snapshot" and
+         mount.get("RW") is False and mount.get("Source") == os.fspath(snapshot), "ContainerSnapshotMount")
+
+
 def verify_container(data, image, lock, snapshot, *, entrypoint=None, command=None):
     need(isinstance(data, dict), "ContainerShape")
     host, inner, state = data.get("HostConfig"), data.get("Config"), data.get("State")
@@ -119,11 +128,7 @@ def verify_container(data, image, lock, snapshot, *, entrypoint=None, command=No
     need(_empty_optional(host.get("PortBindings"), dict) and host.get("PublishAllPorts") is False, "ContainerPorts")
     need(host.get("IpcMode") in ("private", ""), "ContainerIpcMode")
     need(host.get("CgroupnsMode") in ("private", ""), "ContainerCgroupnsMode")
-    mounts = data.get("Mounts")
-    need(isinstance(mounts, list) and len(mounts) == 1 and isinstance(mounts[0], dict), "ContainerMountCount")
-    mount = mounts[0]
-    need(mount.get("Type") == "bind" and mount.get("Destination") == "/snapshot" and
-         mount.get("RW") is False and mount.get("Source") == os.fspath(snapshot), "ContainerSnapshotMount")
+    verify_snapshot_mount(data, snapshot)
 
 
 def validate_probe(name, value):
@@ -199,10 +204,10 @@ def verify_yarax_lock(lock):
 
 def yarax_fixtures():
     return {
-        "upx_markers": b"\x00UPX!----UPX0----UPX1\x00",
+        "upx_markers": b"\x00UPX!----UPX0----UPX1\x00-EncodedCommand\x00FromBase64String\x00sekurlsa::",
         "utf16_markers": b"\x00\x00" + "-EncodedCommand\x00FromBase64String\x00sekurlsa::".encode("utf-16le"),
         "clean": b"deterministic clean fixture\x00",
-        "repeated_markers": b"UPX!" * 80,
+        "repeated_markers": b"UPX!" * 80 + b"sekurlsa::",
     }
 
 
@@ -213,8 +218,7 @@ def compare_yarax_observations(data, observations, ruleset, max_matches=64):
     for rule in ruleset["rules"]:
         for pattern in rule["patterns"]:
             needle, start = bytes.fromhex(pattern["hex"]), 0
-            # Later matches of one pattern cannot enter the first max_matches overall.
-            for _ in range(max_matches):
+            for _ in range(min(YARAX_MATCHES_PER_PATTERN, max_matches)):
                 offset = data.find(needle, start)
                 if offset < 0:
                     break
@@ -477,10 +481,11 @@ class NativeVerifier:
                 data = self.one_inspect(["inspect", cid])
                 need(data.get("Id") == cid and data.get("Name") == "/" + name and
                      data.get("Image") == self.lock["image_id"], "CreateLookupOwnership")
+                verify_snapshot_mount(data, snapshot)
                 row["container_id"] = cid
                 self.cleanup(row)
             else:
-                row["verified"] = True  # Successful exact-name lookup proved absence.
+                row["verified"] = True  # Observed absent at this lookup; a late daemon create remains possible.
         except Exception:
             raise VerificationError("CreateCleanupUnverified") from None
 
