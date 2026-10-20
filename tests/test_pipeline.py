@@ -68,7 +68,7 @@ class PipelineKnownAnswerTests(unittest.TestCase):
         self.assertEqual({key: f.value for key, f in found.items()}, expected)
         self.assertEqual({v.status for v in analysis.verdicts}, {"supported"})
         self.assertEqual(len(analysis.verdicts), len(expected))
-        self.assertEqual(report.to_dict(analysis)["summary"], {"supported": len(expected), "unsupported": 0, "contradicted": 0, "unreviewed": 0})
+        self.assertEqual(report.to_dict(analysis)["summary"], {"supported": len(expected), "derived": 0, "unsupported": 0, "contradicted": 0, "unreviewed": 0})
 
     def test_clean_elf_control_has_no_capability_findings(self):
         data = elf()[0] + clean_control()

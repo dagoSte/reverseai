@@ -1,4 +1,4 @@
-# ReverseAI contract (reverseai.contract/1)
+# ReverseAI contract (reverseai.contract/2)
 
 The types live in `reverseai/contract.py`. This page fixes how the M1 components
 connect, so lanes can be built in parallel and joined without negotiation.
@@ -179,6 +179,72 @@ M2a; only what differs is listed. Fixed by the coordinator before the lanes.
 - **Claim**: `signatures.rule_matches`, confidence `observed`, cites only
   `yarax.matches`; its value is the sorted unique rule IDs of the cited matches.
   The capability analyst plans it when the YARA-X tool is available.
+
+## Derived evidence (contract/2, M3)
+
+Owner decision `owner-m3-derived`. Some tools interpret code (functions,
+pseudocode, calls) in ways the host cannot re-derive from the input bytes.
+Contract/2 admits them as **derived** evidence, never as verified fact.
+
+- **Declared per operation**: `OperationSpec.derived = True`. Rule 1 still
+  applies to everything the host can check: for a derived operation the host
+  re-derives the observation's **anchor** (its Location must be exactly the
+  file range the observation names, mapped through the host's own section
+  decoding, inside an executable section where the value says code) and checks
+  the value's schema and bounds; the remaining fields are the tool's
+  interpretation. A refusal fails the whole operation, as before.
+- **Evidence records are unchanged**: the gateway still makes them with
+  `make_evidence`, bound to the input bytes at the anchor, the tool, the
+  operation and the exact observation value. A derived observation is always
+  anchored in the input; output that cannot be anchored is not admitted.
+- **Claims**: a claim rule whose operations are all derived must carry
+  confidence `inferred`. A rule never mixes derived and non-derived operations.
+- **Verdicts**: `VERDICT_STATUS` gains `derived`. A finding whose provenance
+  and claim checks pass is `derived` (not `supported`) when any cited
+  evidence comes from a derived operation; its reason says so. A derived
+  finding never contradicts and is never contradicted: it is the tool's
+  reading, shown with its source, not a fact that competes with verified ones.
+- **Reports** list derived findings in their own section, "Derived by
+  analysis tools (not verified against the bytes)", after the supported ones,
+  with the tool, image and operation that produced them.
+- **Roles**: `ROLES` gains `code` for the analyst that plans Ghidra operations.
+
+## Contained Ghidra worker (M3a)
+
+Same container interface and reply protocol as M2a; what differs:
+
+- **Image**: `containers/ghidra/`, linux/arm64, built from the pinned
+  `python:3.12-slim` base with the owner-approved downloads (`owner-m3-downloads`):
+  Ghidra 12.1.4 (`ddac49f9...d4db`), Temurin JDK 21.0.12.1+1 aarch64
+  (`23e37e02...e223`) and, in a build stage only, Debian `g++`/`make` to
+  build the arm64 decompiler and demangler natives. Lock keys: the M2a keys plus
+  `ghidra_sha256`, `jdk_sha256`; `wheel_sha256` is absent. Adapter `12.1.4-r1`.
+- **Resource profile** (per tool, fixed in `reverseai/contained.py`; LIEF and
+  YARA-X keep theirs): `--memory 2g --memory-swap 2g --pids-limit 256
+  --cpus 2 --tmpfs /tmp:rw,noexec,nosuid,nodev,size=512m`, wall limit 240 s.
+  Every other run flag is the M2a flag. The native verifier proves this profile.
+- **Analysis**: one headless import per run into a project under `/tmp`, fixed
+  reviewed query code baked into the image, fixed analyzers: no servers, no
+  debugger, no external debug-file lookup, Swift demangler off, analysis timeout
+  below the wall limit. Requests cannot select scripts, loaders or options.
+  M3a accepts ELF and PE; Mach-O comes with the host decoder in M3b.
+- **Operation** `ghidra.analyze` (derived): args `max_functions` int 1..128
+  default 64, `decompile` int 0..16 default 8, `max_chars` int 64..2048 default
+  1024, `max_calls` int 0..256 default 128; at most 400 observations. One run
+  returns three kinds, each anchored at its file range:
+  - `{"kind": "function", "index", "name", "entry", "size"}` at the function's
+    first bytes (at most 4,096), functions address-sorted, index from 0;
+  - `{"kind": "pseudocode", "index", "entry", "text", "truncated"}` at the same
+    anchor, for the entry-point function and then the largest functions
+    (ties by lower entry), `decompile` in all, text cut at `max_chars`;
+  - `{"kind": "call", "from", "to", "to_name"}` at the call instruction's bytes.
+  `name`/`to_name` are at most 128 printable characters. Values are virtual
+  addresses; the host maps each anchor through its own section table and refuses
+  an observation whose anchor is not inside an executable section.
+- **Claims** (all `inferred`, all derived): `code.functions` = names in index
+  order; `code.pseudocode` = `{"entry", "text", "truncated"}` for one function
+  (one finding per decompiled function); `code.calls` = sorted unique
+  `[from, to_name]` pairs.
 
 ## Known-answer fixtures
 

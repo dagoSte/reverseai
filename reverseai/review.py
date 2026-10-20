@@ -42,7 +42,7 @@ def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tool
     """One verdict per finding ID, sorted; tools are ToolSpecs keyed by tool name."""
     data = bytes(data)
     data_sha256 = sha256_hex(data)
-    findings, problems = {}, {}
+    findings, problems, derived = {}, {}, set()
     for result in results:
         own = {}  # citations resolve only inside the finding's own result
         for item in result.evidence:
@@ -63,18 +63,23 @@ def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tool
                     continue
                 local.extend(f"{evidence_id}: {problem}" for problem in _evidence_problems(item, data, data_sha256, input, tools))
                 cited.append(item)
+                spec = tools.get(item.tool.name)
+                if isinstance(spec, ToolSpec) and getattr(spec.operations.get(item.operation), "derived", False):
+                    derived.add(finding.id)
             # Provenance first; then the claim must follow from what it cites.
             reasons.extend(local or claims.check(finding, cited))
-    # Only findings that pass both checks can contradict: an unsupported claim must not cancel a verified one.
+    # Only verified findings contradict each other: neither an unsupported nor a derived claim can cancel a verified one.
     values = {}
     for finding_id, finding in findings.items():
-        if not problems[finding_id]:
+        if not problems[finding_id] and finding_id not in derived:
             values.setdefault(finding.claim_key, set()).add(canonical_json(finding.value))
     verdicts = []
     for finding_id in sorted(findings):
         finding, reasons = findings[finding_id], tuple(dict.fromkeys(problems[finding_id]))
         if reasons:
             verdicts.append(ReviewVerdict(finding_id, "unsupported", reasons))
+        elif finding_id in derived:
+            verdicts.append(ReviewVerdict(finding_id, "derived", ("cites a derived operation: the tool's reading, not verified against the bytes",)))
         elif len(values[finding.claim_key]) > 1:
             verdicts.append(ReviewVerdict(finding_id, "contradicted", (f"another finding gives {finding.claim_key} a different value",)))
         else:

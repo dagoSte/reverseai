@@ -67,6 +67,26 @@ def _signature_rules(observations):
     return sorted(set(rules)) if rules and all(isinstance(r, str) and r for r in rules) else None
 
 
+def _kind(name):
+    """Observations of one derived kind, or None when any cited observation is of another kind."""
+    return lambda observations: observations if observations and all(o.get("kind") == name for o in observations) else None
+
+
+def _function_names(observations):
+    functions = _kind("function")(observations)
+    return [o["name"] for o in sorted(functions, key=lambda o: o["index"])] if functions else None
+
+
+def _pseudocode(observations):
+    texts = _kind("pseudocode")(observations)
+    return {key: texts[0][key] for key in ("entry", "text", "truncated")} if texts and len(texts) == 1 else None
+
+
+def _calls(observations):
+    calls = _kind("call")(observations)
+    return [list(pair) for pair in sorted({(o["from"], o["to_name"]) for o in calls})] if calls else None
+
+
 # claim_key -> (confidence the claim must carry, {operation it may cite: derive(observations) -> expected value or None}).
 # A claim may cite several allowed operations; each operation's citations must yield the same value.
 RULES = {
@@ -77,6 +97,10 @@ RULES = {
     "sections.writable_executable_indices": ("inferred", {"lief.sections": _writable_executable_indices}),
     "strings.urls": ("observed", {"strings.indicators": _urls}),
     "signatures.rule_matches": ("observed", {"yarax.matches": _signature_rules}),
+    # contract/2 derived claims: the tool's reading, always inferred, reviewed as "derived"
+    "code.functions": ("inferred", {"ghidra.analyze": _function_names}),
+    "code.pseudocode": ("inferred", {"ghidra.analyze": _pseudocode}),
+    "code.calls": ("inferred", {"ghidra.analyze": _calls}),
     **{f"capability.{name}": ("inferred", {"strings.indicators": _category(name)}) for name in CATEGORIES},
 }
 
@@ -90,6 +114,9 @@ STATEMENTS = {
     "sections.writable_executable_indices": "Section indices that are both writable and executable",
     "strings.urls": "URL strings in the input",
     "signatures.rule_matches": "Reviewed signature rules whose exact byte patterns occur in the input",
+    "code.functions": "Functions the analysis tool identified, in address order",
+    "code.pseudocode": "Pseudocode the analysis tool decompiled for one function",
+    "code.calls": "Calls between functions the analysis tool identified",
     **{f"capability.{name}": f"String hints of {name.replace('_', ' ')} capability (names only, not behaviour)" for name in CATEGORIES},
 }
 

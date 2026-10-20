@@ -87,18 +87,24 @@ def to_markdown(analysis):
         "",
     ]
     supported = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] == "supported"]
-    rejected = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] != "supported"]
-    if supported:
-        lines += ["| Analyst | Checked statement | Value | Confidence | Evidence (operation @ offset+length) |", "|---|---|---|---|---|"]
-        for result, finding in supported:
+    derived = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] == "derived"]
+    rejected = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] not in ("supported", "derived")]
+
+    def table(rows):
+        out = ["| Analyst | Checked statement | Value | Confidence | Evidence (operation @ offset+length) |", "|---|---|---|---|---|"]
+        for result, finding in rows:
             cited = "; ".join(
                 f"{evidence[i]['operation']} @ {evidence[i]['location']['offset']}+{evidence[i]['location']['length']}"
                 for i in finding["evidence_ids"][:6] if i in evidence)
             more = len(finding["evidence_ids"]) - 6
             cited += f"; +{more} more" if more > 0 else ""
-            lines.append(f"| {result['role']} | {finding['statement']} | {_cell(finding['value'])} | {finding['confidence']} | {cited} |")
-    else:
-        lines.append("No finding was supported by the evidence.")
+            out.append(f"| {result['role']} | {finding['statement']} | {_cell(finding['value'])} | {finding['confidence']} | {cited} |")
+        return out
+
+    lines += table(supported) if supported else ["No finding was supported by the evidence."]
+    if derived:
+        # contract/2: the tool's reading, anchored in the input but not verified against it
+        lines += ["", "## Derived by analysis tools (not verified against the bytes)", ""] + table(derived)
     lines += ["", "## Rejected or unreviewed claims", ""]
     if rejected:
         lines += ["| Analyst | Claim (analyst wording, unchecked) | Verdict | Reasons |", "|---|---|---|---|"]

@@ -13,7 +13,7 @@ import hashlib
 import json
 import re
 
-CONTRACT_VERSION = "reverseai.contract/1"
+CONTRACT_VERSION = "reverseai.contract/2"
 
 MAX_EXCERPT_BYTES = 4096
 MAX_OBSERVATION_BYTES = 4096
@@ -23,10 +23,10 @@ MAX_STRING_ARG_CHARS = 256
 MAX_WORKER_REPLY_BYTES = 262_144
 WORKER_PROTOCOL = "reverseai.worker/1"
 
-ROLES = ("structural", "capability")
+ROLES = ("structural", "capability", "code")
 FINDING_CONFIDENCE = ("observed", "inferred")
 RESULT_STATUS = ("ok", "error", "budget_exceeded")
-VERDICT_STATUS = ("supported", "unsupported", "contradicted")
+VERDICT_STATUS = ("supported", "derived", "unsupported", "contradicted")
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
@@ -254,11 +254,13 @@ class OperationSpec:
     args: Mapping[str, ArgSpec]
     handler: Handler  # (frozen bytes, validated args) -> list[Observation]
     max_observations: int = 1024
+    derived: bool = False  # contract/2: values are the tool's interpretation; the host re-derives only the anchor
 
     def __post_init__(self):
         require(isinstance(self.name, str) and _OPERATION.match(self.name), "Invalid operation name")
         require(all(isinstance(k, str) and _NAME.match(k) and isinstance(v, ArgSpec) for k, v in self.args.items()), "Invalid argument specs")
         require(callable(self.handler), "Operation handler must be callable")
+        require(type(self.derived) is bool, "OperationSpec derived must be a bool")
 
     def validate_args(self, raw) -> dict:
         """Unknown arguments are refused; missing ones take the declared default."""
@@ -451,4 +453,4 @@ class ReviewVerdict:
         require(isinstance(self.finding_id, str) and _ID.match(self.finding_id), "Invalid verdict finding ID")
         require(self.status in VERDICT_STATUS, "Invalid verdict status")
         require(all(isinstance(r, str) and len(r) <= 200 for r in self.reasons), "Invalid verdict reasons")
-        require(self.status == "supported" or self.reasons, "A rejected finding needs a reason")
+        require(self.status == "supported" or self.reasons, "A finding that is not supported needs a reason")
