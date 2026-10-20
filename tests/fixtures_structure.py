@@ -334,3 +334,53 @@ def elf_dynamic_imports(*, width=64, order="<", gnu_hash=False):
         out[start:start + len(value)] = value
     return bytes(out), {"library_names": [strings_offset + 1], "symbol_names": [strings_offset + 13, strings_offset + 19],
                         "dynamic": dynamic_offset, "hash": hash_offset}
+
+
+def elf_dynamic_mapping_product(count=2000, *, distinct=False):
+    """Many PT_LOAD/PT_DYNAMIC headers: repeated ambiguous aliases, or distinct unmapped queries."""
+    phoff, phsize, base = 64, 56, 0x400000
+    dynamic = phoff + phsize * count * 2
+    tables = count if distinct else 1
+    strings = dynamic + tables * 48
+    total = strings + 2
+    ident = b"\x7fELF" + bytes((2, 1, 1)) + bytes(9)
+    header = ident + struct.pack("<HHIQQQIHHHHHH", 3, 62, 1, 0, phoff, 0, 0, 64, phsize, count * 2, 64, 0, 0)
+    if distinct:
+        loads = b"".join(struct.pack("<IIQQQQQQ", 1, 4, strings, base + i * 4, base + i * 4, 2, 2, 1)
+                         for i in range(count))
+    else:
+        load = struct.pack("<IIQQQQQQ", 1, 4, 0, base, base, total, total, 0x1000)
+        loads = load * count
+    dynamics = b"".join(struct.pack("<IIQQQQQQ", 2, 4, dynamic + (i * 48 if distinct else 0), 0, 0, 48, 48, 8)
+                        for i in range(count))
+    tags = b"".join(struct.pack("<6Q", 5, base + count * 4 + 16 + i * 4 if distinct else base + strings,
+                               10, 2, 0, 0) for i in range(tables))
+    return header + loads + dynamics + tags + b"x\0"
+
+
+def elf_dynamic_hash_product(*, chains=True, tables=200, entries=2000):
+    """Distinct dynamic tables share a large GNU hash table and an unmapped symbol pointer."""
+    base = 0x400000
+    hash_offset = (64 + 56 * (tables + 1) + 15) & ~15
+    buckets = 1 if chains else entries
+    hashed = struct.pack("<4I", buckets, 1, 1, 0) + bytes(8)
+    bucket_start = hash_offset + len(hashed)
+    hashed += struct.pack("<I", 1) if chains else bytes(4 * entries)
+    chain_start = hash_offset + len(hashed)
+    if chains:
+        hashed += struct.pack("<I", 2) * (entries - 1) + struct.pack("<I", 1)
+    dynamic = (hash_offset + len(hashed) + 15) & ~15
+    strings = dynamic + tables * 96
+    total = strings + 2
+    tags = b"".join(struct.pack("<QQ", tag, value) for tag, value in (
+        (5, base + strings), (10, 2), (6, base + total + 0x1000), (11, 24), (0x6FFFFEF5, base + hash_offset), (0, 0)))
+    ident = b"\x7fELF" + bytes((2, 1, 1)) + bytes(9)
+    header = ident + struct.pack("<HHIQQQIHHHHHH", 3, 62, 1, 0, 64, 0, 0, 64, 56, tables + 1, 64, 0, 0)
+    program = struct.pack("<IIQQQQQQ", 1, 4, 0, base, base, total, total, 0x1000)
+    program += b"".join(struct.pack("<IIQQQQQQ", 2, 4, dynamic + i * 96, 0, 0, 96, 96, 8) for i in range(tables))
+    out = bytearray(total)
+    out[:len(header + program)] = header + program
+    out[hash_offset:hash_offset + len(hashed)] = hashed
+    out[dynamic:strings] = tags * tables
+    out[strings:] = b"x\0"
+    return bytes(out), {"counted_start": chain_start if chains else bucket_start, "counted_end": chain_start + entries * 4 if chains else chain_start}
