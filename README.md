@@ -6,59 +6,78 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M1 prototype.** Two deterministic analysts (file structure and string
-indicators) run through an allowlisting gateway, and an evidence reviewer checks
-every claim against the frozen input bytes. It uses only the Python standard
-library and synthetic test fixtures. No external analysis tools, model-driven
-agents, containers or platform containment are part of M1, and none is claimed.
+**Status: M2b released, M3 (Ghidra) in progress.** Deterministic analysts read
+file structure and string indicators in-process, and two pinned open-source tools,
+LIEF and YARA-X, run in locked containers. Every value a tool reports is re-derived
+by the host from the input bytes before it can become evidence, and a reviewer
+re-checks each claim against those bytes. Model-driven agents are not part of the
+current releases.
 
-## Try the M1 prototype
+## How it works
 
-Python 3.12 or later, no dependencies:
+<p align="center">
+  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway runs allowlisted operations in host parsers and in a locked container per run (LIEF, YARA-X, Ghidra); the host re-derives every value a tool reports from the bytes; evidence binds hash, tool, operation and byte range; analysts make claims; a reviewer re-checks bytes and rules; the report sorts findings into supported, derived, unsupported and contradicted.">
+</p>
+
+What this buys, and how each point is checked:
+
+| Property | How it holds |
+| --- | --- |
+| A supported finding is backed by exact bytes | The reviewer recomputes the input hash, the byte range and its hash for every cited item, and the claim rule must yield exactly the claimed value. |
+| A compromised tool can hide evidence but not invent it | The host re-derives every value a contained worker reports (headers, sections, signature matches) from its own copy of the bytes and refuses the whole reply on any mismatch. |
+| Tools cannot reach the host or the network | One container per run: no network, read-only root, non-root user, every capability dropped, no new privileges, CPU, memory, process and time limits, a single read-only snapshot mount, image pinned by ID. `tests/verify_m2_runtime.py` proves these limits against the real engine. |
+| Interpretations stay labelled | Decompiled code and function lists (M3) are *derived*: anchored in the input and reviewed, but never presented as verified fact and never able to contradict one. |
+| One claim cannot cancel a verified one | Only findings whose evidence all verifies can contradict each other. |
+| Reports are reproducible | Same input and budget, same report; the report names each tool version and container image. |
+
+## Roadmap
+
+| Milestone | Scope | State |
+| --- | --- | --- |
+| M1 | Gateway, structural and capability analysts, evidence reviewer, reports | released |
+| M2a | LIEF 1.0.0 in a container, host re-derivation of every worker value | released |
+| M2b | YARA-X 1.21.0 in a container, reviewed literal ruleset, verified signature matches | released |
+| M3 | Ghidra 12.1.4 headless: functions, pseudocode, calls as derived evidence; then Mach-O | in progress |
+| M4 | JADX for Android packages | planned |
+| M5 | JavaScript application analysis | planned |
+| M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
+| M7 | Measured comparison with REA Safe Agent on a known-answer corpus | planned |
+
+## Try it
+
+Python 3.12 or later, no Python dependencies:
 
 ```sh
 python3 -m reverseai analyze path/to/approved-file --out new-report-dir
 python3 -B -m unittest discover -s tests -t . -v
 ```
 
+With Docker and the locally built, pinned images (`tools/build_lief_image.py`,
+`tools/build_yarax_image.py`), add `--with-lief` and `--with-yarax`; the command
+refuses cleanly when an image or Docker is missing. The native containment proof:
+
+```sh
+python3 -B tests/verify_m2_runtime.py --tool lief --profile small --offline --lock containers/lief/image.lock.json --receipt <new file>
+```
+
 The command reads one approved regular file without executing it and writes
 `report.json` and `report.md`: supported findings with their byte evidence, and
-rejected claims with the reviewer's reasons. Findings marked *inferred* are hints
-from names in the file, not proof of behaviour. The contract between components
-is in [docs/contract.md](docs/contract.md).
+rejected claims with the reviewer's reasons. Findings marked *inferred* are hints,
+not proof of behaviour. The contract between components is in
+[docs/contract.md](docs/contract.md).
 
-Known limits of M1, by design:
+Known limits, by design:
 
-- Only ELF and PE headers and section tables are parsed. A Mach-O file is
-  recognized by its magic bytes only; universal (fat) binaries are reported as
-  unrecognized. String indicators are lexical hints (an API name or a word such
-  as "connect"), never proof of behaviour.
-- The reviewer checks provenance and the claim rules in `reverseai/claims.py`; a
-  claim type without a rule is never supported. The Markdown report states each
-  supported finding in the reviewer's own words; an analyst's free wording appears
-  only under rejected claims and in the JSON.
-- Time budgets are soft: a Python handler that overruns is reported and its late
-  output discarded, but it cannot be killed. M1 has no process or container
-  isolation and claims none.
-- Reports are reproducible for a given input and budget unless a shared global
-  budget runs out; then which concurrent analyst received the last slots may vary,
-  and the run says `budget_exceeded`.
+- ELF and PE headers and section tables are parsed; a Mach-O file is recognized
+  by its magic bytes only until M3b. String indicators and signature rules are
+  lexical hints, never proof of behaviour.
+- A claim type without a rule in `reverseai/claims.py` is never supported. The
+  Markdown report states supported findings in the reviewer's own words.
+- In-process handlers have soft time budgets; contained workers have hard wall,
+  memory and process limits. Containment is proven on Docker Desktop linux/arm64
+  only; other platforms need their own proof.
 - Reports contain bounded text taken from the sample. They are written with
   private permissions, and Markdown shows that text only inside code spans.
-
-## Planned workflow
-
-1. Select and approve input bytes.
-2. Create private frozen copies for contained analysis.
-3. Schedule independent analysis tasks within shared resource budgets.
-4. Run approved tool operations through a controlled gateway.
-5. Collect evidence with input hashes, tool versions and precise locations.
-6. Review contradictions and unsupported claims before producing the report.
-
-Initial tool candidates are Ghidra, JADX, the open-source LIEF core and YARA-X.
-capa, FLOSS and Binwalk are later candidates, subject to interface, license,
-dependency and containment review. Tools are candidates, not installed features.
-Samples will not be launched as native programs in the initial static profile.
 
 ## Security foundation
 
