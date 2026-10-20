@@ -78,14 +78,14 @@ class BuildTests(unittest.TestCase):
         pull, built = self.docker.calls
         self.assertEqual(pull, ("pull", "--platform", "linux/arm64", build.BASE))
         self.assertEqual(built[:4], ("build", "--platform", "linux/arm64", "--pull=false"))
-        self.assertEqual(built[4:8], ("--iidfile", built[5], "--tag", "reverseai-ghidra:12.1.4-r3"))
+        self.assertEqual(built[4:8], ("--iidfile", built[5], "--tag", "reverseai-ghidra:12.1.4-r4"))
         self.assertEqual(len(built), 9)  # network is restricted by the Dockerfile itself (one natives RUN)
         self.assertEqual(self.docker.context, [
             "Dockerfile", "downloads", "downloads/" + build.ASSETS["jdk"]["name"], "downloads/" + build.ASSETS["ghidra"]["name"],
             "ghidra_scripts", "ghidra_scripts/ReverseAIOptions.java", "ghidra_scripts/ReverseAIQuery.java", "unpack.py", "worker.py"])
         self.assertEqual(self.docker.downloads, {build.ASSETS[key]["name"]: FAKE[key] for key in FAKE})
         self.assertEqual(json.loads(self.lock.read_text()), {
-            "adapter_version": "12.1.4-r3", "base_digest": build.BASE_DIGEST, "image_id": "sha256:" + "a" * 64,
+            "adapter_version": "12.1.4-r4", "base_digest": build.BASE_DIGEST, "image_id": "sha256:" + "a" * 64,
             "ghidra_sha256": hashlib.sha256(FAKE["ghidra"]).hexdigest(), "jdk_sha256": hashlib.sha256(FAKE["jdk"]).hexdigest(),
             "platform": "linux/arm64"})
 

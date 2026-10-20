@@ -20,7 +20,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from reverseai.contract import WorkerError, parse_worker_reply, sha256_hex
+from reverseai.contract import Location, Observation, WorkerError, parse_worker_reply, sha256_hex
+from reverseai.tools import ghidra_verify, structure
 from tests.fixtures_code import TEXT_SIZE, elf_code, elf_data_only, macho_code, pe_code
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +85,42 @@ def expected(layout, names=None, *, args=DEFAULTS, texts=None):
 
 def observe(data, q, **args):
     return worker.observations(data, q, dict(DEFAULTS, **args))
+
+
+def macho_commands(data):
+    """The load commands of a thin 64-bit Mach-O, as (cmd, bytes)."""
+    count, at, found = struct.unpack_from("<I", data, 16)[0], 32, []
+    for _ in range(count):
+        command, size = struct.unpack_from("<II", data, at)
+        found.append((command, data[at:at + size]))
+        at += size
+    return found
+
+
+def macho_rebuilt(data, commands, cputype=None):
+    """macho_code with other load commands; the code at 0x200 and __LINKEDIT stay where they are."""
+    header = bytearray(data[:32])
+    struct.pack_into("<II", header, 16, len(commands), sum(map(len, commands)))
+    if cputype is not None:
+        struct.pack_into("<I", header, 4, cputype)
+    rebuilt = bytes(header) + b"".join(commands)
+    assert len(rebuilt) <= 0x200
+    return rebuilt + bytes(0x200 - len(rebuilt)) + data[0x200:]
+
+
+def unixthread(flavor, count, pc, pc_offset, extra=b""):
+    """LC_UNIXTHREAD with one (flavor, count) state holding pc at pc_offset, then extra bytes."""
+    state = bytearray(count * 4)
+    if pc_offset + 8 <= len(state):
+        struct.pack_into("<Q", state, pc_offset, pc)
+    body = struct.pack("<II", flavor, count) + bytes(state) + extra
+    return struct.pack("<II", 0x5, 8 + len(body)) + body
+
+
+def macho_text_and_main(data):
+    commands = macho_commands(data)
+    return (next(body for command, body in commands if command == 0x19 and body[8:14] == b"__TEXT"),
+            next(body for command, body in commands if command == 0x80000028))
 
 
 class KnownAnswerTests(unittest.TestCase):
@@ -409,11 +446,13 @@ class FileMapTests(unittest.TestCase):
             with self.subTest(flags=hex(flags)):
                 self.assertEqual(worker.macho_map(bytes(attributes))[1], [(0x200, 0x256, 0x100000200, True)])
         main = data.index((0x80000028).to_bytes(4, "little") + (24).to_bytes(4, "little"))
-        cases = {"the last command past sizeofcmds": (main + 4, 32), "more sections than the command holds": (nsects, 2),
-                 "section bytes past the end": (section_size, 0x1000)}
-        for label, (at, value) in cases.items():
+        filesize = 32 + 72 + 48  # __TEXT's filesize: a section past it is not mapped, a segment past the input is refused
+        cases = {"the last command past sizeofcmds": ((main + 4, 32),), "more sections than the command holds": ((nsects, 2),),
+                 "section bytes past the end": ((section_size, 0x1000), (filesize, 0x2000))}
+        for label, patches in cases.items():
             broken = bytearray(data)
-            broken[at:at + 4] = value.to_bytes(4, "little")
+            for at, value in patches:
+                broken[at:at + 4] = value.to_bytes(4, "little")
             with self.subTest(label), self.assertRaises(worker.TruncatedStructure):
                 worker.macho_map(bytes(broken))
         vmaddr = 0x1000  # a 32-bit header: LC_SEGMENT with its 56-byte command and 68-byte sections
@@ -424,6 +463,74 @@ class FileMapTests(unittest.TestCase):
         thin32 += bytes(0x100 - len(thin32)) + bytes(0x10)
         self.assertEqual(worker.kind(thin32), "macho")
         self.assertEqual(worker.macho_map(thin32), (vmaddr + 0x100, [(0x100, 0x110, vmaddr + 0x100, True)]))
+
+    def test_the_macho_entry_follows_the_hosts_lc_main_and_lc_unixthread_rule(self):
+        """Decision m3b-macho-entry: the entry that leads the pseudocode is the one the host verifier checks."""
+        data, layout = macho_code()
+        text, main = macho_text_and_main(data)
+        def text_with(field, value):  # __TEXT with one of vmaddr (24), vmsize (32), filesize (48) changed
+            changed = bytearray(text)
+            struct.pack_into("<Q", changed, field, value)
+            return bytes(changed)
+        alias = struct.pack("<II16sQQQQiiII", 0x19, 72, b"__ALIAS", 0x200000000, 0x1000, 0, 0x256, 5, 5, 0, 0)
+        x86 = unixthread(4, 42, 0x100000200, 128)
+        malformed = unixthread(4, 42, 0x100000200, 128, struct.pack("<II", 9, 4))
+        cases = {
+            "LC_MAIN": (data, 0x100000200),
+            "x86_64 rip": (macho_rebuilt(data, [text, x86]), 0x100000200),
+            "arm64 pc": (macho_rebuilt(data, [text, unixthread(6, 68, 0x100000220, 256)], cputype=0x100000C), 0x100000220),
+            "LC_MAIN before a thread": (macho_rebuilt(data, [text, main, unixthread(4, 42, 0x100000250, 128)]), 0x100000200),
+            "arm64 state in an x86_64 file": (macho_rebuilt(data, [text, unixthread(6, 68, 0x100000220, 256)]), 0),
+            "wrong state count": (macho_rebuilt(data, [text, unixthread(4, 41, 0x100000200, 128)]), 0),
+            "a record past its command": (macho_rebuilt(data, [text, malformed]), 0),
+            "LC_MAIN with a malformed thread": (macho_rebuilt(data, [text, main, malformed]), 0),
+            "a 4-byte thread tail": (macho_rebuilt(data, [text, unixthread(4, 42, 0x100000200, 128, bytes(4))]), 0),
+            "two threads": (macho_rebuilt(data, [x86, x86]), 0),
+            "two LC_MAIN": (macho_rebuilt(data, [text, main, main]), 0),
+            "short LC_MAIN": (macho_rebuilt(data, [text, struct.pack("<IIQ", 0x80000028, 16, 0x200), x86]), 0),
+            "entryoff past vmsize": (macho_rebuilt(data, [text_with(32, 0x100), main]), 0),
+            "segment past the input": (macho_rebuilt(data, [text_with(48, 0x2000), main]), 0),
+            "segment past the address space": (macho_rebuilt(data, [text_with(32, 2**64 - 0x100000000 + 1), main]), 0),
+            "two segments hold entryoff": (macho_rebuilt(data, [text, alias, main]), 0),
+            "no entry command": (macho_rebuilt(data, [text]), 0),
+        }
+        for label, (sample, entry) in cases.items():
+            with self.subTest(label):
+                self.assertEqual(worker.macho_map(sample)[0], entry)
+                self.assertEqual(worker.macho_map(sample)[0], structure.macho_entry(sample) or 0)
+
+    def test_macho_sections_outside_their_segments_file_bytes_are_not_mapped(self):
+        """Decision m3b-macho-zerofill: the worker maps exactly the code sections the host's macho_sections keeps."""
+        data, _ = macho_code()
+        text_segment = 32 + 72
+        for label, at, value, mapped in (("declared", None, None, True), ("segment ends inside the section", text_segment + 48, 0x250, False),
+                                         ("segment starts after the section", text_segment + 40, 0x201, False)):
+            sample = bytearray(data)
+            if at is not None:
+                struct.pack_into("<Q", sample, at, value)  # __TEXT filesize, then fileoff
+            sample = bytes(sample)
+            host = [(row["offset"], row["offset"] + row["size"], row["addr"], row["executable"])
+                    for row in structure.macho_sections(sample) if row["size"] and row["offset"]]
+            with self.subTest(label):
+                self.assertEqual(worker.macho_map(sample)[1], host)
+                self.assertEqual(bool(host), mapped)
+
+    def test_an_lc_unixthread_macho_reply_passes_the_host_verifier(self):
+        """The same Mach-O through the worker (Ghidra's query in ReverseAIQuery's order) and the host verifier."""
+        data, layout = macho_code()
+        text, _ = macho_text_and_main(data)
+        threaded = macho_rebuilt(data, [text, unixthread(4, 42, layout["entry"], 128)])
+        spans = {f["entry"]: f["size"] for f in layout["functions"]}
+        offsets = {f["entry"]: f["offset"] for f in layout["functions"]}
+        for sample in (data, threaded):
+            def ghidra(format_, args, entry_offset, sample=sample):
+                q = query(sample, layout, names=["entry", "add_numbers", "compute", "constant"])
+                q["pseudocode"].sort(key=lambda p: (offsets[p["entry"]] != entry_offset, -spans[p["entry"]], p["entry"]))
+                return q
+            records = worker.run("ghidra.analyze", DEFAULTS, sample, query_of=ghidra)
+            with self.subTest(threaded=sample is threaded):
+                self.assertEqual([r["value"]["entry"] for r in records if r["value"]["kind"] == "pseudocode"][0], layout["entry"])
+                ghidra_verify.verify(sample, [Observation(Location(**r["location"]), r["value"]) for r in records], DEFAULTS)
 
     def test_only_elf_pe_and_thin_little_endian_macho_are_accepted(self):
         for data in (b"", b"\xca\xfe\xba\xbe" + bytes(60), b"\xfe\xed\xfa\xcf" + bytes(60), b"PK\x03\x04" + bytes(60),
@@ -573,7 +680,7 @@ class BuildInputTests(unittest.TestCase):
     def test_scripts_lock_and_dockerfile_are_pinned_consistently(self):
         lock = json.loads((SOURCE / "image.lock.json").read_text(encoding="utf-8"))
         self.assertEqual(set(lock), {"adapter_version", "base_digest", "ghidra_sha256", "image_id", "jdk_sha256", "platform"})
-        self.assertEqual((lock["adapter_version"], lock["platform"], worker.ADAPTER_VERSION), ("12.1.4-r3", "linux/arm64", "12.1.4-r3"))
+        self.assertEqual((lock["adapter_version"], lock["platform"], worker.ADAPTER_VERSION), ("12.1.4-r4", "linux/arm64", "12.1.4-r4"))
         self.assertEqual(lock["ghidra_sha256"], "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db")
         self.assertEqual(lock["jdk_sha256"], "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223")
         self.assertEqual(lock["base_digest"], json.loads((ROOT / "containers" / "lief" / "image.lock.json").read_text())["base_digest"])
