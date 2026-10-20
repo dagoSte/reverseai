@@ -14,8 +14,12 @@ ELF_SECTIONS = ((b".text", 1, 0x6, 32), (b".data", 1, 0x3, 16), (b".rwx", 1, 0x7
 PE_SECTIONS = ((b".text", 0x60000020, 0x200), (b".data", 0xC0000040, 0x200), (b".rwx", 0xE0000020, 0x200))
 
 
-def elf(*, width=64, order="<", kind=2, machine=62, entry=0x401000, sections=ELF_SECTIONS):
-    """An ELF header, section contents, .shstrtab and a section table (null entry first, .shstrtab last)."""
+def elf(*, width=64, order="<", kind=2, machine=62, entry=0x401000, sections=ELF_SECTIONS, extended=False, shstrndx=None):
+    """An ELF header, section contents, .shstrtab and a section table (null entry first, .shstrtab last).
+
+    extended uses ELF extended numbering: e_shnum 0 and e_shstrndx SHN_XINDEX, with the real values in
+    section 0's sh_size and sh_link. shstrndx overrides the header's name table index.
+    """
     header_size, entry_size = (64, 64) if width == 64 else (52, 40)
     contents, offsets, position = b"", [], header_size
     for _, _, _, size in sections:
@@ -34,13 +38,14 @@ def elf(*, width=64, order="<", kind=2, machine=62, entry=0x401000, sections=ELF
     shnum = len(sections) + 2
     word = "Q" if width == 64 else "I"
     layout = order + ("IIQQQQIIQQ" if width == 64 else "IIIIIIIIII")
-    table = bytes(entry_size)  # SHN_UNDEF
+    names_index = shnum - 1 if shstrndx is None else shstrndx
+    table = struct.pack(layout, 0, 0, 0, 0, 0, shnum if extended else 0, names_index if extended else 0, 0, 0, 0)
     for (name, sh_type, flags, size), name_offset, offset in zip(sections, name_offsets, offsets):
         table += struct.pack(layout, name_offset, sh_type, flags, 0, offset, size, 0, 0, 1, 0)
     table += struct.pack(layout, shstrtab_name, 3, 0, 0, strtab_offset, len(names), 0, 0, 1, 0)
     ident = b"\x7fELF" + bytes([2 if width == 64 else 1, 1 if order == "<" else 2, 1]) + bytes(9)
     header = ident + struct.pack(order + "HHI" + word * 3 + "IHHHHHH", kind, machine, 1, entry, 0, shoff, 0,
-                                 header_size, 0, 0, entry_size, shnum, shnum - 1)
+                                 header_size, 0, 0, entry_size, 0 if extended else shnum, 0xFFFF if extended else names_index)
     data = header + contents + names
     data += bytes(shoff - len(data)) + table
     return data, {"header_size": header_size, "entry_size": entry_size, "shoff": shoff, "shnum": shnum,
@@ -97,6 +102,9 @@ def malformed():
         "pe truncated optional": (pe64[:coff + 30], both),
         "pe huge section count": (patched(pe64, coff + 2, "<H", 0xFFFF), tables),
         "pe huge optional size": (patched(pe64, coff + 16, "<H", 0xFFFF), tables),
+        # Undersized: the following bytes exist, so only the declared size can reject them.
+        "pe zero optional size": (patched(pe64, coff + 16, "<H", 0), both),
+        "pe optional size below its fields": (patched(pe64, coff + 16, "<H", 8), both),
         "pe truncated section table": (pe64[:pe_layout["table_offset"] + 50], tables),
     }
 

@@ -31,10 +31,16 @@ def _require(condition, message):
         raise IntakeError(message)
 
 
+def display_name(path: Path) -> str:
+    """The file name for reports: host names are bytes, so non-UTF-8 bytes become \\xNN escapes."""
+    name = os.fsencode(path.name).decode("utf-8", "backslashreplace")
+    return name if len(name) <= 255 else name[:254] + "\u2026"
+
+
 def _regular_stat(path: Path):
     try:
         value = path.lstat()
-    except OSError:
+    except (OSError, ValueError):  # ValueError: a NUL byte in the path
         raise IntakeError("Input file could not be inspected") from None
     _require(not stat.S_ISLNK(value.st_mode) and not getattr(value, "st_file_attributes", 0) & _REPARSE_POINT,
              "Symlinks and reparse points cannot be input files")
@@ -54,7 +60,7 @@ def snapshot(path) -> tuple[bytes, InputRef]:
         # the identity check below then refuses it.
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
                              | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_BINARY", 0))
-    except OSError:
+    except (OSError, ValueError):
         raise IntakeError("Input file could not be opened") from None
     try:
         with os.fdopen(descriptor, "rb") as handle:
@@ -71,4 +77,4 @@ def snapshot(path) -> tuple[bytes, InputRef]:
     _require(len(data) <= MAX_INPUT_BYTES and len(data) == opened.st_size == after.st_size
              and (opened.st_mtime_ns, opened.st_ctime_ns) == (after.st_mtime_ns, after.st_ctime_ns),
              "Input changed while reading")
-    return data, InputRef(sha256=sha256_hex(data), size=len(data), name=path.name)
+    return data, InputRef(sha256=sha256_hex(data), size=len(data), name=display_name(path))

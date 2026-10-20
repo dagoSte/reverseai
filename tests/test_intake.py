@@ -1,6 +1,9 @@
+import json
 import os
 from pathlib import Path
+import stat
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -84,6 +87,72 @@ class IntakeTests(unittest.TestCase):
             value = real(descriptor)
             return Changed(value, st_mtime_ns=value.st_mtime_ns + 1) if len(calls) > 1 else value
         with patch.object(intake.os, "fstat", side_effect=touched):
+            self.refused(self.sample, "Input changed while reading")
+
+    def test_an_empty_file_is_frozen(self):
+        empty = self.root / "empty.bin"
+        empty.write_bytes(b"")
+        self.assertEqual(intake.snapshot(empty), (b"", InputRef(sha256=sha256_hex(b""), size=0, name="empty.bin")))
+
+    def test_a_nul_in_the_path_is_an_intake_error(self):
+        self.refused(str(self.root) + "/a\x00b", "Input file could not be inspected")
+
+    def test_non_utf8_names_become_escapes_that_reports_can_encode(self):
+        name = intake.display_name(Path(os.fsdecode(b"/any/bad\xffname.bin")))
+        self.assertEqual(name, "bad\\xffname.bin")
+        json.dumps(name).encode("utf-8")
+        self.assertEqual(len(intake.display_name(Path("n" * 300))), 255)
+
+    def test_the_input_ref_uses_the_display_name(self):
+        with patch.object(intake, "display_name", return_value="shown.bin") as shown:
+            self.assertEqual(intake.snapshot(self.sample)[1].name, "shown.bin")
+        shown.assert_called_once()
+
+    def test_a_real_non_utf8_file_name_reaches_the_input_ref_escaped(self):
+        try:
+            raw = os.fsencode(self.root) + b"/bad\xffname.bin"
+            with open(raw, "wb") as handle:
+                handle.write(b"x")
+        except OSError:
+            self.skipTest("this file system refuses non-UTF-8 names")  # macOS APFS does
+        self.assertEqual(intake.snapshot(os.fsdecode(raw))[1].name, "bad\\xffname.bin")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs need a POSIX host")
+    def test_a_fifo_swapped_in_after_inspection_is_refused_without_blocking(self):
+        real = intake._regular_stat
+        def swap(path):
+            value = real(path)
+            path.unlink()
+            os.mkfifo(path)
+            return value
+        outcome = []
+        def attempt():
+            try:
+                intake.snapshot(self.sample)
+            except intake.IntakeError as error:
+                outcome.append(str(error))
+        with patch.object(intake, "_regular_stat", side_effect=swap):
+            worker = threading.Thread(target=attempt, daemon=True)
+            worker.start()
+            worker.join(timeout=10)
+        if worker.is_alive():  # unblock the reader before failing
+            os.close(os.open(self.sample, os.O_WRONLY | os.O_NONBLOCK))
+            self.fail("opening a FIFO blocked: O_NONBLOCK is missing")
+        self.assertEqual(outcome, ["Input file changed identity while opening"])
+
+    def test_the_open_handle_is_checked_again(self):
+        real = os.fstat
+        for label, changes, message in (
+                ("second hard link", {"st_nlink": 2}, "Input file changed identity while opening"),
+                ("not a regular file", {"st_mode": stat.S_IFIFO | 0o644}, "Input file changed identity while opening")):
+            with self.subTest(label), patch.object(intake.os, "fstat", side_effect=lambda fd, c=changes: Changed(real(fd), **c)):
+                self.refused(self.sample, message)
+        calls = []
+        def ctime_changed(descriptor):
+            calls.append(descriptor)
+            value = real(descriptor)
+            return Changed(value, st_ctime_ns=value.st_ctime_ns + 1) if len(calls) > 1 else value
+        with patch.object(intake.os, "fstat", side_effect=ctime_changed):
             self.refused(self.sample, "Input changed while reading")
 
     def test_a_link_swapped_in_after_inspection_is_not_followed(self):

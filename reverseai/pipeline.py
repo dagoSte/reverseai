@@ -26,7 +26,7 @@ def analyze_bytes(data, ref, *, budget=None, analysts=ANALYSTS, tools=TOOLS):
         findings = analyst.conclude(task, partial.evidence) if partial.evidence else ()
         results.append(AnalysisResult(task.id, task.role, partial.status, partial.evidence, tuple(findings), partial.errors))
     refs = {spec.ref.name: spec.ref for spec in tools}
-    verdicts = review.review(data, ref, results, refs)
+    verdicts = review.review(data, ref, results, {spec.ref.name: spec for spec in tools})
     return Analysis(ref, tuple(sorted(refs.values(), key=lambda r: r.name)), tuple(results), tuple(verdicts))
 
 
