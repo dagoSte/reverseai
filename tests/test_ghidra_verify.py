@@ -79,6 +79,7 @@ class MachOAnchorTests(unittest.TestCase):
             struct.pack_into("<I", changed, text_section + 64, 0x80000400 | section_type)
             with self.subTest(section_type=section_type):
                 self.assertFalse(self.accepts(self.items[:1], data=bytes(changed)))
+                self.assertFalse(self.accepts([], data=bytes(changed)))
 
     def test_macho_function_only_anchors_require_unique_file_and_virtual_maps(self):
         self.assertTrue(self.accepts(self.items[:1]))
