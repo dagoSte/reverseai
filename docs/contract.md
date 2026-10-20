@@ -28,6 +28,7 @@ approved file
 | `reverseai/tools/strings.py` | lane B | `TOOL: ToolSpec` named `strings` |
 | `reverseai/analysts/capability.py` | lane B | `plan`, `conclude` as above |
 | `reverseai/gateway.py` | lane B | `Gateway(tools: Iterable[ToolSpec], budget: Budget)` with `run(task, data) -> AnalysisResult` |
+| `reverseai/claims.py` | coordinator (contract) | `RULES`, `check(finding, cited_evidence) -> tuple[str, ...]` reasons |
 | `reverseai/pipeline.py`, `reverseai/cli.py`, `reverseai/report.py` | coordinator | integration |
 
 ## Rules every component keeps
@@ -58,7 +59,11 @@ approved file
    inside the input and that the excerpt hash matches the frozen bytes. A finding
    that no longer matches its own ID (`finding_intact`), or that shares its ID with
    different content, is `unsupported`. A finding is also `unsupported` if any cited
-   item is missing or fails, or if it cites none; `contradicted` if another finding whose cited
+   item is missing or fails, if it cites none, or if `reverseai.claims.check` finds
+   that its claim_key has no rule, cites an operation the rule does not allow, or
+   that the cited observations do not yield exactly the claimed value. The reviewer
+   thereby checks that a claim follows from its evidence, not only that the
+   evidence exists; `contradicted` if another finding whose cited
    evidence also all verifies has the same `claim_key` and a different `value`;
    otherwise `supported`. An unsupported finding never contradicts anything, so
    a claim without valid evidence cannot cancel a verified one.
