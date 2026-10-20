@@ -169,6 +169,25 @@ class BuildTests(unittest.TestCase):
                     self.build(source=source)
                 self.assertEqual(self.docker.calls, [])
 
+    def test_trailing_backslash_runs_match_a_native_buildkit_parse(self):
+        """Measured with buildx v0.37.2 (cache-only builds, M3B-W): only a single trailing backslash, with or without
+        spaces after it, joins the next line; runs of 2 to 5 end the instruction."""
+        joins = {1: True, 2: False, 3: False, 4: False, 5: False}
+        for run, joined in joins.items():
+            for tail in ("", "  "):
+                with self.subTest(run=run, tail=tail):
+                    lines = build.logical_instructions("RUN echo first " + "\\" * run + tail + "\nRUN echo SECOND\n")
+                    self.assertEqual(len(lines), 1 if joined else 2)
+                    source = self.copy(f"run-{run}{'-spaces' if tail else ''}")
+                    (source / "Dockerfile").write_bytes(PREFIX + ("RUN true " + "\\" * run + tail + "\n").encode()
+                                                        + b"ADD https://example.invalid/x /x\nUSER 65534:65534\n")
+                    if joined:  # BuildKit reads ADD as words of the RUN command, and so does the guard
+                        self.assertEqual(self.build(source=source), 0)
+                    else:
+                        with self.assertRaisesRegex(SystemExit, "ADD is refused"):
+                            self.build(source=source)
+                    self.docker.calls.clear()
+
     def test_control_bytes_and_escaped_backslashes_cannot_hide_an_instruction(self):
         body = PREFIX
         user = b"USER 65534:65534\n"
