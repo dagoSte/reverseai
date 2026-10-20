@@ -6,7 +6,7 @@ from reverseai.contained import DockerExecutor, ContainedError, inspect_image
 from reverseai.contract import (
     ArgSpec, ContractError, OperationSpec, ToolRef, ToolSpec, parse_worker_reply, sha256_hex,
 )
-from reverseai.tools import lief_verify
+from reverseai.tools import lief_verify, structure
 
 REF = ToolRef("lief", "1.0.0-r2")
 DEFAULT_LOCK = Path(__file__).resolve().parents[2] / "containers/lief/image.lock.json"
@@ -21,6 +21,9 @@ def make_tool(executor=None):
     def handler(name, cap):
         def invoke(data, args):
             checked = operations[name].validate_args(args)
+            identified = structure.identify(data, {})
+            if not identified or identified[0].value["format"] not in ("elf", "pe"):
+                return []  # the M2a worker reads ELF and PE only; the host decides this, and no container starts
             digest = sha256_hex(data)
             raw = executor.run(name, checked, data, digest)
             # No more observations than the validated request allows (max_sections, or the headers cap).

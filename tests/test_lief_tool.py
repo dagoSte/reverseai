@@ -129,3 +129,20 @@ class AvailabilityTests(unittest.TestCase):
                     path.write_text(json.dumps(newer))
                     self.assertEqual(lief_tool.TOOL.runtime["image"], newer["image_id"])
                     self.assertEqual(tool.runtime["image"], lock()["image_id"])
+
+
+class FormatGateTests(unittest.TestCase):
+    def test_mach_o_and_unknown_inputs_start_no_worker_and_yield_no_observations(self):
+        from tests.fixtures_structure import macho, macho_fat
+
+        class NoRun:
+            lock = {"image_id": "sha256:" + "1" * 64, "platform": "linux/arm64"}
+
+            def run(self, *args, **kwargs):
+                raise AssertionError("the LIEF worker must not start for this input")
+
+        tool = lief_tool.make_tool(NoRun())
+        thin, fat = macho(), macho_fat()
+        for data in (thin[0] if isinstance(thin, tuple) else thin, fat[0] if isinstance(fat, tuple) else fat, b"plain text"):
+            for name in ("lief.headers", "lief.sections"):
+                self.assertEqual(tool.operations[name].handler(data, {}), [])
