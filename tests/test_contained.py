@@ -56,7 +56,7 @@ class ExecutorTests(unittest.TestCase):
         name, mount = argv[argv.index("--name") + 1], argv[argv.index("--mount") + 1]
         self.assertRegex(name, r"^reverseai-[a-f0-9]{32}$")
         self.assertEqual(argv, [
-            "docker", "run", "--rm", "--init", "--name", name, "--platform", "linux/arm64",
+            "docker", "run", "--rm", "--init", "--pull", "never", "--name", name, "--platform", "linux/arm64",
             "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
             "--user", "65534:65534", "--pids-limit", "64", "--memory", "512m", "--memory-swap", "512m",
             "--cpus", "1", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m", "--log-driver", "none",
