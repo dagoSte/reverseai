@@ -50,6 +50,8 @@ def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tool
         for finding in result.findings:
             first = findings.setdefault(finding.id, finding)
             reasons = problems.setdefault(finding.id, [])
+            if finding.claim_key in claims.DERIVED_CLAIMS:
+                derived.add(finding.id)
             if not finding_intact(finding):
                 reasons.append("finding does not match its ID")
                 continue

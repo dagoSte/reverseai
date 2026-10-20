@@ -23,7 +23,7 @@ WALL_SECONDS = 45
 GHIDRA_WALL_SECONDS = 240
 PLATFORM = "linux/arm64"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
-GHIDRA_VERSION = "12.1.4-r1"
+GHIDRA_VERSION = "12.1.4-r2"
 GHIDRA_PINS = MappingProxyType({
     "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
     "ghidra_sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",

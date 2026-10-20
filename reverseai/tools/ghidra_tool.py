@@ -6,7 +6,7 @@ from reverseai.contained import ContainedError, DockerExecutor, inspect_image, l
 from reverseai.contract import ArgSpec, ContractError, OperationSpec, ToolRef, ToolSpec, WorkerError, parse_worker_reply, sha256_hex
 from reverseai.tools import ghidra_verify
 
-REF = ToolRef("ghidra", "12.1.4-r1")
+REF = ToolRef("ghidra", "12.1.4-r2")
 DEFAULT_LOCK = Path(__file__).resolve().parents[2] / "containers/ghidra/image.lock.json"
 
 
