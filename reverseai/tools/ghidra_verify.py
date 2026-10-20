@@ -39,6 +39,8 @@ def _sections(data):
         _check(data[:4] in (b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"))
         mapped = structure.macho_sections(data)
         _check(bool(mapped))
+        width = 64 if data[:4] == b"\xcf\xfa\xed\xfe" else 32
+        _check(all(row["addr"] + row["size"] <= 2**width for row in mapped))
         sections = [_Section(row["addr"], row["offset"], row["size"], row["size"], row["executable"])
                     for row in mapped]
         return sections, structure.macho_entry(data)

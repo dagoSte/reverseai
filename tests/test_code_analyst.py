@@ -15,7 +15,7 @@ from reverseai.review import review
 
 DATA = bytes(range(256)) * 32
 INPUT = InputRef(sha256_hex(DATA), len(DATA), "inline.bin")
-REF = ToolRef("ghidra", "12.1.4-r3")
+REF = ToolRef("ghidra", "12.1.4-r4")
 
 
 def tool(*, ref=REF, derived=True, operation="ghidra.analyze"):
@@ -57,6 +57,7 @@ class CodeAnalystTests(unittest.TestCase):
     def test_plan_is_optional_and_requires_the_exact_derived_operation(self):
         self.assertIsNone(code.plan(INPUT))
         for other in (tool(ref=ToolRef("ghidra", "12.1.4-r1")), tool(ref=ToolRef("ghidra", "12.1.4-r2")),
+                      tool(ref=ToolRef("ghidra", "12.1.4-r3")),
                       tool(derived=False), tool(operation="ghidra.other")):
             with self.subTest(tool=other.ref, operations=tuple(other.operations)):
                 self.assertIsNone(code.plan(INPUT, tools=(other,)))
@@ -106,6 +107,7 @@ class CodeAnalystTests(unittest.TestCase):
             observed(data=DATA[:-1] + b"!", **value),
             observed(ref=ToolRef("ghidra", "12.1.4-r1"), **value),
             observed(ref=ToolRef("ghidra", "12.1.4-r2"), **value),
+            observed(ref=ToolRef("ghidra", "12.1.4-r3"), **value),
             observed(ref=ToolRef("other", "12.1.4-r1"), operation="other.analyze", **value),
             observed(operation="ghidra.other", **value),
         )

@@ -23,7 +23,7 @@ def lock():
 
 
 def ghidra_lock():
-    return {"image_id": "sha256:" + "a" * 64, "platform": "linux/arm64", "adapter_version": "12.1.4-r3",
+    return {"image_id": "sha256:" + "a" * 64, "platform": "linux/arm64", "adapter_version": "12.1.4-r4",
             "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
             "ghidra_sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",
             "jdk_sha256": "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223"}
@@ -306,8 +306,11 @@ class LockAndArgvTests(unittest.TestCase):
 
 class GhidraBoundaryTests(unittest.TestCase):
     def test_lock_has_exact_pinned_ghidra_keys_and_no_wheel(self):
-        kwargs = {"adapter_version": "12.1.4-r3"}
+        kwargs = {"adapter_version": "12.1.4-r4"}
         self.assertEqual(load_lock(ghidra_lock(), **kwargs), ghidra_lock())
+        for version in ("12.1.4-r1", "12.1.4-r2", "12.1.4-r3"):
+            with self.subTest(version=version), self.assertRaises(ContainedError):
+                load_lock(dict(ghidra_lock(), adapter_version=version), **kwargs)
         for field in ghidra_lock():
             value = ghidra_lock()
             del value[field]
@@ -376,7 +379,7 @@ class GhidraBoundaryTests(unittest.TestCase):
                     if fail:
                         raise ContainedTimeout("WorkerTimeout")
                     return b"reply"
-                executor = DockerExecutor(ghidra_lock(), runner=runner, adapter_version="12.1.4-r3",
+                executor = DockerExecutor(ghidra_lock(), runner=runner, adapter_version="12.1.4-r4",
                                           inspect=lambda image: image, staging_root=folder)
                 with self.subTest(fail=fail):
                     if fail:
@@ -396,7 +399,7 @@ class GhidraBoundaryTests(unittest.TestCase):
 
     def test_default_ghidra_executor_selects_the_closed_profile_on_the_same_runner(self):
         with tempfile.TemporaryDirectory() as folder, patch("reverseai.contained.run_bounded", return_value=b"reply") as runner:
-            executor = DockerExecutor(ghidra_lock(), adapter_version="12.1.4-r3", inspect=lambda image: image, staging_root=folder)
+            executor = DockerExecutor(ghidra_lock(), adapter_version="12.1.4-r4", inspect=lambda image: image, staging_root=folder)
             executor.run("ghidra.analyze", {}, b"inert", sha256_hex(b"inert"))
             self.assertEqual(runner.call_args.kwargs,
                              {"profile": "ghidra", "timeout": 240, "max_output": MAX_WORKER_REPLY_BYTES})
