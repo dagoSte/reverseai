@@ -1,0 +1,106 @@
+"""Build the pinned LIEF worker image and write containers/lief/image.lock.json.
+
+Usage (from the repository root):
+    python3 -B tools/build_lief_image.py --wheel-dir DIR [--download] [--tag TAG] [--lock PATH]
+
+The base image is pulled by its linux/arm64 manifest digest. The LIEF wheel must be
+in DIR (or, with --download, is fetched from the single PyPI URL below) and must
+match the SHA-256 in containers/lief/requirements.txt. The build itself runs with
+--network none and installs only from that local wheel. Every docker call is an
+argv list; nothing goes through a shell.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = ROOT / "containers" / "lief"
+PLATFORM = "linux/arm64"
+BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
+BASE = "python:3.12-slim@" + BASE_DIGEST
+ADAPTER_VERSION = "1.0.0-r1"
+WHEEL = "lief-1.0.0-cp312-abi3-manylinux_2_28_aarch64.whl"
+WHEEL_URL = ("https://files.pythonhosted.org/packages/5a/f8/3aba2989bd9f48e796de5260a19acb2af1e6562b147e32a2a26e418a9b58/"
+             + WHEEL)
+WHEEL_BYTES_LIMIT = 16 * 1024 * 1024
+
+
+def wheel_sha256():
+    """The one hash pinned in requirements.txt."""
+    pinned = re.findall(r"--hash=sha256:([0-9a-f]{64})", (SOURCE / "requirements.txt").read_text(encoding="utf-8"))
+    if len(pinned) != 1:
+        raise SystemExit("requirements.txt must pin exactly one SHA-256")
+    return pinned[0]
+
+
+def file_sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def fetch_wheel(target, expected):
+    with urllib.request.urlopen(WHEEL_URL, timeout=60) as response:  # fixed HTTPS URL; redirects stay on PyPI's host
+        if urllib.parse.urlsplit(response.geturl()).hostname != "files.pythonhosted.org":
+            raise SystemExit("unexpected wheel host")
+        data = response.read(WHEEL_BYTES_LIMIT + 1)
+    if len(data) > WHEEL_BYTES_LIMIT or hashlib.sha256(data).hexdigest() != expected:
+        raise SystemExit("downloaded wheel does not match the pinned SHA-256")
+    target.write_bytes(data)
+
+
+def docker(*args, capture=False):
+    result = subprocess.run(["docker", *args], check=True, text=True, capture_output=capture)
+    return result.stdout.strip() if capture else None
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--wheel-dir", type=Path, required=True, help="Private directory holding the pinned LIEF wheel")
+    parser.add_argument("--download", action="store_true", help="Fetch the pinned wheel into --wheel-dir if it is missing")
+    parser.add_argument("--tag", default="reverseai-lief:" + ADAPTER_VERSION)
+    parser.add_argument("--lock", type=Path, default=SOURCE / "image.lock.json")
+    args = parser.parse_args(argv)
+
+    expected = wheel_sha256()
+    wheel = args.wheel_dir / WHEEL
+    if not wheel.is_file():
+        if not args.download:
+            raise SystemExit(f"missing {WHEEL} in --wheel-dir (or pass --download)")
+        args.wheel_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fetch_wheel(wheel, expected)
+    if file_sha256(wheel) != expected:
+        raise SystemExit("wheel does not match the pinned SHA-256")
+
+    docker("pull", "--platform", PLATFORM, BASE)
+    with tempfile.TemporaryDirectory(prefix="reverseai-lief-build-") as temporary:
+        context = Path(temporary)
+        for name in ("Dockerfile", "requirements.txt", "worker.py"):
+            shutil.copy2(SOURCE / name, context / name)
+        (context / "wheels").mkdir()
+        shutil.copy2(wheel, context / "wheels" / WHEEL)
+        iidfile = context / "image.id"
+        docker("build", "--platform", PLATFORM, "--network", "none", "--pull=false", "--iidfile", str(iidfile),
+               "--tag", args.tag, str(context))
+        image_id = iidfile.read_text(encoding="utf-8").strip()
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+        raise SystemExit("docker build returned no image ID")
+    lock = {"image_id": image_id, "platform": PLATFORM, "base_digest": BASE_DIGEST, "wheel_sha256": expected,
+            "adapter_version": ADAPTER_VERSION}
+    text = json.dumps(lock, indent=2, sort_keys=True) + "\n"
+    args.lock.write_text(text, encoding="utf-8")
+    print(text, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
