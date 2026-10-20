@@ -103,6 +103,25 @@ class IntakeTests(unittest.TestCase):
         json.dumps(name).encode("utf-8")
         self.assertEqual(len(intake.display_name(Path("n" * 300))), 255)
 
+    def test_a_literal_backslash_never_looks_like_an_escaped_byte(self):
+        text = intake.display_name(Path(os.fsdecode(b"/any/a\\xffb.bin")))  # the four characters \ x f f
+        byte = intake.display_name(Path(os.fsdecode(b"/any/a\xffb.bin")))  # the single byte 0xFF
+        self.assertEqual((text, byte), ("a\\x5cxffb.bin", "a\\xffb.bin"))
+        self.assertEqual(intake.display_name(Path("caf\u00e9 \u6587\u4ef6.bin")), "caf\u00e9 \u6587\u4ef6.bin")
+
+    def test_truncation_keeps_whole_escapes(self):
+        cases = (
+            (b"n" * 251 + b"\xff", "n" * 251 + "\\xff"),  # exactly 255 characters: unchanged
+            (b"n" * 252 + b"\xff\xfe", "n" * 252 + "\u2026"),  # the escape would cross 254: dropped whole
+            (b"n" * 250 + b"\\" + b"n" * 10, "n" * 250 + "\\x5c" + "\u2026"),
+            (b"\xff" * 100, "\\xff" * 63 + "\u2026"),
+        )
+        for raw, expected in cases:
+            with self.subTest(raw=raw[-12:]):
+                shown = intake.display_name(Path(os.fsdecode(b"/any/" + raw)))
+                self.assertEqual(shown, expected)
+                self.assertLessEqual(len(shown), 255)
+
     def test_the_input_ref_uses_the_display_name(self):
         with patch.object(intake, "display_name", return_value="shown.bin") as shown:
             self.assertEqual(intake.snapshot(self.sample)[1].name, "shown.bin")
