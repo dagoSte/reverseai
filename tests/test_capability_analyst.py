@@ -8,6 +8,10 @@ from reverseai.contract import (
 from reverseai.gateway import Gateway
 from reverseai.tools.strings import TOOL
 from tests.fixtures_strings import clean_control, known_strings
+from tests.fixtures_yarax import FakeExecutor, known_matches, reply
+from reverseai import pipeline
+from reverseai.contained import ContainedTimeout
+from reverseai.tools import yarax_tool
 
 
 def input_ref(data):
@@ -125,6 +129,77 @@ class CapabilityTests(unittest.TestCase):
             ("capability.process_injection", ["open_process"]),
         ])
         self.assertEqual(findings[0].evidence_ids, (result.evidence[1].id,))
+
+    def test_yarax_plan_is_optional_content_bound_and_gives_worker_time_to_finish(self):
+        data, matches = known_matches()
+        tool = yarax_tool.make_tool(FakeExecutor(reply(data, matches)))
+        plain, planned = capability.plan(input_ref(data)), capability.plan(input_ref(data), tools=(tool,))
+        self.assertEqual([request.operation for request in planned.operations],
+                         ["strings.extract", "strings.indicators", "yarax.matches"])
+        self.assertEqual(planned.operations[-1].args, {"max_matches": 64})
+        self.assertNotEqual(plain.id, planned.id)
+        self.assertEqual(planned, capability.plan(input_ref(data), tools=(tool,)))
+        self.assertEqual(planned.budget.max_operations, 3)
+        self.assertGreater(planned.budget.max_wall_seconds, 45)
+        self.assertEqual(plain, capability.plan(input_ref(data), tools=(TOOL,)))
+
+    def test_yarax_finding_cites_every_match_including_repeated_rule_occurrences(self):
+        data, matches = known_matches()
+        tool = yarax_tool.make_tool(FakeExecutor(reply(data, matches)))
+        task = capability.plan(input_ref(data), tools=(tool,))
+        result = Gateway([TOOL, tool], Budget(max_wall_seconds=60)).run(task, data)
+        self.assertEqual(result.status, "ok")
+        signatures = [f for f in capability.conclude(task, result.evidence) if f.claim_key == "signatures.rule_matches"]
+        self.assertEqual(len(signatures), 1)
+        finding = signatures[0]
+        self.assertEqual(finding.value, ["base64_decode_api", "powershell_encoded_command", "upx_packed"])
+        self.assertEqual(finding.confidence, "observed")
+        self.assertEqual(set(finding.evidence_ids), {e.id for e in result.evidence if e.operation == "yarax.matches"})
+        self.assertEqual(len(finding.evidence_ids), 4)
+        self.assertEqual(capability.conclude(task, result.evidence), capability.conclude(task, tuple(reversed(result.evidence))))
+
+    def test_fake_worker_pipeline_supports_real_signature_bytes_and_refuses_lies_atomically(self):
+        data, matches = known_matches()
+        for honest in (True, False):
+            current = data if honest else data.replace(b"UPX0", b"FAKE")
+            executor = FakeExecutor(reply(current, matches))
+            tool = yarax_tool.make_tool(executor)
+            analysis = pipeline.analyze_bytes(current, input_ref(current), tools=pipeline.TOOLS + (tool,))
+            result = next(result for result in analysis.results if result.role == "capability")
+            signatures = [f for f in result.findings if f.claim_key == "signatures.rule_matches"]
+            with self.subTest(honest=honest):
+                self.assertEqual(result.status, "ok" if honest else "error")
+                if honest:
+                    self.assertEqual(len(signatures), 1)
+                    self.assertEqual(next(v.status for v in analysis.verdicts if v.finding_id == signatures[0].id), "supported")
+                else:
+                    self.assertEqual(signatures, [])
+                    self.assertFalse(any(e.operation == "yarax.matches" for e in result.evidence))
+                    self.assertEqual(result.errors, ("yarax.matches: ContractError",))
+
+    def test_no_matches_and_worker_timeout_never_become_signature_findings(self):
+        data = b"inert clean control"
+        for failure in (False, True):
+            executor = FakeExecutor(reply(data))
+            if failure:
+                def timeout(*args):
+                    raise ContainedTimeout("WorkerTimeout")
+                executor.run = timeout
+            tool = yarax_tool.make_tool(executor)
+            analysis = pipeline.analyze_bytes(data, input_ref(data), tools=pipeline.TOOLS + (tool,))
+            result = next(result for result in analysis.results if result.role == "capability")
+            with self.subTest(timeout=failure):
+                self.assertFalse(any(f.claim_key == "signatures.rule_matches" for f in result.findings))
+                self.assertEqual(result.status, "budget_exceeded" if failure else "ok")
+
+    def test_foreign_input_yarax_version_and_operation_do_not_support_signatures(self):
+        data = b"UPX!"
+        task = capability.plan(input_ref(data))
+        value = Observation(Location(0, 4), {"ruleset": "m2_fixture_v1", "rule": "upx_packed", "pattern": "$a"})
+        foreign = (make_evidence(b"UPX0", yarax_tool.REF, "yarax.matches", value),
+                   make_evidence(data, ToolRef("yarax", "1.21.0-r2"), "yarax.matches", value),
+                   make_evidence(data, yarax_tool.REF, "yarax.other", value))
+        self.assertEqual(capability.conclude(task, foreign), ())
 
 
 if __name__ == "__main__":

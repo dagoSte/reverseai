@@ -1,4 +1,4 @@
-"""Fixed Docker boundary for the LIEF worker; no native parser runs on the host."""
+"""Fixed Docker boundary for contained tools; no native tool runs on the host."""
 
 from collections.abc import Mapping
 import json
@@ -18,10 +18,8 @@ import uuid
 from reverseai.contract import MAX_WORKER_REPLY_BYTES, canonical_json, sha256_hex
 
 STAGING_ROOT = Path("/Users/Shared/rea-safe-staging-501")
-DEFAULT_LOCK = Path(__file__).resolve().parents[1] / "containers/lief/image.lock.json"
 WALL_SECONDS = 45
 PLATFORM = "linux/arm64"
-ADAPTER_VERSION = "1.0.0-r2"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
@@ -33,8 +31,8 @@ class ContainedTimeout(ContainedError, TimeoutError):
     pass
 
 
-def load_lock(lock):
-    """Copy a lock mapping, or read a small local lock file, and validate its pins."""
+def load_lock(lock, *, adapter_version="1.0.0-r2", extra_keys=()):
+    """Validate tool-provided pins; the default version preserves legacy M2a callers."""
     try:
         if isinstance(lock, Mapping):
             value = dict(lock)
@@ -46,13 +44,17 @@ def load_lock(lock):
             value = json.loads(raw)
         if not isinstance(value, dict) or not _DIGEST.fullmatch(value.get("image_id", "")):
             raise ValueError
-        if value.get("platform") != PLATFORM or value.get("adapter_version") != ADAPTER_VERSION:
+        if value.get("platform") != PLATFORM or value.get("adapter_version") != adapter_version:
             raise ValueError
         if not _DIGEST.fullmatch(value.get("base_digest", "")):
             raise ValueError
         if not re.fullmatch(r"[0-9a-f]{64}", value.get("wheel_sha256", "")):
             raise ValueError
-        return {key: value[key] for key in ("image_id", "platform", "base_digest", "wheel_sha256", "adapter_version")}
+        keys = ("image_id", "platform", "base_digest", "wheel_sha256", "adapter_version") + tuple(extra_keys)
+        if extra_keys and (set(value) != set(keys) or any(
+                not re.fullmatch(r"[0-9a-f]{64}", value.get(key, "")) for key in extra_keys)):
+            raise ValueError
+        return {key: value[key] for key in keys}
     except (OSError, ValueError, TypeError):
         raise ContainedError("InvalidImageLock") from None
 
@@ -67,6 +69,10 @@ def _validated_args(operation, args):
         count = args.get("max_sections", 32)
         if type(count) is int and 1 <= count <= 64:
             return {"max_sections": count}
+    if operation == "yarax.matches" and not set(args) - {"ruleset", "max_matches"}:
+        count = args.get("max_matches", 32)
+        if args.get("ruleset", "m2_fixture_v1") == "m2_fixture_v1" and type(count) is int and 1 <= count <= 64:
+            return {"ruleset": "m2_fixture_v1", "max_matches": count}
     raise ContainedError("InvalidWorkerArguments")
 
 
@@ -148,8 +154,9 @@ class DockerExecutor:
     The lock is frozen at construction so the reported identity matches every run.
     """
 
-    def __init__(self, lock=DEFAULT_LOCK, runner=run_bounded, *, inspect=inspect_image, staging_root=STAGING_ROOT):
-        self.lock = MappingProxyType(load_lock(lock))
+    def __init__(self, lock, runner=run_bounded, *, adapter_version="1.0.0-r2", extra_keys=(),
+                 inspect=inspect_image, staging_root=STAGING_ROOT):
+        self.lock = MappingProxyType(load_lock(lock, adapter_version=adapter_version, extra_keys=extra_keys))
         self.runner = runner
         self.inspect = inspect
         self.staging_root = Path(staging_root)

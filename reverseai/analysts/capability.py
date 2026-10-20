@@ -1,18 +1,25 @@
-"""A deterministic capability analyst: string clues, not behavioral conclusions."""
+"""A deterministic capability analyst: string hints and verified signature matches."""
 
 from reverseai.contract import (
     MAX_EVIDENCE_PER_FINDING, AnalysisTask, Budget, InputRef, OperationRequest,
     content_id, make_finding,
 )
 from reverseai.tools.strings import RULE_CATEGORIES, TOOL
+from reverseai.tools.yarax_tool import REF as YARAX_REF
 
 
-def plan(input: InputRef) -> AnalysisTask:
+def plan(input: InputRef, *, tools=()) -> AnalysisTask:
+    operations = (OperationRequest("strings.extract"), OperationRequest("strings.indicators"))
+    identity = {"input": input.sha256, "role": "capability"}
+    budget = Budget(max_operations=2, max_concurrency=1)
+    if any(tool.ref == YARAX_REF for tool in tools):
+        operations += (OperationRequest("yarax.matches", {"max_matches": 64}),)
+        identity["operations"] = [request.operation for request in operations]
+        budget = Budget(max_operations=3, max_concurrency=1, max_wall_seconds=60)
     return AnalysisTask(
-        content_id("tk", {"input": input.sha256, "role": "capability"}),
+        content_id("tk", identity),
         "capability", input,
-        (OperationRequest("strings.extract"), OperationRequest("strings.indicators")),
-        Budget(max_operations=2, max_concurrency=1),
+        operations, budget,
     )
 
 
@@ -47,5 +54,13 @@ def conclude(task, evidence):
         findings.append(make_finding(
             "capability", "URL strings observed in the input.", "strings.urls",
             selected, (urls[url] for url in selected), confidence="observed",
+        ))
+    matches = [item for item in evidence if item.input_sha256 == task.input.sha256 and item.tool == YARAX_REF
+               and item.operation == "yarax.matches" and item.location.within(task.input.size)
+               and isinstance(item.observation.get("rule"), str) and item.observation["rule"]]
+    if matches:
+        findings.append(make_finding(
+            "capability", "Reviewed signature patterns observed in the input.", "signatures.rule_matches",
+            sorted({item.observation["rule"] for item in matches}), (item.id for item in matches), confidence="observed",
         ))
     return tuple(findings)
