@@ -177,6 +177,23 @@ class ContainedToolWiringTests(unittest.TestCase):
             self.assertIn("LIEF worker is unavailable", out.getvalue())
             self.assertFalse(Path(temporary, "r").exists())
 
+    def test_with_yarax_refuses_cleanly_when_the_worker_is_unavailable(self):
+        from reverseai.contained import ContainedError
+        from reverseai.tools import yarax_tool
+        for patch in ({"available": mock.DEFAULT}, {"make_tool": ContainedError("InvalidImageLock")}):
+            with self.subTest(patch=sorted(patch)), tempfile.TemporaryDirectory() as temporary, \
+                    mock.patch.object(yarax_tool, "available", return_value="make_tool" in patch), \
+                    mock.patch.object(yarax_tool, "make_tool", side_effect=patch.get("make_tool")):
+                sample = Path(temporary, "sample.bin")
+                sample.write_bytes(pe()[0])
+                out = io.StringIO()
+                with contextlib.redirect_stderr(out), self.assertRaises(SystemExit) as stopped:
+                    cli.main(["analyze", str(sample), "--out", str(Path(temporary, "r")), "--with-yarax"])
+                self.assertEqual(stopped.exception.code, 1)
+                self.assertIn("YARA-X worker is unavailable", out.getvalue())
+                self.assertNotIn("Traceback", out.getvalue())
+                self.assertFalse(Path(temporary, "r").exists())
+
     def test_with_lief_refuses_cleanly_when_the_lock_breaks_after_the_check(self):
         from reverseai.contained import ContainedError
         from reverseai.tools import lief_tool

@@ -56,6 +56,8 @@ def main(argv=None):
     analyze.add_argument("file", type=Path)
     analyze.add_argument("--out", type=Path, required=True, help="New or empty directory for report.json and report.md")
     analyze.add_argument("--with-lief", action="store_true", help="Also run the pinned LIEF worker in its container (M2a)")
+    analyze.add_argument("--with-yarax", action="store_true",
+                         help="Also run the pinned YARA-X worker with the reviewed ruleset in its container (M2b)")
     args = parser.parse_args(argv)
 
     try:
@@ -65,16 +67,19 @@ def main(argv=None):
     if unusable:
         parser.exit(1, "reverseai: --out must be a new or empty directory\n")
     tools = pipeline.TOOLS
-    if args.with_lief:
+    for wanted, module, label in ((args.with_lief, "lief_tool", "LIEF"), (args.with_yarax, "yarax_tool", "YARA-X")):
+        if not wanted:
+            continue
+        from importlib import import_module
         from reverseai.contained import ContainedError
-        from reverseai.tools import lief_tool
+        contained = import_module(f"reverseai.tools.{module}")
         try:
             # The lock can change between the check and the build of the tool.
-            worker = lief_tool.make_tool() if lief_tool.available() else None
+            worker = contained.make_tool() if contained.available() else None
         except ContainedError:
             worker = None
         if worker is None:
-            parser.exit(1, "reverseai: the LIEF worker is unavailable (image lock, image or Docker missing)\n")
+            parser.exit(1, f"reverseai: the {label} worker is unavailable (image lock, image or Docker missing)\n")
         tools = tools + (worker,)
     try:
         data, ref = intake.snapshot(args.file)
