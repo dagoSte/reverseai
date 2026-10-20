@@ -288,7 +288,7 @@ verified evidence (not derived), as in M1.
   names of the cited `symbols` observations. One finding each.
 - **Ghidra on Mach-O (M3b)**: the worker accepts thin Mach-O; the host maps
   Ghidra anchors through `macho_sections` (an anchor must lie inside an executable
-  section's file bytes). Adapter `12.1.4-r3`.
+  section's file bytes). Adapter `12.1.4-r4` (decision `m3b-fix-round`).
 
 ## Known-answer fixtures
 
