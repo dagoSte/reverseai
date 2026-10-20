@@ -87,8 +87,9 @@ are **not verified** for ReverseAI. Each dependency needs its own inventory.
   plugins for a later run; affected 1.5.2–1.5.5, patched 1.5.6. Use a fresh home
   and workspace, refuse XAPK/project/script inputs, and admit only pinned plugins.
   [Advisory](https://github.com/skylot/jadx/security/advisories/GHSA-gpvc-ccw7-744v).
-- **GHSA-w6f5-h4x4-rfpj / CVE-2026-42049**: GUI Gradle-export code injection,
-  patched 1.5.6; **GHSA-jwv3-q635-w9m4 / CVE-2026-42447**: summary HTML
+- **GHSA-w6f5-h4x4-rfpj / CVE-2026-42049**: Gradle-export code injection in
+  jadx-core, reachable from CLI `--export-gradle`, patched 1.5.6;
+  **GHSA-jwv3-q635-w9m4 / CVE-2026-42447**: summary HTML
   injection in jadx-gui, also patched 1.5.6. Do not build exports or render tool HTML.
   [Export advisory](https://github.com/skylot/jadx/security/advisories/GHSA-w6f5-h4x4-rfpj),
   [HTML advisory](https://github.com/skylot/jadx/security/advisories/GHSA-jwv3-q635-w9m4).
@@ -194,6 +195,10 @@ machine and section count; the optional header binds its magic/entry fields.
 Do not span the gap with one Location: `e_lfanew` may exceed 4,096. Check the
 declared optional-header size before reading each field; refuse structures above
 the location cap. [PE layout](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format).
+Normalize observation fields to M1's `format`, `machine_name`, and ELF `shnum`
+(with `shoff`) or PE `number_of_sections`, only in the physical header observation
+that supplies each field. ELF `shnum=0` with nonzero `shoff` is an extended-count
+sentinel, so it cannot support a zero-section finding.
 The adapter and known-answer tests must verify semantic field decoding too;
 M1's generic reviewer verifies hashes/locations, not whether a parser interpreted
 a header correctly. Use fixed parsers/options; do not expose LIEF's mutation APIs.
@@ -274,6 +279,13 @@ expanded bytes, per-member bytes and compression-ratio limits before extraction.
    execution manifest. `ToolRef` currently names only a tool/version; require a
    new adapter version whenever hidden settings change, or extend the cache key
    contract explicitly. Do not silently reuse results across execution contexts.
+5. **Claim admission.** Extend [reverseai/claims.py](../reverseai/claims.py) before
+   accepting M2a findings: each `claim_key` maps to several explicitly allowed
+   operations, with a derive function per operation. Group citations by operation;
+   every group's derivation must yield the same canonical claimed value. Unknown
+   operations, missing fields and failed derivations stay unsupported; all current
+   provenance checks and M1 rules remain. Add a rule and trusted `STATEMENTS` entry
+   for `sections.writable_executable_indices`, distinct from M1's name-based rule.
 
 ## 3. Containment inheritance and fresh verification
 
@@ -381,14 +393,21 @@ controls/markup and label it so hyperlinks/HTML cannot impersonate provenance.
 ## 5. Smallest M2 milestone and proof
 
 Proposed M2a: one pinned LIEF worker image, `lief.headers` and `lief.sections`,
-one input snapshot, direct-byte evidence, the existing reviewer/report and an
-updated structural analyst. Extend its plan/tool filter for LIEF and normalize
+one input snapshot, direct-byte evidence, the current reviewer/report with extended
+claim rules, and an updated structural analyst. Extend its plan/tool filter for
+LIEF and normalize
 header fields to the same values for `format.container`, `format.machine` and
 `format.section_count`; group/cite only the physical observations supporting each
-value. Give index-based writable/executable section lists the distinct claim key
-`sections.writable_executable_indices`; do not reuse M1's name-based value without
-byte-backed names. Pin normalization, exact citations and contradiction tests.
-Integration points: [structural analyst](../reverseai/analysts/structural.py), [claim-key comparison](../reverseai/review.py).
+value. In `reverseai/claims.py`, admit `lief.headers` alongside `structure.identify`
+for format, and alongside `structure.headers` for machine/count, using a derive
+function per operation and the normalized observation fields above. Define
+`sections.writable_executable_indices` as sorted unique integer section indices
+from cited `lief.sections` observations whose writable/executable flags are both
+true; add its reviewer rule and trusted statement. Do not reuse M1's name-based
+value without byte-backed names. Pin rule admission, normalization, exact citations
+and contradiction tests, including mixed-operation agreement and disagreement.
+Integration points: [structural analyst](../reverseai/analysts/structural.py),
+[claim rules/statements](../reverseai/claims.py), [claim-key comparison](../reverseai/review.py).
 Approve contained-executor contract versioning first; no derived-evidence schema
 is needed while every exposed field has honest checked input-byte provenance.
 Keep the host package standard-library-only and never import `lief` there.
