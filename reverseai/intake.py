@@ -32,9 +32,29 @@ def _require(condition, message):
 
 
 def display_name(path: Path) -> str:
-    """The file name for reports: host names are bytes, so non-UTF-8 bytes become \\xNN escapes."""
-    name = os.fsencode(path.name).decode("utf-8", "backslashreplace")
-    return name if len(name) <= 255 else name[:254] + "\u2026"
+    """The file name for reports, unambiguous and at most 255 characters.
+
+    Host names are bytes: non-UTF-8 bytes and the backslash itself become \\xNN
+    escapes, so the text "\\xff" and the byte 0xFF never look alike. Truncation
+    keeps whole escapes and ends with an ellipsis.
+    """
+    units = []
+    for character in os.fsencode(path.name).decode("utf-8", "surrogateescape"):
+        if character == "\\":
+            units.append("\\x5c")
+        elif "\udc80" <= character <= "\udcff":
+            units.append("\\x{:02x}".format(ord(character) - 0xDC00))
+        else:
+            units.append(character)
+    if sum(map(len, units)) <= 255:
+        return "".join(units)
+    kept, length = [], 0
+    for unit in units:
+        if length + len(unit) > 254:
+            break
+        kept.append(unit)
+        length += len(unit)
+    return "".join(kept) + "\u2026"
 
 
 def _regular_stat(path: Path):
