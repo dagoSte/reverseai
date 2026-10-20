@@ -103,6 +103,35 @@ approved file
 8. **No execution.** Nothing in M1 runs the sample, installs software, opens a
    network connection or calls a model.
 
+## Contained worker interface (M2a)
+
+Fixed by the coordinator so the worker image and the host executor can be built
+in parallel. Nothing in this interface comes from a sample, an analyst or a peer.
+
+- **Image**: built locally from a digest-pinned base and a hash-pinned wheel;
+  `containers/lief/image.lock.json` records `image_id`, `platform`
+  (`linux/arm64`), `base_digest`, `wheel_sha256` and `adapter_version`. The host
+  refuses to run an image whose ID differs from the lock.
+- **Entrypoint**: `python3 -I -B /opt/reverseai/worker.py`, user `65534:65534`,
+  no shell needed. Arguments: `<operation> <canonical JSON of validated args>`.
+- **Input**: one file `/snapshot/input` (mode 0444 in a 0555 directory) on a
+  read-only bind mount of a private per-run folder under
+  `/Users/Shared/rea-safe-staging-501`, removed after the run. No other mount.
+- **Run flags** (exact, built by `reverseai/contained.py` as an argv list):
+  `docker run --rm --name reverseai-<random> --platform linux/arm64
+  --network none --read-only --cap-drop ALL --security-opt no-new-privileges
+  --user 65534:65534 --pids-limit 64 --memory 512m --memory-swap 512m --cpus 1
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --log-driver none
+  --mount type=bind,source=<run folder>,target=/snapshot,readonly
+  <image_id> <operation> <args>`.
+- **Output**: one `reverseai.worker/1` JSON object on stdout, at most
+  `MAX_WORKER_REPLY_BYTES`; stderr is discarded. Wall limit per run 45 s; on
+  timeout the host kills the named container and reports `budget_exceeded`.
+- **Observations**: field names follow M1 (`format`, `machine_name`, `shnum`
+  with `shoff`, `number_of_sections`; section `index`, `offset`, `size`,
+  `writable`, `executable`), one observation per physical structure, each
+  Location inside that structure and at most 4,096 bytes.
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under
