@@ -3,6 +3,7 @@ from dataclasses import replace
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from reverseai.contract import (
     AnalysisTask, ArgSpec, Budget, InputRef, Location, Observation, OperationRequest,
@@ -52,6 +53,67 @@ class GatewayTests(unittest.TestCase):
                 self.assertEqual(result.status, "error")
                 self.assertEqual(result.evidence, ())
         self.assertEqual(calls, [])
+
+    def test_input_is_hashed_once_per_run_including_multiple_observations(self):
+        gateway = Gateway([tool(lambda data, args: [observation(i) for i in range(4)])], Budget())
+        request = task()
+        full_input_hashes = []
+
+        def hashing(value):
+            if value == DATA:
+                full_input_hashes.append(1)
+            return sha256_hex(value)
+
+        with patch("reverseai.gateway.sha256_hex", side_effect=hashing), \
+                patch("reverseai.contract.sha256_hex", side_effect=hashing):
+            first = gateway.run(request, DATA)
+            replay = gateway.run(request, DATA)
+        self.assertEqual(first.status, "ok")
+        self.assertEqual(len(first.evidence), 4)
+        self.assertEqual(replay.evidence, first.evidence)
+        self.assertEqual(len(full_input_hashes), 2)
+
+    def test_timed_out_operation_retries_once_for_concurrent_larger_tasks(self):
+        release = threading.Event()
+        calls = []
+
+        def handler(data, args):
+            calls.append(1)
+            if len(calls) == 1:
+                release.wait(timeout=3)
+            return [observation()]
+
+        gateway = Gateway([tool(handler)], Budget(max_operations=1, max_concurrency=2))
+        first = gateway.run(task(budget=Budget(max_wall_seconds=0.03)), DATA)
+        self.assertEqual(first.status, "budget_exceeded")
+        self.assertEqual(first.evidence, ())
+        started = time.monotonic()
+        blocked_retry = gateway.run(task(budget=Budget(max_wall_seconds=0.02)), DATA)
+        self.assertLess(time.monotonic() - started, 0.75)
+        self.assertEqual(blocked_retry.status, "budget_exceeded")
+        self.assertEqual(calls, [1])
+        barrier = threading.Barrier(3)
+
+        def retry():
+            barrier.wait(timeout=2)
+            return gateway.run(task(budget=Budget(max_wall_seconds=2)), DATA)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(retry) for _ in range(2)]
+            try:
+                barrier.wait(timeout=2)
+                self.assertEqual(calls, [1])
+            finally:
+                release.set()
+            results = [future.result(timeout=3) for future in futures]
+        self.assertEqual([result.status for result in results], ["ok", "ok"])
+        self.assertEqual(calls, [1, 1])
+        self.assertEqual(results[0].evidence, results[1].evidence)
+        self.assertEqual(len(results[0].evidence), 1)
+        self.assertEqual(first.evidence, ())
+        refused = gateway.run(task(OperationRequest("fake.observe", {"n": 1})), DATA)
+        self.assertEqual(refused.status, "budget_exceeded")
+        self.assertEqual(calls, [1, 1])
 
     def test_unknown_operation_refused_and_run_continues(self):
         calls = []
@@ -142,14 +204,17 @@ class GatewayTests(unittest.TestCase):
         gateway = Gateway([tool(lambda data, args: {"not": "observations"})], Budget())
         self.assertEqual(gateway.run(task(), DATA).errors, ("fake.observe: TypeError",))
 
-    def test_operation_observation_cap_preserves_prefix_and_cache(self):
+    def test_budget_retry_preserves_prefix_without_charging_global_limits_twice(self):
         calls = []
-        gateway = Gateway([tool(lambda data, args: calls.append(1) or [observation(i) for i in range(3)], cap=2)], Budget())
+        limit = sum(len(canonical_json(make_evidence(DATA, REF, "fake.observe", observation(i)).to_dict()).encode())
+                    for i in range(2))
+        gateway = Gateway([tool(lambda data, args: calls.append(1) or [observation(i) for i in range(3)], cap=2)],
+                          Budget(max_operations=1, max_evidence=2, max_output_bytes=limit))
         for _ in range(2):
             result = gateway.run(task(), DATA)
             self.assertEqual(result.status, "budget_exceeded")
             self.assertEqual([e.location.offset for e in result.evidence], [0, 1])
-        self.assertEqual(calls, [1])
+        self.assertEqual(calls, [1, 1])
 
     def test_task_evidence_cap_applies_also_to_replay(self):
         gateway = Gateway([tool(lambda data, args: [observation(i) for i in range(3)])], Budget())
@@ -286,9 +351,9 @@ class GatewayTests(unittest.TestCase):
         finally:
             release.set()
             self.assertTrue(finished.wait(timeout=2))
-        cached = gateway.run(task(OperationRequest("fake.other")), DATA)
-        self.assertEqual(cached.status, "budget_exceeded")
-        self.assertEqual(cached.evidence, ())
+        retried = gateway.run(task(OperationRequest("fake.other")), DATA)
+        self.assertEqual(retried.status, "ok")
+        self.assertEqual(len(retried.evidence), 1)
         self.assertEqual(len(result.evidence), 1)
 
     def test_global_wall_deadline_overrides_long_task_deadline(self):
