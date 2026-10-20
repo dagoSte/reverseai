@@ -7,10 +7,14 @@ LIEF 1.0.0 is lenient with malformed input: it returns partial or guessed header
 and it picks ELF byte order from the machine field rather than EI_DATA. So every
 value this worker reports is decoded twice, by LIEF and by the small decoder below,
 and must agree; disagreement, truncation or an unsupported layout is an error reply,
-never a partial answer. Observations follow M1's field names, one per physical
-structure, each Location inside that structure and at most 4,096 bytes. Section
-names are deferred. Nothing but the one JSON object is written, to stdout only.
-The functions take bytes and plain dicts, so they are testable without LIEF.
+never a partial answer. The ELF class and byte order are the exception: LIEF only
+echoes the same e_ident bytes, so they come from the decoder alone, and a byte order
+LIEF does not follow shows up in the multi-byte fields it does check. LIEF runs with
+fixed parser options: every optional parse is off, leaving headers and section
+tables. Observations follow M1's field names, one per physical structure, each
+Location inside that structure and at most 4,096 bytes. Section names are deferred.
+Nothing but the one JSON object is written, to stdout only. The functions take bytes
+and plain dicts, so they are testable without LIEF.
 """
 
 import hashlib
@@ -20,7 +24,7 @@ import struct
 import sys
 
 PROTOCOL = "reverseai.worker/1"
-ADAPTER_VERSION = "1.0.0-r1"
+ADAPTER_VERSION = "1.0.0-r2"
 SNAPSHOT = "/snapshot/input"
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 MAX_LOCATION = 4096
@@ -33,6 +37,11 @@ PE_MACHINES = {0x14C: "x86", 0x1C4: "arm", 0x8664: "x86_64", 0xAA64: "aarch64"}
 PE_OPTIONAL = {0x10B: "pe32", 0x20B: "pe32+"}
 SHF_WRITE, SHF_EXECINSTR = 0x1, 0x4
 SCN_MEM_EXECUTE, SCN_MEM_WRITE = 0x20000000, 0x80000000
+# Every parse_* option of LIEF 1.0.0's ParserConfig (lief/ELF.pyi, lief/PE/__init__.pyi in the pinned wheel); all are set off.
+ELF_PARSER_OFF = ("parse_dyn_symbols", "parse_notes", "parse_overlay", "parse_relocations", "parse_symbol_versions",
+                  "parse_symtab_symbols")
+PE_PARSER_OFF = ("parse_arm64x_binary", "parse_exceptions", "parse_exports", "parse_imports", "parse_reloc", "parse_rsrc",
+                 "parse_signature")
 
 
 class WorkerFailure(Exception):
@@ -69,6 +78,14 @@ class ParserRefused(WorkerFailure):
 
 class InconsistentParse(WorkerFailure):
     """LIEF and the byte decoder disagree about a reported field."""
+
+
+class ParserOptionsChanged(WorkerFailure):
+    """This LIEF's parser options are not exactly the ones the worker turns off."""
+
+
+class SnapshotUnreadable(WorkerFailure):
+    pass
 
 
 def location(offset, length, size):
@@ -111,7 +128,7 @@ def elf_raw(data):
             "machine": machine, "entry": entry, "shoff": shoff, "shentsize": shentsize, "shnum": shnum, "shstrndx": shstrndx}
 
 
-ELF_CHECKED = ("class", "endianness", "type", "machine", "entry", "shoff", "shentsize", "shnum")
+ELF_CHECKED = ("type", "machine", "entry", "shoff", "shentsize", "shnum")
 
 
 def elf_header_observations(raw, size):
@@ -245,21 +262,40 @@ def parse_request(argv):
     raise InvalidRequest()
 
 
+def parser_config(config_class, off):
+    """A config whose parse_* options are exactly off, all set False; a missing or new option is an error, never ignored."""
+    config = config_class()
+    if sorted(name for name in dir(config) if name.startswith("parse_")) != sorted(off):
+        raise ParserOptionsChanged()
+    for name in off:
+        setattr(config, name, False)
+        if getattr(config, name) is not False:
+            raise ParserOptionsChanged()
+    return config
+
+
+def parser_configs():
+    """The fixed LIEF parser configs; the image build runs this once, so a LIEF with other options fails the build."""
+    import lief
+
+    return {"elf": parser_config(lief.ELF.ParserConfig, ELF_PARSER_OFF), "pe": parser_config(lief.PE.ParserConfig, PE_PARSER_OFF)}
+
+
 def lief_facts(data, format_):
-    """The same fields as read by LIEF; the only function that imports it (inside the image)."""
+    """The same fields as read by LIEF; the only function that parses with it (inside the image)."""
     import warnings
 
     import lief
 
     warnings.simplefilter("ignore")  # unknown enum values otherwise warn on stderr
     lief.logging.disable()
-    binary = lief.ELF.parse(data) if format_ == "elf" else lief.PE.parse(data)
+    config = parser_configs()[format_]
+    binary = lief.ELF.parse(data, config) if format_ == "elf" else lief.PE.parse(data, config)
     if binary is None:
         raise ParserRefused()
     header = binary.header
     if format_ == "elf":
-        return {"class": {1: 32, 2: 64}.get(int(header.identity_class)),
-                "endianness": {1: "little", 2: "big"}.get(int(header.identity_data)), "type": int(header.file_type),
+        return {"type": int(header.file_type),
                 "machine": int(header.machine_type), "entry": header.entrypoint, "shoff": header.section_header_offset,
                 "shentsize": header.section_header_size, "shnum": header.numberof_sections,
                 "sections": [(s.offset, s.size, int(s.flags)) for s in binary.sections]}
@@ -295,9 +331,12 @@ def error_name(exc):
     return name if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", name) else "WorkerError"
 
 
-def reply(argv, data, facts_of=None):
-    digest = hashlib.sha256(data[:MAX_INPUT_BYTES]).hexdigest()
+def reply(argv, data, facts_of=None, digest=None):
+    """One reply; data None means the snapshot could not be read, digest defaults to the SHA-256 of data."""
+    digest = digest or hashlib.sha256(data or b"").hexdigest()
     try:
+        if data is None:
+            raise SnapshotUnreadable()
         operation, args = parse_request(argv)
         if len(data) > MAX_INPUT_BYTES:
             raise InputTooLarge()
@@ -307,13 +346,22 @@ def reply(argv, data, facts_of=None):
         return {"protocol": PROTOCOL, "status": "error", "snapshot_sha256": digest, "error": error_name(exc)}
 
 
+def read_snapshot(path):
+    """At most MAX_INPUT_BYTES + 1 bytes, and the SHA-256 of the whole file: the digest the host compares."""
+    digest, kept = hashlib.sha256(), bytearray()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(1 << 20):
+            digest.update(chunk)
+            kept += chunk[:MAX_INPUT_BYTES + 1 - len(kept)]
+    return bytes(kept), digest.hexdigest()
+
+
 def main(argv=None, snapshot=SNAPSHOT):
     try:
-        with open(snapshot, "rb") as handle:
-            data = handle.read(MAX_INPUT_BYTES + 1)
+        data, digest = read_snapshot(snapshot)
     except OSError:
-        data = b""
-    message = reply(sys.argv[1:] if argv is None else argv, data)
+        data, digest = None, None
+    message = reply(sys.argv[1:] if argv is None else argv, data, digest=digest)
     sys.stdout.write(json.dumps(message, sort_keys=True, separators=(",", ":")) + "\n")
     sys.stdout.flush()
     return 0

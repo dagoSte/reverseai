@@ -45,7 +45,7 @@ class LiefToolTests(unittest.TestCase):
     def test_metadata_and_headers_bind_the_snapshot_digest(self):
         executor = FakeExecutor(reply(self.data, [item(0, 64, **HEADER)]))
         tool = lief_tool.make_tool(executor)
-        self.assertEqual((tool.ref.name, tool.ref.version), ("lief", "1.0.0-r1"))
+        self.assertEqual((tool.ref.name, tool.ref.version), ("lief", "1.0.0-r2"))
         self.assertTrue(tool.contained)
         self.assertEqual(tool.runtime, {"image": lock()["image_id"], "platform": "linux/arm64"})
         self.assertEqual(tool.operations["lief.headers"].max_observations, 3)

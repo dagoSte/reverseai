@@ -207,7 +207,7 @@ def receipt_passes(receipt):
              bool(re.fullmatch(r"sha256:[0-9a-f]{64}", pins["image_id"])), "ReceiptImage")
         need(bool(re.fullmatch(r"sha256:[0-9a-f]{64}", pins["base_digest"])) and
              bool(re.fullmatch(r"[0-9a-f]{64}", pins["wheel_sha256"])) and
-             pins["adapter_version"] == "1.0.0-r1", "ReceiptLockPins")
+             pins["adapter_version"] == "1.0.0-r2", "ReceiptLockPins")
         rows = receipt["checks"]
         need(isinstance(rows, list) and len(rows) == len(REQUIRED_CHECKS) and
              {r["id"] for r in rows} == set(REQUIRED_CHECKS) and all(r["status"] == "passed" for r in rows),

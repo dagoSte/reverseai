@@ -40,7 +40,7 @@ def image_fixture():
 
 def lock_fixture():
     return {"image_id": IMAGE_ID, "platform": "linux/arm64", "base_digest": "sha256:" + "b" * 64,
-            "wheel_sha256": "c" * 64, "adapter_version": "1.0.0-r1"}
+            "wheel_sha256": "c" * 64, "adapter_version": "1.0.0-r2"}
 
 
 def container_fixture():
@@ -823,7 +823,7 @@ class ReceiptTests(unittest.TestCase):
         for field, values in {
             "base_digest": ("", "sha256:bad", "sha256:" + "A" * 64, "b" * 64, None, []),
             "wheel_sha256": ("", "c" * 63, "C" * 64, "sha256:" + "c" * 64, None, []),
-            "adapter_version": ("", "1.0.0", "1.0.0-r2", None, []),
+            "adapter_version": ("", "1.0.0", "1.0.0-r1", None, []),
         }.items():
             for value in values:
                 receipt = receipt_fixture()

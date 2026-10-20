@@ -19,7 +19,7 @@ from reverseai.contract import sha256_hex
 
 def lock():
     return {"image_id": "sha256:" + "a" * 64, "platform": "linux/arm64",
-            "base_digest": "sha256:" + "b" * 64, "wheel_sha256": "c" * 64, "adapter_version": "1.0.0-r1"}
+            "base_digest": "sha256:" + "b" * 64, "wheel_sha256": "c" * 64, "adapter_version": "1.0.0-r2"}
 
 
 class ExecutorTests(unittest.TestCase):

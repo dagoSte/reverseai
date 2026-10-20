@@ -107,7 +107,7 @@ class LiefStructuralTests(unittest.TestCase):
 
     def evidence(self, data, operation, offset, length, value):
         from reverseai.contract import Location
-        return make_evidence(data, ToolRef("lief", "1.0.0-r1"), operation, Observation(Location(offset, length), value))
+        return make_evidence(data, ToolRef("lief", "1.0.0-r2"), operation, Observation(Location(offset, length), value))
 
     def assert_supported(self, data, task, evidence, findings):
         from reverseai.contract import AnalysisResult
