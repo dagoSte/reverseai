@@ -1,6 +1,7 @@
 """M1 pipeline: snapshot -> plan -> gateway -> conclude -> review."""
 
 from concurrent.futures import ThreadPoolExecutor
+import copy
 
 from reverseai import intake, review
 from reverseai.analysts import capability, structural
@@ -22,8 +23,9 @@ def analyze_bytes(data, ref, *, budget=None, analysts=ANALYSTS, tools=TOOLS):
         gathered = list(pool.map(lambda task: gateway.run(task, data), tasks))
     results = []
     for analyst, task, partial in zip(analysts, tasks, gathered):
-        # The reviewer, not the analyst, decides whether partial evidence is enough.
-        findings = analyst.conclude(task, partial.evidence) if partial.evidence else ()
+        # The reviewer, not the analyst, decides whether partial evidence is enough. Analysts get
+        # copies: the result keeps the gateway's records, so an analyst cannot alter them.
+        findings = analyst.conclude(task, copy.deepcopy(partial.evidence)) if partial.evidence else ()
         results.append(AnalysisResult(task.id, task.role, partial.status, partial.evidence, tuple(findings), partial.errors))
     refs = {spec.ref.name: spec.ref for spec in tools}
     verdicts = review.review(data, ref, results, refs)

@@ -1,4 +1,9 @@
-"""Deterministic JSON and Markdown reports: no timestamps, host paths or raw input bytes."""
+"""Deterministic JSON and Markdown reports without timestamps or host paths.
+
+Reports carry bounded text taken from the sample (strings, URLs, section names)
+and from analysts. It stays untrusted: Markdown shows it only inside code spans,
+where HTML, links, images and autolinks do not render.
+"""
 
 from dataclasses import dataclass
 
@@ -54,10 +59,12 @@ def to_json(analysis):
 
 
 def _cell(value):
+    """Untrusted text as one inert code span; "-" when empty."""
     text = value if isinstance(value, str) else canonical_json(value)
-    text = "".join(c if c.isprintable() else "�" for c in text)
-    text = text.replace("|", "\\|").replace("`", "'")
-    return text if len(text) <= 200 else text[:199].rstrip("\\") + "…"
+    text = "".join(c if c.isprintable() else "�" for c in text).replace("`", "'")
+    if len(text) > 200:
+        text = text[:199] + "…"
+    return "`" + text.replace("|", "\\|") + "`" if text.strip() else "-"
 
 
 def to_markdown(analysis):
@@ -66,7 +73,7 @@ def to_markdown(analysis):
     lines = [
         "# ReverseAI static analysis report",
         "",
-        f"- Input: `{_cell(report['input']['name'])}`, {report['input']['size']} bytes",
+        f"- Input: {_cell(report['input']['name'])}, {report['input']['size']} bytes",
         f"- SHA-256: `{report['input']['sha256']}`",
         f"- Contract: {report['contract']}; ReverseAI {report['reverseai']}",
         "- Tools: " + ", ".join(f"{t['name']} {t['version']}" for t in report["tools"]),
@@ -97,7 +104,7 @@ def to_markdown(analysis):
         lines.append("None.")
     lines += ["", "## Analyst runs", "", "| Analyst | Status | Evidence items | Errors |", "|---|---|---|---|"]
     for result in report["results"]:
-        lines.append(f"| {result['role']} | {result['status']} | {len(result['evidence'])} | {_cell('; '.join(result['errors'])) or '-'} |")
+        lines.append(f"| {result['role']} | {result['status']} | {len(result['evidence'])} | {_cell('; '.join(result['errors']))} |")
     summary = report["summary"]
     lines += ["", "Summary: " + ", ".join(f"{summary[k]} {k}" for k in summary), ""]
     return "\n".join(lines)

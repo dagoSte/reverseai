@@ -3,8 +3,10 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import tempfile
 import unittest
+from unittest import mock
 
 from reverseai import cli, pipeline, report
 from reverseai.analysts import capability
@@ -98,6 +100,25 @@ class PipelineKnownAnswerTests(unittest.TestCase):
         self.assertIn("budget_exceeded", report.to_markdown(analysis))
 
 
+class HostileTextTests(unittest.TestCase):
+    NAMES = (b"<img src=x onerror=alert(1)>", b"[click](https://evil.example/x)", b"![p](http://e.invalid/p.png)")
+
+    def test_sample_text_renders_only_inside_code_spans(self):
+        data = elf(sections=tuple((name, 1, 0x7, 8) for name in self.NAMES))[0]
+        analysis = pipeline.analyze_bytes(data, ref(data))
+        names = findings(analysis)[("structural", "sections.writable_executable")].value
+        self.assertEqual(sorted(names), sorted(name.decode() for name in self.NAMES))
+        table = [line for line in report.to_markdown(analysis).splitlines() if line.startswith("|")]
+        hostile = 0
+        for line in table:
+            for cell in re.split(r"(?<!\\)\|", line)[1:-1]:
+                cell = cell.strip()
+                if any(marker in cell for marker in ("<", "](", "://")):
+                    hostile += 1
+                    self.assertTrue(cell.startswith("`") and cell.endswith("`") and "`" not in cell[1:-1], cell)
+        self.assertGreater(hostile, 0)
+
+
 class CliTests(unittest.TestCase):
     def run_cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -136,6 +157,61 @@ class CliTests(unittest.TestCase):
             self.assertIn("input refused", err)
             self.assertNotIn(temporary, err)
             self.assertFalse(Path(temporary, "other").exists())
+
+    def test_reports_are_private(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sample, out = Path(temporary, "sample.bin"), Path(temporary, "report")
+            sample.write_bytes(elf()[0])
+            self.assertEqual(self.run_cli("analyze", str(sample), "--out", str(out))[0], 0)
+            self.assertEqual(out.stat().st_mode & 0o777, 0o700)
+            for name in ("report.json", "report.md"):
+                self.assertEqual((out / name).stat().st_mode & 0o777, 0o600)
+
+    def test_swapping_the_output_path_during_analysis_cannot_redirect_reports(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sample, out = Path(temporary, "sample.bin"), Path(temporary, "report")
+            moved, elsewhere = Path(temporary, "moved"), Path(temporary, "elsewhere")
+            sample.write_bytes(elf()[0])
+            elsewhere.mkdir()
+            original = pipeline.analyze_bytes
+
+            def swap_then_analyze(*args, **kwargs):
+                os.rename(out, moved)
+                os.symlink(elsewhere, out)
+                return original(*args, **kwargs)
+
+            with mock.patch.object(pipeline, "analyze_bytes", swap_then_analyze):
+                code, _, _ = self.run_cli("analyze", str(sample), "--out", str(out))
+            self.assertEqual(code, 0)
+            self.assertEqual(list(elsewhere.iterdir()), [])
+            self.assertEqual(sorted(p.name for p in moved.iterdir()), ["report.json", "report.md"])
+
+    def test_output_failures_are_short_and_name_what_was_written(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sample, out = Path(temporary, "sample.bin"), Path(temporary, "report")
+            sample.write_bytes(elf()[0])
+            out.mkdir()
+            out.chmod(0o500)
+            try:
+                code, stdout, err = self.run_cli("analyze", str(sample), "--out", str(out))
+            finally:
+                out.chmod(0o700)
+            self.assertEqual((code, stdout), (1, ""))
+            self.assertEqual(err, "reverseai: output failed: PermissionError; written: nothing\n")
+            other = Path(temporary, "other")
+            with mock.patch.object(report, "to_markdown", side_effect=ValueError("secret /path")):
+                code, _, err = self.run_cli("analyze", str(sample), "--out", str(other))
+            self.assertEqual(code, 1)
+            self.assertEqual(err, "reverseai: output failed: ValueError; written: report.json\n")
+            self.assertNotIn(temporary, err)
+
+    def test_uncreatable_output_is_refused_without_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sample = Path(temporary, "sample.bin")
+            sample.write_bytes(elf()[0])
+            code, _, err = self.run_cli("analyze", str(sample), "--out", str(Path(temporary, "missing", "report")))
+            self.assertEqual(code, 1)
+            self.assertEqual(err, "reverseai: output refused: --out cannot be created\n")
 
 
 if __name__ == "__main__":

@@ -51,9 +51,11 @@ class ReportTests(unittest.TestCase):
         self.assertIn("a\\|b'c", supported)
         self.assertIn("The sample was not executed.", text)
 
-    def test_long_cells_are_visibly_truncated(self):
-        self.assertEqual(report._cell("x" * 300), "x" * 199 + "…")
-        self.assertEqual(report._cell("|" * 150), "\\|" * 99 + "…")
+    def test_cells_are_inert_code_spans(self):
+        self.assertEqual(report._cell("x" * 300), "`" + "x" * 199 + "…`")
+        self.assertEqual(report._cell("a|b`c"), "`a\\|b'c`")
+        self.assertEqual(report._cell("\udcff\x00"), "`\ufffd\ufffd`")
+        self.assertEqual(report._cell(""), "-")
 
     def test_no_supported_findings(self):
         text = report.to_markdown(analysis("unsupported"))
