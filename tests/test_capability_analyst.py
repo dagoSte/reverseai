@@ -8,7 +8,7 @@ from reverseai.contract import (
 from reverseai.gateway import Gateway
 from reverseai.tools.strings import TOOL
 from tests.fixtures_strings import clean_control, known_strings
-from tests.fixtures_yarax import FakeExecutor, known_matches, reply
+from tests.fixtures_yarax import FakeExecutor, known_matches, match, reply
 from reverseai import pipeline
 from reverseai.contained import ContainedTimeout
 from reverseai.tools import yarax_tool
@@ -158,6 +158,27 @@ class CapabilityTests(unittest.TestCase):
         self.assertEqual(len(finding.evidence_ids), 4)
         self.assertEqual(capability.conclude(task, result.evidence), capability.conclude(task, tuple(reversed(result.evidence))))
 
+    def test_a_capped_pattern_flood_keeps_the_later_rule_and_an_over_cap_reply_admits_nothing(self):
+        data = b"UPX!" * 64 + b"sekurlsa::"
+        matches = [match(index * 4) for index in range(4)] + [
+            match(256, b"sekurlsa::", "credential_dump_marker")]
+        for extra in (False, True):
+            items = matches if not extra else matches[:4] + [match(16)] + matches[4:]
+            tool = yarax_tool.make_tool(FakeExecutor(reply(data, items)))
+            analysis = pipeline.analyze_bytes(data, input_ref(data), tools=pipeline.TOOLS + (tool,))
+            result = next(result for result in analysis.results if result.role == "capability")
+            signatures = [f for f in result.findings if f.claim_key == "signatures.rule_matches"]
+            with self.subTest(over_cap=extra):
+                if extra:
+                    self.assertEqual(result.status, "error")
+                    self.assertEqual(signatures, [])
+                    self.assertFalse(any(e.operation == "yarax.matches" for e in result.evidence))
+                else:
+                    self.assertEqual(result.status, "ok")
+                    self.assertEqual(signatures[0].value, ["credential_dump_marker", "upx_packed"])
+                    self.assertEqual(len(signatures[0].evidence_ids), 5)
+                    self.assertEqual(next(v.status for v in analysis.verdicts if v.finding_id == signatures[0].id), "supported")
+
     def test_fake_worker_pipeline_supports_real_signature_bytes_and_refuses_lies_atomically(self):
         data, matches = known_matches()
         for honest in (True, False):
@@ -197,7 +218,7 @@ class CapabilityTests(unittest.TestCase):
         task = capability.plan(input_ref(data))
         value = Observation(Location(0, 4), {"ruleset": "m2_fixture_v1", "rule": "upx_packed", "pattern": "$a"})
         foreign = (make_evidence(b"UPX0", yarax_tool.REF, "yarax.matches", value),
-                   make_evidence(data, ToolRef("yarax", "1.21.0-r2"), "yarax.matches", value),
+                   make_evidence(data, ToolRef("yarax", "1.21.0-r1"), "yarax.matches", value),
                    make_evidence(data, yarax_tool.REF, "yarax.other", value))
         self.assertEqual(capability.conclude(task, foreign), ())
 

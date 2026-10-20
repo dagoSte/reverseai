@@ -10,7 +10,7 @@ from unittest.mock import patch
 from reverseai.contained import ContainedError
 from reverseai.contract import ContractError, WorkerError, sha256_hex
 from reverseai.tools import yarax_tool
-from tests.fixtures_yarax import FakeExecutor, known_matches, match, reply, yarax_lock
+from tests.fixtures_yarax import FakeExecutor, known_matches, match, pattern_table, reply, yarax_lock
 
 
 class YaraxToolTests(unittest.TestCase):
@@ -20,7 +20,7 @@ class YaraxToolTests(unittest.TestCase):
     def test_metadata_defaults_and_snapshot_are_bound_to_the_executor(self):
         executor = FakeExecutor(reply(self.data, self.matches))
         tool = yarax_tool.make_tool(executor)
-        self.assertEqual((tool.ref.name, tool.ref.version), ("yarax", "1.21.0-r1"))
+        self.assertEqual((tool.ref.name, tool.ref.version), ("yarax", "1.21.0-r2"))
         self.assertTrue(tool.contained)
         self.assertEqual(tool.runtime, {"image": yarax_lock()["image_id"], "platform": "linux/arm64"})
         self.assertEqual(set(tool.operations), {"yarax.matches"})
@@ -41,15 +41,26 @@ class YaraxToolTests(unittest.TestCase):
         self.assertEqual(executor.calls, [])
 
     def test_counts_1_32_64_are_allowed_but_the_requested_cap_is_not_exceeded(self):
-        data = b"UPX!" * 65
-        for count in (1, 32, 64):
-            matches = [match(i * 4) for i in range(count)]
-            executor = FakeExecutor(reply(data, matches))
-            operation = yarax_tool.make_tool(executor).operations["yarax.matches"]
-            self.assertEqual(len(operation.handler(data, {"max_matches": count})), count)
-            executor.response = reply(data, matches + [match(count * 4)])
-            with self.subTest(count=count), self.assertRaises(ContractError):
-                operation.handler(data, {"max_matches": count})
+        raw, data, matches = pattern_table()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "ruleset.json"
+            path.write_bytes(raw)
+            for count in (1, 32, 64):
+                executor = FakeExecutor(reply(data, matches[:count]))
+                executor.lock["ruleset_sha256"] = sha256_hex(raw)
+                with patch.object(yarax_tool, "RULESET_PATH", path):
+                    operation = yarax_tool.make_tool(executor).operations["yarax.matches"]
+                self.assertEqual(len(operation.handler(data, {"max_matches": count})), count)
+                extra = matches[count:count + 1] or [copy.deepcopy(matches[-1])]
+                executor.response = reply(data, matches[:count] + extra)
+                with self.subTest(count=count), self.assertRaises(ContractError):
+                    operation.handler(data, {"max_matches": count})
+
+    def test_fifth_occurrence_fails_the_whole_operation_after_four_valid_matches(self):
+        data = b"UPX!" * 5
+        executor = FakeExecutor(reply(data, [match(index * 4) for index in range(5)]))
+        with self.assertRaisesRegex(ContractError, "^Worker match not confirmed by the bytes$"):
+            yarax_tool.make_tool(executor).operations["yarax.matches"].handler(data, {"max_matches": 64})
 
     def test_bad_final_observation_refuses_the_entire_reply(self):
         matches = copy.deepcopy(self.matches)
@@ -122,4 +133,4 @@ class AvailabilityTests(unittest.TestCase):
                     with patch.object(yarax_tool, "DockerExecutor", wraps=yarax_tool.DockerExecutor) as factory:
                         yarax_tool.make_tool()
                     self.assertEqual(factory.call_args.kwargs,
-                                     {"adapter_version": "1.21.0-r1", "extra_keys": ("ruleset_sha256",)})
+                                     {"adapter_version": "1.21.0-r2", "extra_keys": ("ruleset_sha256",)})

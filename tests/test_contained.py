@@ -216,8 +216,8 @@ class ExecutorTests(unittest.TestCase):
 
 class LockAndArgvTests(unittest.TestCase):
     def test_tool_supplied_version_and_extra_digest_are_validated_and_frozen(self):
-        value = dict(lock(), adapter_version="1.21.0-r1", ruleset_sha256="d" * 64)
-        kwargs = {"adapter_version": "1.21.0-r1", "extra_keys": ("ruleset_sha256",)}
+        value = dict(lock(), adapter_version="1.21.0-r2", ruleset_sha256="d" * 64)
+        kwargs = {"adapter_version": "1.21.0-r2", "extra_keys": ("ruleset_sha256",)}
         self.assertEqual(load_lock(value, **kwargs), value)
         executor = DockerExecutor(value, **kwargs)
         value["ruleset_sha256"] = "e" * 64
@@ -255,8 +255,8 @@ class LockAndArgvTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o555)
                 self.assertEqual(stat.S_IMODE((staged / "input").stat().st_mode), 0o444)
                 return b"reply"
-            executor = DockerExecutor(dict(lock(), adapter_version="1.21.0-r1", ruleset_sha256="d" * 64),
-                                      runner=runner, adapter_version="1.21.0-r1", extra_keys=("ruleset_sha256",),
+            executor = DockerExecutor(dict(lock(), adapter_version="1.21.0-r2", ruleset_sha256="d" * 64),
+                                      runner=runner, adapter_version="1.21.0-r2", extra_keys=("ruleset_sha256",),
                                       inspect=lambda image: image, staging_root=folder)
             self.assertEqual(executor.run("yarax.matches", {}, data, sha256_hex(data)), b"reply")
             self.assertEqual(list(Path(folder).iterdir()), [])
