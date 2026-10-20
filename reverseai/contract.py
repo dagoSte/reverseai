@@ -1,0 +1,377 @@
+"""Shared task, operation, evidence, finding and review contract (reverseai.contract/1).
+
+Every lane builds against these types. Tools return Observations; only the gateway
+turns them into Evidence with make_evidence, so evidence IDs and excerpt hashes are
+computed in one place and the reviewer can recompute them from the frozen bytes.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+import hashlib
+import json
+import re
+
+CONTRACT_VERSION = "reverseai.contract/1"
+
+MAX_EXCERPT_BYTES = 4096
+MAX_OBSERVATION_BYTES = 4096
+MAX_CLAIM_CHARS = 280
+MAX_EVIDENCE_PER_FINDING = 64
+MAX_STRING_ARG_CHARS = 256
+
+ROLES = ("structural", "capability")
+FINDING_CONFIDENCE = ("observed", "inferred")
+RESULT_STATUS = ("ok", "error", "budget_exceeded")
+VERDICT_STATUS = ("supported", "unsupported", "contradicted")
+
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_NAME = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
+_OPERATION = re.compile(r"[a-z][a-z0-9_]{0,31}\.[a-z][a-z0-9_]{0,31}\Z")
+_CLAIM_KEY = re.compile(r"[a-z][a-z0-9_.]{0,63}\Z")
+_VERSION = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,31}\Z")
+_ID = re.compile(r"[a-z]{2,4}-[0-9a-f]{16}\Z")
+
+
+class ContractError(ValueError):
+    """A value does not satisfy reverseai.contract/1."""
+
+
+def require(condition, message):
+    if not condition:
+        raise ContractError(message)
+
+
+def canonical_json(value) -> str:
+    """Deterministic JSON used for IDs, de-duplication keys and size limits."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def content_id(prefix: str, value) -> str:
+    return f"{prefix}-{sha256_hex(canonical_json(value).encode())[:16]}"
+
+
+def check_json_value(value, *, depth=0):
+    """Observation and finding values: JSON scalars, lists and string-keyed dicts only."""
+    require(depth <= 8, "JSON value nested too deeply")
+    if value is None or isinstance(value, (bool, str)):
+        return
+    if isinstance(value, int):
+        require(-(2**63) <= value < 2**64, "Integer out of range")
+        return
+    if isinstance(value, list):
+        for item in value:
+            check_json_value(item, depth=depth + 1)
+        return
+    require(isinstance(value, dict), f"Unsupported JSON type {type(value).__name__}")
+    for key, item in value.items():
+        require(isinstance(key, str), "JSON object keys must be strings")
+        check_json_value(item, depth=depth + 1)
+
+
+@dataclass(frozen=True)
+class InputRef:
+    sha256: str
+    size: int
+    name: str  # display only; never used as a path
+
+    def __post_init__(self):
+        require(isinstance(self.sha256, str) and _SHA256.match(self.sha256), "Invalid input sha256")
+        require(type(self.size) is int and self.size >= 0, "Invalid input size")
+        require(isinstance(self.name, str) and 0 < len(self.name) <= 255 and "\x00" not in self.name, "Invalid input name")
+
+
+@dataclass(frozen=True)
+class ToolRef:
+    name: str
+    version: str
+
+    def __post_init__(self):
+        require(isinstance(self.name, str) and _NAME.match(self.name), "Invalid tool name")
+        require(isinstance(self.version, str) and _VERSION.match(self.version), "Invalid tool version")
+
+
+@dataclass(frozen=True)
+class Location:
+    """Half-open byte range [offset, offset + length) inside the analysed input."""
+
+    offset: int
+    length: int
+
+    def __post_init__(self):
+        require(type(self.offset) is int and self.offset >= 0, "Invalid location offset")
+        require(type(self.length) is int and 0 < self.length <= MAX_EXCERPT_BYTES, "Invalid location length")
+
+    def within(self, size: int) -> bool:
+        return self.offset + self.length <= size
+
+
+@dataclass(frozen=True)
+class Observation:
+    """What a tool handler returns: a byte range and a bounded JSON description."""
+
+    location: Location
+    value: dict
+
+    def __post_init__(self):
+        require(isinstance(self.location, Location), "Observation location must be a Location")
+        require(isinstance(self.value, dict), "Observation value must be a dict")
+        check_json_value(self.value)
+        require(len(canonical_json(self.value).encode()) <= MAX_OBSERVATION_BYTES, "Observation value too large")
+
+
+@dataclass(frozen=True)
+class Evidence:
+    id: str
+    input_sha256: str
+    tool: ToolRef
+    operation: str
+    location: Location
+    excerpt_sha256: str
+    observation: dict
+
+    def __post_init__(self):
+        require(isinstance(self.input_sha256, str) and _SHA256.match(self.input_sha256), "Invalid evidence input sha256")
+        require(isinstance(self.tool, ToolRef), "Evidence tool must be a ToolRef")
+        require(isinstance(self.operation, str) and _OPERATION.match(self.operation), "Invalid evidence operation")
+        require(self.operation.split(".", 1)[0] == self.tool.name, "Evidence operation must belong to its tool")
+        require(isinstance(self.location, Location), "Evidence location must be a Location")
+        require(isinstance(self.excerpt_sha256, str) and _SHA256.match(self.excerpt_sha256), "Invalid excerpt sha256")
+        Observation(self.location, self.observation)
+        require(self.id == evidence_id(self.input_sha256, self.tool, self.operation, self.location, self.excerpt_sha256, self.observation),
+                "Evidence ID does not match its content")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "input_sha256": self.input_sha256,
+            "tool": {"name": self.tool.name, "version": self.tool.version},
+            "operation": self.operation,
+            "location": {"offset": self.location.offset, "length": self.location.length},
+            "excerpt_sha256": self.excerpt_sha256,
+            "observation": self.observation,
+        }
+
+
+def evidence_id(input_sha256, tool, operation, location, excerpt_sha256, observation) -> str:
+    return content_id("ev", {
+        "input_sha256": input_sha256,
+        "tool": [tool.name, tool.version],
+        "operation": operation,
+        "location": [location.offset, location.length],
+        "excerpt_sha256": excerpt_sha256,
+        "observation": observation,
+    })
+
+
+def make_evidence(data: bytes, tool: ToolRef, operation: str, observation: Observation) -> Evidence:
+    """The only constructor the gateway uses: binds an observation to the frozen bytes."""
+    require(isinstance(data, (bytes, bytearray)), "Evidence needs the frozen input bytes")
+    require(isinstance(observation, Observation), "Evidence needs an Observation")
+    location = observation.location
+    require(location.within(len(data)), "Observation location is outside the input")
+    fields = {
+        "input_sha256": sha256_hex(bytes(data)),
+        "tool": tool,
+        "operation": operation,
+        "location": location,
+        "excerpt_sha256": sha256_hex(bytes(data[location.offset:location.offset + location.length])),
+        "observation": observation.value,
+    }
+    return Evidence(id=evidence_id(**fields), **fields)
+
+
+def evidence_from_dict(raw) -> Evidence:
+    require(isinstance(raw, dict) and set(raw) == {"id", "input_sha256", "tool", "operation", "location", "excerpt_sha256", "observation"},
+            "Invalid evidence fields")
+    require(isinstance(raw["tool"], dict) and set(raw["tool"]) == {"name", "version"}, "Invalid evidence tool")
+    require(isinstance(raw["location"], dict) and set(raw["location"]) == {"offset", "length"}, "Invalid evidence location")
+    return Evidence(
+        id=raw["id"],
+        input_sha256=raw["input_sha256"],
+        tool=ToolRef(**raw["tool"]),
+        operation=raw["operation"],
+        location=Location(**raw["location"]),
+        excerpt_sha256=raw["excerpt_sha256"],
+        observation=raw["observation"],
+    )
+
+
+@dataclass(frozen=True)
+class ArgSpec:
+    """Bounded argument: an int range, a short string or a closed set. Never a path or a flag."""
+
+    kind: str  # "int" | "str" | "enum"
+    minimum: int = 0
+    maximum: int = 0
+    choices: tuple = ()
+    default: object = None
+
+    def __post_init__(self):
+        require(self.kind in ("int", "str", "enum"), "Invalid argument kind")
+        if self.kind == "enum":
+            require(self.choices and all(isinstance(c, str) for c in self.choices), "Enum needs string choices")
+        if self.kind == "int":
+            require(self.minimum <= self.maximum, "Invalid int range")
+
+    def check(self, value):
+        if self.kind == "int":
+            require(type(value) is int and self.minimum <= value <= self.maximum, "Integer argument out of range")
+        elif self.kind == "enum":
+            require(value in self.choices, "Argument not in allowed choices")
+        else:
+            require(isinstance(value, str) and len(value) <= MAX_STRING_ARG_CHARS and "\x00" not in value
+                    and "/" not in value and "\\" not in value and not value.startswith("-"),
+                    "String argument is not allowed")
+        return value
+
+
+Handler = Callable[[bytes, Mapping[str, object]], list]
+
+
+@dataclass(frozen=True)
+class OperationSpec:
+    name: str  # "<tool>.<operation>"
+    args: Mapping[str, ArgSpec]
+    handler: Handler  # (frozen bytes, validated args) -> list[Observation]
+    max_observations: int = 1024
+
+    def __post_init__(self):
+        require(isinstance(self.name, str) and _OPERATION.match(self.name), "Invalid operation name")
+        require(all(isinstance(k, str) and _NAME.match(k) and isinstance(v, ArgSpec) for k, v in self.args.items()), "Invalid argument specs")
+        require(callable(self.handler), "Operation handler must be callable")
+
+    def validate_args(self, raw) -> dict:
+        """Unknown arguments are refused; missing ones take the declared default."""
+        require(isinstance(raw, Mapping), "Operation arguments must be a mapping")
+        unknown = set(raw) - set(self.args)
+        require(not unknown, f"Unknown arguments: {sorted(unknown)}")
+        out = {}
+        for key, spec in sorted(self.args.items()):
+            value = raw.get(key, spec.default)
+            require(value is not None, f"Missing argument {key}")
+            out[key] = spec.check(value)
+        return out
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    ref: ToolRef
+    operations: Mapping[str, OperationSpec]
+
+    def __post_init__(self):
+        require(isinstance(self.ref, ToolRef), "ToolSpec ref must be a ToolRef")
+        for name, op in self.operations.items():
+            require(name == op.name and name.split(".", 1)[0] == self.ref.name, "Operation must be keyed by name and belong to its tool")
+
+
+@dataclass(frozen=True)
+class OperationRequest:
+    operation: str
+    args: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self):
+        require(isinstance(self.operation, str) and _OPERATION.match(self.operation), "Invalid requested operation")
+        require(isinstance(self.args, Mapping), "Requested arguments must be a mapping")
+
+
+def operation_key(input_sha256: str, tool: ToolRef, operation: str, args: Mapping) -> str:
+    """De-duplication key: the same validated operation on the same bytes and tool version runs once."""
+    return content_id("op", {"input": input_sha256, "tool": [tool.name, tool.version], "operation": operation, "args": dict(args)})
+
+
+@dataclass(frozen=True)
+class Budget:
+    max_concurrency: int = 2
+    max_wall_seconds: float = 30.0
+    max_output_bytes: int = 1_048_576  # canonical JSON of all evidence produced
+    max_evidence: int = 4096
+    max_operations: int = 64
+
+    def __post_init__(self):
+        require(type(self.max_concurrency) is int and 1 <= self.max_concurrency <= 16, "Invalid concurrency budget")
+        require(isinstance(self.max_wall_seconds, (int, float)) and 0 < self.max_wall_seconds <= 3600, "Invalid time budget")
+        require(type(self.max_output_bytes) is int and 0 < self.max_output_bytes <= 64 * 1_048_576, "Invalid output budget")
+        require(type(self.max_evidence) is int and 0 < self.max_evidence <= 100_000, "Invalid evidence budget")
+        require(type(self.max_operations) is int and 0 < self.max_operations <= 1024, "Invalid operation budget")
+
+
+@dataclass(frozen=True)
+class AnalysisTask:
+    id: str
+    role: str
+    input: InputRef
+    operations: tuple  # tuple[OperationRequest, ...]
+    budget: Budget = Budget(max_concurrency=1)
+
+    def __post_init__(self):
+        require(isinstance(self.id, str) and _ID.match(self.id), "Invalid task ID")
+        require(self.role in ROLES, "Unknown analyst role")
+        require(isinstance(self.input, InputRef), "Task input must be an InputRef")
+        require(isinstance(self.operations, tuple) and self.operations and all(isinstance(o, OperationRequest) for o in self.operations),
+                "Task needs a tuple of OperationRequest")
+        require(isinstance(self.budget, Budget), "Task budget must be a Budget")
+
+
+@dataclass(frozen=True)
+class Finding:
+    id: str
+    role: str
+    claim: str
+    claim_key: str  # stable key: two findings with the same key and different values contradict
+    value: object
+    evidence_ids: tuple
+    confidence: str = "observed"
+
+    def __post_init__(self):
+        require(self.role in ROLES, "Unknown finding role")
+        require(isinstance(self.claim, str) and 0 < len(self.claim) <= MAX_CLAIM_CHARS, "Invalid claim text")
+        require(isinstance(self.claim_key, str) and _CLAIM_KEY.match(self.claim_key), "Invalid claim key")
+        check_json_value(self.value)
+        require(isinstance(self.evidence_ids, tuple) and len(self.evidence_ids) <= MAX_EVIDENCE_PER_FINDING
+                and all(isinstance(e, str) and _ID.match(e) and e.startswith("ev-") for e in self.evidence_ids), "Invalid evidence IDs")
+        require(self.confidence in FINDING_CONFIDENCE, "Invalid finding confidence")
+        require(self.id == finding_id(self.role, self.claim_key, self.value, self.evidence_ids), "Finding ID does not match its content")
+
+
+def finding_id(role, claim_key, value, evidence_ids) -> str:
+    return content_id("fi", {"role": role, "claim_key": claim_key, "value": value, "evidence": sorted(evidence_ids)})
+
+
+def make_finding(role, claim, claim_key, value, evidence_ids, confidence="observed") -> Finding:
+    ids = tuple(sorted(set(evidence_ids)))
+    return Finding(finding_id(role, claim_key, value, ids), role, claim, claim_key, value, ids, confidence)
+
+
+@dataclass(frozen=True)
+class AnalysisResult:
+    task_id: str
+    role: str
+    status: str
+    evidence: tuple  # tuple[Evidence, ...]
+    findings: tuple  # tuple[Finding, ...]
+    errors: tuple = ()  # tuple[str, ...], short and free of input bytes
+
+    def __post_init__(self):
+        require(self.role in ROLES and self.status in RESULT_STATUS, "Invalid result role or status")
+        require(all(isinstance(e, Evidence) for e in self.evidence), "Result evidence must be Evidence")
+        require(all(isinstance(f, Finding) and f.role == self.role for f in self.findings), "Result findings must match the role")
+        require(all(isinstance(e, str) and len(e) <= 200 for e in self.errors), "Invalid result errors")
+
+
+@dataclass(frozen=True)
+class ReviewVerdict:
+    finding_id: str
+    status: str
+    reasons: tuple = ()
+
+    def __post_init__(self):
+        require(isinstance(self.finding_id, str) and _ID.match(self.finding_id), "Invalid verdict finding ID")
+        require(self.status in VERDICT_STATUS, "Invalid verdict status")
+        require(all(isinstance(r, str) and len(r) <= 200 for r in self.reasons), "Invalid verdict reasons")
+        require(self.status == "supported" or self.reasons, "A rejected finding needs a reason")
