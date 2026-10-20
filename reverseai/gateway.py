@@ -29,6 +29,7 @@ class _Execution:
     evidence: list[Evidence] = field(default_factory=list)
     status: str = "ok"
     errors: tuple[str, ...] = ()
+    time_cut: bool = False
 
 
 def _error(operation, exc):
@@ -59,17 +60,18 @@ class Gateway:
         self._evidence_ids = set()
         self._output_bytes = 0
 
-    def _finish(self, execution, status, errors=()):
+    def _finish(self, execution, status, errors=(), *, time_cut=False):
         with self._lock:
             if not execution.done.is_set():
                 execution.status = status
                 execution.errors = errors
+                execution.time_cut = time_cut
                 execution.done.set()
 
     def _work(self, execution, data, digest, ref, spec, args):
         try:
             if time.monotonic() >= execution.deadline:
-                self._finish(execution, "budget_exceeded")
+                self._finish(execution, "budget_exceeded", time_cut=True)
                 return
             observations = spec.handler(data, MappingProxyType(args))
             if not isinstance(observations, (list, tuple)):
@@ -88,10 +90,12 @@ class Gateway:
                     if execution.done.is_set():
                         return
                     new = evidence.id not in self._evidence_ids
-                    if (time.monotonic() >= execution.deadline
-                            or (new and (len(self._evidence_ids) >= self.budget.max_evidence
-                                         or self._output_bytes + size > self.budget.max_output_bytes))):
+                    fixed_cut = new and (len(self._evidence_ids) >= self.budget.max_evidence
+                                         or self._output_bytes + size > self.budget.max_output_bytes)
+                    time_cut = time.monotonic() >= execution.deadline
+                    if time_cut or fixed_cut:
                         execution.status = "budget_exceeded"
+                        execution.time_cut = time_cut and not fixed_cut
                         execution.done.set()
                         return
                     execution.evidence.append(evidence)
@@ -99,10 +103,11 @@ class Gateway:
                         self._evidence_ids.add(evidence.id)
                         self._output_bytes += size
             status = "budget_exceeded" if time.monotonic() >= execution.deadline else "ok"
-            self._finish(execution, status)
+            self._finish(execution, status, time_cut=status == "budget_exceeded")
         except Exception as exc:
             status = "budget_exceeded" if time.monotonic() >= execution.deadline else "error"
-            self._finish(execution, status, (_error(spec.name, exc),) if status == "error" else ())
+            self._finish(execution, status, (_error(spec.name, exc),) if status == "error" else (),
+                         time_cut=status == "budget_exceeded")
         finally:
             self._slots.release()
             execution.stopped.set()
@@ -112,7 +117,7 @@ class Gateway:
             with self._lock:
                 previous = self._cache.get(key)
                 owner = previous is None or (previous.done.is_set()
-                        and previous.status == "budget_exceeded" and previous.stopped.is_set())
+                        and previous.time_cut and previous.stopped.is_set())
                 if owner:
                     if (time.monotonic() >= deadline
                             or (previous is None and self._operation_count >= self.budget.max_operations)):
@@ -125,7 +130,7 @@ class Gateway:
                     execution = previous
             if owner:
                 if not self._slots.acquire(timeout=max(0, deadline - time.monotonic())):
-                    self._finish(execution, "budget_exceeded")
+                    self._finish(execution, "budget_exceeded", time_cut=True)
                     execution.stopped.set()
                 else:
                     # An overrun keeps its slot until exit. Its sealed result
@@ -140,8 +145,8 @@ class Gateway:
                         execution.stopped.set()
             completed = execution.done.wait(timeout=max(0, deadline - time.monotonic()))
             if not completed and owner:
-                self._finish(execution, "budget_exceeded")
-            if completed and not owner and execution.status == "budget_exceeded":
+                self._finish(execution, "budget_exceeded", time_cut=True)
+            if completed and not owner and execution.time_cut:
                 if execution.stopped.wait(timeout=max(0, deadline - time.monotonic())):
                     continue
                 return (), "budget_exceeded", ()
