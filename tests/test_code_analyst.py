@@ -2,11 +2,12 @@
 
 import copy
 from dataclasses import replace
+from types import SimpleNamespace
 import unittest
 
 from reverseai.analysts import code
 from reverseai.contract import (
-    MAX_EVIDENCE_PER_FINDING, AnalysisResult, ArgSpec, Evidence, InputRef, Location, Observation,
+    MAX_EVIDENCE_PER_FINDING, AnalysisResult, ArgSpec, ContractError, Evidence, InputRef, Location, Observation,
     OperationRequest, OperationSpec, ToolRef, ToolSpec, content_id, evidence_id, make_evidence, sha256_hex,
 )
 from reverseai.review import review
@@ -14,7 +15,7 @@ from reverseai.review import review
 
 DATA = bytes(range(256)) * 32
 INPUT = InputRef(sha256_hex(DATA), len(DATA), "inline.bin")
-REF = ToolRef("ghidra", "12.1.4-r1")
+REF = ToolRef("ghidra", "12.1.4-r2")
 
 
 def tool(*, ref=REF, derived=True, operation="ghidra.analyze"):
@@ -55,7 +56,7 @@ class CodeAnalystTests(unittest.TestCase):
 
     def test_plan_is_optional_and_requires_the_exact_derived_operation(self):
         self.assertIsNone(code.plan(INPUT))
-        for other in (tool(ref=ToolRef("ghidra", "12.1.4-r2")), tool(derived=False), tool(operation="ghidra.other")):
+        for other in (tool(ref=ToolRef("ghidra", "12.1.4-r1")), tool(derived=False), tool(operation="ghidra.other")):
             with self.subTest(tool=other.ref, operations=tuple(other.operations)):
                 self.assertIsNone(code.plan(INPUT, tools=(other,)))
         self.assertIsNone(code.plan(INPUT, tools=(ToolSpec(REF, {}),)))
@@ -102,7 +103,7 @@ class CodeAnalystTests(unittest.TestCase):
         value = dict(function().observation)
         foreign = (
             observed(data=DATA[:-1] + b"!", **value),
-            observed(ref=ToolRef("ghidra", "12.1.4-r2"), **value),
+            observed(ref=ToolRef("ghidra", "12.1.4-r1"), **value),
             observed(ref=ToolRef("other", "12.1.4-r1"), operation="other.analyze", **value),
             observed(operation="ghidra.other", **value),
         )
@@ -154,13 +155,31 @@ class CodeAnalystTests(unittest.TestCase):
                 invalid.append(changed)
             invalid.append(dict(value, extra="unexpected"))
         invalid.extend((dict(values[0], index=True), dict(values[0], index=-1), dict(values[0], index=128),
-                        dict(values[0], entry=-1), dict(values[0], size=0), dict(values[0], name="x" * 129),
+                        dict(values[0], entry=-1),
+                        dict(values[0], size=0), dict(values[0], name="x" * 129),
                         dict(values[0], name="line\nname"), dict(values[1], text=[]),
                         dict(values[1], text="x" * 2049), dict(values[1], truncated=1),
                         dict(values[2], **{"from": True}), dict(values[2], to_name="bad\x00name")))
         for value in invalid:
             with self.subTest(value=value):
                 self.assertEqual(code.conclude(self.task, (observed(length=5, **value),)), ())
+        self.assertTrue(code.conclude(self.task, (observed(length=16, **values[2]),)))
+        self.assertEqual(code.conclude(self.task, (observed(length=17, **values[2]),)), ())
+        overflow = dict(values[0], entry=2**64)
+        self.assertFalse(code._valid(SimpleNamespace(observation=overflow, location=Location(0, 5))))
+        with self.assertRaises(ContractError):
+            observed(length=5, **overflow)
+
+    def test_sixty_five_reverse_named_functions_keep_index_order_across_chunks(self):
+        self.task = replace(self.task, operations=(OperationRequest("ghidra.analyze", {"max_functions": 65}),))
+        names = [f"function_{64 - index:03d}" for index in range(65)]
+        evidence = tuple(function(index, name=name) for index, name in enumerate(names))
+        findings = code.conclude(self.task, tuple(reversed(evidence)))
+        self.assertEqual([f.claim_key for f in findings], ["code.functions", "code.functions"])
+        self.assertEqual([f.value for f in findings], [names[:64], names[64:]])
+        self.assertEqual([set(f.evidence_ids) for f in findings],
+                         [{item.id for item in evidence[:64]}, {evidence[64].id}])
+        self.assertEqual({v.status for v in self.verdicts(evidence, findings)}, {"derived"})
 
     def test_pseudocode_alone_keeps_exact_text_and_truncation(self):
         item = pseudocode(text="`<img src=x>\nreturn user_input;", truncated=True)
