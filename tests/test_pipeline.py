@@ -240,6 +240,18 @@ class CliTests(unittest.TestCase):
             self.assertNotIn(temporary, err)
             self.assertNotIn("Traceback", err)
 
+    def test_an_unreadable_empty_output_directory_is_refused_without_paths(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sample, out = Path(temporary, "sample.bin"), Path(temporary, "report")
+            sample.write_bytes(elf()[0])
+            out.mkdir()
+            out.chmod(0)
+            try:
+                code, _, err = self.run_cli("analyze", str(sample), "--out", str(out))
+            finally:
+                out.chmod(0o700)
+            self.assertEqual((code, err), (1, "reverseai: --out must be a new or empty directory\n"))
+
     def test_analysis_errors_are_not_reported_as_output_errors(self):
         with tempfile.TemporaryDirectory() as temporary:
             sample, out = Path(temporary, "sample.bin"), Path(temporary, "report")

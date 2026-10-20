@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from reverseai import claims
 from reverseai.contract import Location, Observation, ToolRef, make_evidence, make_finding
@@ -11,8 +12,9 @@ def evidence(tool, operation, offset=0, **value):
     return make_evidence(DATA, tool, operation, Observation(Location(offset, 4), value))
 
 
-def finding(claim_key, value, cited, role="structural"):
-    return make_finding(role, "A claim.", claim_key, value, [item.id for item in cited])
+def finding(claim_key, value, cited, role="structural", confidence=None):
+    confidence = confidence or claims.RULES.get(claim_key, ("observed",))[0]
+    return make_finding(role, "A claim.", claim_key, value, [item.id for item in cited], confidence)
 
 
 class ClaimRuleTests(unittest.TestCase):
@@ -56,6 +58,28 @@ class ClaimRuleTests(unittest.TestCase):
         self.assertNotEqual(claims.check(wrong_category, [inject]), ())
         self.assertEqual(claims.check(finding("strings.urls", ["https://example.invalid/x"], [url], "capability"), [url]), ())
         self.assertNotEqual(claims.check(finding("strings.urls", ["https://evil.invalid/"], [url], "capability"), [url]), ())
+
+    def test_confidence_is_fixed_by_the_rule(self):
+        rwx = evidence(STRUCTURE, "structure.sections", 0, name=".rwx", writable=True, executable=True)
+        overstated = finding("sections.writable_executable", [".rwx"], [rwx], confidence="observed")
+        self.assertEqual(claims.check(overstated, [rwx]), ("sections.writable_executable must be inferred",))
+
+    def test_a_claim_may_cite_every_operation_its_rule_allows_if_they_agree(self):
+        lief = ToolRef("lief", "1.0.0")
+        two_operations = ("observed", {
+            "structure.identify": lambda obs: claims._one(o.get("format") for o in obs),
+            "lief.headers": lambda obs: claims._one(o.get("format") for o in obs),
+        })
+        stdlib = evidence(STRUCTURE, "structure.identify", 0, format="pe")
+        agrees = evidence(lief, "lief.headers", 4, format="pe")
+        disagrees = evidence(lief, "lief.headers", 8, format="elf")
+        with mock.patch.dict(claims.RULES, {"format.container": two_operations}):
+            self.assertEqual(claims.check(finding("format.container", "pe", [stdlib, agrees]), [stdlib, agrees]), ())
+            self.assertEqual(claims.check(finding("format.container", "pe", [stdlib, disagrees]), [stdlib, disagrees]),
+                             ("cited evidence does not yield the claimed value",))
+            self.assertEqual(claims.check(finding("format.container", "pe", [stdlib, evidence(STRUCTURE, "structure.headers", 12, format="pe")]),
+                                          [stdlib, evidence(STRUCTURE, "structure.headers", 12, format="pe")]),
+                             ("format.container may only cite lief.headers, structure.identify evidence",))
 
     def test_unknown_claims_and_empty_citations_are_never_supported(self):
         pe = evidence(STRUCTURE, "structure.identify", format="pe")

@@ -63,8 +63,11 @@ approved file
    that no longer matches its own ID (`finding_intact`), or that shares its ID with
    different content, is `unsupported`. A finding is also `unsupported` if any cited
    item is missing or fails, if it cites none, or if `reverseai.claims.check` finds
-   that its claim_key has no rule, cites an operation the rule does not allow, or
-   that the cited observations do not yield exactly the claimed value. The reviewer
+   that its claim_key has no rule, that its confidence differs from the rule's,
+   that it cites an operation the rule does not allow, or that the citations of
+   any allowed operation do not yield exactly the claimed value (a rule may allow
+   several operations, for example a stdlib parser and a contained tool; each
+   must agree). The reviewer
    thereby checks that a claim follows from its evidence, not only that the
    evidence exists; `contradicted` if another finding whose cited
    evidence also all verifies has the same `claim_key` and a different `value`;

@@ -44,14 +44,15 @@ def _urls(observations):
 
 CATEGORIES = ("process_injection", "persistence", "network", "crypto", "anti_debug")
 
-# claim_key -> (operation every cited item must come from, derive(observations) -> expected value or None)
+# claim_key -> (confidence the claim must carry, {operation it may cite: derive(observations) -> expected value or None}).
+# A claim may cite several allowed operations; each operation's citations must yield the same value.
 RULES = {
-    "format.container": ("structure.identify", lambda obs: _one(o.get("format") for o in obs)),
-    "format.machine": ("structure.headers", lambda obs: _one(o.get("machine_name") for o in obs)),
-    "format.section_count": ("structure.headers", lambda obs: _one(_section_count(o) for o in obs)),
-    "sections.writable_executable": ("structure.sections", _writable_executable),
-    "strings.urls": ("strings.indicators", _urls),
-    **{f"capability.{name}": ("strings.indicators", _category(name)) for name in CATEGORIES},
+    "format.container": ("observed", {"structure.identify": lambda obs: _one(o.get("format") for o in obs)}),
+    "format.machine": ("observed", {"structure.headers": lambda obs: _one(o.get("machine_name") for o in obs)}),
+    "format.section_count": ("observed", {"structure.headers": lambda obs: _one(_section_count(o) for o in obs)}),
+    "sections.writable_executable": ("inferred", {"structure.sections": _writable_executable}),
+    "strings.urls": ("observed", {"strings.indicators": _urls}),
+    **{f"capability.{name}": ("inferred", {"strings.indicators": _category(name)}) for name in CATEGORIES},
 }
 
 
@@ -76,12 +77,19 @@ def check(finding, cited):
     rule = RULES.get(finding.claim_key)
     if rule is None:
         return ("no claim rule for this claim_key",)
-    operation, derive = rule
+    confidence, derivations = rule
     if not cited:
         return ("finding cites no evidence",)
-    if any(item.operation != operation for item in cited):
-        return (f"{finding.claim_key} may only cite {operation} evidence",)
-    expected = derive([item.observation for item in cited])
-    if expected is None or canonical_json(expected) != canonical_json(finding.value):
-        return ("cited evidence does not yield the claimed value",)
+    if finding.confidence != confidence:
+        return (f"{finding.claim_key} must be {confidence}",)
+    groups = {}
+    for item in cited:
+        if item.operation not in derivations:
+            return (f"{finding.claim_key} may only cite {', '.join(sorted(derivations))} evidence",)
+        groups.setdefault(item.operation, []).append(item.observation)
+    claimed = canonical_json(finding.value)
+    for operation, observations in sorted(groups.items()):
+        expected = derivations[operation](observations)
+        if expected is None or canonical_json(expected) != claimed:
+            return ("cited evidence does not yield the claimed value",)
     return ()

@@ -7,7 +7,6 @@ import stat
 import sys
 
 from reverseai import intake, pipeline, report
-from reverseai.contract import ContractError
 
 # Reports hold text taken from untrusted samples: private to the user.
 DIRECTORY_MODE = 0o700
@@ -66,7 +65,7 @@ def main(argv=None):
         parser.exit(1, "reverseai: --out must be a new or empty directory\n")
     try:
         data, ref = intake.snapshot(args.file)
-    except (ContractError, OSError, ValueError) as error:
+    except (OSError, ValueError) as error:  # ContractError is a ValueError
         parser.exit(1, f"reverseai: input refused: {type(error).__name__}\n")
     try:
         directory = open_output(args.out)
@@ -76,7 +75,7 @@ def main(argv=None):
     try:
         try:
             analysis = pipeline.analyze_bytes(data, ref)
-        except (ContractError, ValueError) as error:
+        except ValueError as error:
             parser.exit(1, f"reverseai: analysis failed: {type(error).__name__}\n")
         for name, render in zip(REPORTS, (report.to_json, report.to_markdown)):
             write_new(directory, name, render(analysis))
