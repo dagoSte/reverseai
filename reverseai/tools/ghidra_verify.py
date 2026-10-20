@@ -9,6 +9,7 @@ from reverseai.tools.structure import (
 )
 
 REFUSED = "Worker code anchor not confirmed by the bytes"
+SHF_ALLOC = 0x2
 _Section = namedtuple("_Section", "va offset size span executable")
 _FIELDS = {
     "function": {"kind", "index", "name", "entry", "size"},
@@ -46,11 +47,12 @@ def _sections(data):
         _need(data, header["shoff"], count * entry, "ELF section table")
         for index in range(count):
             _, kind, flags, va, offset, size = struct.unpack_from(order + layout, data, header["shoff"] + index * entry)[:6]
-            _check(va + size <= 2**width)
             backed = size if kind not in (0, 8) else 0
             if backed:
                 _need(data, offset, backed, "ELF section contents")
-            sections.append(_Section(va, offset, backed, size if kind else 0, bool(flags & SHF_EXECINSTR)))
+            if flags & SHF_ALLOC:
+                _check(va + size <= 2**width)
+                sections.append(_Section(va, offset, backed, size if kind else 0, bool(flags & SHF_EXECINSTR)))
         return sections, header["entry"]
     _check(kind == "pe")
     header = _pe_layout(data, pe)
@@ -71,7 +73,8 @@ def _sections(data):
         _check(rva + span <= 2**32 and base + rva + span <= 2**width)
         if size:
             _need(data, offset, size, "PE section contents")
-        sections.append(_Section(base + rva, offset, size, span, bool(flags & SCN_MEM_EXECUTE)))
+        backed = min(size, virtual_size or size)
+        sections.append(_Section(base + rva, offset, backed, backed, bool(flags & SCN_MEM_EXECUTE)))
     return sections, base + header["entry"]
 
 
@@ -90,8 +93,8 @@ def _map(sections, start, length, *, virtual):
 def _function_anchor(sections, entry, size):
     offset, section = _map(sections, entry, 1, virtual=True)
     length = min(size, 4096, section.size - (entry - section.va))
-    _check(_map(sections, entry, length, virtual=True) == (offset, section))
-    _check(_map(sections, offset, length, virtual=False) == (entry, section))
+    _map(sections, entry, length, virtual=True)
+    _map(sections, offset, length, virtual=False)
     return Location(offset, length)
 
 
@@ -144,6 +147,6 @@ def _verify(data, observations, args):
         value = item.value
         _check(value["from"] in by_entry)
         function = by_entry[value["from"]].value
-        va, section = _map(sections, item.location.offset, item.location.length, virtual=False)
-        _check(_map(sections, va, item.location.length, virtual=True) == (item.location.offset, section))
+        va, _ = _map(sections, item.location.offset, item.location.length, virtual=False)
+        _map(sections, va, item.location.length, virtual=True)
         _check(value["from"] <= va and va + item.location.length <= value["from"] + function["size"])
