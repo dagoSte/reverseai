@@ -45,6 +45,13 @@ class AnchorTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "^" + ghidra_verify.REFUSED + "$"):
             self.check(items, **kwargs)
 
+    def accepts(self, items, **kwargs):
+        try:
+            self.check(items, **kwargs)
+            return True
+        except ContractError:
+            return False
+
     def test_shared_elf_pe_and_data_only_fixtures_have_valid_exact_anchors(self):
         for generator in (elf_code, pe_code, elf_data_only):
             data, layout = generator()
@@ -120,6 +127,7 @@ class AnchorTests(unittest.TestCase):
         for field, value in ((16, self.layout["text"]["address"]), (24, self.layout["text"]["offset"]),
                              (16, self.layout["text"]["address"] + 10), (24, self.layout["text"]["offset"] + 10)):
             data = bytearray(self.data)
+            struct.pack_into("<Q", data, self.layout["shoff"] + 2 * 64 + 8, 0x2)
             struct.pack_into("<Q", data, self.layout["shoff"] + 2 * 64 + field, value)
             with self.subTest(elf_field=field):
                 self.refuse(data=bytes(data))
@@ -129,6 +137,70 @@ class AnchorTests(unittest.TestCase):
             struct.pack_into("<I", changed, 0x40 + 24 + 240 + 40 + field, value)
             with self.subTest(pe_field=field):
                 self.refuse(records(layout), data=bytes(changed))
+
+    def test_pie_code_ignores_non_allocated_virtual_and_file_aliases(self):
+        data, layout = elf(kind=3, entry=0x10,
+                           sections=((b".text", 1, 6, 32), (b".debug", 1, 0, 128)))
+        data = bytearray(data)
+        struct.pack_into("<Q", data, layout["shoff"] + 64 + 16, 0x10)
+        item = {"location": {"offset": layout["offsets"][0], "length": 16},
+                "value": {"kind": "function", "index": 0, "name": "pie_entry", "entry": 0x10, "size": 16}}
+        for flags in (0, 4):
+            changed = bytearray(data)
+            struct.pack_into("<Q", changed, layout["shoff"] + 2 * 64 + 8, flags)
+            with self.subTest(non_allocated_flags=flags):
+                self.assertTrue(self.accepts([item], data=bytes(changed)))
+                struct.pack_into("<Q", changed, layout["shoff"] + 2 * 64 + 24, layout["offsets"][0])
+                self.assertTrue(self.accepts([item], data=bytes(changed)))
+
+    def test_executable_but_non_allocated_elf_section_cannot_anchor_code(self):
+        data = bytearray(self.data)
+        struct.pack_into("<Q", data, self.layout["shoff"] + 64 + 8, 0x4)
+        self.refuse(self.items[:1], data=bytes(data))
+
+    def test_pe_raw_padding_is_not_mapped_and_zero_virtual_size_uses_raw_size(self):
+        data, layout = pe_code()
+        item = records(layout)[0]
+        for relative, admitted in ((layout["text"]["size"] - 1, True), (layout["text"]["size"], False),
+                                   (layout["text_raw_size"] - 1, False)):
+            item["value"].update(entry=layout["text"]["address"] + relative, size=1)
+            item["location"] = {"offset": layout["text"]["offset"] + relative, "length": 1}
+            with self.subTest(relative=relative):
+                self.assertEqual(self.accepts([item], data=data), admitted)
+        changed = bytearray(data)
+        struct.pack_into("<I", changed, 0x40 + 24 + 240 + 8, 0)
+        self.assertTrue(self.accepts([item], data=bytes(changed)))
+
+    def test_function_only_reply_rejects_file_aliases_without_call_records(self):
+        for generator in (elf_code, pe_code):
+            data, layout = generator()
+            item = records(layout)[0]
+            self.assertTrue(self.accepts([item], data=data))
+            changed = bytearray(data)
+            if layout["format"] == "elf":
+                at = layout["shoff"] + 2 * 64
+                struct.pack_into("<Q", changed, at + 8, 0x2)
+                struct.pack_into("<Q", changed, at + 16, 0x600000)
+                struct.pack_into("<Q", changed, at + 24, layout["text"]["offset"] + 10)
+            else:
+                struct.pack_into("<I", changed, 0x40 + 24 + 240 + 40 + 20, layout["text"]["offset"] + 10)
+            with self.subTest(format=layout["format"]):
+                self.refuse([item], data=bytes(changed))
+
+    def test_function_only_reply_rejects_virtual_overlap_away_from_its_entry(self):
+        for generator in (elf_code, pe_code):
+            data, layout = generator()
+            item = records(layout)[0]
+            self.assertTrue(self.accepts([item], data=data))
+            changed = bytearray(data)
+            if layout["format"] == "elf":
+                at = layout["shoff"] + 2 * 64
+                struct.pack_into("<Q", changed, at + 8, 0x2)
+                struct.pack_into("<Q", changed, at + 16, layout["text"]["address"] + 10)
+            else:
+                struct.pack_into("<I", changed, 0x40 + 24 + 240 + 40 + 12, 0x1000 + 10)
+            with self.subTest(format=layout["format"]):
+                self.refuse([item], data=bytes(changed))
 
     def test_virtual_only_nobits_and_pe_tail_bytes_cannot_be_file_anchors(self):
         data = bytearray(self.data)
@@ -178,6 +250,49 @@ class AnchorTests(unittest.TestCase):
         items = copy.deepcopy(self.items)
         items[8]["value"].update(to=2**64 - 1, to_name="external_target")
         self.check(items)
+
+    def test_call_cannot_precede_its_from_function_even_when_the_upper_bound_passes(self):
+        function = copy.deepcopy(self.items[1])
+        function["value"]["index"] = 0
+        call = copy.deepcopy(self.items[8])
+        call["value"]["from"] = function["value"]["entry"]
+        call["location"] = {"offset": function["location"]["offset"], "length": 1}
+        self.check([function, call])
+        call["location"]["offset"] -= 1
+        self.refuse([function, call])
+
+    def test_function_span_keeps_a_later_call_in_a_sparse_body(self):
+        data, layout = elf(entry=0x1000, sections=((b".text", 1, 6, 0x80),))
+        data = bytearray(data)
+        struct.pack_into("<Q", data, layout["shoff"] + 64 + 16, 0x1000)
+        function = {"location": {"offset": layout["offsets"][0], "length": 0x65},
+                    "value": {"kind": "function", "index": 0, "name": "sparse", "entry": 0x1000, "size": 0x65}}
+        call = {"location": {"offset": layout["offsets"][0] + 0x60, "length": 5},
+                "value": {"kind": "call", "from": 0x1000, "to": 0, "to_name": "external"}}
+        self.check([function, call], data=bytes(data))
+        call["location"]["offset"] += 1
+        self.refuse([function, call], data=bytes(data))
+
+    def test_call_after_the_4096_byte_function_anchor_still_requires_a_unique_virtual_map(self):
+        data, layout = elf(entry=0x1000, sections=((b".text", 1, 6, 8192), (b".data", 1, 3, 16)))
+        data = bytearray(data)
+        struct.pack_into("<Q", data, layout["shoff"] + 64 + 16, 0x1000)
+        function = {"location": {"offset": layout["offsets"][0], "length": 4096},
+                    "value": {"kind": "function", "index": 0, "name": "large", "entry": 0x1000, "size": 7000}}
+        call = {"location": {"offset": layout["offsets"][0] + 5000, "length": 5},
+                "value": {"kind": "call", "from": 0x1000, "to": 0, "to_name": "external"}}
+        self.check([function, call], data=bytes(data))
+        struct.pack_into("<Q", data, layout["shoff"] + 2 * 64 + 16, 0x1000 + 5000)
+        self.refuse([function, call], data=bytes(data))
+
+    def test_function_only_entries_are_strictly_increasing_with_valid_reindexed_records(self):
+        items = copy.deepcopy(self.items[:2])
+        self.check(items)
+        for reordered in (list(reversed(items)), [items[0], copy.deepcopy(items[0])]):
+            changed = copy.deepcopy(reordered)
+            for index, item in enumerate(changed):
+                item["value"]["index"] = index
+            self.refuse(changed)
 
     def test_individual_request_limits_and_overall_observation_cap_are_enforced(self):
         for args in (dict(ARGS, max_functions=3), dict(ARGS, decompile=3), dict(ARGS, max_calls=3)):
