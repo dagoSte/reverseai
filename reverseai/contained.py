@@ -80,7 +80,7 @@ def build_argv(image_id, name, staging_folder, operation, args):
     if not isinstance(folder, str) or not os.path.isabs(folder) or any(c in folder for c in ",\r\n\x00"):
         raise ContainedError("InvalidStagingFolder")
     return [
-        "docker", "run", "--rm", "--init", "--name", name, "--platform", PLATFORM,
+        "docker", "run", "--rm", "--init", "--pull", "never", "--name", name, "--platform", PLATFORM,
         "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
         "--user", "65534:65534", "--pids-limit", "64", "--memory", "512m", "--memory-swap", "512m",
         "--cpus", "1", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m", "--log-driver", "none",

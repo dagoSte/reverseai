@@ -8,7 +8,15 @@ from unittest.mock import patch
 from reverseai import contained
 from reverseai.contract import ContractError, Location, Observation, WorkerError, WORKER_PROTOCOL, sha256_hex
 from reverseai.tools import lief_tool
+from tests.fixtures_structure import elf
 from tests.test_contained import lock
+
+ELF, ELF_LAYOUT = elf()
+# What an honest worker reports for ELF: its header and section header entry 2 (.data); the host re-derives both.
+HEADER = {"structure": "elf", "format": "elf", "class": 64, "endianness": "little", "type": 2, "machine": 62,
+          "machine_name": "x86_64", "entry": 0x401000, "shnum": 5, "shoff": ELF_LAYOUT["shoff"]}
+SECTION_2 = {"structure": "section", "index": 2, "offset": ELF_LAYOUT["offsets"][1], "size": 16, "flags": 0x3,
+             "writable": True, "executable": False}
 
 
 class FakeExecutor:
@@ -32,21 +40,21 @@ def item(offset=0, length=4, **value):
 
 
 class LiefToolTests(unittest.TestCase):
-    data = b"\x7fELF" + bytes(128)
+    data = ELF
 
     def test_metadata_and_headers_bind_the_snapshot_digest(self):
-        executor = FakeExecutor(reply(self.data, [item(format="elf", machine_name="aarch64", shnum=4)]))
+        executor = FakeExecutor(reply(self.data, [item(0, 64, **HEADER)]))
         tool = lief_tool.make_tool(executor)
         self.assertEqual((tool.ref.name, tool.ref.version), ("lief", "1.0.0-r1"))
         self.assertTrue(tool.contained)
         self.assertEqual(tool.runtime, {"image": lock()["image_id"], "platform": "linux/arm64"})
         self.assertEqual(tool.operations["lief.headers"].max_observations, 3)
         observed = tool.operations["lief.headers"].handler(self.data, {})
-        self.assertEqual(observed, (Observation(Location(0, 4), {"format": "elf", "machine_name": "aarch64", "shnum": 4}),))
+        self.assertEqual(observed, (Observation(Location(0, 64), HEADER),))
         self.assertEqual(executor.calls, [("lief.headers", {}, self.data, sha256_hex(self.data))])
 
     def test_sections_default_and_range_are_enforced_before_executor(self):
-        executor = FakeExecutor(reply(self.data, [item(index=2, writable=True, executable=True)]))
+        executor = FakeExecutor(reply(self.data, [{"location": {"offset": ELF_LAYOUT["shoff"] + 2 * 64, "length": 64}, "value": SECTION_2}]))
         operation = lief_tool.make_tool(executor).operations["lief.sections"]
         self.assertEqual(operation.max_observations, 64)
         self.assertEqual(operation.handler(self.data, {})[0].value["index"], 2)

@@ -4,6 +4,7 @@ from reverseai.contained import DEFAULT_LOCK, DockerExecutor, ContainedError, in
 from reverseai.contract import (
     ArgSpec, ContractError, OperationSpec, ToolRef, ToolSpec, parse_worker_reply, sha256_hex,
 )
+from reverseai.tools import lief_verify
 
 REF = ToolRef("lief", "1.0.0-r1")
 
@@ -22,6 +23,8 @@ def make_tool(executor=None):
             observations = parse_worker_reply(raw, input_sha256=digest, max_observations=cap)
             if any(not item.location.within(len(data)) for item in observations):
                 raise ContractError("Worker location outside the snapshot")
+            for item in observations:  # every worker value is re-derived from the controller's bytes
+                lief_verify.verify(name, data, item)
             return observations
         return invoke
 
