@@ -1640,5 +1640,843 @@ class MainSourceChangeGuardTests(unittest.TestCase):
         self.assert_source_change_refused("executor")
 
 
+class YaraxRulesetTests(unittest.TestCase):
+    REVIEWED_SHA256 = "e2217ff703858af17fe8eee8ac0d4cc44dfefd632e096bb4b527b89b08a062a7"
+
+    def lock(self):
+        return {"ruleset_sha256": self.REVIEWED_SHA256}
+
+    def test_repository_ruleset_has_the_reviewed_bytes_and_declared_literal_patterns(self):
+        raw = verifier.YARAX_RULESET_PATH.read_bytes()
+        self.assertEqual(sha256_hex(raw), self.REVIEWED_SHA256)
+        self.assertEqual(verifier.YARAX_RULESET_SHA256, self.REVIEWED_SHA256)
+        ruleset = verifier.load_yarax_ruleset(self.lock())
+        self.assertEqual(ruleset, json.loads(raw))
+        self.assertEqual(ruleset["ruleset"], "m2_fixture_v1")
+        self.assertEqual([rule["id"] for rule in ruleset["rules"]],
+                         ["upx_packed", "powershell_encoded_command", "base64_decode_api",
+                          "credential_dump_marker"])
+        self.assertEqual(sum(len(rule["patterns"]) for rule in ruleset["rules"]), 9)
+        for rule in ruleset["rules"]:
+            for pattern in rule["patterns"]:
+                with self.subTest(rule=rule["id"], pattern=pattern["id"]):
+                    self.assertGreaterEqual(len(bytes.fromhex(pattern["hex"])), 4)
+                    self.assertLessEqual(len(bytes.fromhex(pattern["hex"])), 256)
+
+    def test_an_explicit_path_accepts_only_the_identical_reviewed_bytes(self):
+        raw = verifier.YARAX_RULESET_PATH.read_bytes()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "ruleset.json"
+            path.write_bytes(raw)
+            self.assertEqual(verifier.load_yarax_ruleset(self.lock(), path), json.loads(raw))
+            for corrupted in (raw + b"\n", raw.replace(b"55505821", b"55505822"), b"not JSON"):
+                path.write_bytes(corrupted)
+                with self.subTest(corrupted=corrupted[:20]), \
+                        self.assertRaises(verifier.VerificationError):
+                    verifier.load_yarax_ruleset(self.lock(), path)
+
+    def test_a_matching_unreviewed_lock_hash_cannot_authorize_changed_rules(self):
+        raw = verifier.YARAX_RULESET_PATH.read_bytes() + b"\n"
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "ruleset.json"
+            path.write_bytes(raw)
+            with self.assertRaises(verifier.VerificationError):
+                verifier.load_yarax_ruleset({"ruleset_sha256": sha256_hex(raw)}, path)
+
+    def test_missing_wrong_or_malformed_lock_hashes_are_refused(self):
+        for lock in (None, [], False, {}, {"ruleset_sha256": None},
+                     {"ruleset_sha256": "e" * 64}, {"ruleset_sha256": self.REVIEWED_SHA256.upper()},
+                     {"ruleset_sha256": []}, {"ruleset_sha256": True}):
+            with self.subTest(lock=lock), self.assertRaises(verifier.VerificationError):
+                verifier.load_yarax_ruleset(lock)
+
+    def test_missing_and_unreadable_rulesets_are_refused(self):
+        with tempfile.TemporaryDirectory() as folder:
+            missing = Path(folder) / "missing.json"
+            with self.assertRaises(verifier.VerificationError):
+                verifier.load_yarax_ruleset(self.lock(), missing)
+            with mock.patch.object(verifier, "YARAX_RULESET_PATH", missing), \
+                    self.assertRaises(verifier.VerificationError):
+                verifier.load_yarax_ruleset(self.lock())
+        with mock.patch.object(Path, "open", side_effect=PermissionError), \
+                self.assertRaises(verifier.VerificationError):
+            verifier.load_yarax_ruleset(self.lock())
+
+    def test_ruleset_read_is_bounded_and_oversized_bytes_never_reach_the_decoder(self):
+        opened = mock.mock_open(read_data=b"x" * 65_537)
+        with mock.patch.object(Path, "open", opened), \
+                mock.patch.object(verifier, "decode") as decoder, \
+                self.assertRaises(verifier.VerificationError):
+            verifier.load_yarax_ruleset(self.lock())
+        opened.return_value.read.assert_called_once()
+        requested = opened.return_value.read.call_args.args[0]
+        self.assertGreater(requested, 0)
+        self.assertLessEqual(requested, 65_537)
+        decoder.assert_not_called()
+
+    def test_hashes_are_checked_before_attempting_to_decode_untrusted_bytes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "ruleset.json"
+            path.write_bytes(b"not JSON")
+            with mock.patch.object(verifier, "decode") as decoder, \
+                    self.assertRaises(verifier.VerificationError):
+                verifier.load_yarax_ruleset(self.lock(), path)
+        decoder.assert_not_called()
+
+
+class YaraxKnownAnswerTests(unittest.TestCase):
+    def setUp(self):
+        self.ruleset = verifier.load_yarax_ruleset({
+            "ruleset_sha256": "e2217ff703858af17fe8eee8ac0d4cc44dfefd632e096bb4b527b89b08a062a7"})
+        self.data = verifier.yarax_fixtures()
+
+    def record(self, offset, length, rule="upx_packed", pattern="$a"):
+        return {"location": {"offset": offset, "length": length},
+                "value": {"ruleset": "m2_fixture_v1", "rule": rule, "pattern": pattern}}
+
+    def observations(self, records):
+        from reverseai.contract import Location, Observation
+        return tuple(Observation(Location(**record["location"]), record["value"]) for record in records)
+
+    def compare(self, data, records, max_matches=64, ruleset=None):
+        return verifier.compare_yarax_observations(data, self.observations(records),
+                                                  self.ruleset if ruleset is None else ruleset,
+                                                  max_matches=max_matches)
+
+    def upx_records(self):
+        return [self.record(1, 4), self.record(9, 4, pattern="$b"),
+                self.record(17, 4, pattern="$c")]
+
+    def test_four_fixtures_are_deterministic_declared_inert_bytes(self):
+        self.assertEqual(verifier.YARAX_FIXTURE_NAMES,
+                         ("upx_markers", "utf16_markers", "clean", "repeated_markers"))
+        self.assertEqual(self.data, {
+            "upx_markers": b"\0UPX!----UPX0----UPX1\0",
+            "utf16_markers": b"\0\0" + "-EncodedCommand\0FromBase64String\0sekurlsa::".encode("utf-16le"),
+            "clean": b"deterministic clean fixture\0",
+            "repeated_markers": b"UPX!" * 80,
+        })
+        self.assertEqual(verifier.yarax_fixtures(), self.data)
+        self.assertTrue(all(type(data) is bytes for data in self.data.values()))
+
+    def test_upx_matches_use_the_declared_offsets_and_pattern_ids(self):
+        self.assertIsNone(self.compare(self.data["upx_markers"], self.upx_records()))
+
+    def test_utf16_matches_have_byte_offsets_and_full_byte_lengths(self):
+        records = [self.record(2, 30, "powershell_encoded_command", "$w"),
+                   self.record(34, 32, "base64_decode_api", "$w"),
+                   self.record(68, 20, "credential_dump_marker", "$w")]
+        self.assertIsNone(self.compare(self.data["utf16_markers"], records))
+        for index in range(3):
+            changed = copy.deepcopy(records)
+            changed[index]["location"]["length"] //= 2
+            with self.subTest(character_length=index), self.assertRaises(verifier.VerificationError):
+                self.compare(self.data["utf16_markers"], changed)
+
+    def test_all_ascii_rule_families_are_verified_against_manually_declared_ranges(self):
+        data = b"UPX!\0UPX0\0UPX1\0-EncodedCommand\0FromBase64String\0sekurlsa::"
+        records = [self.record(0, 4), self.record(5, 4, pattern="$b"),
+                   self.record(10, 4, pattern="$c"),
+                   self.record(15, 15, "powershell_encoded_command"),
+                   self.record(31, 16, "base64_decode_api"),
+                   self.record(48, 10, "credential_dump_marker")]
+        self.assertIsNone(self.compare(data, records))
+
+    def test_clean_input_has_exactly_no_matches(self):
+        self.assertIsNone(self.compare(self.data["clean"], []))
+        with self.assertRaises(verifier.VerificationError):
+            self.compare(self.data["clean"], [self.record(0, 4)])
+        with self.assertRaises(verifier.VerificationError):
+            self.compare(self.data["upx_markers"], [])
+
+    def test_repeated_matches_are_cut_at_caps_one_thirty_two_and_sixty_four(self):
+        data = self.data["repeated_markers"]
+        for cap in (1, 32, 64):
+            records = [self.record(4 * index, 4) for index in range(cap)]
+            with self.subTest(cap=cap):
+                self.assertIsNone(self.compare(data, records, max_matches=cap))
+        records = [self.record(4 * index, 4) for index in range(64)]
+        self.assertIsNone(verifier.compare_yarax_observations(data, self.observations(records), self.ruleset))
+
+    def test_capped_results_cannot_omit_early_matches_or_include_later_real_matches(self):
+        data = self.data["repeated_markers"]
+        for cap in (1, 32, 64):
+            expected = [self.record(4 * index, 4) for index in range(cap)]
+            for mutation in ("missing", "extra", "later", "duplicate"):
+                changed = copy.deepcopy(expected)
+                if mutation == "missing":
+                    changed.pop()
+                elif mutation == "extra":
+                    changed.append(self.record(4 * cap, 4))
+                elif mutation == "later":
+                    changed[-1] = self.record(4 * cap, 4)
+                else:
+                    changed.append(copy.deepcopy(changed[0]))
+                with self.subTest(cap=cap, mutation=mutation), \
+                        self.assertRaises(verifier.VerificationError):
+                    self.compare(data, changed, max_matches=cap)
+
+    def test_matches_cannot_be_omitted_duplicated_added_or_reordered(self):
+        for mutation in ("missing_first", "missing_middle", "missing_last", "duplicate", "extra", "reordered"):
+            records = self.upx_records()
+            if mutation.startswith("missing"):
+                records.pop({"missing_first": 0, "missing_middle": 1, "missing_last": 2}[mutation])
+            elif mutation == "duplicate":
+                records[1] = copy.deepcopy(records[0])
+            elif mutation == "extra":
+                records.append(copy.deepcopy(records[-1]))
+            else:
+                records[0], records[1] = records[1], records[0]
+            with self.subTest(mutation=mutation), self.assertRaises(verifier.VerificationError):
+                self.compare(self.data["upx_markers"], records)
+
+    def test_match_values_require_exactly_three_correct_string_fields(self):
+        for field in ("ruleset", "rule", "pattern"):
+            for bad in ("unknown", None, False, 1, [], {}):
+                records = self.upx_records()
+                records[0]["value"][field] = bad
+                with self.subTest(field=field, bad=bad), self.assertRaises(verifier.VerificationError):
+                    self.compare(self.data["upx_markers"], records)
+            records = self.upx_records()
+            del records[0]["value"][field]
+            with self.subTest(missing=field), self.assertRaises(verifier.VerificationError):
+                self.compare(self.data["upx_markers"], records)
+        records = self.upx_records()
+        records[0]["value"]["category"] = "packer"
+        with self.assertRaises(verifier.VerificationError):
+            self.compare(self.data["upx_markers"], records)
+
+    def test_json_object_field_order_does_not_change_a_valid_match(self):
+        records = self.upx_records()
+        records[0]["value"] = {"pattern": "$a", "rule": "upx_packed", "ruleset": "m2_fixture_v1"}
+        self.assertIsNone(self.compare(self.data["upx_markers"], records))
+
+    def test_duplicate_json_value_fields_are_refused_at_the_worker_reply_boundary(self):
+        from reverseai.contract import ContractError
+        data = self.data["upx_markers"]
+        reply = {"protocol": WORKER_PROTOCOL, "status": "ok", "snapshot_sha256": sha256_hex(data),
+                 "observations": self.upx_records()}
+        raw = json.dumps(reply).replace('"rule": "upx_packed"',
+                                        '"rule": "upx_packed", "rule": "upx_packed"', 1).encode()
+        with self.assertRaises(ContractError):
+            parse_worker_reply(raw, input_sha256=sha256_hex(data), max_observations=64)
+
+    def test_match_ranges_require_exact_pattern_bytes_lengths_and_in_bounds_locations(self):
+        data = self.data["upx_markers"]
+        for offset, length in ((0, 4), (2, 4), (1, 3), (1, 5), (len(data), 4), (len(data) - 1, 4)):
+            records = self.upx_records()
+            records[0]["location"] = {"offset": offset, "length": length}
+            with self.subTest(offset=offset, length=length), self.assertRaises(verifier.VerificationError):
+                self.compare(data, records)
+
+    def test_invalid_caps_inputs_collections_and_observation_shapes_are_refused(self):
+        for cap in (0, 65, -1, True, 1.0, "32", None):
+            with self.subTest(cap=cap), self.assertRaises(verifier.VerificationError):
+                self.compare(self.data["upx_markers"], self.upx_records(), max_matches=cap)
+        for data in (None, "UPX!", bytearray(b"UPX!"), []):
+            with self.subTest(data=data), self.assertRaises(verifier.VerificationError):
+                verifier.compare_yarax_observations(data, [], self.ruleset)
+        for observations in (None, {}, "matches", False, [None], [{}], ["match"]):
+            with self.subTest(observations=observations), self.assertRaises(verifier.VerificationError):
+                verifier.compare_yarax_observations(self.data["clean"], observations, self.ruleset)
+
+    def test_equal_offset_matches_are_sorted_by_rule_then_pattern_before_capping(self):
+        ruleset = {"ruleset": "m2_fixture_v1", "rules": [
+            {"id": "z_rule", "patterns": [{"id": "$z", "hex": "55505821"},
+                                           {"id": "$a", "hex": "55505821"}]},
+            {"id": "a_rule", "patterns": [{"id": "$a", "hex": "55505821"}]},
+        ]}
+        records = [self.record(0, 4, "a_rule"), self.record(0, 4, "z_rule"),
+                   self.record(0, 4, "z_rule", "$z")]
+        self.assertIsNone(self.compare(b"UPX!", records, ruleset=ruleset))
+        self.assertIsNone(self.compare(b"UPX!", records[:1], max_matches=1, ruleset=ruleset))
+        for left, right in ((0, 1), (1, 2)):
+            changed = copy.deepcopy(records)
+            changed[left], changed[right] = changed[right], changed[left]
+            with self.subTest(left=left, right=right), self.assertRaises(verifier.VerificationError):
+                self.compare(b"UPX!", changed, ruleset=ruleset)
+
+    def test_overlapping_literal_matches_are_not_skipped(self):
+        ruleset = {"ruleset": "m2_fixture_v1", "rules": [
+            {"id": "overlap", "patterns": [{"id": "$a", "hex": "41414141"}]}]}
+        records = [self.record(offset, 4, "overlap") for offset in (0, 1, 2)]
+        self.assertIsNone(self.compare(b"AAAAAA", records, ruleset=ruleset))
+        with self.assertRaises(verifier.VerificationError):
+            self.compare(b"AAAAAA", records[:1], ruleset=ruleset)
+
+
+class YaraxReceiptTests(unittest.TestCase):
+    def receipt(self):
+        receipt = receipt_fixture()
+        receipt.update(tool="yarax", ruleset_sha256=
+                       "e2217ff703858af17fe8eee8ac0d4cc44dfefd632e096bb4b527b89b08a062a7")
+        receipt["lock"] = {
+            "adapter_version": "1.21.0-r1",
+            "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
+            "image_id": IMAGE_ID, "platform": "linux/arm64",
+            "ruleset_sha256": receipt["ruleset_sha256"],
+            "wheel_sha256": "9bd9961b44b47dd747d526e61c703a2a8170426d003e789e7724bc7862de6d56",
+        }
+        names = ("local_daemon", "image", "container", "runtime_identity", "network", "write_root",
+                 "write_snapshot", "setuid", "capability", "pids", "memory", "wall", "stdout",
+                 "upx_markers.matches", "utf16_markers.matches", "clean.matches", "repeated_markers.matches")
+        receipt["checks"] = [{"id": name, "status": "passed"} for name in names]
+        receipt["cleanup"] = [{"container_id": f"{index + 1:064x}", "verified": True,
+                               "staging_removed": True} for index in range(14)]
+        return receipt
+
+    def test_complete_yarax_receipt_has_seventeen_checks_and_fourteen_unique_cleanups(self):
+        receipt = self.receipt()
+        self.assertEqual(verifier.YARAX_RULESET_NAME, "m2_fixture_v1")
+        self.assertEqual(verifier.YARAX_ADAPTER_VERSION, receipt["lock"]["adapter_version"])
+        self.assertEqual(verifier.YARAX_BASE_DIGEST, receipt["lock"]["base_digest"])
+        self.assertEqual(verifier.YARAX_WHEEL_SHA256, receipt["lock"]["wheel_sha256"])
+        self.assertEqual(verifier.YARAX_REQUIRED_CHECKS, tuple(row["id"] for row in receipt["checks"]))
+        self.assertEqual(len(verifier.YARAX_REQUIRED_CHECKS), 17)
+        self.assertEqual(verifier.YARAX_NATIVE_RUNS, 14)
+        self.assertTrue(verifier.receipt_passes(receipt))
+
+    def test_yarax_lock_requires_exactly_the_six_profile_keys(self):
+        for field in self.receipt()["lock"]:
+            receipt = self.receipt()
+            del receipt["lock"][field]
+            with self.subTest(missing=field):
+                self.assertFalse(verifier.receipt_passes(receipt))
+        receipt = self.receipt()
+        receipt["lock"]["unexpected"] = "unreviewed"
+        self.assertFalse(verifier.receipt_passes(receipt))
+
+    def test_well_formed_but_unreviewed_base_wheel_adapter_and_ruleset_pins_are_refused(self):
+        for field, value in (("base_digest", "sha256:" + "b" * 64), ("wheel_sha256", "c" * 64),
+                             ("adapter_version", "1.21.0"), ("adapter_version", "1.0.0-r2"),
+                             ("ruleset_sha256", "d" * 64)):
+            receipt = self.receipt()
+            receipt["lock"][field] = value
+            with self.subTest(field=field, value=value):
+                self.assertFalse(verifier.receipt_passes(receipt))
+        receipt = self.receipt()
+        receipt["lock"]["ruleset_sha256"] = receipt["ruleset_sha256"] = "d" * 64
+        self.assertFalse(verifier.receipt_passes(receipt))
+
+    def test_top_level_ruleset_hash_is_required_and_bound_to_the_reviewed_lock(self):
+        receipt = self.receipt()
+        del receipt["ruleset_sha256"]
+        self.assertFalse(verifier.receipt_passes(receipt))
+        for value in ("d" * 64, self.receipt()["ruleset_sha256"].upper(), None, [], True):
+            receipt = self.receipt()
+            receipt["ruleset_sha256"] = value
+            with self.subTest(value=value):
+                self.assertFalse(verifier.receipt_passes(receipt))
+
+    def test_lief_and_yarax_profile_evidence_cannot_be_relabelled(self):
+        lief = receipt_fixture()
+        lief["tool"] = "yarax"
+        self.assertFalse(verifier.receipt_passes(lief))
+        yarax = self.receipt()
+        yarax["tool"] = "lief"
+        self.assertFalse(verifier.receipt_passes(yarax))
+        for key in ("checks", "cleanup", "lock"):
+            receipt = self.receipt()
+            receipt[key] = receipt_fixture()[key]
+            with self.subTest(lief_evidence=key):
+                self.assertFalse(verifier.receipt_passes(receipt))
+
+    def test_yarax_identity_offline_and_source_digest_bindings_are_exact(self):
+        for field, values in {
+            "schema": ("reverseai.m2-runtime/2", None), "platform": ("linux/amd64", None),
+            "tool": ("yara", None), "profile": ("large", None), "offline": (False, 1, "true", None),
+            "lock_sha256": ("a" * 63, "A" * 64, None),
+            "verifier_sha256": ("a" * 65, "g" * 64, None),
+            "executor_sha256": ("sha256:" + "a" * 64, [], True),
+        }.items():
+            for value in values:
+                receipt = self.receipt()
+                receipt[field] = value
+                with self.subTest(field=field, value=value):
+                    self.assertFalse(verifier.receipt_passes(receipt))
+            receipt = self.receipt()
+            del receipt[field]
+            with self.subTest(missing=field):
+                self.assertFalse(verifier.receipt_passes(receipt))
+
+    def test_yarax_image_and_locked_platform_must_agree(self):
+        for field, value in (("image_id", "sha256:" + "d" * 64), ("platform", "linux/amd64")):
+            receipt = self.receipt()
+            receipt["lock"][field] = value
+            with self.subTest(field=field):
+                self.assertFalse(verifier.receipt_passes(receipt))
+        for value in ("sha256:bad", "sha256:" + "A" * 64, None, 1):
+            receipt = self.receipt()
+            receipt["image_id"] = receipt["lock"]["image_id"] = value
+            with self.subTest(image_id=value):
+                self.assertFalse(verifier.receipt_passes(receipt))
+
+    def test_every_yarax_check_must_be_present_once_and_passed(self):
+        for index, row in enumerate(self.receipt()["checks"]):
+            for mutation in ("missing", "duplicate", "failed", "not_run", "false", "status_missing"):
+                receipt = self.receipt()
+                if mutation == "missing":
+                    receipt["checks"].pop(index)
+                elif mutation == "duplicate":
+                    receipt["checks"][index] = copy.deepcopy(receipt["checks"][(index + 1) % 17])
+                elif mutation == "status_missing":
+                    del receipt["checks"][index]["status"]
+                else:
+                    receipt["checks"][index]["status"] = False if mutation == "false" else mutation
+                with self.subTest(check=row["id"], mutation=mutation):
+                    self.assertFalse(verifier.receipt_passes(receipt))
+        receipt = self.receipt()
+        receipt["checks"].append({"id": "unexpected", "status": "passed"})
+        self.assertFalse(verifier.receipt_passes(receipt))
+
+    def test_cleanup_requires_exactly_fourteen_distinct_containers(self):
+        for mutation in ("missing", "extra", "duplicate"):
+            receipt = self.receipt()
+            if mutation == "missing":
+                receipt["cleanup"].pop()
+            elif mutation == "extra":
+                receipt["cleanup"].append({"container_id": "f" * 64, "verified": True,
+                                           "staging_removed": True})
+            else:
+                receipt["cleanup"][1] = copy.deepcopy(receipt["cleanup"][0])
+            with self.subTest(mutation=mutation):
+                self.assertFalse(verifier.receipt_passes(receipt))
+
+    def test_every_yarax_cleanup_requires_verified_absence_and_removed_staging(self):
+        for index in range(14):
+            for field in ("verified", "staging_removed"):
+                for value in (False, None, 1, "true"):
+                    receipt = self.receipt()
+                    receipt["cleanup"][index][field] = value
+                    with self.subTest(index=index, field=field, value=value):
+                        self.assertFalse(verifier.receipt_passes(receipt))
+                receipt = self.receipt()
+                del receipt["cleanup"][index][field]
+                with self.subTest(index=index, missing=field):
+                    self.assertFalse(verifier.receipt_passes(receipt))
+
+    def test_malformed_yarax_sections_rows_and_cleanup_ids_are_refused(self):
+        for field in ("checks", "cleanup", "lock"):
+            for value in (None, [], {}, False, "invalid"):
+                receipt = self.receipt()
+                receipt[field] = value
+                with self.subTest(field=field, value=value):
+                    self.assertFalse(verifier.receipt_passes(receipt))
+        for value in (None, [], False, "row", {}):
+            for field in ("checks", "cleanup"):
+                receipt = self.receipt()
+                receipt[field][0] = value
+                with self.subTest(field=field, row=value):
+                    self.assertFalse(verifier.receipt_passes(receipt))
+        for value in ("", "a" * 63, "A" * 64, "sha256:" + "a" * 64, None, [], 1):
+            receipt = self.receipt()
+            receipt["cleanup"][0]["container_id"] = value
+            with self.subTest(container_id=value):
+                self.assertFalse(verifier.receipt_passes(receipt))
+        receipt = self.receipt()
+        del receipt["cleanup"][0]["container_id"]
+        self.assertFalse(verifier.receipt_passes(receipt))
+
+
+class YaraxNativeProfileTests(unittest.TestCase):
+    def setUp(self):
+        self.boundary = FakeBoundary()
+        self.lock = YaraxReceiptTests().receipt()["lock"]
+        self.ruleset = verifier.load_yarax_ruleset(self.lock)
+        self.receipt = {"checks": [], "cleanup": []}
+        self.native = verifier.NativeVerifier(self.boundary, self.lock, self.receipt,
+                                               tool="yarax", ruleset=self.ruleset)
+        self.native.image = image_fixture()
+        self.data = verifier.yarax_fixtures()
+        self.args = {"ruleset": "m2_fixture_v1", "max_matches": 64}
+        self.argv = self.boundary.build_argv(IMAGE_ID, "reverseai-yarax-owned", str(SNAPSHOT),
+                                             "yarax.matches", self.args)
+
+    def run_worker(self):
+        return self.native.runner(self.argv, timeout=45, max_output=262144)
+
+    def commands(self):
+        return [row[0] for row in self.boundary.calls]
+
+    def assert_owned_cleanup(self):
+        self.assertEqual(self.commands()[-2:], [
+            ["docker", "rm", "--force", FakeBoundary.CID],
+            ["docker", "ps", "--all", "--no-trunc", "--filter", "id=" + FakeBoundary.CID,
+             "--format", "{{.ID}}"],
+        ])
+        self.assertEqual(self.receipt["cleanup"][0]["container_id"], FakeBoundary.CID)
+        self.assertTrue(self.receipt["cleanup"][0]["verified"])
+
+    def records(self, name):
+        declared = YaraxKnownAnswerTests()
+        if name == "upx_markers":
+            return declared.upx_records()
+        if name == "utf16_markers":
+            return [declared.record(2, 30, "powershell_encoded_command", "$w"),
+                    declared.record(34, 32, "base64_decode_api", "$w"),
+                    declared.record(68, 20, "credential_dump_marker", "$w")]
+        if name == "repeated_markers":
+            return [declared.record(4 * index, 4) for index in range(64)]
+        self.assertEqual(name, "clean")
+        return []
+
+    def reply(self, data, records, **changes):
+        value = {"protocol": WORKER_PROTOCOL, "status": "ok", "snapshot_sha256": sha256_hex(data),
+                 "observations": records}
+        value.update(changes)
+        return json.dumps(value).encode()
+
+    def run_with_inspections(self, count):
+        self.native.inspected = count
+        with mock.patch.object(self.native, "local_daemon", return_value={}), \
+                mock.patch.object(self.native, "image_check", return_value={}), \
+                mock.patch.object(self.native, "control", return_value={}) as control, \
+                mock.patch.object(self.native, "known_answer", return_value={}) as known_answer, \
+                mock.patch.object(verifier, "fixtures", side_effect=AssertionError("LIEF fixture fallback")):
+            self.native.run()
+        self.assertEqual(control.call_args_list,
+                         [mock.call(name, self.data["upx_markers"]) for name in verifier.CONTROL_NAMES])
+        self.assertEqual(known_answer.call_args_list,
+                         [mock.call(data, "yarax.matches") for data in self.data.values()])
+        self.assertEqual({row["id"] for row in self.receipt["checks"]}, set(verifier.YARAX_REQUIRED_CHECKS))
+        self.assertEqual(len(self.receipt["checks"]), 17)
+        return next(row for row in self.receipt["checks"] if row["id"] == "container")
+
+    def test_full_profile_routes_ten_controls_four_fixtures_and_fourteen_inspections(self):
+        self.assertEqual(self.run_with_inspections(14),
+                         {"id": "container", "status": "passed", "evidence": None})
+        self.assertTrue(all(row["status"] == "passed" for row in self.receipt["checks"]))
+
+    def test_missing_or_extra_yarax_inspections_refuse_the_container_check(self):
+        for count in (0, 13, 15, 18):
+            self.setUp()
+            with self.subTest(count=count):
+                self.assertEqual(self.run_with_inspections(count),
+                                 {"id": "container", "status": "failed", "reason": "ContainerInspectionMissing"})
+
+    def test_yarax_constructor_requires_reviewed_pins_and_a_ruleset(self):
+        for ruleset in (None, [], "ruleset", False):
+            with self.subTest(ruleset=ruleset), self.assertRaises(verifier.VerificationError):
+                verifier.NativeVerifier(self.boundary, self.lock, self.receipt, tool="yarax", ruleset=ruleset)
+        for field in self.lock:
+            lock = dict(self.lock)
+            del lock[field]
+            with self.subTest(missing=field), self.assertRaises(verifier.VerificationError):
+                verifier.NativeVerifier(self.boundary, lock, self.receipt, tool="yarax", ruleset=self.ruleset)
+        self.assertEqual(self.boundary.calls, [])
+
+    def test_each_control_uses_yarax_operation_arguments_and_its_probe_name(self):
+        for name in verifier.CONTROL_NAMES:
+            value = probe_fixture(name)
+            with self.subTest(probe=name), \
+                    mock.patch.object(self.native, "invoke", return_value=json.dumps(value).encode()) as invoke:
+                self.assertEqual(self.native.control(name, self.data["upx_markers"]), value)
+                invoke.assert_called_once_with(self.data["upx_markers"], "yarax.matches",
+                                               {"ruleset": "m2_fixture_v1", "max_matches": 32}, probe=name)
+
+    def test_known_answers_accept_every_fixture_including_sixty_four_matches(self):
+        for name, data in self.data.items():
+            records = self.records(name)
+            with self.subTest(fixture=name), \
+                    mock.patch.object(self.native, "invoke", return_value=self.reply(data, records)) as invoke, \
+                    mock.patch.object(verifier, "compare_observations", side_effect=AssertionError("LIEF comparison fallback")):
+                self.assertEqual(self.native.known_answer(data, "yarax.matches"),
+                                 {"input_sha256": sha256_hex(data), "input_bytes": len(data),
+                                  "observations": len(records)})
+                invoke.assert_called_once_with(data, "yarax.matches",
+                                               {"ruleset": "m2_fixture_v1", "max_matches": 64})
+
+    def test_known_answer_refuses_other_operations_without_invoking_a_worker(self):
+        with mock.patch.object(self.native, "invoke") as invoke:
+            for operation in ("lief.headers", "lief.sections", "yara.matches", "yarax.headers"):
+                with self.subTest(operation=operation), self.assertRaises(verifier.VerificationError):
+                    self.native.known_answer(self.data["upx_markers"], operation)
+        invoke.assert_not_called()
+
+    def test_known_answer_refuses_forged_protocol_snapshot_and_over_cap_replies(self):
+        from reverseai.contract import ContractError
+        data = self.data["repeated_markers"]
+        records = self.records("repeated_markers")
+        for raw in (self.reply(data, records, protocol="reverseai.worker/2"),
+                    self.reply(data, records, snapshot_sha256="0" * 64),
+                    self.reply(data, records + [YaraxKnownAnswerTests().record(256, 4)]),
+                    b"x" * (MAX_WORKER_REPLY_BYTES + 1)):
+            with self.subTest(reply_bytes=len(raw)), mock.patch.object(self.native, "invoke", return_value=raw), \
+                    self.assertRaises(ContractError):
+                self.native.known_answer(data, "yarax.matches")
+
+    def test_known_answer_refuses_well_formed_but_forged_or_hidden_observations(self):
+        data = self.data["upx_markers"]
+        for mutation in ("wrong_rule", "wrong_range", "hidden", "duplicate", "reordered"):
+            records = self.records("upx_markers")
+            if mutation == "wrong_rule":
+                records[0]["value"]["rule"] = "credential_dump_marker"
+            elif mutation == "wrong_range":
+                records[0]["location"]["offset"] = 0
+            elif mutation == "hidden":
+                records.pop()
+            elif mutation == "duplicate":
+                records[1] = copy.deepcopy(records[0])
+            else:
+                records.reverse()
+            with self.subTest(mutation=mutation), \
+                    mock.patch.object(self.native, "invoke", return_value=self.reply(data, records)), \
+                    self.assertRaises(verifier.VerificationError):
+                self.native.known_answer(data, "yarax.matches")
+
+    def test_invoke_passes_yarax_adapter_and_extra_lock_key_to_the_executor_factory(self):
+        executor = SimpleNamespace(run=mock.Mock(return_value=b"canned reply"))
+        self.boundary.DockerExecutor = mock.Mock(return_value=executor)
+        data = self.data["upx_markers"]
+        self.assertEqual(self.native.invoke(data, "yarax.matches", self.args, probe="stdout"), b"canned reply")
+        self.boundary.DockerExecutor.assert_called_once_with(
+            self.lock, runner=self.native.runner, adapter_version="1.21.0-r1", extra_keys=("ruleset_sha256",))
+        executor.run.assert_called_once_with("yarax.matches", self.args, data, sha256_hex(data))
+        self.assertIsNone(self.native.active)
+
+    def test_yarax_runner_inspects_the_operation_and_cleans_only_the_created_id(self):
+        self.assertEqual(self.run_worker(), b"canned worker reply")
+        commands = self.commands()
+        self.assertEqual([argv[:2] for argv in commands],
+                         [["docker", "create"], ["docker", "inspect"], ["docker", "start"],
+                          ["docker", "rm"], ["docker", "ps"]])
+        self.assertEqual(commands[0][-2:], ["yarax.matches", '{"max_matches":64,"ruleset":"m2_fixture_v1"}'])
+        self.assertEqual(commands[1], ["docker", "inspect", FakeBoundary.CID])
+        self.assertEqual(commands[2], ["docker", "start", "--attach", FakeBoundary.CID])
+        self.assertEqual(self.boundary.calls[2][1:], (45, MAX_WORKER_REPLY_BYTES))
+        self.assertEqual(self.native.inspected, 1)
+        self.assert_owned_cleanup()
+
+    def test_yarax_unsafe_inspection_blocks_start_and_still_cleans_the_created_id(self):
+        self.boundary.inspect["HostConfig"]["NetworkMode"] = "host"
+        with self.assertRaises(verifier.VerificationError):
+            self.run_worker()
+        self.assertFalse(any(argv[:2] == ["docker", "start"] for argv in self.commands()))
+        self.assertEqual(self.native.inspected, 0)
+        self.assert_owned_cleanup()
+
+    def test_yarax_stdout_probe_records_only_the_exact_output_limit_failure(self):
+        self.native.active = "stdout"
+        self.boundary.start_error = self.boundary.ContainedError("WorkerOutputLimit")
+        value = verifier.decode(self.run_worker())
+        verifier.validate_probe("stdout", value)
+        self.assertEqual(value["error"], "WorkerOutputLimit")
+        self.assert_owned_cleanup()
+
+    def test_yarax_wall_probe_requires_observed_running_and_the_full_wall_limit(self):
+        self.native.active = "wall"
+        self.boundary.wait_for_running = True
+        self.boundary.start_error = self.boundary.ContainedTimeout("WorkerTimeout")
+        with mock.patch.object(verifier.time, "monotonic", side_effect=(100.0, 145.1)):
+            value = verifier.decode(self.run_worker())
+        verifier.validate_probe("wall", value)
+        self.assertTrue(value["running_observed"])
+        self.assertAlmostEqual(value["elapsed"], 45.1)
+        self.assert_owned_cleanup()
+
+    def test_yarax_uncertain_create_keeps_the_failure_and_removes_owned_staging(self):
+        failure = OSError("lost create reply")
+        self.boundary.create_error = failure
+        with tempfile.TemporaryDirectory() as folder:
+            staging = Path(folder) / "snapshot"
+
+            def executor_factory(lock, *, runner, adapter_version, extra_keys):
+                self.assertEqual(lock, self.lock)
+                self.assertEqual(adapter_version, "1.21.0-r1")
+                self.assertEqual(extra_keys, ("ruleset_sha256",))
+
+                def run(operation, args, data, digest):
+                    staging.mkdir()
+                    (staging / "input").write_bytes(data)
+                    argv = self.boundary.build_argv(IMAGE_ID, "reverseai-yarax-owned", str(staging), operation, args)
+                    try:
+                        return runner(argv, timeout=45, max_output=MAX_WORKER_REPLY_BYTES)
+                    finally:
+                        (staging / "input").unlink()
+                        staging.rmdir()
+                return SimpleNamespace(run=run)
+
+            self.boundary.DockerExecutor = mock.Mock(side_effect=executor_factory)
+            with self.assertRaises(OSError) as caught:
+                self.native.invoke(self.data["upx_markers"], "yarax.matches", self.args)
+            self.assertIs(caught.exception, failure)
+            self.assertEqual(list(Path(folder).iterdir()), [])
+        self.assert_owned_cleanup()
+        self.assertTrue(self.receipt["cleanup"][0]["uncertain_create"])
+        self.assertTrue(self.receipt["cleanup"][0]["staging_removed"])
+        self.assertIsNone(self.native.active)
+        self.assertFalse(any(argv[:2] == ["docker", "start"] for argv in self.commands()))
+
+
+class YaraxMainTests(unittest.TestCase):
+    def run_cli(self, *, lock=None, ruleset_state="reviewed", change=None, native_error=None):
+        reviewed = verifier.YARAX_RULESET_PATH.read_bytes()
+        lock = YaraxReceiptTests().receipt()["lock"] if lock is None else lock
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            initial = {"verifier": b"inert verifier source one", "executor": b"inert executor source one"}
+            sources = {name: root / (name + ".py") for name in initial}
+            for name, path in sources.items():
+                path.write_bytes(initial[name])
+            ruleset = root / "ruleset.json"
+            if ruleset_state != "missing":
+                ruleset.write_bytes(reviewed if ruleset_state == "reviewed" else
+                                    b"x" * 65_537 if ruleset_state == "oversized" else reviewed + b"\n")
+            lock_path = root / "image.lock.json"
+            lock_raw = json.dumps(lock).encode()
+            lock_path.write_bytes(lock_raw)
+            output = root / "receipt.json"
+            boundary = SimpleNamespace(WALL_SECONDS=45, __file__=str(sources["executor"]),
+                                       load_lock=mock.Mock(side_effect=lambda value, **kwargs: copy.deepcopy(value)),
+                                       run_bounded=mock.Mock(side_effect=AssertionError("unexpected process boundary")))
+
+            def native_factory(called_boundary, called_lock, receipt, **options):
+                self.assertIs(called_boundary, boundary)
+
+                def run():
+                    if native_error is not None:
+                        raise native_error
+                    canned = YaraxReceiptTests().receipt()
+                    for key in ("image_id", "checks", "cleanup"):
+                        receipt[key] = canned[key]
+                    if change == "ruleset":
+                        ruleset.write_bytes(reviewed + b"\n")
+                    elif change == "missing_ruleset":
+                        ruleset.unlink()
+                    elif change in sources:
+                        sources[change].write_bytes(initial[change] + b" changed during verification")
+                return SimpleNamespace(run=run)
+
+            with mock.patch.object(reverseai, "contained", boundary, create=True), \
+                    mock.patch.object(verifier, "__file__", str(sources["verifier"])), \
+                    mock.patch.object(verifier, "YARAX_RULESET_PATH", ruleset), \
+                    mock.patch.object(verifier, "NativeVerifier", side_effect=native_factory) as factory, \
+                    mock.patch.object(verifier, "load_yarax_ruleset", wraps=verifier.load_yarax_ruleset) as loader, \
+                    mock.patch.object(verifier.sys, "stderr", new=io.StringIO()):
+                result = verifier.main(["--tool", "yarax", "--profile", "small", "--offline",
+                                        "--lock", str(lock_path), "--receipt", str(output)])
+            receipt = json.loads(output.read_bytes())
+        boundary.run_bounded.assert_not_called()
+        return SimpleNamespace(result=result, receipt=receipt, boundary=boundary, factory=factory,
+                               loader=loader, lock=lock, lock_raw=lock_raw, reviewed=reviewed, initial=initial)
+
+    def test_complete_cli_receipt_keeps_exact_yarax_checks_cleanups_and_hash_bindings(self):
+        run = self.run_cli()
+        self.assertEqual(run.result, 0)
+        self.assertTrue(run.receipt["passed"])
+        self.assertEqual(run.receipt["tool"], "yarax")
+        self.assertEqual(run.receipt["ruleset_sha256"], sha256_hex(run.reviewed))
+        self.assertEqual(run.receipt["lock_sha256"], sha256_hex(run.lock_raw))
+        for name, raw in run.initial.items():
+            self.assertEqual(run.receipt[name + "_sha256"], sha256_hex(raw))
+        self.assertEqual({row["id"] for row in run.receipt["checks"]}, set(verifier.YARAX_REQUIRED_CHECKS))
+        self.assertEqual(len(run.receipt["checks"]), 17)
+        self.assertTrue(all(row["status"] == "passed" for row in run.receipt["checks"]))
+        self.assertEqual(len(run.receipt["cleanup"]), 14)
+
+    def test_cli_passes_yarax_lock_options_and_verified_ruleset_to_the_native_factory(self):
+        run = self.run_cli()
+        run.boundary.load_lock.assert_called_once_with(
+            run.lock, adapter_version="1.21.0-r1", extra_keys=("ruleset_sha256",))
+        run.factory.assert_called_once()
+        self.assertEqual(run.factory.call_args.args[:2], (run.boundary, run.lock))
+        self.assertEqual(run.factory.call_args.kwargs,
+                         {"tool": "yarax", "ruleset": json.loads(run.reviewed)})
+        self.assertEqual(run.loader.call_count, 2)
+
+    def test_cli_wrong_lock_pins_are_refused_before_shared_loading_and_native_creation(self):
+        for field, value in (("adapter_version", "1.0.0-r2"), ("base_digest", "sha256:" + "b" * 64),
+                             ("wheel_sha256", "c" * 64), ("ruleset_sha256", "d" * 64),
+                             ("platform", "linux/amd64"), ("image_id", "sha256:bad")):
+            lock = YaraxReceiptTests().receipt()["lock"]
+            lock[field] = value
+            with self.subTest(field=field):
+                run = self.run_cli(lock=lock)
+                self.assertEqual(run.result, 1)
+                self.assertFalse(run.receipt["passed"])
+                run.boundary.load_lock.assert_not_called()
+                run.loader.assert_not_called()
+                run.factory.assert_not_called()
+        for mutation in ("missing", "extra"):
+            lock = YaraxReceiptTests().receipt()["lock"]
+            if mutation == "missing":
+                del lock["ruleset_sha256"]
+            else:
+                lock["unreviewed"] = True
+            with self.subTest(keys=mutation):
+                run = self.run_cli(lock=lock)
+                self.assertEqual(run.result, 1)
+                run.boundary.load_lock.assert_not_called()
+                run.factory.assert_not_called()
+
+    def test_cli_missing_corrupt_or_oversized_rulesets_are_refused_before_native_creation(self):
+        for state in ("missing", "corrupt", "oversized"):
+            with self.subTest(ruleset=state):
+                run = self.run_cli(ruleset_state=state)
+                self.assertEqual(run.result, 1)
+                self.assertFalse(run.receipt["passed"])
+                run.boundary.load_lock.assert_called_once()
+                run.factory.assert_not_called()
+                self.assertNotIn("ruleset_sha256", run.receipt)
+
+    def test_controller_failure_marks_only_the_seventeen_yarax_checks_not_run(self):
+        lock = YaraxReceiptTests().receipt()["lock"]
+        lock["base_digest"] = "sha256:" + "b" * 64
+        run = self.run_cli(lock=lock)
+        self.assertEqual(run.result, 1)
+        self.assertIn({"id": "controller", "status": "failed", "reason": "YaraxLockPins"}, run.receipt["checks"])
+        self.assertEqual({row["id"] for row in run.receipt["checks"] if row["status"] == "not_run"},
+                         set(verifier.YARAX_REQUIRED_CHECKS))
+        self.assertEqual(len(run.receipt["checks"]), 18)
+
+    def test_ruleset_change_during_run_refuses_an_otherwise_complete_receipt(self):
+        run = self.run_cli(change="ruleset")
+        self.assertEqual(run.result, 1)
+        self.assertFalse(run.receipt["passed"])
+        self.assertIn({"id": "controller", "status": "failed", "reason": "YaraxRulesetHash"}, run.receipt["checks"])
+        self.assertEqual(run.receipt["ruleset_sha256"], sha256_hex(run.reviewed))
+        self.assertEqual(run.loader.call_count, 2)
+
+    def test_ruleset_removal_during_run_refuses_an_otherwise_complete_receipt(self):
+        run = self.run_cli(change="missing_ruleset")
+        self.assertEqual(run.result, 1)
+        self.assertFalse(run.receipt["passed"])
+        self.assertIn({"id": "controller", "status": "failed", "reason": "YaraxRulesetUnavailable"},
+                      run.receipt["checks"])
+
+    def test_yarax_keeps_both_source_change_guards_and_the_original_hashes(self):
+        for source in ("verifier", "executor"):
+            with self.subTest(source=source):
+                run = self.run_cli(change=source)
+                self.assertEqual(run.result, 1)
+                self.assertFalse(run.receipt["passed"])
+                self.assertIn({"id": "controller", "status": "failed", "reason": "SourceChangedDuringVerification"},
+                              run.receipt["checks"])
+                for name, raw in run.initial.items():
+                    self.assertEqual(run.receipt[name + "_sha256"], sha256_hex(raw))
+
+    def test_yarax_runtime_failure_cannot_fall_back_to_lief_or_its_check_list(self):
+        run = self.run_cli(native_error=verifier.VerificationError("CannedYaraxFailure"))
+        self.assertEqual(run.result, 1)
+        self.assertFalse(run.receipt["passed"])
+        run.factory.assert_called_once()
+        self.assertEqual(run.factory.call_args.kwargs["tool"], "yarax")
+        self.assertIn({"id": "controller", "status": "failed", "reason": "CannedYaraxFailure"},
+                      run.receipt["checks"])
+        self.assertEqual({row["id"] for row in run.receipt["checks"] if row["status"] == "not_run"},
+                         set(verifier.YARAX_REQUIRED_CHECKS))
+
+    def test_yarax_cli_requires_explicit_lock_and_receipt_paths(self):
+        base = ["--tool", "yarax", "--profile", "small", "--offline"]
+        for remaining in ([], ["--lock", "unused-lock.json"], ["--receipt", "unused-receipt.json"]):
+            with self.subTest(arguments=remaining), \
+                    mock.patch.object(verifier.sys, "stderr", new=io.StringIO()), \
+                    mock.patch.object(verifier, "NativeVerifier") as factory, \
+                    self.assertRaises(SystemExit) as caught:
+                verifier.main(base + remaining)
+            self.assertEqual(caught.exception.code, 2)
+            factory.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

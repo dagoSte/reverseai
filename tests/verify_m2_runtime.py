@@ -1,7 +1,7 @@
-"""Native LIEF containment checks; ordinary unittest discovery never runs Docker.
+"""Native LIEF/YARA-X containment checks; ordinary unittest discovery never runs Docker.
 
-Run from the repository root with --tool lief --profile small --offline
---lock containers/lief/image.lock.json --receipt NEW_PRIVATE_FILE.
+Run from the repository root with --tool lief (or yarax), --profile small --offline,
+--lock containers/<tool>/image.lock.json --receipt NEW_PRIVATE_FILE.
 Unit tests establish validator behaviour; only a successful native run supplies
 runtime evidence for its exact image, platform, executor and verifier hashes.
 """
@@ -40,6 +40,16 @@ CONTROL_NAMES = ("runtime_identity", "network", "write_root", "write_snapshot", 
 REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                    *(f"{name}.{op}" for name in FIXTURE_NAMES for op in ("headers", "sections")))
 NATIVE_RUNS = len(CONTROL_NAMES) + 2 * len(FIXTURE_NAMES)
+YARAX_RULESET_NAME = "m2_fixture_v1"
+YARAX_RULESET_PATH = Path(__file__).resolve().parents[1] / "containers/yarax/m2_fixture_v1.json"
+YARAX_RULESET_SHA256 = "e2217ff703858af17fe8eee8ac0d4cc44dfefd632e096bb4b527b89b08a062a7"
+YARAX_WHEEL_SHA256 = "9bd9961b44b47dd747d526e61c703a2a8170426d003e789e7724bc7862de6d56"
+YARAX_BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
+YARAX_ADAPTER_VERSION = "1.21.0-r1"
+YARAX_FIXTURE_NAMES = ("upx_markers", "utf16_markers", "clean", "repeated_markers")
+YARAX_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
+                         *(f"{name}.matches" for name in YARAX_FIXTURE_NAMES))
+YARAX_NATIVE_RUNS = len(CONTROL_NAMES) + len(YARAX_FIXTURE_NAMES)
 
 
 class VerificationError(ValueError):
@@ -162,6 +172,66 @@ def fixtures():
             "pe32plus": data, "pe32plus-distant": bytes(distant)}
 
 
+def load_yarax_ruleset(lock, path=None):
+    try:
+        with (YARAX_RULESET_PATH if path is None else Path(path)).open("rb") as stream:
+            raw = stream.read(65_537)
+    except OSError:
+        raise VerificationError("YaraxRulesetUnavailable") from None
+    need(len(raw) <= 65_536, "YaraxRulesetTooLarge")
+    need(isinstance(lock, dict) and lock.get("ruleset_sha256") == sha256_hex(raw) == YARAX_RULESET_SHA256,
+         "YaraxRulesetHash")
+    value = decode(raw)
+    need(isinstance(value, dict) and value.get("ruleset") == YARAX_RULESET_NAME and
+         isinstance(value.get("rules"), list), "YaraxRulesetShape")
+    return value
+
+
+def verify_yarax_lock(lock):
+    need(isinstance(lock, dict) and
+         set(lock) == {"adapter_version", "base_digest", "image_id", "platform", "ruleset_sha256", "wheel_sha256"},
+         "YaraxLockPins")
+    need(lock["adapter_version"] == YARAX_ADAPTER_VERSION and lock["platform"] == PLATFORM and
+         lock["base_digest"] == YARAX_BASE_DIGEST and lock["wheel_sha256"] == YARAX_WHEEL_SHA256 and
+         lock["ruleset_sha256"] == YARAX_RULESET_SHA256 and
+         bool(re.fullmatch(r"sha256:[0-9a-f]{64}", str(lock["image_id"]))), "YaraxLockPins")
+
+
+def yarax_fixtures():
+    return {
+        "upx_markers": b"\x00UPX!----UPX0----UPX1\x00",
+        "utf16_markers": b"\x00\x00" + "-EncodedCommand\x00FromBase64String\x00sekurlsa::".encode("utf-16le"),
+        "clean": b"deterministic clean fixture\x00",
+        "repeated_markers": b"UPX!" * 80,
+    }
+
+
+def compare_yarax_observations(data, observations, ruleset, max_matches=64):
+    need(isinstance(data, bytes) and isinstance(observations, (list, tuple)) and
+         type(max_matches) is int and 1 <= max_matches <= 64, "KnownAnswerShape")
+    expected = []
+    for rule in ruleset["rules"]:
+        for pattern in rule["patterns"]:
+            needle, start = bytes.fromhex(pattern["hex"]), 0
+            # Later matches of one pattern cannot enter the first max_matches overall.
+            for _ in range(max_matches):
+                offset = data.find(needle, start)
+                if offset < 0:
+                    break
+                expected.append((offset, len(needle), YARAX_RULESET_NAME, rule["id"], pattern["id"]))
+                start = offset + 1
+    expected.sort(key=lambda row: (row[0], row[3], row[4]))
+    expected = expected[:max_matches]
+    actual = []
+    for item in observations:
+        need(isinstance(item, Observation) and item.location.within(len(data)), "KnownAnswerLocation")
+        need(set(item.value) == {"ruleset", "rule", "pattern"} and
+             all(type(item.value[key]) is str for key in ("ruleset", "rule", "pattern")), "KnownAnswerMatch")
+        actual.append((item.location.offset, item.location.length,
+                       item.value["ruleset"], item.value["rule"], item.value["pattern"]))
+    need(actual == expected, "KnownAnswerMatches")
+
+
 def compare_observations(data, operation, observations):
     need(operation in ("lief.headers", "lief.sections") and isinstance(observations, (list, tuple)), "KnownAnswerShape")
     for item in observations:
@@ -199,8 +269,9 @@ def compare_observations(data, operation, observations):
 
 def receipt_passes(receipt):
     try:
+        tool = receipt.get("tool")
         need(receipt.get("schema") == "reverseai.m2-runtime/1" and receipt.get("platform") == PLATFORM and
-             receipt.get("tool") == "lief" and receipt.get("profile") == "small" and receipt.get("offline") is True,
+             tool in ("lief", "yarax") and receipt.get("profile") == "small" and receipt.get("offline") is True,
              "ReceiptIdentity")
         for key in ("lock_sha256", "verifier_sha256", "executor_sha256"):
             need(bool(re.fullmatch(r"[0-9a-f]{64}", receipt.get(key, ""))), "ReceiptBinding")
@@ -209,13 +280,18 @@ def receipt_passes(receipt):
              bool(re.fullmatch(r"sha256:[0-9a-f]{64}", pins["image_id"])), "ReceiptImage")
         need(bool(re.fullmatch(r"sha256:[0-9a-f]{64}", pins["base_digest"])) and
              bool(re.fullmatch(r"[0-9a-f]{64}", pins["wheel_sha256"])) and
-             pins["adapter_version"] == "1.0.0-r2", "ReceiptLockPins")
+             pins["adapter_version"] == ("1.0.0-r2" if tool == "lief" else YARAX_ADAPTER_VERSION), "ReceiptLockPins")
+        if tool == "yarax":
+            verify_yarax_lock(pins)
+            need(receipt.get("ruleset_sha256") == YARAX_RULESET_SHA256, "ReceiptYaraxPins")
+        required = REQUIRED_CHECKS if tool == "lief" else YARAX_REQUIRED_CHECKS
+        runs = NATIVE_RUNS if tool == "lief" else YARAX_NATIVE_RUNS
         rows = receipt["checks"]
-        need(isinstance(rows, list) and len(rows) == len(REQUIRED_CHECKS) and
-             {r["id"] for r in rows} == set(REQUIRED_CHECKS) and all(r["status"] == "passed" for r in rows),
+        need(isinstance(rows, list) and len(rows) == len(required) and
+             {r["id"] for r in rows} == set(required) and all(r["status"] == "passed" for r in rows),
              "ReceiptChecks")
         cleanup = receipt["cleanup"]
-        need(len(cleanup) == NATIVE_RUNS and len({r["container_id"] for r in cleanup}) == NATIVE_RUNS and
+        need(len(cleanup) == runs and len({r["container_id"] for r in cleanup}) == runs and
              all(re.fullmatch(r"[0-9a-f]{64}", r["container_id"]) and r["verified"] is True and
                  r["staging_removed"] is True for r in cleanup), "ReceiptCleanup")
         return True
@@ -334,8 +410,14 @@ def derive_control_argv(argv, image_id, code=None):
 class NativeVerifier:
     """A native controller; constructors and all unit validators are Docker-free."""
 
-    def __init__(self, boundary, lock, receipt):
+    def __init__(self, boundary, lock, receipt, *, tool="lief", ruleset=None):
+        need(tool in ("lief", "yarax"), "VerifierTool")
+        need(tool != "yarax" or isinstance(ruleset, dict), "YaraxRulesetShape")
+        if tool == "yarax":
+            verify_yarax_lock(lock)
         self.boundary, self.lock, self.receipt = boundary, lock, receipt
+        self.tool, self.ruleset = tool, ruleset
+        self.native_runs = NATIVE_RUNS if tool == "lief" else YARAX_NATIVE_RUNS
         self.image = None
         self.active = None
         self.inspected = 0
@@ -476,7 +558,9 @@ class NativeVerifier:
 
     def invoke(self, data, operation, args, *, probe=None):
         self.active, self.last = probe, None
-        executor = self.boundary.DockerExecutor(self.lock, runner=self.runner)
+        options = {} if self.tool == "lief" else {"adapter_version": YARAX_ADAPTER_VERSION,
+                                                   "extra_keys": ("ruleset_sha256",)}
+        executor = self.boundary.DockerExecutor(self.lock, runner=self.runner, **options)
         try:
             return executor.run(operation, args, data, sha256_hex(data))
         finally:
@@ -497,11 +581,19 @@ class NativeVerifier:
         return row["status"] == "passed"
 
     def control(self, name, data):
-        value = decode(self.invoke(data, "lief.headers", {}, probe=name))
+        operation = "lief.headers" if self.tool == "lief" else "yarax.matches"
+        args = {} if self.tool == "lief" else {"ruleset": YARAX_RULESET_NAME, "max_matches": 32}
+        value = decode(self.invoke(data, operation, args, probe=name))
         validate_probe(name, value)
         return value
 
     def known_answer(self, data, operation):
+        if self.tool == "yarax":
+            need(operation == "yarax.matches", "KnownAnswerShape")
+            raw = self.invoke(data, operation, {"ruleset": YARAX_RULESET_NAME, "max_matches": 64})
+            observations = parse_worker_reply(raw, input_sha256=sha256_hex(data), max_observations=64)
+            compare_yarax_observations(data, observations, self.ruleset, max_matches=64)
+            return {"input_sha256": sha256_hex(data), "input_bytes": len(data), "observations": len(observations)}
         raw = self.invoke(data, operation, {} if operation == "lief.headers" else {"max_sections": 64})
         observations = parse_worker_reply(raw, input_sha256=sha256_hex(data),
                                           max_observations=3 if operation == "lief.headers" else 64)
@@ -511,13 +603,14 @@ class NativeVerifier:
     def run(self):
         if not self.record("local_daemon", self.local_daemon) or not self.record("image", self.image_check):
             return
-        values = fixtures()
+        values = fixtures() if self.tool == "lief" else yarax_fixtures()
+        control_data = values["elf64le"] if self.tool == "lief" else values["upx_markers"]
         for name in CONTROL_NAMES:
-            self.record(name, lambda name=name: self.control(name, values["elf64le"]))
+            self.record(name, lambda name=name: self.control(name, control_data))
         for name, data in values.items():
-            for op in ("headers", "sections"):
-                self.record(f"{name}.{op}", lambda data=data, op=op: self.known_answer(data, "lief." + op))
-        self.record("container", lambda: need(self.inspected == NATIVE_RUNS, "ContainerInspectionMissing"))
+            for op in (("headers", "sections") if self.tool == "lief" else ("matches",)):
+                self.record(f"{name}.{op}", lambda data=data, op=op: self.known_answer(data, self.tool + "." + op))
+        self.record("container", lambda: need(self.inspected == self.native_runs, "ContainerInspectionMissing"))
 
 
 def write_receipt(path, receipt):
@@ -530,7 +623,7 @@ def write_receipt(path, receipt):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tool", choices=("lief",), required=True)
+    parser.add_argument("--tool", choices=("lief", "yarax"), required=True)
     parser.add_argument("--profile", choices=("small",), required=True)
     parser.add_argument("--offline", action="store_true", required=True)
     parser.add_argument("--lock", type=Path, required=True)
@@ -547,10 +640,23 @@ def main(argv=None):
             raw = stream.read(16_385)
         need(len(raw) <= 16_384, "LockTooLarge")
         receipt["lock_sha256"] = sha256_hex(raw)
-        receipt["lock"] = contained.load_lock(decode(raw))
+        options = {} if args.tool == "lief" else {"adapter_version": YARAX_ADAPTER_VERSION,
+                                                  "extra_keys": ("ruleset_sha256",)}
+        candidate_lock = decode(raw)
+        if args.tool == "yarax":
+            verify_yarax_lock(candidate_lock)
+        receipt["lock"] = contained.load_lock(candidate_lock, **options)
+        ruleset = None
+        if args.tool == "yarax":
+            ruleset = load_yarax_ruleset(receipt["lock"])
+            receipt["ruleset_sha256"] = receipt["lock"]["ruleset_sha256"]
         executor_source = Path(contained.__file__)
         receipt["executor_sha256"] = sha256_hex(executor_source.read_bytes())
-        NativeVerifier(contained, receipt["lock"], receipt).run()
+        if args.tool == "lief":
+            NativeVerifier(contained, receipt["lock"], receipt).run()
+        else:
+            NativeVerifier(contained, receipt["lock"], receipt, tool="yarax", ruleset=ruleset).run()
+            load_yarax_ruleset(receipt["lock"])
         need(receipt["verifier_sha256"] == sha256_hex(Path(__file__).read_bytes()) and
              receipt["executor_sha256"] == sha256_hex(executor_source.read_bytes()), "SourceChangedDuringVerification")
     except KeyboardInterrupt:
@@ -560,7 +666,8 @@ def main(argv=None):
         receipt["checks"].append({"id": "controller", "status": "failed",
                                   "reason": str(exc) if isinstance(exc, VerificationError) else type(exc).__name__})
     recorded = {row["id"] for row in receipt["checks"]}
-    receipt["checks"].extend({"id": name, "status": "not_run"} for name in REQUIRED_CHECKS if name not in recorded)
+    required = REQUIRED_CHECKS if args.tool == "lief" else YARAX_REQUIRED_CHECKS
+    receipt["checks"].extend({"id": name, "status": "not_run"} for name in required if name not in recorded)
     receipt["passed"] = receipt_passes(receipt)
     try:
         write_receipt(args.receipt, receipt)
