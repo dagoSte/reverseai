@@ -1,0 +1,8 @@
+{
+  "adapter_version": "1.21.0-r1",
+  "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
+  "image_id": "sha256:2b6b68c0355514959c78138f510b564c1346f03f5682963611af717307d4e0d5",
+  "platform": "linux/arm64",
+  "ruleset_sha256": "e2217ff703858af17fe8eee8ac0d4cc44dfefd632e096bb4b527b89b08a062a7",
+  "wheel_sha256": "9bd9961b44b47dd747d526e61c703a2a8170426d003e789e7724bc7862de6d56"
+}
