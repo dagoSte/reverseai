@@ -241,6 +241,12 @@ Same container interface and reply protocol as M2a; what differs:
   `name`/`to_name` are at most 128 printable characters. Values are virtual
   addresses; the host maps each anchor through its own section table and refuses
   an observation whose anchor is not inside an executable section.
+  A function's `size` is its span: from `entry` to the last byte of its body,
+  so a body with gaps keeps the calls in its later ranges; a call's instruction
+  must lie inside the span of the function named by `from`. Section tables
+  count only what is mapped from the file: ELF sections with `SHF_ALLOC`, and
+  for PE the first `min(SizeOfRawData, VirtualSize)` bytes (`SizeOfRawData`
+  when `VirtualSize` is 0). Decision `m3a-function-span`.
 - **Claims** (all `inferred`, all derived): `code.functions` = names in index
   order; `code.pseudocode` = `{"entry", "text", "truncated"}` for one function
   (one finding per decompiled function); `code.calls` = sorted unique
