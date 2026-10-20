@@ -3,11 +3,12 @@
 import copy
 import struct
 import unittest
+from unittest.mock import patch
 
 from reverseai.contract import ContractError, Location, Observation
-from reverseai.tools import ghidra_verify
-from tests.fixtures_code import elf_code, pe_code, elf_data_only
-from tests.fixtures_structure import elf, pe
+from reverseai.tools import ghidra_verify, structure
+from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code
+from tests.fixtures_structure import elf, pe, macho
 
 ARGS = {"max_functions": 64, "decompile": 8, "max_chars": 1024, "max_calls": 128}
 
@@ -30,6 +31,101 @@ def records(layout):
 
 def observations(items):
     return tuple(Observation(Location(**item["location"]), item["value"]) for item in items)
+
+
+class MachOAnchorTests(unittest.TestCase):
+    def setUp(self):
+        self.data, self.layout = macho_code()
+        self.items = records(self.layout)
+
+    def accepts(self, items=None, *, data=None):
+        try:
+            ghidra_verify.verify(self.data if data is None else data,
+                                 observations(self.items if items is None else items), ARGS)
+            return True
+        except ContractError:
+            return False
+
+    def test_macho_functions_calls_and_pseudocode_have_exact_executable_anchors(self):
+        self.assertTrue(self.accepts())
+        self.assertTrue(self.accepts([]))
+        for index in (0, 4, 8):
+            changed = copy.deepcopy(self.items)
+            changed[index]["location"]["offset"] += 20 if index == 8 else 1
+            with self.subTest(index=index):
+                self.assertFalse(self.accepts(changed))
+
+    def test_macho_thin_little_endian_anchors_work_at_both_widths(self):
+        for width in (32, 64):
+            data, layout = macho(width=width, sections=((b"__text", b"__TEXT", 0x80000000, 5, 32),))
+            item = {"location": {"offset": layout["content_start"], "length": 16},
+                    "value": {"kind": "function", "index": 0, "name": "declared", "size": 16,
+                              "entry": layout["addresses"][0]}}
+            with self.subTest(width=width):
+                self.assertTrue(self.accepts([item], data=data))
+                item["location"]["offset"] += 1
+                self.assertFalse(self.accepts([item], data=data))
+
+    def test_macho_non_executable_and_zero_fill_sections_cannot_anchor_code(self):
+        self.assertTrue(self.accepts(self.items[:1]))
+        text_segment = 32 + 72  # __PAGEZERO, followed by __TEXT in the declared fixture
+        text_section = text_segment + 72
+        changed = bytearray(self.data)
+        struct.pack_into("<I", changed, text_segment + 60, 1)
+        struct.pack_into("<I", changed, text_section + 64, 0)
+        self.assertFalse(self.accepts(self.items[:1], data=bytes(changed)))
+        for section_type in (1, 0xC, 0x12):
+            changed = bytearray(self.data)
+            struct.pack_into("<I", changed, text_section + 64, 0x80000400 | section_type)
+            with self.subTest(section_type=section_type):
+                self.assertFalse(self.accepts(self.items[:1], data=bytes(changed)))
+                self.assertFalse(self.accepts([], data=bytes(changed)))
+
+    def test_macho_function_only_anchors_require_unique_file_and_virtual_maps(self):
+        self.assertTrue(self.accepts(self.items[:1]))
+        row = {"index": 0, "name": "__TEXT,__text", "addr": self.layout["text"]["address"],
+               "offset": self.layout["text"]["offset"], "size": self.layout["text"]["size"],
+               "executable": True, "writable": False}
+        for alias in ({**row, "addr": row["addr"] + 10, "offset": row["offset"] + 100},
+                      {**row, "addr": row["addr"] + 100, "offset": row["offset"] + 10}):
+            with self.subTest(alias=alias), patch.object(structure, "macho_sections", return_value=[row, alias]):
+                self.assertFalse(self.accepts(self.items[:1]))
+
+    def test_macho_anchors_cannot_start_in_headers_or_extend_past_the_section(self):
+        self.assertTrue(self.accepts(self.items[:1]))
+        row = copy.deepcopy(self.items[0])
+        row["value"].update(entry=self.layout["image_base"], size=1)
+        row["location"] = {"offset": 0, "length": 1}
+        self.assertFalse(self.accepts([row]))
+        row = copy.deepcopy(self.items[0])
+        row["value"]["size"] = 1024
+        row["location"]["length"] = self.layout["text"]["size"]
+        self.assertTrue(self.accepts([row]))
+        row["location"]["length"] += 1
+        self.assertFalse(self.accepts([row]))
+
+    def test_macho_entry_point_controls_pseudocode_priority_and_none_uses_size(self):
+        at = 32
+        for _ in range(struct.unpack_from("<I", self.data, 16)[0]):
+            command, size = struct.unpack_from("<II", self.data, at)
+            if command == 0x80000028:
+                break
+            at += size
+        self.assertEqual(command, 0x80000028)
+        changed = bytearray(self.data)
+        struct.pack_into("<Q", changed, at + 8, self.layout["functions"][3]["offset"])
+        functions = self.items[:4]
+        pseudos = {row["value"]["index"]: row for row in self.items if row["value"]["kind"] == "pseudocode"}
+        self.assertTrue(self.accepts(functions + [pseudos[i] for i in (3, 2, 0, 1)], data=bytes(changed)))
+        self.assertFalse(self.accepts(functions + [pseudos[i] for i in (0, 2, 1, 3)], data=bytes(changed)))
+        struct.pack_into("<I", changed, at, 0x80000029)  # an unrelated command, so no declared entry
+        self.assertTrue(self.accepts(functions + [pseudos[i] for i in (2, 0, 1, 3)], data=bytes(changed)))
+        self.assertFalse(self.accepts(functions + [pseudos[i] for i in (0, 2, 1, 3)], data=bytes(changed)))
+
+    def test_macho_truncated_sections_refuse_even_an_empty_reply(self):
+        for size in (4, 28, 103, 175, 255):
+            with self.subTest(size=size):
+                self.assertFalse(self.accepts([], data=self.data[:size]))
 
 
 class AnchorTests(unittest.TestCase):

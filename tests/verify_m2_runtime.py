@@ -27,7 +27,7 @@ if __package__ in (None, ""):
 from reverseai.contract import MAX_WORKER_REPLY_BYTES, Observation, parse_worker_reply, sha256_hex
 from reverseai.tools import structure, ghidra_verify
 from tests.fixtures_structure import elf, pe
-from tests.fixtures_code import elf_code, pe_code, elf_data_only
+from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code
 
 
 PLATFORM = "linux/arm64"
@@ -52,11 +52,11 @@ YARAX_FIXTURE_NAMES = ("upx_markers", "utf16_markers", "clean", "repeated_marker
 YARAX_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                          *(f"{name}.matches" for name in YARAX_FIXTURE_NAMES))
 YARAX_NATIVE_RUNS = len(CONTROL_NAMES) + len(YARAX_FIXTURE_NAMES)
-GHIDRA_ADAPTER_VERSION = "12.1.4-r2"
+GHIDRA_ADAPTER_VERSION = "12.1.4-r3"
 GHIDRA_BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
 GHIDRA_SHA256 = "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db"
 GHIDRA_JDK_SHA256 = "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223"
-GHIDRA_FIXTURE_NAMES = ("elf_code", "pe_code", "elf_data_only")
+GHIDRA_FIXTURE_NAMES = ("elf_code", "pe_code", "elf_data_only", "macho_code")
 GHIDRA_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                           *(f"{name}.analyze" for name in GHIDRA_FIXTURE_NAMES))
 GHIDRA_NATIVE_RUNS = len(CONTROL_NAMES) + len(GHIDRA_FIXTURE_NAMES)
@@ -258,7 +258,7 @@ def verify_ghidra_lock(lock):
 
 
 def ghidra_fixtures():
-    return dict(zip(GHIDRA_FIXTURE_NAMES, (elf_code()[0], pe_code()[0], elf_data_only()[0])))
+    return dict(zip(GHIDRA_FIXTURE_NAMES, (elf_code()[0], pe_code()[0], elf_data_only()[0], macho_code()[0])))
 
 
 def ghidra_args():
@@ -266,9 +266,9 @@ def ghidra_args():
 
 
 def compare_ghidra_observations(data, observations):
-    """Check fixture entries/calls/ELF symbols and require working decompilation."""
+    """Check fixture entries/calls/symbols and require working decompilation."""
     need(type(data) is bytes and isinstance(observations, (list, tuple)), "KnownAnswerShape")
-    layout = next((layout for sample, layout in (elf_code(), pe_code(), elf_data_only()) if sample == data), None)
+    layout = next((layout for sample, layout in (elf_code(), pe_code(), elf_data_only(), macho_code()) if sample == data), None)
     need(layout is not None, "KnownAnswerFixture")
     groups = {"function": [], "pseudocode": [], "call": []}
     schemas = {"function": {"kind", "index", "name", "entry", "size"},
@@ -285,7 +285,10 @@ def compare_ghidra_observations(data, observations):
     need(not layout["functions"] or groups["pseudocode"], "KnownAnswerPseudocodeMissing")
     for index, (item, expected) in enumerate(zip(functions, layout["functions"])):
         value = item.value
-        remaining = layout.get("text_raw_size", layout["text"]["size"]) - (expected["offset"] - layout["text"]["offset"])
+        mapped_size = layout.get("text_raw_size", layout["text"]["size"])
+        if layout["format"] == "pe":
+            mapped_size = min(mapped_size, layout["text"]["size"] or mapped_size)
+        remaining = mapped_size - (expected["offset"] - layout["text"]["offset"])
         need(type(value["index"]) is int and value["index"] == index and
              type(value["entry"]) is int and value["entry"] == expected["entry"] and
              type(value["size"]) is int and 1 <= value["size"] and value["entry"] + value["size"] <= 2**64,
@@ -294,8 +297,10 @@ def compare_ghidra_observations(data, observations):
              item.location.length == min(value["size"], 4096, remaining), "KnownAnswerFunctionAnchor")
         need(type(value["name"]) is str and 1 <= len(value["name"]) <= 128 and
              value["name"].isprintable(), "KnownAnswerName")
-        if layout["format"] == "elf":
-            need(value["name"] == expected["name"], "KnownAnswerELFName")
+        if layout["format"] in ("elf", "macho"):
+            name = "entry" if layout["format"] == "macho" and expected["entry"] == layout["entry"] else expected["name"]
+            need(value["name"] == name,
+                 "KnownAnswerELFName" if layout["format"] == "elf" else "KnownAnswerMachOName")
     names = {item.value["entry"]: item.value["name"] for item in functions}
     for item, expected in zip(calls, layout["calls"]):
         value = item.value

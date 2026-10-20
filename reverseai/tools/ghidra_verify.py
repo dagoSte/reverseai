@@ -4,6 +4,7 @@ from collections import namedtuple
 import struct
 
 from reverseai.contract import ContractError, Location, Observation
+from reverseai.tools import structure
 from reverseai.tools.structure import (
     SHF_EXECINSTR, SCN_MEM_EXECUTE, _elf_layout, _format, _need, _pe_layout,
 )
@@ -34,6 +35,13 @@ def _name(value):
 def _sections(data):
     kind, pe, _ = _format(data)
     sections = []
+    if kind == "macho":
+        _check(data[:4] in (b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe"))
+        mapped = structure.macho_sections(data)
+        _check(bool(mapped))
+        sections = [_Section(row["addr"], row["offset"], row["size"], row["size"], row["executable"])
+                    for row in mapped]
+        return sections, structure.macho_entry(data)
     if kind == "elf":
         width, order, _, header = _elf_layout(data)
         entry, layout = (40, "IIIIIIIIII") if width == 32 else (64, "IIQQQQIIQQ")
