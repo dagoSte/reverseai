@@ -65,6 +65,11 @@ class DerivedTests(unittest.TestCase):
         finding = make_finding("code", "Code.", "code.pseudocode", {"entry": 0x1000, "text": "int entry(void) {}", "truncated": False},
                                [first.id, second.id], "inferred")
         self.assertEqual(verdicts([finding], [first, second])[finding.id].status, "unsupported")
+        # Two citations with equal values: only the one-observation rule refuses them, whatever the evidence ID order.
+        twin = observed(128, kind="pseudocode", index=0, entry=0x1000, text="int entry(void) {}", truncated=False)
+        same = make_finding("code", "Code.", "code.pseudocode", {"entry": 0x1000, "text": "int entry(void) {}", "truncated": False},
+                            [first.id, twin.id], "inferred")
+        self.assertEqual(verdicts([same], [first, twin])[same.id].status, "unsupported")
 
     def test_an_anchor_that_no_longer_matches_the_bytes_is_unsupported(self):
         evidence = observed(0, kind="function", index=0, name="entry", entry=0x1000, size=32)
