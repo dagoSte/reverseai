@@ -299,3 +299,38 @@ def pe_imports(*, plus=True, libraries=((b"KERNEL32.dll", (b"ExitProcess", 7)), 
                   symbol_names=[[raw + i for i in group] for group in symbol_names],
                   thunks=[raw + i for i in thunk_offsets], word=word)
     return bytes(out), layout
+
+
+def elf_dynamic_imports(*, width=64, order="<", gnu_hash=False):
+    """Sectionless ELF with PT_LOAD/PT_DYNAMIC and a SysV or GNU dynamic-symbol hash table."""
+    header_size, phsize, symsize = (64, 56, 24) if width == 64 else (52, 32, 16)
+    base, dynamic_offset, hash_offset, symbols_offset, strings_offset = 0x400000, 0x100, 0x180, 0x200, 0x300
+    names = b"\0libalpha.so\0alpha\0beta\0defined\0"
+    names_at = [1, 13, 19, 24]
+    symbols = bytes(symsize)
+    for name, section in ((names_at[1], 0), (names_at[2], 0), (names_at[3], 1)):
+        symbols += struct.pack(order + "IBBHQQ", name, 0x12, 0, section, 0, 0) if width == 64 else struct.pack(order + "IIIBBH", name, 0, 0, 0x12, 0, section)
+    if gnu_hash:
+        hashed = struct.pack(order + "4I", 1, 3, 1, 0) + bytes(width // 8) + struct.pack(order + "II", 3, 1)
+    else:
+        hashed = struct.pack(order + "7I", 1, 4, 3, 0, 0, 0, 0)
+    tags = ((1, 1), (5, base + strings_offset), (10, len(names)), (6, base + symbols_offset),
+            (11, symsize), (0x6FFFFEF5 if gnu_hash else 4, base + hash_offset), (0, 0))
+    dynamic = b"".join(struct.pack(order + ("QQ" if width == 64 else "II"), *tag) for tag in tags)
+    size = strings_offset + len(names)
+    ident = b"\x7fELF" + bytes((2 if width == 64 else 1, 1 if order == "<" else 2, 1)) + bytes(9)
+    word = "Q" if width == 64 else "I"
+    header = ident + struct.pack(order + "HHI" + word * 3 + "IHHHHHH", 3, 62, 1, 0, header_size, 0, 0,
+                                  header_size, phsize, 2, 64 if width == 64 else 40, 0, 0)
+    if width == 64:
+        program = struct.pack(order + "IIQQQQQQ", 1, 4, 0, base, base, size, size, 0x1000)
+        program += struct.pack(order + "IIQQQQQQ", 2, 4, dynamic_offset, base + dynamic_offset, base + dynamic_offset, len(dynamic), len(dynamic), 8)
+    else:
+        program = struct.pack(order + "8I", 1, 0, base, base, size, size, 4, 0x1000)
+        program += struct.pack(order + "8I", 2, dynamic_offset, base + dynamic_offset, base + dynamic_offset, len(dynamic), len(dynamic), 4, 4)
+    out = bytearray(size)
+    out[:len(header + program)] = header + program
+    for start, value in ((dynamic_offset, dynamic), (hash_offset, hashed), (symbols_offset, symbols), (strings_offset, names)):
+        out[start:start + len(value)] = value
+    return bytes(out), {"library_names": [strings_offset + 1], "symbol_names": [strings_offset + 13, strings_offset + 19],
+                        "dynamic": dynamic_offset, "hash": hash_offset}
