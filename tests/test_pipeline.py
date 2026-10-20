@@ -161,6 +161,8 @@ class ContainedToolWiringTests(unittest.TestCase):
         function = Observation(Location(0, 16), {"kind": "function", "index": 0, "name": "entry", "entry": 0x400000, "size": 16})
         tools = pipeline.TOOLS + (self.fake_ghidra([function]),)
         self.assertEqual(pipeline._budget(tools), pipeline.GHIDRA_BUDGET)
+        # The global budget must outlast the 240 s Ghidra worker wall and the code task's 300 s.
+        self.assertGreater(pipeline.GHIDRA_BUDGET.max_wall_seconds, 300)
         analysis = pipeline.analyze_bytes(data, ref(data), tools=tools)
         code = [r for r in analysis.results if r.role == "code"]
         self.assertEqual(len(code), 1)

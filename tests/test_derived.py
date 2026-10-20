@@ -57,6 +57,13 @@ class DerivedTests(unittest.TestCase):
                                                                      "truncated": False}, [e.id], "inferred") for e in (first, second)]
         self.assertEqual({v.status for v in verdicts(findings, [first, second]).values()}, {"derived"})
 
+    def test_a_pseudocode_claim_cites_exactly_one_function(self):
+        first = observed(0, kind="pseudocode", index=0, entry=0x1000, text="int entry(void) {}", truncated=False)
+        second = observed(64, kind="pseudocode", index=1, entry=0x1040, text="int entry(void) {}", truncated=False)
+        finding = make_finding("code", "Code.", "code.pseudocode", {"entry": 0x1000, "text": "int entry(void) {}", "truncated": False},
+                               [first.id, second.id], "inferred")
+        self.assertEqual(verdicts([finding], [first, second])[finding.id].status, "unsupported")
+
     def test_an_anchor_that_no_longer_matches_the_bytes_is_unsupported(self):
         evidence = observed(0, kind="function", index=0, name="entry", entry=0x1000, size=32)
         finding = make_finding("code", "Functions.", "code.functions", ["entry"], [evidence.id], "inferred")

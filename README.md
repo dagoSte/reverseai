@@ -8,16 +8,18 @@ in parallel, then a reviewer will check the evidence behind their conclusions.
 
 **Status: M3a released candidate: Ghidra joins LIEF and YARA-X.** Deterministic
 analysts read file structure and string indicators in-process, and three pinned
-open-source tools, LIEF, YARA-X and Ghidra, run in locked containers. Every value a tool reports is re-derived
-by the host from the input bytes before it can become evidence, and a reviewer
-re-checks each claim against those bytes. Ghidra's functions, pseudocode and calls
-are reported as *derived*: anchored in the bytes and reviewed, never shown as verified.
+open-source tools, LIEF, YARA-X and Ghidra, run in locked containers. Every value
+LIEF and YARA-X report is re-derived by the host from the input bytes before it can
+become evidence, and a reviewer re-checks each claim against those bytes. Ghidra's
+functions, pseudocode and calls are its own reading: the host re-derives only their
+anchors (the exact file bytes, inside an executable section), and the report shows
+them as *derived*, never as verified.
 Model-driven agents are not part of the current releases.
 
 ## How it works
 
 <p align="center">
-  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway runs allowlisted operations in host parsers and in a locked container per run (LIEF, YARA-X, Ghidra); the host re-derives every value a tool reports from the bytes; evidence binds hash, tool, operation and byte range; analysts make claims; a reviewer re-checks bytes and rules; the report sorts findings into supported, derived, unsupported and contradicted.">
+  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway runs allowlisted operations in host parsers and in a locked container per run (LIEF, YARA-X, Ghidra); the host re-derives every LIEF and YARA-X value, and every Ghidra anchor, from the bytes; evidence binds hash, tool, operation and byte range; analysts make claims; a reviewer re-checks bytes and rules; the report sorts findings into supported, derived, unsupported and contradicted.">
 </p>
 
 What this buys, and how each point is checked:
@@ -25,7 +27,7 @@ What this buys, and how each point is checked:
 | Property | How it holds |
 | --- | --- |
 | A supported finding is backed by exact bytes | The reviewer recomputes the input hash, the byte range and its hash for every cited item, and the claim rule must yield exactly the claimed value. |
-| A compromised tool can hide evidence but not invent it | The host re-derives every value a contained worker reports (headers, sections, signature matches) from its own copy of the bytes and refuses the whole reply on any mismatch. |
+| A compromised tool can hide evidence but not invent verified evidence | The host re-derives every value LIEF and YARA-X report (headers, sections, signature matches) from its own copy of the bytes and refuses the whole reply on any mismatch; for Ghidra it re-derives every anchor, and Ghidra's interpretations can only ever be reported as derived. |
 | Tools cannot reach the host or the network | One container per run: no network, read-only root, non-root user, every capability dropped, no new privileges, CPU, memory, process and time limits, a single read-only snapshot mount, image pinned by ID. `tests/verify_m2_runtime.py` proves these limits against the real engine. |
 | Interpretations stay labelled | Ghidra's function lists, pseudocode and calls are *derived*: the host re-derives each anchor (the exact file bytes, inside an executable section), the reviewer re-checks them, and the report lists them apart; they never count as verified and never contradict a verified finding. |
 | One claim cannot cancel a verified one | Only findings whose evidence all verifies can contradict each other. |
