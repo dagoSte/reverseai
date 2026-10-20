@@ -25,6 +25,7 @@ from reverseai.contract import (
 class _Execution:
     deadline: float
     done: threading.Event = field(default_factory=threading.Event)
+    stopped: threading.Event = field(default_factory=threading.Event)
     evidence: list[Evidence] = field(default_factory=list)
     status: str = "ok"
     errors: tuple[str, ...] = ()
@@ -55,7 +56,7 @@ class Gateway:
         self._cache: dict[str, _Execution] = {}
         self._started = None
         self._operation_count = 0
-        self._evidence_count = 0
+        self._evidence_ids = set()
         self._output_bytes = 0
 
     def _finish(self, execution, status, errors=()):
@@ -65,7 +66,7 @@ class Gateway:
                 execution.errors = errors
                 execution.done.set()
 
-    def _work(self, execution, data, ref, spec, args):
+    def _work(self, execution, data, digest, ref, spec, args):
         try:
             if time.monotonic() >= execution.deadline:
                 self._finish(execution, "budget_exceeded")
@@ -81,20 +82,22 @@ class Gateway:
                     raise TypeError("Expected an Observation")
                 # Freeze nested JSON too: frozen dataclasses alone do not freeze dicts.
                 observation = Observation(observation.location, deepcopy(observation.value))
-                evidence = make_evidence(data, ref, spec.name, observation)
+                evidence = make_evidence(data, ref, spec.name, observation, input_sha256=digest)
                 size = _size(evidence)
                 with self._lock:
                     if execution.done.is_set():
                         return
+                    new = evidence.id not in self._evidence_ids
                     if (time.monotonic() >= execution.deadline
-                            or self._evidence_count >= self.budget.max_evidence
-                            or self._output_bytes + size > self.budget.max_output_bytes):
+                            or (new and (len(self._evidence_ids) >= self.budget.max_evidence
+                                         or self._output_bytes + size > self.budget.max_output_bytes))):
                         execution.status = "budget_exceeded"
                         execution.done.set()
                         return
                     execution.evidence.append(evidence)
-                    self._evidence_count += 1
-                    self._output_bytes += size
+                    if new:
+                        self._evidence_ids.add(evidence.id)
+                        self._output_bytes += size
             status = "budget_exceeded" if time.monotonic() >= execution.deadline else "ok"
             self._finish(execution, status)
         except Exception as exc:
@@ -102,38 +105,50 @@ class Gateway:
             self._finish(execution, status, (_error(spec.name, exc),) if status == "error" else ())
         finally:
             self._slots.release()
+            execution.stopped.set()
 
-    def _execute(self, key, data, ref, spec, args, deadline):
-        with self._lock:
-            execution = self._cache.get(key)
-            owner = execution is None
+    def _execute(self, key, data, digest, ref, spec, args, deadline):
+        while True:
+            with self._lock:
+                previous = self._cache.get(key)
+                owner = previous is None or (previous.done.is_set()
+                        and previous.status == "budget_exceeded" and previous.stopped.is_set())
+                if owner:
+                    if (time.monotonic() >= deadline
+                            or (previous is None and self._operation_count >= self.budget.max_operations)):
+                        return (), "budget_exceeded", ()
+                    execution = _Execution(deadline)
+                    self._cache[key] = execution
+                    if previous is None:
+                        self._operation_count += 1
+                else:
+                    execution = previous
             if owner:
-                if self._operation_count >= self.budget.max_operations or time.monotonic() >= deadline:
-                    return (), "budget_exceeded", ()
-                execution = _Execution(deadline)
-                self._cache[key] = execution
-                self._operation_count += 1
-        if owner:
-            if not self._slots.acquire(timeout=max(0, deadline - time.monotonic())):
+                if not self._slots.acquire(timeout=max(0, deadline - time.monotonic())):
+                    self._finish(execution, "budget_exceeded")
+                    execution.stopped.set()
+                else:
+                    # An overrun keeps its slot until exit. Its sealed result
+                    # rejects late evidence; same-key retries wait for that exit.
+                    worker = threading.Thread(target=self._work,
+                                              args=(execution, data, digest, ref, spec, args), daemon=True)
+                    try:
+                        worker.start()
+                    except Exception as exc:
+                        self._slots.release()
+                        self._finish(execution, "error", (_error(spec.name, exc),))
+                        execution.stopped.set()
+            completed = execution.done.wait(timeout=max(0, deadline - time.monotonic()))
+            if not completed and owner:
                 self._finish(execution, "budget_exceeded")
-            else:
-                # Python threads cannot be killed. M1 handlers are pure, bounded
-                # functions; an overrun keeps its semaphore slot until it exits.
-                # The completed cache entry rejects any evidence arriving late.
-                worker = threading.Thread(target=self._work,
-                                          args=(execution, data, ref, spec, args), daemon=True)
-                try:
-                    worker.start()
-                except Exception as exc:
-                    self._slots.release()
-                    self._finish(execution, "error", (_error(spec.name, exc),))
-        completed = execution.done.wait(timeout=max(0, deadline - time.monotonic()))
-        if not completed and owner:
-            self._finish(execution, "budget_exceeded")
-        with self._lock:
-            # A short-lived cache waiter cannot cancel the original execution.
-            status = execution.status if completed else "budget_exceeded"
-            return tuple(deepcopy(execution.evidence)), status, execution.errors if completed else ()
+            if completed and not owner and execution.status == "budget_exceeded":
+                if execution.stopped.wait(timeout=max(0, deadline - time.monotonic())):
+                    continue
+                return (), "budget_exceeded", ()
+            with self._lock:
+                # A short-lived cache waiter cannot cancel the original execution.
+                status = execution.status if completed else "budget_exceeded"
+                return tuple(deepcopy(execution.evidence)), status, execution.errors if completed else ()
 
     def run(self, task: AnalysisTask, data: bytes) -> AnalysisResult:
         started = time.monotonic()
@@ -150,7 +165,8 @@ class Gateway:
         def result(state):
             return AnalysisResult(task.id, task.role, state, tuple(evidence), (), tuple(errors))
 
-        if not isinstance(data, bytes) or len(data) != task.input.size or sha256_hex(data) != task.input.sha256:
+        digest = sha256_hex(data) if isinstance(data, bytes) and len(data) == task.input.size else None
+        if digest != task.input.sha256:
             errors.append("input: hash or size mismatch")
             return result("error")
         for index, request in enumerate(task.operations):
@@ -169,7 +185,7 @@ class Gateway:
                 errors.append(_error(spec.name, exc))
                 status = "error"
                 continue
-            produced, operation_status, operation_errors = self._execute(key, data, ref, spec, args, deadline)
+            produced, operation_status, operation_errors = self._execute(key, data, digest, ref, spec, args, deadline)
             for item in produced:
                 if item.id in seen:
                     continue
