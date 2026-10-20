@@ -45,10 +45,17 @@ def wheel_sha256():
 
 
 def check_dockerfile(path):
-    """The lock records BASE_DIGEST, so the Dockerfile must have one FROM line naming exactly BASE."""
-    instructions = [line.split() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    """The lock records BASE_DIGEST, so the Dockerfile must build from exactly BASE and nothing else: one FROM line,
+    no COPY --from or RUN --mount ...from= (another image or stage), and no parser directive (# syntax=, # escape=)."""
+    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    instructions = [line.split() for line in lines if not line.startswith("#")]
     if [words for words in instructions if words[0].upper() == "FROM"] != [["FROM", BASE]]:
         raise SystemExit("Dockerfile FROM differs from the pinned base " + BASE)
+    if any(re.match(r"#\s*\w+\s*=", line) for line in lines):
+        raise SystemExit("Dockerfile parser directives are refused")
+    flags = [word.lower() for words in instructions for word in words if word.startswith("--")]
+    if any(flag.startswith("--from") or (flag.startswith("--mount") and "from=" in flag) for flag in flags):
+        raise SystemExit("Dockerfile reads from another image or stage")
 
 
 def file_sha256(path):

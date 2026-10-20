@@ -113,6 +113,8 @@ class HeaderTests(unittest.TestCase):
         data, layout = pe()
         coff = layout["lfanew"] + 4
         cases = ((pe(optional_size=20)[0], {"structure": "optional", "optional_magic": "pe32+", "entry_rva": 0x1000}),
+                 (patched(data, coff + 16, "<H", 19), {"structure": "optional", "optional_magic": "pe32+"}),
+                 (patched(data, coff + 16, "<H", 18), {"structure": "optional", "optional_magic": "pe32+"}),
                  (patched(data, coff + 16, "<H", 8), {"structure": "optional", "optional_magic": "pe32+"}),
                  (patched(data, coff + 16, "<H", 2), {"structure": "optional", "optional_magic": "pe32+"}),
                  (patched(data, coff + 16, "<H", 1), {"structure": "optional"}),
@@ -212,6 +214,8 @@ class SectionTests(unittest.TestCase):
     def test_max_sections_caps_the_entries(self):
         self.assertEqual(len(run("lief.sections", elf()[0], max_sections=2)["observations"]), 2)
         self.assertEqual(len(run("lief.sections", elf()[0])["observations"]), 5)
+        self.assertEqual([v["index"] for v in values(run("lief.sections", pe()[0], max_sections=2))], [0, 1])
+        self.assertEqual(len(run("lief.sections", pe()[0])["observations"]), 3)
 
     def test_elf_extended_numbering_is_refused_not_listed_empty(self):
         data, _ = elf(extended=True)
@@ -350,6 +354,13 @@ class ParserConfigTests(unittest.TestCase):
         for names in (worker.ELF_PARSER_OFF, worker.PE_PARSER_OFF):
             config = worker.parser_config(config_class((*names, "page_size", "rebase")), names)
             self.assertEqual({name: getattr(config, name) for name in names}, dict.fromkeys(names, False))
+
+    def test_the_options_are_lief_1_0_0s(self):
+        """Copied from lief/ELF.pyi and lief/PE/__init__.pyi of the pinned wheel: offline, without the image build."""
+        self.assertEqual(worker.ELF_PARSER_OFF, ("parse_dyn_symbols", "parse_notes", "parse_overlay", "parse_relocations",
+                                                 "parse_symbol_versions", "parse_symtab_symbols"))
+        self.assertEqual(worker.PE_PARSER_OFF, ("parse_arm64x_binary", "parse_exceptions", "parse_exports", "parse_imports",
+                                                "parse_reloc", "parse_rsrc", "parse_signature"))
 
     def test_a_missing_new_or_ignored_option_is_an_error(self):
         names = worker.ELF_PARSER_OFF

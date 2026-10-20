@@ -20,7 +20,8 @@ def make_tool(executor=None):
             checked = operations[name].validate_args(args)
             digest = sha256_hex(data)
             raw = executor.run(name, checked, data, digest)
-            observations = parse_worker_reply(raw, input_sha256=digest, max_observations=cap)
+            # No more observations than the validated request allows (max_sections, or the headers cap).
+            observations = parse_worker_reply(raw, input_sha256=digest, max_observations=checked.get("max_sections", cap))
             if any(not item.location.within(len(data)) for item in observations):
                 raise ContractError("Worker location outside the snapshot")
             for item in observations:  # every worker value is re-derived from the controller's bytes

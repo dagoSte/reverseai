@@ -88,6 +88,29 @@ class BuildTests(unittest.TestCase):
                     self.build(source=source)
                 self.assertEqual(self.docker.calls, [])
 
+    def test_another_image_or_stage_and_parser_directives_are_refused_before_docker(self):
+        base = "FROM " + build.BASE
+        for label, lines, reason in (
+                ("COPY --from an image", [base, "COPY --from=busybox /bin/sh /bin/sh"], "another image or stage"),
+                ("COPY --FROM upper case", [base, "COPY --FROM=busybox /bin/sh /bin/sh"], "another image or stage"),
+                ("RUN --mount from", [base, "RUN --mount=type=bind,from=busybox,target=/x true"], "another image or stage"),
+                ("RUN --mount on a continuation line", [base, "RUN \\", "    --mount=type=bind,from=busybox,target=/x true"],
+                 "another image or stage"),
+                ("syntax directive", ["# syntax=docker/dockerfile:1", base], "parser directives"),
+                ("escape directive", ["#escape=`", base], "parser directives"),
+                ("check directive with spaces", ["#  check = skip=all", base], "parser directives")):
+            with self.subTest(label):
+                source = self.root / label.replace(" ", "-")
+                shutil.copytree(build.SOURCE, source, ignore=shutil.ignore_patterns("image.lock.json"))
+                (source / "Dockerfile").write_text("\n".join(lines) + "\n")
+                with self.assertRaisesRegex(SystemExit, reason):
+                    self.build(source=source)
+                self.assertEqual(self.docker.calls, [])
+        mount = self.root / "cache-mount"
+        shutil.copytree(build.SOURCE, mount, ignore=shutil.ignore_patterns("image.lock.json"))
+        (mount / "Dockerfile").write_text("# a comment = not a directive here\n" + base + "\nRUN --mount=type=tmpfs,target=/x true\n")
+        self.assertEqual(self.build(source=mount), 0)
+
     def test_a_wheel_with_another_hash_is_refused_before_docker(self):
         (self.wheels / build.WHEEL).write_bytes(WHEEL_BYTES + b"!")
         with self.assertRaisesRegex(SystemExit, "pinned SHA-256"):
@@ -123,6 +146,34 @@ class DownloadTests(unittest.TestCase):
                 build.fetch_wheel(target, hashlib.sha256(WHEEL_BYTES).hexdigest())
             self.assertFalse(target.exists())
         self.assertEqual(RedirectHandler.requested, ["/" + build.WHEEL])
+
+    def test_the_download_is_size_and_hash_checked_before_it_is_written(self):
+        class Opener:
+            def __init__(self, body):
+                self.body, self.urls = body, []
+
+            def open(self, url, timeout):
+                self.urls.append(url)
+                return io.BytesIO(self.body)
+
+        pinned = hashlib.sha256(WHEEL_BYTES).hexdigest()
+        for label, body, limit, refused in (("pinned bytes", WHEEL_BYTES, build.WHEEL_BYTES_LIMIT, False),
+                                            ("other bytes", WHEEL_BYTES + b"!", build.WHEEL_BYTES_LIMIT, True),
+                                            ("over the size limit", WHEEL_BYTES, len(WHEEL_BYTES) - 1, True)):
+            opener = Opener(body)
+            with self.subTest(label), tempfile.TemporaryDirectory() as temporary, \
+                    patch.object(build.urllib.request, "build_opener", return_value=opener) as factory, \
+                    patch.object(build, "WHEEL_BYTES_LIMIT", limit):
+                target = Path(temporary, build.WHEEL)
+                if refused:
+                    with self.assertRaisesRegex(SystemExit, "does not match the pinned SHA-256"):
+                        build.fetch_wheel(target, pinned)
+                    self.assertFalse(target.exists())
+                else:
+                    build.fetch_wheel(target, pinned)
+                    self.assertEqual(target.read_bytes(), WHEEL_BYTES)
+                factory.assert_called_once_with(build.RefuseRedirects)
+                self.assertEqual(opener.urls, [build.WHEEL_URL])
 
 
 if __name__ == "__main__":
