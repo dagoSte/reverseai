@@ -58,6 +58,8 @@ def main(argv=None):
     analyze.add_argument("--with-lief", action="store_true", help="Also run the pinned LIEF worker in its container (M2a)")
     analyze.add_argument("--with-yarax", action="store_true",
                          help="Also run the pinned YARA-X worker with the reviewed ruleset in its container (M2b)")
+    analyze.add_argument("--with-ghidra", action="store_true",
+                         help="Also run pinned Ghidra headless in its container; its findings are derived, not verified (M3)")
     args = parser.parse_args(argv)
 
     try:
@@ -67,7 +69,8 @@ def main(argv=None):
     if unusable:
         parser.exit(1, "reverseai: --out must be a new or empty directory\n")
     tools = pipeline.TOOLS
-    for wanted, module, label in ((args.with_lief, "lief_tool", "LIEF"), (args.with_yarax, "yarax_tool", "YARA-X")):
+    for wanted, module, label in ((args.with_lief, "lief_tool", "LIEF"), (args.with_yarax, "yarax_tool", "YARA-X"),
+                                  (args.with_ghidra, "ghidra_tool", "Ghidra")):
         if not wanted:
             continue
         from importlib import import_module
