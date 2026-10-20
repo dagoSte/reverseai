@@ -51,8 +51,10 @@ approved file
    the input hash, checks the tool name and version against the registered tools,
    checks that the location is inside the input and that the excerpt hash matches
    the frozen bytes. A finding is `unsupported` if any cited item is missing or
-   fails, or if it cites none; `contradicted` if another finding has the same
-   `claim_key` and a different `value`; otherwise `supported`.
+   fails, or if it cites none; `contradicted` if another finding whose cited
+   evidence also all verifies has the same `claim_key` and a different `value`;
+   otherwise `supported`. An unsupported finding never contradicts anything, so
+   a claim without valid evidence cannot cancel a verified one.
 7. **Errors are short and inert.** Error and reason strings never contain input
    bytes or host paths.
 8. **No execution.** Nothing in M1 runs the sample, installs software, opens a
