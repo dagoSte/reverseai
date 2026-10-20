@@ -163,8 +163,10 @@ M2a; only what differs is listed. Fixed by the coordinator before the lanes.
 - **Operation** `yarax.matches`: args `ruleset` enum `("m2_fixture_v1",)`,
   default `m2_fixture_v1`; `max_matches` int 1..64, default 32; at most 64
   observations. The worker sets a scan timeout below the 45 s wall limit and a
-  per-pattern match limit, and reports matches in ascending (offset, rule,
-  pattern) order, cut at `max_matches`.
+  per-pattern match limit of 4, and reports matches in ascending (offset, rule,
+  pattern) order, cut at `max_matches`. Worker and host refuse a ruleset whose
+  pattern count times 4 exceeds 64, so a `max_matches` of 64 never hides a
+  matched rule (decision `m2b-per-pattern-cap`).
 - **Observation**: one per match, value
   `{"ruleset": <name>, "rule": <rule id>, "pattern": <pattern id>}` at
   `Location(offset, len(pattern bytes))`.
