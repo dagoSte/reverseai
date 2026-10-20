@@ -48,9 +48,14 @@ approved file
    stopped at its time, memory, CPU, process and output limits. Its stdout must
    pass `parse_worker_reply` (protocol `reverseai.worker/1`): bounded
    observations plus the digest of the snapshot it read, which must equal the
-   `InputRef` hash, or an error class name. The gateway then makes evidence from
-   the controller's own bytes with `make_evidence`; worker-supplied evidence IDs
-   or excerpt hashes are never accepted. The controller never parses with the
+   `InputRef` hash, or an error class name. Worker replies are untrusted beyond
+   their schema: before any evidence is made, the host re-derives every value of
+   every observation from the controller's own bytes at that observation's
+   Location, with in-process decoding, and refuses the whole reply when a value
+   disagrees, is missing, is unknown or cannot be re-derived. A compromised
+   worker can therefore withhold evidence but never invent it. The gateway then
+   makes evidence from the controller's own bytes with `make_evidence`;
+   worker-supplied evidence IDs or excerpt hashes are never accepted. The controller never parses with the
    tool natively, and the sample itself is never executed. `ToolSpec.runtime`
    records the image digest and platform; the `ToolRef` version changes whenever
    the adapter, image or hidden settings change.
@@ -118,7 +123,7 @@ in parallel. Nothing in this interface comes from a sample, an analyst or a peer
   read-only bind mount of a private per-run folder under
   `/Users/Shared/rea-safe-staging-501`, removed after the run. No other mount.
 - **Run flags** (exact, built by `reverseai/contained.py` as an argv list):
-  `docker run --rm --init --name reverseai-<random> --platform linux/arm64
+  `docker run --rm --init --pull never --name reverseai-<random> --platform linux/arm64
   --network none --read-only --cap-drop ALL --security-opt no-new-privileges
   --user 65534:65534 --pids-limit 64 --memory 512m --memory-swap 512m --cpus 1
   --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m --log-driver none
