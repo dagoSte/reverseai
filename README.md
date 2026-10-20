@@ -6,12 +6,13 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M2b released, M3 (Ghidra) in progress.** Deterministic analysts read
-file structure and string indicators in-process, and two pinned open-source tools,
-LIEF and YARA-X, run in locked containers. Every value a tool reports is re-derived
+**Status: M3a released candidate: Ghidra joins LIEF and YARA-X.** Deterministic
+analysts read file structure and string indicators in-process, and three pinned
+open-source tools, LIEF, YARA-X and Ghidra, run in locked containers. Every value a tool reports is re-derived
 by the host from the input bytes before it can become evidence, and a reviewer
-re-checks each claim against those bytes. Model-driven agents are not part of the
-current releases.
+re-checks each claim against those bytes. Ghidra's functions, pseudocode and calls
+are reported as *derived*: anchored in the bytes and reviewed, never shown as verified.
+Model-driven agents are not part of the current releases.
 
 ## How it works
 
@@ -26,7 +27,7 @@ What this buys, and how each point is checked:
 | A supported finding is backed by exact bytes | The reviewer recomputes the input hash, the byte range and its hash for every cited item, and the claim rule must yield exactly the claimed value. |
 | A compromised tool can hide evidence but not invent it | The host re-derives every value a contained worker reports (headers, sections, signature matches) from its own copy of the bytes and refuses the whole reply on any mismatch. |
 | Tools cannot reach the host or the network | One container per run: no network, read-only root, non-root user, every capability dropped, no new privileges, CPU, memory, process and time limits, a single read-only snapshot mount, image pinned by ID. `tests/verify_m2_runtime.py` proves these limits against the real engine. |
-| Interpretations stay labelled | Decompiled code and function lists (M3) are *derived*: anchored in the input and reviewed, but never presented as verified fact and never able to contradict one. |
+| Interpretations stay labelled | Ghidra's function lists, pseudocode and calls are *derived*: the host re-derives each anchor (the exact file bytes, inside an executable section), the reviewer re-checks them, and the report lists them apart; they never count as verified and never contradict a verified finding. |
 | One claim cannot cancel a verified one | Only findings whose evidence all verifies can contradict each other. |
 | Reports are reproducible | Same input and budget, same report; the report names each tool version and container image. |
 
@@ -37,7 +38,8 @@ What this buys, and how each point is checked:
 | M1 | Gateway, structural and capability analysts, evidence reviewer, reports | released |
 | M2a | LIEF 1.0.0 in a container, host re-derivation of every worker value | released |
 | M2b | YARA-X 1.21.0 in a container, reviewed literal ruleset, verified signature matches | released |
-| M3 | Ghidra 12.1.4 headless: functions, pseudocode, calls as derived evidence; then Mach-O | in progress |
+| M3a | Ghidra 12.1.4 headless on ELF and PE: functions, pseudocode, calls as derived evidence (contract/2) | release candidate |
+| M3b | Mach-O: host decoder and Ghidra on Mach-O; more Ghidra queries (imports, xrefs, strings by reference) | planned |
 | M4 | JADX for Android packages | planned |
 | M5 | JavaScript application analysis | planned |
 | M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
@@ -54,7 +56,8 @@ python3 -B -m unittest discover -s tests -t . -v
 ```
 
 With Docker and the locally built, pinned images (`tools/build_lief_image.py`,
-`tools/build_yarax_image.py`), add `--with-lief` and `--with-yarax`; the command
+`tools/build_yarax_image.py`, `tools/build_ghidra_image.py`), add `--with-lief`,
+`--with-yarax` and `--with-ghidra`; the command
 refuses cleanly when an image or Docker is missing. The native containment proof:
 
 ```sh

@@ -68,7 +68,7 @@
     <text x="745" y="197" class="h" style="font-size:15px">Locked container, one per run</text>
     <rect x="720" y="212" width="86" height="28" rx="14" fill="#86efac"/><text x="763" y="231" class="chip" text-anchor="middle">LIEF</text>
     <rect x="816" y="212" width="94" height="28" rx="14" fill="#86efac"/><text x="863" y="231" class="chip" text-anchor="middle">YARA-X</text>
-    <rect x="920" y="212" width="84" height="28" rx="14" fill="#93c5fd"/><text x="962" y="230" class="chip" text-anchor="middle" style="font-size:12px">Ghidra · M3</text>
+    <rect x="920" y="212" width="84" height="28" rx="14" fill="#86efac"/><text x="962" y="231" class="chip" text-anchor="middle">Ghidra</text>
     <text x="720" y="264" class="k">no network · read-only root · non-root user</text>
     <text x="720" y="284" class="k">capabilities dropped · CPU, memory, time limits</text>
     <text x="720" y="304" class="k">one read-only snapshot mount · image pinned by ID</text>
@@ -82,7 +82,8 @@
     <path d="M1145 228 l7 7 l13 -14" stroke="#0b1220" stroke-width="3.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
     <text x="1155" y="282" class="h" text-anchor="middle" style="font-size:15px">Host re-derivation</text>
     <text x="1155" y="302" class="s" text-anchor="middle" style="fill:#bbf7d0">every value re-read</text>
-    <text x="1155" y="319" class="s" text-anchor="middle" style="fill:#bbf7d0">from the input bytes</text>
+    <text x="1155" y="319" class="s" text-anchor="middle" style="fill:#bbf7d0">from the input bytes;</text>
+    <text x="1155" y="334" class="s" text-anchor="middle" style="fill:#bbf7d0;font-size:11px">Ghidra: every anchor</text>
   </g>
 
   <!-- Row 1 arrows -->
