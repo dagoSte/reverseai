@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from reverseai.contained import (
     DockerExecutor, ContainedError, ContainedTimeout, MAX_WORKER_REPLY_BYTES,
-    build_argv, load_lock, run_bounded,
+    build_argv, load_lock, resource_profile, run_bounded,
 )
 from reverseai.contract import sha256_hex
 
@@ -20,6 +20,13 @@ from reverseai.contract import sha256_hex
 def lock():
     return {"image_id": "sha256:" + "a" * 64, "platform": "linux/arm64",
             "base_digest": "sha256:" + "b" * 64, "wheel_sha256": "c" * 64, "adapter_version": "1.0.0-r2"}
+
+
+def ghidra_lock():
+    return {"image_id": "sha256:" + "a" * 64, "platform": "linux/arm64", "adapter_version": "12.1.4-r1",
+            "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
+            "ghidra_sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",
+            "jdk_sha256": "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223"}
 
 
 class ExecutorTests(unittest.TestCase):
@@ -297,6 +304,104 @@ class LockAndArgvTests(unittest.TestCase):
             build_argv(lock()["image_id"], "--privileged", "/tmp/staging", "lief.headers", {})
 
 
+class GhidraBoundaryTests(unittest.TestCase):
+    def test_lock_has_exact_pinned_ghidra_keys_and_no_wheel(self):
+        kwargs = {"adapter_version": "12.1.4-r1"}
+        self.assertEqual(load_lock(ghidra_lock(), **kwargs), ghidra_lock())
+        for field in ghidra_lock():
+            value = ghidra_lock()
+            del value[field]
+            with self.subTest(missing=field), self.assertRaisesRegex(ContainedError, "^InvalidImageLock$"):
+                load_lock(value, **kwargs)
+        for field in ("base_digest", "ghidra_sha256", "jdk_sha256"):
+            value = ghidra_lock()
+            value[field] = ("sha256:" if field == "base_digest" else "") + "0" * 64
+            with self.subTest(wrong_pin=field), self.assertRaises(ContainedError):
+                load_lock(value, **kwargs)
+        for extra in ({"wheel_sha256": "b" * 64}, {"extra": "b" * 64}):
+            with self.subTest(extra=extra), self.assertRaises(ContainedError):
+                load_lock(dict(ghidra_lock(), **extra), **kwargs)
+        with self.assertRaises(ContainedError):
+            load_lock(ghidra_lock())
+        with self.assertRaises(ContainedError):
+            load_lock(ghidra_lock(), **kwargs, extra_keys=("extra",))
+
+    def test_fixed_profile_and_exact_argv_only_change_the_agreed_resources(self):
+        expected = {"pids": 256, "memory": "2g", "cpus": 2,
+                    "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=512m", "wall_seconds": 240}
+        profile = resource_profile("ghidra.analyze")
+        self.assertEqual(dict(profile), expected)
+        with self.assertRaises(TypeError):
+            profile["wall_seconds"] = 3600
+        with self.assertRaises(ContainedError):
+            resource_profile("unknown")
+        argv = build_argv(ghidra_lock()["image_id"], "reverseai-abc", "/private/staging", "ghidra.analyze", {})
+        self.assertEqual(argv, [
+            "docker", "run", "--rm", "--init", "--pull", "never", "--name", "reverseai-abc", "--platform", "linux/arm64",
+            "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+            "--user", "65534:65534", "--pids-limit", "256", "--memory", "2g", "--memory-swap", "2g",
+            "--cpus", "2", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=512m", "--log-driver", "none",
+            "--mount", "type=bind,source=/private/staging,target=/snapshot,readonly", ghidra_lock()["image_id"],
+            "ghidra.analyze", '{"decompile":8,"max_calls":128,"max_chars":1024,"max_functions":64}',
+        ])
+        for operation in ("lief.headers", "lief.sections", "yarax.matches"):
+            self.assertEqual(resource_profile(operation)["wall_seconds"], 45)
+
+    def test_all_argument_bounds_and_unknown_resource_or_script_knobs_are_refused(self):
+        for key, low, high in (("max_functions", 1, 128), ("decompile", 0, 16),
+                               ("max_chars", 64, 2048), ("max_calls", 0, 256)):
+            for value in (low, high):
+                argv = build_argv(ghidra_lock()["image_id"], "reverseai-abc", "/tmp/staging", "ghidra.analyze", {key: value})
+                self.assertEqual(json.loads(argv[-1])[key], value)
+            for value in (low - 1, high + 1, True, str(low), float(low)):
+                with self.subTest(key=key, value=value), self.assertRaises(ContainedError):
+                    build_argv(ghidra_lock()["image_id"], "reverseai-abc", "/tmp/staging", "ghidra.analyze", {key: value})
+        for key in ("profile", "timeout", "script", "loader", "path", "entrypoint"):
+            with self.subTest(key=key), self.assertRaises(ContainedError):
+                build_argv(ghidra_lock()["image_id"], "reverseai-abc", "/tmp/staging", "ghidra.analyze", {key: "ghidra"})
+
+    def test_executor_profile_identity_timeout_staging_and_failure_cleanup(self):
+        data = b"inert snapshot"
+        for fail in (False, True):
+            calls = []
+            with tempfile.TemporaryDirectory() as folder:
+                def runner(argv, **kwargs):
+                    calls.append((argv, kwargs))
+                    if argv[1] == "kill":
+                        return b""
+                    staged = Path(argv[argv.index("--mount") + 1].split("source=")[1].split(",target=")[0])
+                    self.assertEqual((staged / "input").read_bytes(), data)
+                    self.assertEqual(stat.S_IMODE(staged.stat().st_mode), 0o555)
+                    self.assertEqual(stat.S_IMODE((staged / "input").stat().st_mode), 0o444)
+                    if fail:
+                        raise ContainedTimeout("WorkerTimeout")
+                    return b"reply"
+                executor = DockerExecutor(ghidra_lock(), runner=runner, adapter_version="12.1.4-r1",
+                                          inspect=lambda image: image, staging_root=folder)
+                with self.subTest(fail=fail):
+                    if fail:
+                        with self.assertRaises(ContainedTimeout):
+                            executor.run("ghidra.analyze", {}, data, sha256_hex(data))
+                    else:
+                        self.assertEqual(executor.run("ghidra.analyze", {}, data, sha256_hex(data)), b"reply")
+                    self.assertEqual(calls[0][1], {"timeout": 240, "max_output": MAX_WORKER_REPLY_BYTES})
+                    self.assertEqual(list(Path(folder).iterdir()), [])
+                    if fail:
+                        self.assertEqual(calls[-1][0], ["docker", "kill", calls[0][0][calls[0][0].index("--name") + 1]])
+                        self.assertEqual(calls[-1][1]["timeout"], 5)
+                with self.assertRaises(ContainedError):
+                    executor.run("lief.headers", {}, data, sha256_hex(data))
+        with self.assertRaises(ContainedError):
+            DockerExecutor(lock(), inspect=lambda image: image).run("ghidra.analyze", {}, data, sha256_hex(data))
+
+    def test_default_ghidra_executor_selects_the_closed_profile_on_the_same_runner(self):
+        with tempfile.TemporaryDirectory() as folder, patch("reverseai.contained.run_bounded", return_value=b"reply") as runner:
+            executor = DockerExecutor(ghidra_lock(), adapter_version="12.1.4-r1", inspect=lambda image: image, staging_root=folder)
+            executor.run("ghidra.analyze", {}, b"inert", sha256_hex(b"inert"))
+            self.assertEqual(runner.call_args.kwargs,
+                             {"profile": "ghidra", "timeout": 240, "max_output": MAX_WORKER_REPLY_BYTES})
+
+
 class ProcessRunnerTests(unittest.TestCase):
     def run_python(self, source, **kwargs):
         return run_bounded([sys.executable, "-I", "-B", "-c", source], **kwargs)
@@ -340,3 +445,13 @@ class ProcessRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ContainedError, "^WorkerOutputLimit$"):
             self.run_python(f"import os; os.write(1, b'x' * {MAX_WORKER_REPLY_BYTES + 1})",
                             timeout=5, max_output=MAX_WORKER_REPLY_BYTES * 2)
+
+    def test_ghidra_profile_cannot_widen_its_module_limit_and_unknown_profiles_never_start(self):
+        with patch("reverseai.contained.GHIDRA_WALL_SECONDS", 0.1):
+            with self.assertRaises(ContainedTimeout):
+                self.run_python("import time; time.sleep(60)", timeout=999, profile="ghidra")
+        with patch("reverseai.contained.subprocess.Popen") as process:
+            for profile in ("unknown", None, 240):
+                with self.subTest(profile=profile), self.assertRaises(ContainedError):
+                    self.run_python("pass", profile=profile)
+            process.assert_not_called()
