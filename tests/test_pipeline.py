@@ -153,7 +153,7 @@ class ContainedToolWiringTests(unittest.TestCase):
         args = {"max_functions": ArgSpec("int", 1, 128, default=64), "decompile": ArgSpec("int", 0, 16, default=8),
                 "max_chars": ArgSpec("int", 64, 2048, default=1024), "max_calls": ArgSpec("int", 0, 256, default=128)}
         op = OperationSpec("ghidra.analyze", args, lambda data, checked: observations, max_observations=400, derived=True)
-        return ToolSpec(ToolRef("ghidra", "12.1.4-r3"), {"ghidra.analyze": op}, contained=True,
+        return ToolSpec(ToolRef("ghidra", "12.1.4-r4"), {"ghidra.analyze": op}, contained=True,
                         runtime={"image": "sha256:" + "2" * 64, "platform": "linux/arm64"})
 
     def test_ghidra_findings_are_reported_as_derived_and_get_the_ghidra_budget(self):

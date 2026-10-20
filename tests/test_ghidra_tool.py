@@ -48,7 +48,7 @@ class ToolTests(unittest.TestCase):
         self.operation = self.tool.operations["ghidra.analyze"]
 
     def test_metadata_defaults_derived_declaration_and_snapshot_binding(self):
-        self.assertEqual((self.tool.ref.name, self.tool.ref.version), ("ghidra", "12.1.4-r3"))
+        self.assertEqual((self.tool.ref.name, self.tool.ref.version), ("ghidra", "12.1.4-r4"))
         self.assertTrue(self.tool.contained)
         self.assertTrue(self.operation.derived)
         self.assertEqual(self.operation.max_observations, 400)
@@ -140,7 +140,7 @@ class ToolTests(unittest.TestCase):
         importlib.reload(ghidra_tool)
         with patch.object(ghidra_tool, "DockerExecutor", return_value=self.executor) as factory:
             tool = ghidra_tool.make_tool()
-            factory.assert_called_once_with(ghidra_tool.DEFAULT_LOCK, adapter_version="12.1.4-r3")
+            factory.assert_called_once_with(ghidra_tool.DEFAULT_LOCK, adapter_version="12.1.4-r4")
             self.assertTrue(tool.operations["ghidra.analyze"].derived)
 
     def test_availability_requires_exact_lock_and_local_image_without_host_native_imports(self):
@@ -150,6 +150,9 @@ class ToolTests(unittest.TestCase):
             return image
         self.assertTrue(ghidra_tool.available(ghidra_lock(), inspect=inspect))
         self.assertEqual(inspected, [ghidra_lock()["image_id"]])
+        for version in ("12.1.4-r1", "12.1.4-r2", "12.1.4-r3"):
+            with self.subTest(version=version):
+                self.assertFalse(ghidra_tool.available(dict(ghidra_lock(), adapter_version=version), inspect=inspect))
         self.assertFalse(ghidra_tool.available(dict(ghidra_lock(), ghidra_sha256="0" * 64), inspect=inspect))
         self.assertEqual(len(inspected), 1)
         self.assertFalse(ghidra_tool.available(ghidra_lock(), inspect=lambda image: "other"))

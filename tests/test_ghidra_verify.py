@@ -66,6 +66,36 @@ class MachOAnchorTests(unittest.TestCase):
                 item["location"]["offset"] += 1
                 self.assertFalse(self.accepts([item], data=data))
 
+    def test_macho_section_virtual_extent_cannot_wrap_its_address_width(self):
+        for width in (32, 64):
+            data, layout = macho(width=width, sections=((b"__text", b"__TEXT", 0x80000400, 5, 32),))
+            for gap in (32, 16):
+                address = 2**width - gap
+                changed = bytearray(data)
+                word = "<Q" if width == 64 else "<I"
+                struct.pack_into(word, changed, layout["header_size"] + 24, address)
+                struct.pack_into(word, changed, layout["section_offsets"][0] + 32, address)
+                item = {"location": {"offset": layout["content_start"], "length": 8},
+                        "value": {"kind": "function", "index": 0, "name": "declared", "size": 8, "entry": address}}
+                # The function fits either way; only the enclosing section wraps when gap is 16.
+                for items in ([item], []):
+                    with self.subTest(width=width, gap=gap, empty=not items):
+                        self.assertEqual(self.accepts(items, data=bytes(changed)), gap == 32)
+
+    def test_macho_32_bit_function_and_call_cannot_cross_the_address_limit(self):
+        data, layout = macho(width=32, sections=((b"__text", b"__TEXT", 0x80000400, 5, 32),))
+        for gap in (32, 16):
+            address = 2**32 - gap
+            changed = bytearray(data)
+            struct.pack_into("<I", changed, layout["header_size"] + 24, address)
+            struct.pack_into("<I", changed, layout["section_offsets"][0] + 32, address)
+            items = [{"location": {"offset": layout["content_start"], "length": 32},
+                      "value": {"kind": "function", "index": 0, "name": "declared", "size": 32, "entry": address}},
+                     {"location": {"offset": layout["content_start"] + 24, "length": 5},
+                      "value": {"kind": "call", "from": address, "to": address, "to_name": "declared"}}]
+            with self.subTest(gap=gap):
+                self.assertEqual(self.accepts(items, data=bytes(changed)), gap == 32)
+
     def test_macho_non_executable_and_zero_fill_sections_cannot_anchor_code(self):
         self.assertTrue(self.accepts(self.items[:1]))
         text_segment = 32 + 72  # __PAGEZERO, followed by __TEXT in the declared fixture
