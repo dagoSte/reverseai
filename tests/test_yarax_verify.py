@@ -19,6 +19,38 @@ def observation(item):
 
 
 class RulesetTests(unittest.TestCase):
+    def test_duplicate_rule_ids_are_refused_even_when_pattern_ids_are_distinct(self):
+        value = {"ruleset": "m2_fixture_v1", "rules": [
+            {"id": "first", "category": "packer", "patterns": [{"id": "$a", "hex": "55505821"}]},
+            {"id": "second", "category": "packer", "patterns": [{"id": "$b", "hex": "55505830"}]}]}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rules.json"
+            raw = json.dumps(value).encode()
+            path.write_bytes(raw)
+            self.assertEqual(dict(yarax_verify.load_patterns(path, sha256_hex(raw))),
+                             {("first", "$a"): b"UPX!", ("second", "$b"): b"UPX0"})
+            value["rules"][1]["id"] = "first"
+            raw = json.dumps(value).encode()
+            path.write_bytes(raw)
+            with self.assertRaisesRegex(ContainedError, "^InvalidRuleset$"):
+                yarax_verify.load_patterns(path, sha256_hex(raw))
+
+    def test_duplicate_pattern_ids_are_refused_even_when_literals_are_distinct(self):
+        value = {"ruleset": "m2_fixture_v1", "rules": [
+            {"id": "first", "category": "packer", "patterns": [
+                {"id": "$a", "hex": "55505821"}, {"id": "$b", "hex": "55505830"}]}]}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "rules.json"
+            raw = json.dumps(value).encode()
+            path.write_bytes(raw)
+            self.assertEqual(dict(yarax_verify.load_patterns(path, sha256_hex(raw))),
+                             {("first", "$a"): b"UPX!", ("first", "$b"): b"UPX0"})
+            value["rules"][0]["patterns"][1]["id"] = "$a"
+            raw = json.dumps(value).encode()
+            path.write_bytes(raw)
+            with self.assertRaisesRegex(ContainedError, "^InvalidRuleset$"):
+                yarax_verify.load_patterns(path, sha256_hex(raw))
+
     def test_pattern_budget_accepts_sixteen_and_refuses_seventeen(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "rules.json"
