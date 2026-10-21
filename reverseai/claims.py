@@ -82,6 +82,11 @@ def _pseudocode(observations):
     return {key: texts[0][key] for key in ("entry", "text", "truncated")} if texts and len(texts) == 1 else None
 
 
+def _java(observations):
+    found = _shaped("java")(observations)
+    return {key: value for key, value in found[0].items() if key != "kind"} if found and len(found) == 1 else None
+
+
 def _calls(observations):
     calls = _shaped("call")(observations)
     return [list(pair) for pair in sorted({(o["from"], o["to_name"]) for o in calls})] if calls else None
@@ -151,6 +156,13 @@ SHAPES = {
                            and _rows(o.get("instructions")) and type(o.get("truncated")) is bool),
     "ref": lambda o: (_uint(o.get("from")) and _uint(o.get("to")) and o.get("type") in REFERENCE_TYPES
                       and _symbol(o.get("to_name"))),
+    # M4b: decompiled Java of one DEX method; printable ASCII, newline and tab only (the worker escapes the rest)
+    "java": lambda o: (all(_ascii(o.get(key), 1, 255) for key in ("dex", "class", "name", "prototype"))
+                       and o.get("form") in JAVA_FORMS and _index(o.get("start")) and _index(o.get("total"))
+                       and isinstance(o.get("text"), str) and len(o["text"]) <= 2048
+                       and all(" " <= char <= "~" or char in "\n\t" for char in o["text"])
+                       and o["start"] + len(o["text"]) <= o["total"]
+                       and (o["form"] != "error" or (o["text"] == "" and o["start"] == o["total"] == 0))),
     "string": lambda o: (_uint(o.get("address")) and o.get("encoding") in ("ascii", "utf-16le")
                          and _ascii(o.get("text"), 2, 128) and type(o.get("truncated")) is bool
                          and (not o["truncated"] or len(o["text"]) == 128) and _sources(o.get("from"))),
@@ -167,7 +179,9 @@ FIELDS = {
     "assembly": {"kind", "index", "entry", "instructions", "truncated"},
     "ref": {"kind", "from", "to", "type", "to_name"},
     "string": {"kind", "address", "encoding", "text", "truncated", "from"},
+    "java": {"kind", "dex", "class", "name", "prototype", "form", "start", "total", "text"},
 }
+JAVA_FORMS = ("java", "fallback", "error")
 REFERENCE_TYPES = ("read", "write", "read_write", "data", "jump")
 
 
@@ -396,6 +410,7 @@ RULES = {
     "code.function_list": ("inferred", {"ghidra.functions": _page("function_row")}),
     "code.function_info": ("inferred", {"ghidra.function": _single(
         "target", ("name", "entry", "size", "matches", "callers_total", "callees_total"))}),
+    "android.java": ("inferred", {"jadx.method": _java}),
     "code.instructions": ("inferred", {"ghidra.function": _single(
         "instructions", ("entry", "start", "total", "rows", "truncated"))}),
     "code.callers": ("inferred", {"ghidra.function": _callers}),
@@ -413,7 +428,7 @@ RULES = {
 
 # contract/2: claims that are always a tool's reading; the reviewer reports them as derived whatever a ToolSpec says.
 DERIVED_CLAIMS = frozenset(key for key, (_, derivations) in RULES.items()
-                           if all(operation.startswith("ghidra.") for operation in derivations))
+                           if all(operation.startswith(("ghidra.", "jadx.")) for operation in derivations))
 
 
 # claim_key -> the fixed statement a supported finding makes; the value column says what it found.
@@ -450,6 +465,7 @@ STATEMENTS = {
     "android.classes": "Classes the DEX files declare (one page)",
     "android.methods": "Methods one DEX class declares (one page)",
     "android.references": "References in DEX code (declarations, not evidence of execution; one page)",
+    "android.java": "Java the decompiler produced for one DEX method (its reading, not verified against the bytes)",
     **{f"capability.{name}": f"String hints of {name.replace('_', ' ')} capability (names only, not behaviour)" for name in CATEGORIES},
 }
 

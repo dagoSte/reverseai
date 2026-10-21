@@ -290,21 +290,23 @@ class ArgSpec:
 
     "literal" (M3d) is search text for in-process tools only: minimum..maximum printable characters, and it may
     contain "/" or start with "-"; a contained tool may not declare one (ToolSpec refuses it).
+    "identity" (M4b) is an escaped DEX identity as rows show it: minimum..maximum printable ASCII characters; a
+    contained tool may declare it, and its worker compares it as text only, never as a path, option or program.
     """
 
-    kind: str  # "int" | "str" | "enum" | "literal"
+    kind: str  # "int" | "str" | "enum" | "literal" | "identity"
     minimum: int = 0
     maximum: int = 0
     choices: tuple = ()
     default: object = None
 
     def __post_init__(self):
-        require(self.kind in ("int", "str", "enum", "literal"), "Invalid argument kind")
+        require(self.kind in ("int", "str", "enum", "literal", "identity"), "Invalid argument kind")
         if self.kind == "enum":
             require(self.choices and all(isinstance(c, str) for c in self.choices), "Enum needs string choices")
         if self.kind == "int":
             require(self.minimum <= self.maximum, "Invalid int range")
-        if self.kind == "literal":
+        if self.kind in ("literal", "identity"):
             require(0 <= self.minimum <= self.maximum <= MAX_STRING_ARG_CHARS, "Invalid literal length range")
 
     def check(self, value):
@@ -315,6 +317,9 @@ class ArgSpec:
         elif self.kind == "literal":
             require(isinstance(value, str) and self.minimum <= len(value) <= self.maximum and value.isprintable(),
                     "Literal argument is not allowed")
+        elif self.kind == "identity":
+            require(isinstance(value, str) and self.minimum <= len(value) <= self.maximum
+                    and all(" " <= char <= "~" for char in value), "Identity argument is not allowed")
         else:
             require(isinstance(value, str) and len(value) <= MAX_STRING_ARG_CHARS and "\x00" not in value
                     and "/" not in value and "\\" not in value and not value.startswith("-"),

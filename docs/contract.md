@@ -683,6 +683,61 @@ and needs an owner-approved download. Decision `m4a-contract`.
   `from`; decompiled Java comes with M4b), `trace_android_references`
   (`dex.references`; `direction` from the arguments).
 
+## Decompiled Java through JADX (M4b, contract/3)
+
+Decisions `owner-next-m4b`, `m4b-contract`. JADX reads the package as data; its
+Java is the decompiler's reading, kept **derived** like Ghidra's pseudocode.
+
+- **Image**: `containers/jadx/`, linux/arm64, built from the pinned
+  `python:3.12-slim` base with JADX 1.5.6 (`jadx-1.5.6.zip`, `545ea2be...8974`,
+  the one approved download) and the JDK bytes already approved for Ghidra
+  (Temurin 21.0.12.1+1, `23e37e02...e223`); a fixed driver is compiled at build
+  time against the bundled `jadx-core`. Lock keys: the M2a keys plus
+  `jadx_sha256`, `jdk_sha256`. Adapter `1.5.6-r1`.
+- **Resource profile** (fixed in `reverseai/contained.py`, proven by the native
+  verifier): as Ghidra's (`--memory 2g --memory-swap 2g --pids-limit 256 --cpus 2
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=512m`, wall 240 s) with a fixed JVM
+  heap and thread count; M4B-W measures and proposes the final values.
+- **Analysis**: one JADX load of the frozen input per run, bundled DEX input
+  only, no resource decoding, no deobfuscation, no export outside `/tmp`, no
+  plugins or options chosen by a request. The driver identifies methods by their
+  raw DEX identity escaped exactly as `dex.*` rows show it; JADX's display
+  renames appear only inside the Java text.
+- **Argument kind `identity`**: 0..255 printable ASCII characters, the escaped
+  form rows show. Unlike `literal`, a contained tool may declare it; its worker
+  compares it as text only, never as a path, option or program.
+- **Operation** `jadx.method` (derived): args `member` identity 0..255 default ""
+  (as `dex.methods`: "" for every `classes*.dex` member), `class` identity
+  1..255, `method` identity 1..255, `prototype` identity 0..255 default "" ("" for
+  every overload), `start` int 0..1048575 default 0, `max_chars` int 64..2048
+  default 1024. One observation per matched method with code, in member and
+  `method_id` order, at most 16 (more fails the operation with a fixed error);
+  methods without code (abstract, native) have none.
+  `{"kind": "java", "dex", "class", "name", "prototype", "form", "start", "total",
+  "text"}`: identities as `dex.methods` rows; `form` `java` (decompiled),
+  `fallback` (JADX's fallback listing when it could not decompile) or `error`
+  (nothing produced: `text` "", `start` = `total` = 0); `total` the length in
+  characters of the method's whole text; `text` its characters from `start`, at
+  most `max_chars`, cut further to the longest prefix whose observation fits
+  4,096 bytes; only printable ASCII, newline and tab (the driver writes any other
+  character as a Java `\uXXXX` escape).
+- **Anchors**: the worker's observations carry no location, offset or artifact.
+  The host anchors each one itself: it decodes the named DEX member with `dex.py`
+  (same limits, same escaped selectors), requires the identity to name exactly one
+  method with code, and anchors the observation at that method's instructions
+  (the `insns` of its `code_item`) inside the member's child artifact. Anything
+  else fails the operation.
+- **Claim** `android.java` (inferred, derived): the observation's fields but
+  `kind`, one finding per method page. It never contradicts and is never
+  contradicted.
+- **Queries**: `inspect_android_method` adds `jadx.method` (same `member`,
+  `class`, `method`, `prototype`; `java_start`, `max_chars`) when run with
+  `--with-jadx` and the locally built pinned image; without it the Java part is
+  absent and the report says so. The Android selector arguments of the queries
+  are `identity`, since rows show escaped identities.
+- **Report**: the derived section shows each method's Java in a fenced block
+  with the tool, image and page (`characters a..b of N`, next `start`).
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under
