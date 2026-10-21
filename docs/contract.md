@@ -717,7 +717,8 @@ Java is the decompiler's reading, kept **derived** like Ghidra's pseudocode.
   form rows show. Unlike `literal`, a contained tool may declare it; its worker
   compares it as text only, never as a path, option or program.
 - **Operation** `jadx.method` (derived): args `member` identity 0..255 default ""
-  (as `dex.methods`: "" for every `classes*.dex` member), `class` identity
+  ("" for every `classes*.dex` member; a name that is no `classes*.dex` member of
+  the input fails the operation, since JADX needs that set), `class` identity
   1..255, `method` identity 1..255, `prototype` identity 0..255 default "" ("" for
   every overload), `start` int 0..1048575 default 0, `max_chars` int 64..2048
   default 1024. One observation per matched method with code, in member and
@@ -731,11 +732,14 @@ Java is the decompiler's reading, kept **derived** like Ghidra's pseudocode.
   `m4b-omitted`) or `error` (nothing produced); `omitted` and `error` have
   `text` "", `start` = `total` = 0; `total` the length in
   characters of the method's whole text; `text` its characters from `start`, at
-  most `max_chars`, cut further to the longest prefix whose observation fits
-  4,096 bytes. The text is printable ASCII, newline and tab only: the driver
+  most `max_chars`; after checking the worker's whole row the host cuts it to the
+  longest prefix whose observation fits 4,096 bytes, never inside a `\uXXXX`
+  escape (decision `m4b-fix-round`). The text is printable ASCII, newline and tab only: the driver
   writes every other UTF-16 unit as a Java `\uXXXX` escape, and `start` and
   `total` count characters of that escaped text. The class declaration line JADX
-  prints before a class's first method is not part of the method's text.
+  prints before a class's first method is not part of the method's text. A
+  selected method whose raw class, name or prototype holds an unpaired surrogate
+  (MUTF-8 allows one) cannot be sent as UTF-8 and fails the operation.
 - **Reply and anchors**: the worker answers each target, in order, with its
   status (`ok`, `fallback`, `omitted`, `decompile_failed`, `class_not_found`,
   `method_not_found`, `no_code`), JADX's `code_offset` and `insns_count` for the

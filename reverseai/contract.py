@@ -308,6 +308,8 @@ class ArgSpec:
             require(self.minimum <= self.maximum, "Invalid int range")
         if self.kind in ("literal", "identity"):
             require(0 <= self.minimum <= self.maximum <= MAX_STRING_ARG_CHARS, "Invalid literal length range")
+        if self.kind == "identity":
+            require(self.maximum <= 255, "Invalid identity length range")  # escaped identities are at most 255
 
     def check(self, value):
         if self.kind == "int":

@@ -44,6 +44,8 @@ class IdentityArgumentTests(unittest.TestCase):
         literal = OperationSpec("jadx.method", {"class": ArgSpec("literal", 1, 255)}, lambda d, a: [], derived=True)
         with self.assertRaises(ContractError):
             ToolSpec(JADX, {"jadx.method": literal}, contained=True)
+        with self.assertRaises(ContractError):  # RD-M4B-CODEX-C R2: the contract bound is 255
+            ArgSpec("identity", 0, 256)
 
 
 class JavaClaimTests(unittest.TestCase):
