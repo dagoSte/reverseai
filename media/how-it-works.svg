@@ -106,18 +106,17 @@
     <text x="52" y="468" class="k">input SHA-256 · tool and version</text>
     <text x="52" y="488" class="k">operation · exact byte range</text>
     <text x="52" y="508" class="k">hash of the bytes at that range</text>
-    <text x="52" y="538" class="s" style="font-size:11.5px">made only by the gateway, ID bound to content</text>
+    <text x="52" y="538" class="s" style="font-size:11.5px">made only by the gateway, content-bound ID</text>
   </g>
   <g>
     <rect class="box" x="330" y="412" width="220" height="150" rx="14"/>
     <circle cx="352" cy="434" r="12" fill="#7dd3fc"/><text x="352" y="438" class="n" text-anchor="middle">7</text>
     <text x="375" y="439" class="h">Analysts</text>
-    <text x="352" y="463" class="k">structural</text>
-    <text x="352" y="481" class="k">capability</text>
-    <text x="352" y="499" class="k">code (Ghidra)</text>
-    <text x="352" y="517" class="s">assembly · cross-references</text>
-    <text x="352" y="535" class="s">referenced strings</text>
-    <text x="352" y="551" class="s" style="font-size:11.5px">each claim cites its evidence</text>
+    <text x="352" y="463" class="k">structural · capability</text>
+    <text x="352" y="487" class="k">code (Ghidra), derived:</text>
+    <text x="352" y="506" class="s">functions · pseudocode · calls</text>
+    <text x="352" y="524" class="s">assembly · references · strings</text>
+    <text x="352" y="548" class="s" style="font-size:11.5px">each claim cites its evidence</text>
   </g>
   <g>
     <rect class="box" x="590" y="412" width="260" height="150" rx="14"/>
