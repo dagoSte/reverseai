@@ -1,6 +1,6 @@
-"""Native LIEF/YARA-X/Ghidra checks; ordinary unittest discovery never runs Docker.
+"""Native LIEF/YARA-X/Ghidra/JADX checks; ordinary unittest discovery never runs Docker.
 
-Run from the repository root with --tool lief (or yarax/ghidra), --profile small --offline,
+Run from the repository root with --tool lief (or yarax/ghidra/jadx), --profile small --offline,
 --lock containers/<tool>/image.lock.json --receipt NEW_PRIVATE_FILE.
 Unit tests establish validator behaviour; only a successful native run supplies
 runtime evidence for its exact image, platform, executor and verifier hashes.
@@ -20,14 +20,16 @@ import sys
 import textwrap
 import threading
 import time
+from types import SimpleNamespace
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from reverseai.contract import MAX_WORKER_REPLY_BYTES, Observation, canonical_json, parse_worker_reply, sha256_hex
+from reverseai.contract import ContractError, Location, MAX_WORKER_REPLY_BYTES, Observation, canonical_json, parse_worker_reply, sha256_hex
 from reverseai.tools import structure, ghidra_verify
 from tests.fixtures_structure import elf, pe
 from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code, elf_refs, pe_refs, macho_refs
+from tests import fixtures_apk
 
 
 PLATFORM = "linux/arm64"
@@ -64,6 +66,19 @@ GHIDRA_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                           *(f"{name}.{case}" for name in GHIDRA_QUERY_FIXTURES for case in GHIDRA_QUERY_CASES))
 GHIDRA_NATIVE_RUNS = len(GHIDRA_REQUIRED_CHECKS) - 3
 GHIDRA_OPERATIONS = ("ghidra.analyze", "ghidra.functions", "ghidra.function", "ghidra.xrefs")
+JADX_ADAPTER_VERSION = "1.5.6-r1"
+JADX_BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
+JADX_ZIP_SHA256 = "545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974"
+JADX_JAR_SHA256 = "fe3e12c45acf75f92369685fd02d1d7a7323385dc725680a9b98a0dac0ea554b"
+JADX_JDK_SHA256 = "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223"
+JADX_DRIVER_PATH = Path(__file__).resolve().parents[1] / "containers/jadx/driver/ReverseAIJadx.java"
+JADX_WORKER_PATH = Path(__file__).resolve().parents[1] / "containers/jadx/worker.py"
+JADX_CASE_NAMES = ("main_init", "helper_int", "helper_string", "on_create", "marker_init",
+                   "compute", "worker_init", "run", "past_end")
+JADX_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
+                        *(f"apk_basic.{name}" for name in JADX_CASE_NAMES),
+                        "jadx.hostile_reply", "jadx.input_mismatch")
+JADX_NATIVE_RUNS = len(JADX_REQUIRED_CHECKS) - 3
 # Measured on r6 image sha256:d4c9076d0f6b0e4123704851f4300f08ab5d2f96ae6e4f37faadbcdf7d96492a.
 # Source: coordinator-forwarded m3d-w-native-oracle.json, SHA-256 d8baabf89e32d3147ec08ea231415e9fd68dadf21fdfb3438e888d75f471674d.
 GHIDRA_QUERY_EXPECTED = {'84a2fe7a4e67702df1bfa4434c1c57aa6fee8d21df4717ed47a1f3688d162e4f': {'function_add': [{'location': {'length': 10,
@@ -415,16 +430,17 @@ def need(condition, reason):
 
 def limits(tool):
     """Independent fixed expectations: pids, memory, nanocpus, tmpfs, wall."""
-    need(tool in ("lief", "yarax", "ghidra"), "VerifierTool")
-    if tool == "ghidra":
-        return (256, 2 * 1024**3, 2_000_000_000, "rw,noexec,nosuid,nodev,size=512m", 240)
+    need(tool in ("lief", "yarax", "ghidra", "jadx"), "VerifierTool")
+    if tool in ("ghidra", "jadx"):
+        return (256, 2 * 1024**3, 2_000_000_000, "rw,noexec,nosuid,nodev,size=512m",
+                240 if tool == "ghidra" else 120)
     return (64, MEMORY, 1_000_000_000, "rw,noexec,nosuid,nodev,size=64m", WALL_SECONDS)
 
 
 def required_checks(tool):
-    need(tool in ("lief", "yarax", "ghidra"), "VerifierTool")
+    need(tool in ("lief", "yarax", "ghidra", "jadx"), "VerifierTool")
     return {"lief": REQUIRED_CHECKS, "yarax": YARAX_REQUIRED_CHECKS,
-            "ghidra": GHIDRA_REQUIRED_CHECKS}[tool]
+            "ghidra": GHIDRA_REQUIRED_CHECKS, "jadx": JADX_REQUIRED_CHECKS}[tool]
 
 
 def native_runs(tool):
@@ -432,6 +448,8 @@ def native_runs(tool):
 
 
 def lock_options(tool):
+    if tool == "jadx":
+        return {"adapter_version": JADX_ADAPTER_VERSION}
     if tool == "ghidra":
         return {"adapter_version": GHIDRA_ADAPTER_VERSION}
     return {} if tool == "lief" else {"adapter_version": YARAX_ADAPTER_VERSION,
@@ -446,6 +464,15 @@ def verify_ghidra_executor_profile(boundary):
         need(dict(profile) == expected and all(type(profile[key]) is type(value) for key, value in expected.items()) and
              type(boundary.GHIDRA_WALL_SECONDS) is int and boundary.GHIDRA_WALL_SECONDS == 240,
              "ExecutorGhidraProfile")
+
+
+def verify_jadx_executor_profile(boundary):
+    expected = {"pids": 256, "memory": "2g", "cpus": 2,
+                "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=512m", "wall_seconds": 120}
+    profile = boundary.resource_profile("jadx.method")
+    need(dict(profile) == expected and all(type(profile[key]) is type(value) for key, value in expected.items()) and
+         type(boundary.JADX_WALL_SECONDS) is int and boundary.JADX_WALL_SECONDS == 120,
+         "ExecutorJadxProfile")
 
 
 def _unique(pairs):
@@ -598,6 +625,129 @@ def verify_ghidra_lock(lock):
          lock["jdk_sha256"] == GHIDRA_JDK_SHA256 and
          isinstance(lock["image_id"], str) and re.fullmatch(r"sha256:[0-9a-f]{64}", lock["image_id"]),
          "GhidraLockPins")
+
+
+def verify_jadx_lock(lock):
+    pins = {"adapter_version": JADX_ADAPTER_VERSION, "platform": PLATFORM, "base_digest": JADX_BASE_DIGEST,
+            "jadx_zip_sha256": JADX_ZIP_SHA256, "jadx_jar_sha256": JADX_JAR_SHA256,
+            "jdk_sha256": JADX_JDK_SHA256}
+    need(isinstance(lock, dict) and set(lock) == {*pins, "driver_sha256", "worker_sha256", "image_id"},
+         "JadxLockPins")
+    need(all(type(lock[key]) is str and lock[key] == value for key, value in pins.items()) and
+         isinstance(lock["image_id"], str) and re.fullmatch(r"sha256:[0-9a-f]{64}", lock["image_id"]),
+         "JadxLockPins")
+    try:
+        need(lock["driver_sha256"] == sha256_hex(JADX_DRIVER_PATH.read_bytes()) and
+             lock["worker_sha256"] == sha256_hex(JADX_WORKER_PATH.read_bytes()), "JadxSourcePins")
+    except OSError:
+        raise VerificationError("JadxSourcePins") from None
+
+
+# Native forms relayed by coord in m4bv-forms; the Java spelling remains derived.
+JADX_FORMS = {"main_init": "omitted", "helper_int": "java", "helper_string": "java",
+              "on_create": "java", "marker_init": "java", "compute": "java",
+              "worker_init": "omitted", "run": "java", "past_end": "java"}
+
+
+def _jadx_fixture(data):
+    sample, layout = fixtures_apk.apk_basic()
+    need(type(data) is bytes and data == sample, "KnownAnswerFixture")
+    return layout
+
+
+def _jadx_targets():
+    f = fixtures_apk
+    return {
+        "main_init": ("classes.dex", f.MAIN, "<init>", "()V"),
+        "helper_int": ("classes.dex", f.MAIN, "helper", "(I)I"),
+        "helper_string": ("classes.dex", f.MAIN, "helper", "(Ljava/lang/String;)I"),
+        "on_create": ("classes.dex", f.MAIN, "onCreate", "(Landroid/os/Bundle;)V"),
+        "marker_init": ("classes.dex", f.MARKER, "<init>", "(Ljava/lang/String;)V"),
+        "compute": ("classes.dex", f.HELPER, "compute", "(II)I"),
+        "worker_init": ("classes2.dex", f.WORKER, "<init>", "()V"),
+        "run": ("classes2.dex", f.WORKER, "run", "()V"),
+    }
+
+
+def jadx_cases(data):
+    """Fixed public jadx.method args; each case selects one declared method."""
+    _jadx_fixture(data)
+    fields = ("member", "class", "method", "prototype")
+    cases = {label: {**dict(zip(fields, identity)), "start": 0, "max_chars": 1024}
+             for label, identity in _jadx_targets().items()}
+    cases["past_end"] = {**cases["helper_int"], "start": 1048575, "max_chars": 64}
+    return cases
+
+
+def jadx_prepared_request(data, args):
+    """Independent fixed worker request, from the fixture declarations only."""
+    layout = _jadx_fixture(data)
+    need(isinstance(args, dict) and any(canonical_json(args) == canonical_json(case)
+         for case in jadx_cases(data).values()), "JadxRequestChanged")
+    members = [dict(row["artifact"]) for row in layout["members"] if row["name"] in layout["dex"]]
+    member = next(i for i, artifact in enumerate(members) if artifact["member"] == args["member"])
+    target = {"member": member, **{key: args[key].encode("utf-8").hex()
+              for key in ("class", "method", "prototype")}}
+    return {"members": members, "targets": [target], "start": args["start"], "max_chars": args["max_chars"]}
+
+
+def jadx_request_allowed(operation, args):
+    if operation != "jadx.method" or not isinstance(args, dict):
+        return False
+    data = fixtures_apk.apk_basic()[0]
+    return any(canonical_json(args) == canonical_json(jadx_prepared_request(data, checked))
+               for checked in jadx_cases(data).values())
+
+
+def compare_jadx_observations(data, args, observations):
+    """Compare one public case against fixture declarations, without Java spelling pins.
+
+    The expected form comes from the native-measured case table. A missing
+    measurement refuses the case until its form is confirmed.
+    """
+    layout = _jadx_fixture(data)
+    need(isinstance(args, dict) and set(args) == {"member", "class", "method", "prototype", "start", "max_chars"}
+         and all(type(args[k]) is str for k in ("member", "class", "method", "prototype"))
+         and type(args["start"]) is int and type(args["max_chars"]) is int, "JadxRequestChanged")
+    matches = [case for case, wanted in jadx_cases(data).items() if wanted == args]
+    need(len(matches) == 1, "JadxRequestChanged")
+    expected_form = JADX_FORMS.get(matches[0])
+    need(expected_form in ("java", "fallback", "omitted", "error"), "JadxOracleMissing")
+    need(isinstance(observations, (list, tuple)) and len(observations) == 1
+         and isinstance(observations[0], Observation), "KnownAnswerShape")
+    method = [m for c in layout["dex"][args["member"]]["classes"] if c["name"] == args["class"]
+              for m in c["methods"] if (m["name"], m["prototype"]) == (args["method"], args["prototype"])]
+    need(len(method) == 1 and method[0]["code_offset"] is not None and method[0]["code_units"] > 0,
+         "JadxFixtureMethod")
+    method = method[0]
+    artifact = next(row["artifact"] for row in layout["members"] if row["name"] == args["member"])
+    item = observations[0]
+    need(item.location == Location(method["code_offset"] + 16, min(method["code_units"] * 2, 4096)),
+         "JadxKnownAnswerAnchor")
+    need(canonical_json(item.artifact) == canonical_json(artifact), "JadxKnownAnswerArtifact")
+    value = item.value
+    fields = {"kind", "dex", "class", "name", "prototype", "form", "start", "total", "text"}
+    need(isinstance(value, dict) and set(value) == fields, "KnownAnswerShape")
+    identity = {"kind": "java", "dex": args["member"], "class": args["class"],
+                "name": args["method"], "prototype": args["prototype"]}
+    need(all(value[key] == expected for key, expected in identity.items()), "JadxKnownAnswerIdentity")
+    forms = ("java", "fallback", "omitted", "error")
+    need(value["form"] in forms and value["form"] == expected_form,
+         "JadxKnownAnswerForm")
+    need(type(value["start"]) is int and type(value["total"]) is int
+         and 0 <= value["start"] <= value["total"] < 2**32 and type(value["text"]) is str
+         and len(value["text"]) <= args["max_chars"]
+         and all(" " <= c <= "~" or c in "\n\t" for c in value["text"])
+         and len(canonical_json(value).encode()) <= 4096, "JadxKnownAnswerPage")
+    if value["form"] in ("omitted", "error"):
+        need(value["text"] == "" and value["start"] == value["total"] == 0, "JadxKnownAnswerPage")
+    else:
+        need(value["total"] > 0 and value["start"] == min(args["start"], value["total"])
+             and value["start"] + len(value["text"]) <= value["total"]
+             and bool(value["text"]) == (value["start"] < value["total"]), "JadxKnownAnswerPage")
+    if matches[0] == "past_end":
+        need(0 < value["total"] <= args["start"] and value["start"] == value["total"]
+             and value["text"] == "", "JadxKnownAnswerPage")
 
 
 def ghidra_fixtures():
@@ -838,16 +988,17 @@ def receipt_passes(receipt):
     try:
         tool = receipt.get("tool")
         need(receipt.get("schema") == "reverseai.m2-runtime/1" and receipt.get("platform") == PLATFORM and
-             tool in ("lief", "yarax", "ghidra") and receipt.get("profile") == "small" and receipt.get("offline") is True,
+             tool in ("lief", "yarax", "ghidra", "jadx") and receipt.get("profile") == "small" and receipt.get("offline") is True,
              "ReceiptIdentity")
         for key in ("lock_sha256", "verifier_sha256", "executor_sha256"):
             need(bool(re.fullmatch(r"[0-9a-f]{64}", receipt.get(key, ""))), "ReceiptBinding")
         pins = receipt["lock"]
         need(pins["platform"] == PLATFORM and receipt["image_id"] == pins["image_id"] and
              bool(re.fullmatch(r"sha256:[0-9a-f]{64}", pins["image_id"])), "ReceiptImage")
-        if tool == "ghidra":
-            verify_ghidra_lock(pins)
-            need("ruleset_sha256" not in receipt and "wheel_sha256" not in receipt, "ReceiptGhidraPins")
+        if tool in ("ghidra", "jadx"):
+            (verify_ghidra_lock if tool == "ghidra" else verify_jadx_lock)(pins)
+            need("ruleset_sha256" not in receipt and "wheel_sha256" not in receipt,
+                 "ReceiptGhidraPins" if tool == "ghidra" else "ReceiptJadxPins")
         else:
             need(bool(re.fullmatch(r"sha256:[0-9a-f]{64}", pins["base_digest"])) and
                  bool(re.fullmatch(r"[0-9a-f]{64}", pins["wheel_sha256"])) and
@@ -982,13 +1133,16 @@ class NativeVerifier:
     """A native controller; constructors and all unit validators are Docker-free."""
 
     def __init__(self, boundary, lock, receipt, *, tool="lief", ruleset=None):
-        need(tool in ("lief", "yarax", "ghidra"), "VerifierTool")
+        need(tool in ("lief", "yarax", "ghidra", "jadx"), "VerifierTool")
         need(tool != "yarax" or isinstance(ruleset, dict), "YaraxRulesetShape")
         if tool == "yarax":
             verify_yarax_lock(lock)
         if tool == "ghidra":
             verify_ghidra_lock(lock)
             verify_ghidra_executor_profile(boundary)
+        if tool == "jadx":
+            verify_jadx_lock(lock)
+            verify_jadx_executor_profile(boundary)
         self.boundary, self.lock, self.receipt = boundary, lock, receipt
         self.tool, self.ruleset = tool, ruleset
         self.native_runs = native_runs(tool)
@@ -1002,7 +1156,7 @@ class NativeVerifier:
         return self.boundary.run_bounded(["docker", *args], timeout=5, max_output=cap)
 
     def run_bounded(self, argv, *, timeout, max_output):
-        options = {"profile": "ghidra"} if self.tool == "ghidra" else {}
+        options = {"profile": self.tool} if self.tool in ("ghidra", "jadx") else {}
         return self.boundary.run_bounded(argv, timeout=timeout, max_output=max_output, **options)
 
     def one_inspect(self, args):
@@ -1079,6 +1233,8 @@ class NativeVerifier:
         operation, args = argv[at + 1], decode(argv[at + 2])
         if self.tool == "ghidra":
             need(ghidra_request_allowed(operation, args), "GhidraRequestChanged")
+        if self.tool == "jadx":
+            need(jadx_request_allowed(operation, args), "JadxRequestChanged")
         need(argv == self.boundary.build_argv(self.lock["image_id"], name, snapshot, operation, args), "BuilderMismatch")
         code = probe_code(self.active, tool=self.tool) if self.active is not None else None
         created = derive_control_argv(argv, self.lock["image_id"], code)
@@ -1167,11 +1323,16 @@ class NativeVerifier:
         args = {} if self.tool == "lief" else {"ruleset": YARAX_RULESET_NAME, "max_matches": 32}
         if self.tool == "ghidra":
             operation, args = "ghidra.analyze", ghidra_args()
+        if self.tool == "jadx":
+            operation, args = "jadx.method", jadx_prepared_request(data, jadx_cases(data)["compute"])
         value = decode(self.invoke(data, operation, args, probe=name))
         validate_probe(name, value, tool=self.tool)
         return value
 
     def known_answer(self, data, operation, args=None):
+        if self.tool == "jadx":
+            need(operation == "jadx.method", "JadxRequestChanged")
+            return self.jadx_known_answer(data, args)
         if self.tool == "ghidra":
             if operation == "ghidra.analyze":
                 need(args is None, "GhidraRequestChanged")
@@ -1201,14 +1362,65 @@ class NativeVerifier:
         compare_observations(data, operation, observations)
         return {"input_sha256": sha256_hex(data), "input_bytes": len(data), "observations": len(observations)}
 
+    def jadx_known_answer(self, data, args, *, negative=None):
+        from reverseai.tools import jadx_tool, jadx_verify
+        need(negative in (None, "shape", "input"), "JadxNegativeChanged")
+        expected = jadx_prepared_request(data, args)
+        state = {"calls": 0, "healthy": False}
+
+        def execute(operation, request, frozen, digest):
+            need(operation == "jadx.method" and frozen == data and digest == sha256_hex(data)
+                 and canonical_json(request) == canonical_json(expected), "JadxRequestChanged")
+            state["calls"] += 1
+            raw = self.invoke(data, operation, request)
+            if negative is not None:
+                # Establish a healthy real reply before testing host refusal of its corrupted copy.
+                rows = jadx_verify.parse_reply(raw, digest)
+                admitted = jadx_verify.verify(data, rows, args)
+                compare_jadx_observations(data, args, admitted)
+                value = decode(raw)
+                if negative == "shape":
+                    need(isinstance(value.get("observations"), list) and value["observations"], "JadxNegativeShape")
+                    value["observations"][0]["unexpected"] = True
+                else:
+                    value["snapshot_sha256"] = "0" * 64
+                state["healthy"] = True
+                return canonical_json(value).encode()
+            return raw
+
+        tool = jadx_tool.make_tool(SimpleNamespace(lock=self.lock, run=execute))
+        operation = tool.operations["jadx.method"]
+        rejected = False
+        try:
+            observations = operation.handler(data, operation.validate_args(args))
+        except ContractError:
+            if negative is None:
+                raise
+            rejected = True
+        need(state["calls"] == 1, "JadxInvocationCount")
+        if negative is not None:
+            need(state["healthy"] and rejected, "JadxNegativeNotRefused")
+            return {"input_sha256": sha256_hex(data), "refused": negative}
+        compare_jadx_observations(data, args, observations)
+        return {"input_sha256": sha256_hex(data), "input_bytes": len(data), "observations": len(observations),
+                "operation": "jadx.method", "args": args}
+
     def run(self):
         if not self.record("local_daemon", self.local_daemon) or not self.record("image", self.image_check):
             return
-        values = fixtures() if self.tool == "lief" else yarax_fixtures() if self.tool == "yarax" else ghidra_fixtures()
-        control_data = values[{"lief": "elf64le", "yarax": "upx_markers", "ghidra": "elf_code"}[self.tool]]
+        values = (fixtures() if self.tool == "lief" else yarax_fixtures() if self.tool == "yarax"
+                  else {"apk_basic": fixtures_apk.apk_basic()[0]} if self.tool == "jadx" else ghidra_fixtures())
+        control_data = values[{"lief": "elf64le", "yarax": "upx_markers", "ghidra": "elf_code", "jadx": "apk_basic"}[self.tool]]
         for name in CONTROL_NAMES:
             self.record(name, lambda name=name: self.control(name, control_data))
         for name, data in values.items():
+            if self.tool == "jadx":
+                for case, args in jadx_cases(data).items():
+                    self.record(f"apk_basic.{case}", lambda args=args: self.known_answer(data, "jadx.method", args))
+                for label, negative in (("jadx.hostile_reply", "shape"), ("jadx.input_mismatch", "input")):
+                    self.record(label, lambda negative=negative:
+                                self.jadx_known_answer(data, jadx_cases(data)["compute"], negative=negative))
+                continue
             for op in (("headers", "sections") if self.tool == "lief" else
                        ("matches",) if self.tool == "yarax" else ("analyze",)):
                 self.record(f"{name}.{op}", lambda data=data, op=op: self.known_answer(data, self.tool + "." + op))
@@ -1231,7 +1443,7 @@ def write_receipt(path, receipt):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tool", choices=("lief", "yarax", "ghidra"), required=True)
+    parser.add_argument("--tool", choices=("lief", "yarax", "ghidra", "jadx"), required=True)
     parser.add_argument("--profile", choices=("small",), required=True)
     parser.add_argument("--offline", action="store_true", required=True)
     parser.add_argument("--lock", type=Path, required=True)
@@ -1254,6 +1466,9 @@ def main(argv=None):
         if args.tool == "ghidra":
             verify_ghidra_lock(candidate_lock)
             verify_ghidra_executor_profile(contained)
+        if args.tool == "jadx":
+            verify_jadx_lock(candidate_lock)
+            verify_jadx_executor_profile(contained)
         receipt["lock"] = contained.load_lock(candidate_lock, **lock_options(args.tool))
         ruleset = None
         if args.tool == "yarax":
@@ -1267,7 +1482,7 @@ def main(argv=None):
             NativeVerifier(contained, receipt["lock"], receipt, tool="yarax", ruleset=ruleset).run()
             load_yarax_ruleset(receipt["lock"])
         else:
-            NativeVerifier(contained, receipt["lock"], receipt, tool="ghidra").run()
+            NativeVerifier(contained, receipt["lock"], receipt, tool=args.tool).run()
         need(receipt["verifier_sha256"] == sha256_hex(Path(__file__).read_bytes()) and
              receipt["executor_sha256"] == sha256_hex(executor_source.read_bytes()), "SourceChangedDuringVerification")
     except KeyboardInterrupt:
