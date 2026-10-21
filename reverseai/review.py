@@ -9,8 +9,8 @@ from collections.abc import Iterable, Mapping
 
 from reverseai import claims
 from reverseai.contract import (
-    AnalysisResult, ContractError, InputRef, ReviewVerdict, ToolSpec, canonical_json, evidence_intact, finding_intact,
-    materialize, sha256_hex,
+    AnalysisResult, ContractError, InputRef, ReviewVerdict, ToolSpec, canonical_json, check_artifact, evidence_intact,
+    finding_intact, materialize, sha256_hex,
 )
 
 MAX_REVIEW_CHILD_BYTES = 128 * 1024 * 1024  # contract/3: distinct child artifacts one review re-materializes
@@ -25,16 +25,19 @@ class _Children:
     def get(self, artifact):
         key = canonical_json(artifact)
         if key not in self.cache:
-            size = artifact.get("size") if isinstance(artifact, dict) else None
-            if type(size) is int and self.spent + size > MAX_REVIEW_CHILD_BYTES:
-                return None, "child artifacts exceed the review budget"
             try:
-                child = materialize(self.data, artifact)
+                check_artifact(artifact)
             except ContractError:
                 self.cache[key] = None
             else:
-                self.cache[key] = child
-                self.spent += len(child)
+                # Charged before inflating, so failed attempts spend the budget too (RD-M4A-CODEX-C R2).
+                if self.spent + artifact["size"] > MAX_REVIEW_CHILD_BYTES:
+                    return None, "child artifacts exceed the review budget"
+                self.spent += artifact["size"]
+                try:
+                    self.cache[key] = materialize(self.data, artifact)
+                except ContractError:
+                    self.cache[key] = None
         child = self.cache[key]
         return (child, None) if child is not None else (None, "child artifact does not match the input")
 

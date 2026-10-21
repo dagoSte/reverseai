@@ -1,4 +1,4 @@
-# ReverseAI contract (reverseai.contract/2)
+# ReverseAI contract (reverseai.contract/3)
 
 The types live in `reverseai/contract.py`. This page fixes how the M1 components
 connect, so lanes can be built in parallel and joined without negotiation.
@@ -576,12 +576,15 @@ and needs an owner-approved download. Decision `m4a-contract`.
   per child and 100:1 expansion; stored members have equal sizes. The gateway
   materializes each child once per operation (at most 128 MiB of distinct
   children, else `budget_exceeded`); the reviewer re-materializes it independently
-  once per review (same budget) and refuses evidence whose child does not match
-  the input. Evidence without an artifact keeps its contract/2 ID and meaning.
+  once per review (same budget, each distinct child charged at its declared size
+  before it is inflated, so a child that fails still spends it; decision
+  `m4a-fix-round-2`) and refuses evidence whose child does not match the input. Evidence without an artifact keeps its contract/2 ID and meaning.
   Worker replies (contained tools) cannot name artifacts yet.
 - **Tools** `apk` 0.1.0 and `dex` 0.1.0 (in-process): `reverseai/tools/apk.py` (ZIP,
   manifest; operations `apk.*`) and `reverseai/tools/dex.py` (DEX; operations
-  `dex.*`), both using `contract.materialize` for members. Limits: input at most 64 MiB (intake), at most
+  `dex.*`). `apk` inflates members with its own bounded inflater (same limits,
+  equivalence tested) and `dex` takes its children from `apk`; the gateway and
+  the reviewer re-derive every child independently with `contract.materialize`. Limits: input at most 64 MiB (intake), at most
   2,048 members, methods 0 and 8 only; encrypted members, ZIP64, multi-disk
   archives, duplicate or traversing names, and local headers or data descriptors
   that disagree with the central directory are refused or flagged; DEX versions
@@ -590,11 +593,16 @@ and needs an owner-approved download. Decision `m4a-contract`.
   class entries per DEX and 1,048,576 string entries (strings decoded only when
   used, each scan at most 65,536 bytes), at most 262,144 `class_data` and
   `type_list` entries in all per DEX; references decoded as a stream, never a
-  list of every instruction; a DEX past these limits is refused with a fixed
+  list of every instruction; the code decoded for one DEX, aliased code items
+  included, at most the DEX's size (decision `m4a-seams-x2`); at most 128 MiB of
+  decoded strings per operation, re-decodes included (`m4a-seams-x3`); a DEX past these limits is refused with a fixed
   error, never cut to a total that looks complete. ZIP tables keep their valid
   prefix when malformed, never read past the buffer. Member names are escaped as import names (at most 255 printable
   characters); DEX strings are decoded from MUTF-8 and escaped the same way (at
-  most 256 characters, `truncated` when longer).
+  most 256 characters, `truncated` when longer). Every literal selector of a `dex.*`
+  operation (`member`, `query`, `class`, `method`, `prototype`) is compared with
+  the escaped text the rows show, never the raw decoded text, so a displayed
+  identity can always be copied back (decision `m4a-fix-round-2`).
 - `apk.inventory`: args `start` 0..65535 default 0, `limit` 1..256 default 128.
   Central directory entries in order: `{"kind": "member", "index", "total",
   "name", "method", "compressed_size", "size", "crc32", "sha256", "flags"}` at the
@@ -602,7 +610,8 @@ and needs an owner-approved download. Decision `m4a-contract`.
   the materialized child's hash, or null when the member cannot be materialized;
   `flags` a sorted list of refusal reasons (`crc`, `duplicate_name`, `encrypted`,
   `header_mismatch`, `ratio`, `symlink`, `too_large`, `traversing_name`,
-  `unsupported_method`), empty when clean; a flagged member is listed but never
+  `unsupported_method`), empty when clean; `crc` covers every failed
+  materialization (CRC, inflate, size or trailing data); a flagged member is listed but never
   materialized; an empty name is listed only with `traversing_name`. The whole archive is refused (no observation) for ZIP64, multiple
   disks, an ambiguous end of central directory or bytes before the first local
   header other than none; an APK signing block between the last member and the
@@ -628,10 +637,14 @@ and needs an owner-approved download. Decision `m4a-contract`.
   0..128 default "" (substring of the class descriptor), `class` literal 0..255
   default "" (when set, exactly that descriptor and `query` must be ""; decision
   `m4a-fix-round`), `start` 0..1048575 default 0, `limit` 1..256 default 128. `{"kind": "class", "index", "total",
-  "dex", "name", "access", "superclass", "interfaces", "source_file"}` at the
+  "dex", "name", "access", "superclass", "interfaces", "interfaces_total",
+  "source_file"}` at the
   32-byte `class_def_item` inside the DEX child; `dex` is the member name,
   `name` and `superclass` descriptors (`superclass` null for none), `interfaces`
-  a list (at most 64), `source_file` or null, `access` the flags as an int.
+  the leading declared interfaces while the observation stays within 4,096
+  bytes, `interfaces_total` the declared count (at most 64, else the operation
+  fails; decision `m4a-fix-round-2`), `source_file` or null ("" is a valid DEX
+  value), `access` the flags as an int.
   Claim `android.classes` (observed) page rows `[dex, name, access, superclass]`.
 - `dex.methods`: args `member` literal 0..255 default "" (as `dex.classes`: ""
   selects every `classes*.dex` member, and a class defined in several members

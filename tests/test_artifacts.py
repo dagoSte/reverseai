@@ -6,8 +6,8 @@ import zlib
 from reverseai import claims
 from reverseai.contract import (
     AnalysisResult, AnalysisTask, Budget, ContractError, Evidence, InputRef, Location, Observation, OperationRequest,
-    OperationSpec, ToolRef, ToolSpec, content_id, evidence_from_dict, evidence_id, evidence_intact, make_evidence,
-    make_finding, materialize, sha256_hex,
+    OperationSpec, ToolRef, ToolSpec, check_artifact, content_id, evidence_from_dict, evidence_id, evidence_intact,
+    make_evidence, make_finding, materialize, sha256_hex,
 )
 from reverseai.gateway import Gateway
 from reverseai.review import review
@@ -255,6 +255,86 @@ class SharedFindingTests(unittest.TestCase):
         for order in ([a, b], [b, a]):
             judged = {v.finding_id: v.status for v in review(DATA, INPUT, order, tools)}
             self.assertEqual((judged[f.id], judged[g.id]), ("contradicted", "contradicted"))
+
+
+class ReviewerBudgetAndShapeTests(unittest.TestCase):
+    """Decision m4a-fix-round-2 (RD-M4A-CODEX-C R2, R5): failed children spend the budget; each guard pinned alone."""
+
+    def test_the_child_size_cap_holds_on_its_own(self):
+        cap = 32 * 1024 * 1024
+        check_artifact(artifact(0, compressed_size=cap, size=cap))
+        with self.assertRaises(ContractError):  # stored, so the ratio cannot be what refuses it
+            check_artifact(artifact(0, compressed_size=cap + 1, size=cap + 1))
+
+    def test_failed_children_spend_the_review_budget_and_stay_cached(self):
+        import reverseai.review as review_module
+        operation = OperationSpec("dex.classes", {}, lambda data, args: [])
+        tools = {"dex": ToolSpec(TOOL, {"dex.classes": operation})}
+        claims.RULES["test.marker"] = ("observed", {"dex.classes": lambda observations: "marker"})
+        self.addCleanup(claims.RULES.pop, "test.marker")
+        good = make_evidence(DATA, TOOL, "dex.classes", observation())
+
+        def wrong(member):  # range, size and CRC right, hash wrong: the child is inflated before it fails
+            art = artifact(member=member, sha256="0" * 64)
+            return Evidence(evidence_id(INPUT.sha256, TOOL, "dex.classes", good.location, good.excerpt_sha256,
+                                        good.observation, art), INPUT.sha256, TOOL, "dex.classes", good.location,
+                            good.excerpt_sha256, good.observation, art)
+        evidence = [wrong("a.dex"), wrong("a.dex"), wrong("b.dex"), wrong("c.dex"), good]
+        findings = [make_finding("structural", "Marker %d." % i, "test.marker", "marker", [item.id], "observed")
+                    for i, item in enumerate(evidence)]
+        calls, real, budget = [], review_module.materialize, review_module.MAX_REVIEW_CHILD_BYTES
+
+        def counting(data, value):
+            calls.append(value["member"])
+            return real(data, value)
+        review_module.materialize, review_module.MAX_REVIEW_CHILD_BYTES = counting, 2 * len(CHILD)
+        try:
+            result = AnalysisResult(content_id("tk", {"t": "budget"}), "structural", "ok", tuple(evidence), tuple(findings))
+            verdicts = {v.finding_id: v for v in review(DATA, INPUT, [result], tools)}
+        finally:
+            review_module.materialize, review_module.MAX_REVIEW_CHILD_BYTES = real, budget
+        self.assertEqual(calls, ["a.dex", "b.dex"])
+        self.assertEqual([verdicts[f.id].status for f in findings], ["unsupported"] * 5)
+        self.assertIn("exceed the review budget", verdicts[findings[3].id].reasons[0])
+        self.assertIn("exceed the review budget", verdicts[findings[4].id].reasons[0])
+
+    def test_member_method_and_reference_rows_refuse_each_bad_field(self):
+        dex, apk = ToolRef("dex", "0.1.0"), ToolRef("apk", "0.1.0")
+        tools = {"dex": ToolSpec(dex, {name: OperationSpec(name, {}, lambda d, a: [])
+                                       for name in ("dex.methods", "dex.references")}),
+                 "apk": ToolSpec(apk, {"apk.inventory": OperationSpec("apk.inventory", {}, lambda d, a: [])})}
+        cases = {
+            ("android.members", apk, "apk.inventory", "member"): (
+                {"name": "classes.dex", "method": 8, "compressed_size": 10, "size": 20, "crc32": 7, "sha256": None,
+                 "flags": ["crc", "ratio"]},
+                [("name", ""), ("name", "a\nb"), ("method", 2**16), ("compressed_size", -1), ("size", True),
+                 ("crc32", 2**32), ("sha256", "ab"), ("sha256", "A" * 64), ("flags", ["ratio", "crc"]),
+                 ("flags", ["crc", "crc"]), ("flags", ["unknown"]), ("flags", "crc")]),
+            ("android.methods", dex, "dex.methods", "method"): (
+                {"dex": "classes.dex", "class": "Lx;", "name": "run", "prototype": "()V", "access": 1,
+                 "code_offset": 112, "code_units": 4},
+                [("dex", ""), ("class", "L\n;"), ("name", ""), ("prototype", "x" * 256), ("access", -1),
+                 ("code_offset", -1), ("code_units", None), ("code_units", "4")]),
+            ("android.references", dex, "dex.references", "dex_ref"): (
+                {"dex": "classes.dex", "from_class": "Lx;", "from_method": "run", "from_prototype": "()V", "at": 8,
+                 "ref_kind": "string", "target": "s" * 256, "target_truncated": True},
+                [("dex", ""), ("from_class", ""), ("from_method", "a\tb"), ("from_prototype", ""), ("at", -1),
+                 ("ref_kind", "class"), ("target", "s" * 513), ("target", "a\nb"), ("target_truncated", 1),
+                 ("target", "s" * 255), ("ref_kind", "method")]),
+        }
+        for (key, ref, operation, kind), (row, bad) in cases.items():
+            fields = claims.PAGES[kind][0]
+
+            def judge(value):
+                item = make_evidence(DATA, ref, operation, Observation(Location(0, 4), {
+                    "kind": kind, "index": 0, "total": 1, **value}, artifact()))
+                finding = make_finding("structural", "Rows.", key, {"start": 0, "total": 1, "rows": [
+                    [value[field] for field in fields]]}, [item.id], "observed")
+                result = AnalysisResult(content_id("tk", {"k": key}), "structural", "ok", (item,), (finding,))
+                return review(DATA, INPUT, [result], tools)[0].status
+            self.assertEqual(judge(row), "supported", key)
+            for field, value in bad:
+                self.assertEqual(judge({**row, field: value}), "unsupported", (key, field, value))
 
 
 if __name__ == "__main__":
