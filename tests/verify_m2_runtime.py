@@ -24,7 +24,7 @@ import time
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from reverseai.contract import MAX_WORKER_REPLY_BYTES, Observation, parse_worker_reply, sha256_hex
+from reverseai.contract import MAX_WORKER_REPLY_BYTES, Observation, canonical_json, parse_worker_reply, sha256_hex
 from reverseai.tools import structure, ghidra_verify
 from tests.fixtures_structure import elf, pe
 from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code, elf_refs, pe_refs, macho_refs
@@ -52,14 +52,356 @@ YARAX_FIXTURE_NAMES = ("upx_markers", "utf16_markers", "clean", "repeated_marker
 YARAX_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                          *(f"{name}.matches" for name in YARAX_FIXTURE_NAMES))
 YARAX_NATIVE_RUNS = len(CONTROL_NAMES) + len(YARAX_FIXTURE_NAMES)
-GHIDRA_ADAPTER_VERSION = "12.1.4-r5"
+GHIDRA_ADAPTER_VERSION = "12.1.4-r6"
 GHIDRA_BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
 GHIDRA_SHA256 = "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db"
 GHIDRA_JDK_SHA256 = "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223"
 GHIDRA_FIXTURE_NAMES = ("elf_code", "pe_code", "elf_data_only", "macho_code", "elf_refs", "pe_refs", "macho_refs")
+GHIDRA_QUERY_FIXTURES = ("elf_refs", "pe_refs", "macho_refs")
+GHIDRA_QUERY_CASES = ("functions_page", "function_add", "function_constant", "xrefs_counter")
 GHIDRA_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
-                          *(f"{name}.analyze" for name in GHIDRA_FIXTURE_NAMES))
-GHIDRA_NATIVE_RUNS = len(CONTROL_NAMES) + len(GHIDRA_FIXTURE_NAMES)
+                          *(f"{name}.analyze" for name in GHIDRA_FIXTURE_NAMES),
+                          *(f"{name}.{case}" for name in GHIDRA_QUERY_FIXTURES for case in GHIDRA_QUERY_CASES))
+GHIDRA_NATIVE_RUNS = len(GHIDRA_REQUIRED_CHECKS) - 3
+GHIDRA_OPERATIONS = ("ghidra.analyze", "ghidra.functions", "ghidra.function", "ghidra.xrefs")
+# Measured on r6 image sha256:d4c9076d0f6b0e4123704851f4300f08ab5d2f96ae6e4f37faadbcdf7d96492a.
+# Source: coordinator-forwarded m3d-w-native-oracle.json, SHA-256 d8baabf89e32d3147ec08ea231415e9fd68dadf21fdfb3438e888d75f471674d.
+GHIDRA_QUERY_EXPECTED = {'84a2fe7a4e67702df1bfa4434c1c57aa6fee8d21df4717ed47a1f3688d162e4f': {'function_add': [{'location': {'length': 10,
+                                                                                                     'offset': 800},
+                                                                                        'value': {'callees_total': 0,
+                                                                                                  'callers_total': 2,
+                                                                                                  'entry': 4294968096,
+                                                                                                  'kind': 'target',
+                                                                                                  'matches': 1,
+                                                                                                  'name': 'add_numbers',
+                                                                                                  'size': 10}},
+                                                                                       {'location': {'length': 10,
+                                                                                                     'offset': 800},
+                                                                                        'value': {'entry': 4294968096,
+                                                                                                  'index': 0,
+                                                                                                  'kind': 'pseudocode',
+                                                                                                  'text': '\n'
+                                                                                                          'int '
+                                                                                                          'add_numbers(int '
+                                                                                                          'param_1,int '
+                                                                                                          'param_2)\n'
+                                                                                                          '\n'
+                                                                                                          '{\n'
+                                                                                                          '  '
+                                                                                                          'return '
+                                                                                                          'param_1 '
+                                                                                                          '+ '
+                                                                                                          'param_2;\n'
+                                                                                                          '}\n'
+                                                                                                          '\n',
+                                                                                                  'truncated': False}},
+                                                                                       {'location': {'length': 5,
+                                                                                                     'offset': 801},
+                                                                                        'value': {'entry': 4294968096,
+                                                                                                  'kind': 'instructions',
+                                                                                                  'rows': [[1,
+                                                                                                            3,
+                                                                                                            'MOV '
+                                                                                                            'RBP,RSP'],
+                                                                                                           [4,
+                                                                                                            2,
+                                                                                                            'MOV '
+                                                                                                            'EAX,EDI']],
+                                                                                                  'start': 1,
+                                                                                                  'total': 6,
+                                                                                                  'truncated': False}},
+                                                                                       {'location': {'length': 5,
+                                                                                                     'offset': 768},
+                                                                                        'value': {'at': 4294968064,
+                                                                                                  'from': 4294968064,
+                                                                                                  'kind': 'caller',
+                                                                                                  'to': 4294968096}},
+                                                                                       {'location': {'length': 5,
+                                                                                                     'offset': 827},
+                                                                                        'value': {'at': 4294968123,
+                                                                                                  'from': 4294968112,
+                                                                                                  'kind': 'caller',
+                                                                                                  'to': 4294968096}}],
+                                                                      'function_constant': [{'location': {'length': 6,
+                                                                                                          'offset': 848},
+                                                                                             'value': {'callees_total': 0,
+                                                                                                       'callers_total': 2,
+                                                                                                       'entry': 4294968144,
+                                                                                                       'kind': 'target',
+                                                                                                       'matches': 1,
+                                                                                                       'name': 'constant',
+                                                                                                       'size': 6}},
+                                                                                            {'location': {'length': 5,
+                                                                                                          'offset': 834},
+                                                                                             'value': {'at': 4294968130,
+                                                                                                       'from': 4294968112,
+                                                                                                       'kind': 'caller',
+                                                                                                       'to': 4294968144}},
+                                                                                            {'location': {'length': 5,
+                                                                                                          'offset': 897},
+                                                                                             'value': {'at': 4294968193,
+                                                                                                       'from': 4294968160,
+                                                                                                       'kind': 'caller',
+                                                                                                       'to': 4294968144}}],
+                                                                      'functions_page': [{'location': {'length': 10,
+                                                                                                       'offset': 800},
+                                                                                          'value': {'entry': 4294968096,
+                                                                                                    'index': 1,
+                                                                                                    'kind': 'function_row',
+                                                                                                    'name': 'add_numbers',
+                                                                                                    'size': 10,
+                                                                                                    'total': 5}},
+                                                                                         {'location': {'length': 27,
+                                                                                                       'offset': 816},
+                                                                                          'value': {'entry': 4294968112,
+                                                                                                    'index': 2,
+                                                                                                    'kind': 'function_row',
+                                                                                                    'name': 'compute',
+                                                                                                    'size': 27,
+                                                                                                    'total': 5}}],
+                                                                      'xrefs_counter': [{'location': {'length': 6,
+                                                                                                      'offset': 878},
+                                                                                         'value': {'at': 4294968174,
+                                                                                                   'from': 4294968160,
+                                                                                                   'index': 0,
+                                                                                                   'kind': 'xref',
+                                                                                                   'to': 4294971456,
+                                                                                                   'total': 2,
+                                                                                                   'type': 'read'}},
+                                                                                        {'location': {'length': 7,
+                                                                                                      'offset': 890},
+                                                                                         'value': {'at': 4294968186,
+                                                                                                   'from': 4294968160,
+                                                                                                   'index': 1,
+                                                                                                   'kind': 'xref',
+                                                                                                   'to': 4294971456,
+                                                                                                   'total': 2,
+                                                                                                   'type': 'read_write'}}]},
+ 'a8c34c434308ca4f62f7e5f114e18582d15c7f7a5be9c2a8835d1f8961a1ec63': {'function_add': [{'location': {'length': 10,
+                                                                                                     'offset': 288},
+                                                                                        'value': {'callees_total': 0,
+                                                                                                  'callers_total': 2,
+                                                                                                  'entry': 4194592,
+                                                                                                  'kind': 'target',
+                                                                                                  'matches': 1,
+                                                                                                  'name': 'add_numbers',
+                                                                                                  'size': 10}},
+                                                                                       {'location': {'length': 10,
+                                                                                                     'offset': 288},
+                                                                                        'value': {'entry': 4194592,
+                                                                                                  'index': 0,
+                                                                                                  'kind': 'pseudocode',
+                                                                                                  'text': '\n'
+                                                                                                          'int '
+                                                                                                          'add_numbers(int '
+                                                                                                          'param_1,int '
+                                                                                                          'param_2)\n'
+                                                                                                          '\n'
+                                                                                                          '{\n'
+                                                                                                          '  '
+                                                                                                          'return '
+                                                                                                          'param_1 '
+                                                                                                          '+ '
+                                                                                                          'param_2;\n'
+                                                                                                          '}\n'
+                                                                                                          '\n',
+                                                                                                  'truncated': False}},
+                                                                                       {'location': {'length': 5,
+                                                                                                     'offset': 289},
+                                                                                        'value': {'entry': 4194592,
+                                                                                                  'kind': 'instructions',
+                                                                                                  'rows': [[1,
+                                                                                                            3,
+                                                                                                            'MOV '
+                                                                                                            'RBP,RSP'],
+                                                                                                           [4,
+                                                                                                            2,
+                                                                                                            'MOV '
+                                                                                                            'EAX,EDI']],
+                                                                                                  'start': 1,
+                                                                                                  'total': 6,
+                                                                                                  'truncated': False}},
+                                                                                       {'location': {'length': 5,
+                                                                                                     'offset': 256},
+                                                                                        'value': {'at': 4194560,
+                                                                                                  'from': 4194560,
+                                                                                                  'kind': 'caller',
+                                                                                                  'to': 4194592}},
+                                                                                       {'location': {'length': 5,
+                                                                                                     'offset': 315},
+                                                                                        'value': {'at': 4194619,
+                                                                                                  'from': 4194608,
+                                                                                                  'kind': 'caller',
+                                                                                                  'to': 4194592}}],
+                                                                      'function_constant': [{'location': {'length': 6,
+                                                                                                          'offset': 336},
+                                                                                             'value': {'callees_total': 0,
+                                                                                                       'callers_total': 2,
+                                                                                                       'entry': 4194640,
+                                                                                                       'kind': 'target',
+                                                                                                       'matches': 1,
+                                                                                                       'name': 'constant',
+                                                                                                       'size': 6}},
+                                                                                            {'location': {'length': 5,
+                                                                                                          'offset': 322},
+                                                                                             'value': {'at': 4194626,
+                                                                                                       'from': 4194608,
+                                                                                                       'kind': 'caller',
+                                                                                                       'to': 4194640}},
+                                                                                            {'location': {'length': 5,
+                                                                                                          'offset': 385},
+                                                                                             'value': {'at': 4194689,
+                                                                                                       'from': 4194656,
+                                                                                                       'kind': 'caller',
+                                                                                                       'to': 4194640}}],
+                                                                      'functions_page': [{'location': {'length': 10,
+                                                                                                       'offset': 288},
+                                                                                          'value': {'entry': 4194592,
+                                                                                                    'index': 1,
+                                                                                                    'kind': 'function_row',
+                                                                                                    'name': 'add_numbers',
+                                                                                                    'size': 10,
+                                                                                                    'total': 5}},
+                                                                                         {'location': {'length': 27,
+                                                                                                       'offset': 304},
+                                                                                          'value': {'entry': 4194608,
+                                                                                                    'index': 2,
+                                                                                                    'kind': 'function_row',
+                                                                                                    'name': 'compute',
+                                                                                                    'size': 27,
+                                                                                                    'total': 5}}],
+                                                                      'xrefs_counter': [{'location': {'length': 6,
+                                                                                                      'offset': 366},
+                                                                                         'value': {'at': 4194670,
+                                                                                                   'from': 4194656,
+                                                                                                   'index': 0,
+                                                                                                   'kind': 'xref',
+                                                                                                   'to': 4198976,
+                                                                                                   'total': 2,
+                                                                                                   'type': 'read'}},
+                                                                                        {'location': {'length': 7,
+                                                                                                      'offset': 378},
+                                                                                         'value': {'at': 4194682,
+                                                                                                   'from': 4194656,
+                                                                                                   'index': 1,
+                                                                                                   'kind': 'xref',
+                                                                                                   'to': 4198976,
+                                                                                                   'total': 2,
+                                                                                                   'type': 'read_write'}}]},
+ 'e15339c0da09e09400ecc16de618a492a49c2a7fb77eb616f424ed30a30130eb': {'function_add': [{'location': {'length': 10,
+                                                                                                     'offset': 544},
+                                                                                        'value': {'callees_total': 0,
+                                                                                                  'callers_total': 2,
+                                                                                                  'entry': 5368713248,
+                                                                                                  'kind': 'target',
+                                                                                                  'matches': 1,
+                                                                                                  'name': 'FUN_140001020',
+                                                                                                  'size': 10}},
+                                                                                       {'location': {'length': 10,
+                                                                                                     'offset': 544},
+                                                                                        'value': {'entry': 5368713248,
+                                                                                                  'index': 0,
+                                                                                                  'kind': 'pseudocode',
+                                                                                                  'text': '\n'
+                                                                                                          'int '
+                                                                                                          'FUN_140001020(void)\n'
+                                                                                                          '\n'
+                                                                                                          '{\n'
+                                                                                                          '  int '
+                                                                                                          'unaff_ESI;\n'
+                                                                                                          '  int '
+                                                                                                          'unaff_EDI;\n'
+                                                                                                          '  \n'
+                                                                                                          '  '
+                                                                                                          'return '
+                                                                                                          'unaff_EDI '
+                                                                                                          '+ '
+                                                                                                          'unaff_ESI;\n'
+                                                                                                          '}\n'
+                                                                                                          '\n',
+                                                                                                  'truncated': False}},
+                                                                                       {'location': {'length': 5,
+                                                                                                     'offset': 545},
+                                                                                        'value': {'entry': 5368713248,
+                                                                                                  'kind': 'instructions',
+                                                                                                  'rows': [[1,
+                                                                                                            3,
+                                                                                                            'MOV '
+                                                                                                            'RBP,RSP'],
+                                                                                                           [4,
+                                                                                                            2,
+                                                                                                            'MOV '
+                                                                                                            'EAX,EDI']],
+                                                                                                  'start': 1,
+                                                                                                  'total': 6,
+                                                                                                  'truncated': False}},
+                                                                                       {'location': {'length': 5,
+                                                                                                     'offset': 512},
+                                                                                        'value': {'at': 5368713216,
+                                                                                                  'from': 5368713216,
+                                                                                                  'kind': 'caller',
+                                                                                                  'to': 5368713248}},
+                                                                                       {'location': {'length': 5,
+                                                                                                     'offset': 571},
+                                                                                        'value': {'at': 5368713275,
+                                                                                                  'from': 5368713264,
+                                                                                                  'kind': 'caller',
+                                                                                                  'to': 5368713248}}],
+                                                                      'function_constant': [{'location': {'length': 6,
+                                                                                                          'offset': 592},
+                                                                                             'value': {'callees_total': 0,
+                                                                                                       'callers_total': 2,
+                                                                                                       'entry': 5368713296,
+                                                                                                       'kind': 'target',
+                                                                                                       'matches': 1,
+                                                                                                       'name': 'FUN_140001050',
+                                                                                                       'size': 6}},
+                                                                                            {'location': {'length': 5,
+                                                                                                          'offset': 578},
+                                                                                             'value': {'at': 5368713282,
+                                                                                                       'from': 5368713264,
+                                                                                                       'kind': 'caller',
+                                                                                                       'to': 5368713296}},
+                                                                                            {'location': {'length': 5,
+                                                                                                          'offset': 641},
+                                                                                             'value': {'at': 5368713345,
+                                                                                                       'from': 5368713312,
+                                                                                                       'kind': 'caller',
+                                                                                                       'to': 5368713296}}],
+                                                                      'functions_page': [{'location': {'length': 10,
+                                                                                                       'offset': 544},
+                                                                                          'value': {'entry': 5368713248,
+                                                                                                    'index': 1,
+                                                                                                    'kind': 'function_row',
+                                                                                                    'name': 'FUN_140001020',
+                                                                                                    'size': 10,
+                                                                                                    'total': 5}},
+                                                                                         {'location': {'length': 27,
+                                                                                                       'offset': 560},
+                                                                                          'value': {'entry': 5368713264,
+                                                                                                    'index': 2,
+                                                                                                    'kind': 'function_row',
+                                                                                                    'name': 'FUN_140001030',
+                                                                                                    'size': 27,
+                                                                                                    'total': 5}}],
+                                                                      'xrefs_counter': [{'location': {'length': 6,
+                                                                                                      'offset': 622},
+                                                                                         'value': {'at': 5368713326,
+                                                                                                   'from': 5368713312,
+                                                                                                   'index': 0,
+                                                                                                   'kind': 'xref',
+                                                                                                   'to': 5368717376,
+                                                                                                   'total': 2,
+                                                                                                   'type': 'read'}},
+                                                                                        {'location': {'length': 7,
+                                                                                                      'offset': 634},
+                                                                                         'value': {'at': 5368713338,
+                                                                                                   'from': 5368713312,
+                                                                                                   'index': 1,
+                                                                                                   'kind': 'xref',
+                                                                                                   'to': 5368717376,
+                                                                                                   'total': 2,
+                                                                                                   'type': 'read_write'}}]}}
 
 
 class VerificationError(ValueError):
@@ -97,12 +439,13 @@ def lock_options(tool):
 
 
 def verify_ghidra_executor_profile(boundary):
-    profile = boundary.resource_profile("ghidra.analyze")
     expected = {"pids": 256, "memory": "2g", "cpus": 2,
                 "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=512m", "wall_seconds": 240}
-    need(dict(profile) == expected and all(type(profile[key]) is type(value) for key, value in expected.items()) and
-         type(boundary.GHIDRA_WALL_SECONDS) is int and boundary.GHIDRA_WALL_SECONDS == 240,
-         "ExecutorGhidraProfile")
+    for operation in GHIDRA_OPERATIONS:
+        profile = boundary.resource_profile(operation)
+        need(dict(profile) == expected and all(type(profile[key]) is type(value) for key, value in expected.items()) and
+             type(boundary.GHIDRA_WALL_SECONDS) is int and boundary.GHIDRA_WALL_SECONDS == 240,
+             "ExecutorGhidraProfile")
 
 
 def _unique(pairs):
@@ -265,6 +608,49 @@ def ghidra_fixtures():
 def ghidra_args():
     return {"max_functions": 64, "decompile": 8, "max_chars": 1024, "max_calls": 128,
             "assembly": 4, "max_instructions": 32, "max_refs": 64, "max_strings": 32}
+
+
+def ghidra_query_requests(data):
+    """Fixed requests on the declared refs-fixture addresses; these do not assert Ghidra's readings."""
+    layout = next((layout for sample, layout in (elf_refs(), pe_refs(), macho_refs()) if sample == data), None)
+    need(layout is not None, "KnownAnswerFixture")
+    base = layout["text"]["address"]
+    function = {"select": "entry", "entry": base + 0x20, "name": "", "parts": "all", "start": 1,
+                "limit": 2, "max_chars": 1024, "max_calls": 64, "max_refs": 64}
+    return {
+        "functions_page": ("ghidra.functions", {"query": "", "start": 1, "limit": 2}),
+        "function_add": ("ghidra.function", function),
+        "function_constant": ("ghidra.function", {**function, "entry": base + 0x50, "parts": "callers",
+                                                  "start": 0, "limit": 64}),
+        "xrefs_counter": ("ghidra.xrefs", {"address": layout["data"]["address"] + 0x40, "start": 0, "limit": 64}),
+    }
+
+
+def ghidra_request_allowed(operation, args):
+    expected = [("ghidra.analyze", ghidra_args())]
+    if operation != "ghidra.analyze":
+        expected = [request for data in (elf_refs()[0], pe_refs()[0], macho_refs()[0])
+                    for request in ghidra_query_requests(data).values()]
+    return any(operation == name and canonical_json(args) == canonical_json(checked) for name, checked in expected)
+
+
+def ghidra_query_case(data, operation, args):
+    matches = [case for case, (name, checked) in ghidra_query_requests(data).items()
+               if operation == name and canonical_json(args) == canonical_json(checked)]
+    need(len(matches) == 1, "GhidraRequestChanged")
+    return matches[0]
+
+
+def compare_ghidra_query(data, operation, args, observations):
+    """Exact ordered rows and byte anchors from the measured, fixed native request cases."""
+    case = ghidra_query_case(data, operation, args)
+    expected = GHIDRA_QUERY_EXPECTED.get(sha256_hex(data), {}).get(case)
+    need(isinstance(expected, list) and bool(expected), "GhidraQueryOracleMissing")
+    need(isinstance(observations, (list, tuple)) and all(isinstance(o, Observation) for o in observations),
+         "KnownAnswerShape")
+    actual = [{"location": {"offset": o.location.offset, "length": o.location.length}, "value": o.value}
+              for o in observations]
+    need(canonical_json(actual) == canonical_json(expected), "GhidraQueryKnownAnswer")
 
 
 def compare_ghidra_observations(data, observations):
@@ -692,7 +1078,7 @@ class NativeVerifier:
         at = argv.index(self.lock["image_id"])
         operation, args = argv[at + 1], decode(argv[at + 2])
         if self.tool == "ghidra":
-            need(operation == "ghidra.analyze" and args == ghidra_args(), "GhidraRequestChanged")
+            need(ghidra_request_allowed(operation, args), "GhidraRequestChanged")
         need(argv == self.boundary.build_argv(self.lock["image_id"], name, snapshot, operation, args), "BuilderMismatch")
         code = probe_code(self.active, tool=self.tool) if self.active is not None else None
         created = derive_control_argv(argv, self.lock["image_id"], code)
@@ -785,14 +1171,24 @@ class NativeVerifier:
         validate_probe(name, value, tool=self.tool)
         return value
 
-    def known_answer(self, data, operation):
+    def known_answer(self, data, operation, args=None):
         if self.tool == "ghidra":
-            need(operation == "ghidra.analyze", "KnownAnswerShape")
-            raw = self.invoke(data, operation, ghidra_args())
-            observations = parse_worker_reply(raw, input_sha256=sha256_hex(data), max_observations=600)
-            ghidra_verify.verify(data, observations, ghidra_args())
-            compare_ghidra_observations(data, observations)
-            return {"input_sha256": sha256_hex(data), "input_bytes": len(data), "observations": len(observations)}
+            if operation == "ghidra.analyze":
+                need(args is None, "GhidraRequestChanged")
+                checked, cap = ghidra_args(), 600
+            else:
+                ghidra_query_case(data, operation, args)
+                checked, cap = args, {"ghidra.functions": 128, "ghidra.function": 643, "ghidra.xrefs": 256}[operation]
+            raw = self.invoke(data, operation, checked)
+            observations = parse_worker_reply(raw, input_sha256=sha256_hex(data), max_observations=cap)
+            if operation == "ghidra.analyze":
+                ghidra_verify.verify(data, observations, checked)
+                compare_ghidra_observations(data, observations)
+            else:
+                ghidra_verify.verify(data, observations, checked, operation=operation)
+                compare_ghidra_query(data, operation, checked, observations)
+            evidence = {"input_sha256": sha256_hex(data), "input_bytes": len(data), "observations": len(observations)}
+            return evidence if operation == "ghidra.analyze" else {**evidence, "operation": operation, "args": checked}
         if self.tool == "yarax":
             need(operation == "yarax.matches", "KnownAnswerShape")
             raw = self.invoke(data, operation, {"ruleset": YARAX_RULESET_NAME, "max_matches": 64})
@@ -816,6 +1212,12 @@ class NativeVerifier:
             for op in (("headers", "sections") if self.tool == "lief" else
                        ("matches",) if self.tool == "yarax" else ("analyze",)):
                 self.record(f"{name}.{op}", lambda data=data, op=op: self.known_answer(data, self.tool + "." + op))
+        if self.tool == "ghidra":
+            for name in GHIDRA_QUERY_FIXTURES:
+                data = values[name]
+                for case, (operation, args) in ghidra_query_requests(data).items():
+                    self.record(f"{name}.{case}", lambda data=data, operation=operation, args=args:
+                                self.known_answer(data, operation, args))
         self.record("container", lambda: need(self.inspected == self.native_runs, "ContainerInspectionMissing"))
 
 

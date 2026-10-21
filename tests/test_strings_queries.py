@@ -91,6 +91,10 @@ class StringsQueryTests(unittest.TestCase):
         self.assertEqual([(o.location.offset,o.value['text']) for o in rows],[(0,'abcd'),(3,'defg')])
         self.assertEqual([o.value['index'] for o in rows],[0,1])
         self.assertEqual([o.value['total'] for o in rows],[2,2])
+        data = 'wide'.encode('utf-16le') + b'\xffafter\0'
+        rows = run('list', data, min_length=4)
+        self.assertEqual([(o.location.offset, o.value['encoding'], o.value['text']) for o in rows],
+                         [(0, 'utf-16le', 'wide'), (9, 'ascii', 'after')])
 
     def test_long_run_boundaries_are_joined_before_paging(self):
         for encoding,codec in [('ascii','ascii'),('utf16le','utf-16le')]:
