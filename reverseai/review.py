@@ -42,13 +42,14 @@ def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tool
     """One verdict per finding ID, sorted; tools are ToolSpecs keyed by tool name."""
     data = bytes(data)
     data_sha256 = sha256_hex(data)
-    findings, problems, derived = {}, {}, set()
+    findings, problems, derived, tasks = {}, {}, set(), {}
     for result in results:
         own = {}  # citations resolve only inside the finding's own result
         for item in result.evidence:
             own.setdefault(item.id, item)
         for finding in result.findings:
             first = findings.setdefault(finding.id, finding)
+            tasks.setdefault(finding.id, result.task_id)
             reasons = problems.setdefault(finding.id, [])
             if finding.claim_key in claims.DERIVED_CLAIMS:
                 derived.add(finding.id)
@@ -71,13 +72,17 @@ def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tool
             # Provenance first; then the claim must follow from what it cites.
             reasons.extend(local or claims.check(finding, cited))
     # Only verified findings contradict each other: neither an unsupported nor a derived claim can cancel a verified one.
-    # Pages of one list (contract M3d) contradict only by a different total or a different row at the same index.
+    # Pages of one list (contract M3d) contradict only by a different total or a different row at the same index, within
+    # the task (one query and its arguments) that produced them; different filters give different lists. A claim the
+    # reviewer checks against its own cited bytes (bytes.read) cannot contradict another one.
     values, pages = {}, {}
+    def family_of(finding_id, finding):
+        return finding.claim_key, canonical_json(finding.value.get("to")), tasks[finding_id]
     for finding_id, finding in findings.items():
-        if problems[finding_id] or finding_id in derived:
+        if problems[finding_id] or finding_id in derived or finding.claim_key in claims.SELF_CHECKED_CLAIMS:
             continue
         if finding.claim_key in claims.PAGE_CLAIMS:
-            family = pages.setdefault((finding.claim_key, canonical_json(finding.value.get("to"))), ({}, set()))
+            family = pages.setdefault(family_of(finding_id, finding), ({}, set()))
             family[1].add(finding.value["total"])
             for index, row in enumerate(finding.value["rows"], finding.value["start"]):
                 family[0].setdefault(index, set()).add(canonical_json(row))
@@ -91,8 +96,10 @@ def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tool
             verdicts.append(ReviewVerdict(finding_id, "unsupported", reasons))
         elif finding_id in derived:
             verdicts.append(ReviewVerdict(finding_id, "derived", ("cites a derived operation: the tool's reading, not verified against the bytes",)))
+        elif finding.claim_key in claims.SELF_CHECKED_CLAIMS:
+            verdicts.append(ReviewVerdict(finding_id, "supported"))
         elif finding.claim_key in claims.PAGE_CLAIMS:
-            if (finding.claim_key, canonical_json(finding.value.get("to"))) in clashing:
+            if family_of(finding_id, finding) in clashing:
                 verdicts.append(ReviewVerdict(finding_id, "contradicted", (f"another page of {finding.claim_key} gives a different total or row",)))
             else:
                 verdicts.append(ReviewVerdict(finding_id, "supported"))

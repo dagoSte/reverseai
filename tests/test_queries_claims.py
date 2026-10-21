@@ -60,7 +60,10 @@ class QueryClaimTests(unittest.TestCase):
         self.assertEqual(judge("segments.list", value, rows), "supported")
         self.assertEqual(judge("segments.list", value, rows[::-1]), "supported")  # cited order does not matter
         gap = [segment(0), segment(2)]
-        self.assertEqual(judge("segments.list", {**value, "start": 0}, gap), "unsupported")
+        gap_rows = [[r.observation[k] for k in ("name", "offset", "filesz", "address", "memsz", "readable", "writable",
+                                                "executable")] for r in gap]
+        # RD-M3D-CODEX-C I1: the claimed rows are the cited ones, so only the missing index 1 can reject them.
+        self.assertEqual(judge("segments.list", {"start": 0, "total": 3, "rows": gap_rows}, gap), "unsupported")
         mixed = [segment(1), segment(2, total=4)]
         self.assertEqual(judge("segments.list", value, mixed), "unsupported")
         past = [segment(1, total=2), segment(2, total=2)]
@@ -194,6 +197,51 @@ class QueryClaimTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewerHardeningTests(unittest.TestCase):
+    """RD-M3D-CODEX-C M1, M2, M3: malformed rows refused without failing, offsets bound, queries kept apart."""
+
+    def test_a_non_ascii_text_row_is_refused_not_raised(self):
+        for operation, key in (("strings.list", "strings.listed"), ("strings.search", "strings.matches")):
+            for encoding in ("ascii", "utf-16le"):
+                row = text_row(operation, 0, 1, HELLO, encoding, "caf\u00e9", length=11)
+                value = {"start": 0, "total": 1, "rows": [[HELLO, encoding, "caf\u00e9", False]]}
+                self.assertEqual(judge(key, value, [row]), "unsupported", (key, encoding))
+
+    def test_bytes_and_string_rows_must_sit_at_their_cited_offset(self):
+        raw = DATA[10:26]
+        moved = observed(STRUCTURE, "structure.read_bytes", 10, 16, kind="bytes", offset=999999, address=None, hex=raw.hex())
+        self.assertEqual(judge("bytes.read", {"offset": 999999, "address": None, "hex": raw.hex()}, [moved]), "unsupported")
+        row = observed(STRINGS, "strings.search", HELLO, 11, kind="string", index=0, total=1, offset=999999,
+                       encoding="ascii", text="hello world", truncated=False)
+        value = {"start": 0, "total": 1, "rows": [[999999, "ascii", "hello world", False]]}
+        self.assertEqual(judge("strings.matches", value, [row]), "unsupported")
+        cut = observed(STRINGS, "strings.list", HELLO, 11, kind="string", index=0, total=1, offset=HELLO + 1,
+                       encoding="ascii", text="hello", truncated=True)
+        self.assertEqual(judge("strings.listed", {"start": 0, "total": 1, "rows": [[HELLO + 1, "ascii", "hello", True]]},
+                               [cut]), "unsupported")
+
+    def test_different_queries_reviewed_together_do_not_contradict(self):
+        def result(task, key, value, cited):
+            finding = make_finding("structural", "A claim.", key, value, [item.id for item in cited], "observed")
+            return finding, AnalysisResult(content_id("tk", {"t": task}), "structural", "ok", tuple(cited), (finding,))
+
+        first = text_row("strings.search", 0, 1, HELLO, "ascii", "hello world")
+        second = text_row("strings.search", 0, 1, WIDE, "utf-16le", "wide")
+        a, ra = result("alpha", "strings.matches", {"start": 0, "total": 1, "rows": [[HELLO, "ascii", "hello world", False]]},
+                       [first])
+        b, rb = result("beta", "strings.matches", {"start": 0, "total": 1, "rows": [[WIDE, "utf-16le", "wide", False]]},
+                       [second])
+        reads = []
+        for task, start in (("read-0", 0), ("read-6", 6)):
+            raw = DATA[start:start + 8]
+            item = observed(STRUCTURE, "structure.read_bytes", start, 8, kind="bytes", offset=start, address=None,
+                            hex=raw.hex())
+            reads.append(result(task, "bytes.read", {"offset": start, "address": None, "hex": raw.hex()}, [item]))
+        judged = {v.finding_id: v.status for v in review(DATA, INPUT, [ra, rb, reads[0][1], reads[1][1]], tools())}
+        self.assertEqual({judged[f.id] for f in (a, b, reads[0][0], reads[1][0])}, {"supported"})
+        # Within one task, two readings of one index still contradict (PageReviewTests).
 
 
 class PageReviewTests(unittest.TestCase):

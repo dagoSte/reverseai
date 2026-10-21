@@ -390,8 +390,12 @@ query names, so M7 can compare them one by one. Decision `m3d-contract`.
   value `{"start", "total", "rows"}`: indexes contiguous from `start`, one `total`,
   rows in index order; an empty page makes no finding. A long page is split into
   findings of at most 64 citations, each a contiguous page; the reviewer compares
-  verified pages of one list row by row, so they contradict only by a different
-  `total` or a different row at the same index (decision `m3d-seams-paging`).
+  verified pages of one list row by row, within the task (one query and its
+  arguments) that produced them, so they contradict only by a different `total`
+  or a different row at the same index (decision `m3d-seams-paging`); results of
+  different queries are never compared as one list. `bytes.read` is checked against
+  its own cited bytes and offset, so two readings never contradict; string rows
+  must sit at their cited offset and hold printable ASCII (decision `m3d-fix-round`).
 
 | Query | Operations (fixed arguments) | Accepted `--arg` keys |
 | --- | --- | --- |

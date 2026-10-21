@@ -221,8 +221,8 @@ PAGES = {
                lambda o: (_import_name(o["name"]) and _uint(o["address"]) and o["type"] in SYMBOL_TYPES
                           and o["binding"] in BINDINGS and _bool(o["defined"]))),
     "string": (("offset", "encoding", "text", "truncated"),
-               lambda o: (_uint(o["offset"]) and o["encoding"] in ("ascii", "utf-16le") and isinstance(o["text"], str)
-                          and 0 < len(o["text"]) <= 256 and o["text"].isprintable() and _bool(o["truncated"]))),
+               lambda o: (_uint(o["offset"]) and o["encoding"] in ("ascii", "utf-16le") and _ascii(o["text"], 1, 256)
+                          and _bool(o["truncated"]))),  # the host scanners admit printable ASCII only (RD-M3D-CODEX-C M1)
     "function_row": (("name", "entry", "size"),
                      lambda o: _symbol(o["name"]) and _uint(o["entry"]) and _uint(o["size"]) and o["size"] > 0),
     "xref": (("at", "from", "type"),
@@ -230,9 +230,12 @@ PAGES = {
 }
 
 
-# Page claims (contract M3d): their findings are pages of one list, so the reviewer compares them row by row.
+# Page claims (contract M3d): their findings are pages of one list, so the reviewer compares them row by row,
+# within the task (one query with its arguments) that produced them.
 PAGE_CLAIMS = frozenset({"segments.list", "symbols.list", "strings.listed", "strings.matches",
                          "code.function_list", "code.xrefs"})
+# Verified claims the reviewer checks against the cited bytes themselves: two of them never contradict each other.
+SELF_CHECKED_CLAIMS = frozenset({"bytes.read"})
 
 
 def _page(kind):
@@ -368,18 +371,22 @@ STATEMENTS = {
 
 
 def _bytes_match(cited):
-    """bytes.read: the hex is exactly the cited bytes (their length and the excerpt hash)."""
+    """bytes.read: the hex is exactly the cited bytes (their offset, length and the excerpt hash)."""
     for item in cited:
         raw = bytes.fromhex(item.observation["hex"])
-        if len(raw) != item.location.length or sha256_hex(raw) != item.excerpt_sha256:
+        if (item.observation["offset"] != item.location.offset or len(raw) != item.location.length
+                or sha256_hex(raw) != item.excerpt_sha256):
             return False
     return True
 
 
 def _texts_match(cited):
-    """strings.listed and strings.matches: an untruncated row's text, encoded, is exactly the cited bytes."""
+    """strings.listed and strings.matches: every row sits at its cited offset; an untruncated row's text, encoded, is
+    exactly the cited bytes."""
     for item in cited:
         row = item.observation
+        if row["offset"] != item.location.offset:
+            return False
         if not row["truncated"]:
             raw = row["text"].encode("ascii" if row["encoding"] == "ascii" else "utf-16-le")
             if len(raw) != item.location.length or sha256_hex(raw) != item.excerpt_sha256:
