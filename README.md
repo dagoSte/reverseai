@@ -6,14 +6,16 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M4a released: Android packages verified on the host.** Deterministic
+**Status: M4b release candidate: decompiled Java through JADX.** Deterministic
 analysts read file structure (ELF, PE and Mach-O), imports and string indicators in-process,
 alongside APK members, binary manifest attributes, DEX classes, methods and code references.
 The gateway and reviewer independently re-derive bytes inside stored or compressed
 package members from the original package (contract/3). These Android results describe
-declarations in the bytes, not evidence of behaviour. Decompiled Java through JADX is
-planned for M4b and needs an approved download.
-Three pinned open-source tools, LIEF, YARA-X and Ghidra, run in locked containers. Every value
+declarations in the bytes, not evidence of behaviour. The official JADX 1.5.6, the one
+approved download (verified by SHA-256), decompiles a selected DEX method to Java in its
+own locked container; the Java is reported as *derived* and is accepted only for the method
+the host's DEX decoder verified, with JADX's code offset and instruction count equal to it.
+Four pinned open-source tools, LIEF, YARA-X, Ghidra and JADX, run in locked containers. Every value
 LIEF and YARA-X report is re-derived by the host from the input bytes before it can
 become evidence, and a reviewer re-checks each claim against those bytes. Ghidra's
 functions, pseudocode, calls, assembly and references from code are its own reading.
@@ -26,7 +28,7 @@ Model-driven agents are not part of the current releases.
 ## How it works
 
 <p align="center">
-  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway serves whole-file analysis or a targeted query through host parsers for native files, APK and DEX, or a locked container per run (LIEF, YARA-X, Ghidra); the host re-derives every LIEF and YARA-X value and every Ghidra anchor, and re-reads referenced strings; evidence binds hash, tool, operation and byte range, with member provenance for bytes inside a package; a reviewer independently rebuilds package members and re-checks cited bytes and claim rules; Ghidra interpretations stay derived; reports separate supported, derived, unsupported and contradicted findings.">
+  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway serves whole-file analysis or a targeted query through host parsers for native files, APK and DEX, or a locked container per run (LIEF, YARA-X, Ghidra, JADX); the host re-derives every LIEF and YARA-X value and every Ghidra anchor, re-reads referenced strings, and binds JADX's Java to a method its own DEX decoder verified; evidence binds hash, tool, operation and byte range, with member provenance for bytes inside a package; a reviewer independently rebuilds package members and re-checks cited bytes and claim rules; Ghidra and JADX interpretations stay derived; reports separate supported, derived, unsupported and contradicted findings.">
 </p>
 
 What this buys, and how each point is checked:
@@ -34,9 +36,9 @@ What this buys, and how each point is checked:
 | Property | How it holds |
 | --- | --- |
 | A supported finding is backed by exact bytes | The reviewer recomputes the input hash, the byte range and its hash for every cited item, and the claim rule must yield exactly the claimed value. |
-| A compromised tool can hide evidence but not invent verified evidence | The host re-derives every value LIEF and YARA-X report (headers, sections, signature matches) from its own copy of the bytes and refuses the whole reply on any mismatch; for Ghidra it re-derives every anchor, and Ghidra's interpretations can only ever be reported as derived. |
+| A compromised tool can hide evidence but not invent verified evidence | The host re-derives every value LIEF and YARA-X report (headers, sections, signature matches) from its own copy of the bytes and refuses the whole reply on any mismatch; for Ghidra it re-derives every anchor; for JADX it requires the code offset and instruction count of the method its own DEX decoder verified. Ghidra's and JADX's interpretations can only ever be reported as derived. |
 | Tools cannot reach the host or the network | One container per run: no network, read-only root, non-root user, every capability dropped, no new privileges, CPU, memory, process and time limits, a single read-only snapshot mount, image pinned by ID. `tests/verify_m2_runtime.py` proves these limits against the real engine. |
-| Interpretations stay labelled | Ghidra's function lists, pseudocode, calls, assembly, references from code and referenced strings are *derived*: the host checks every anchor and re-reads string contents, while interpretations and reference relationships remain Ghidra's reading. The reviewer re-checks citations and the report lists these findings apart; they never count as verified and never contradict a verified finding. |
+| Interpretations stay labelled | Ghidra's function lists, pseudocode, calls, assembly, references from code and referenced strings, and JADX's Java, are *derived*: the host checks every anchor and re-reads string contents, while interpretations and reference relationships remain the tool's reading. The reviewer re-checks citations and the report lists these findings apart; they never count as verified and never contradict a verified finding. |
 | One claim cannot cancel a verified one | Only findings whose evidence all verifies can contradict each other. |
 | Reports are reproducible | Same input and budget, same report; the report names each tool version and container image. |
 
@@ -52,7 +54,7 @@ What this buys, and how each point is checked:
 | M3c | Ghidra assembly, references from code and referenced strings as derived evidence | released |
 | M3d | Targeted queries by name, address or text with paging; REA's 16 native query names | released |
 | M4a | APK members, binary manifest and DEX classes, methods and code references verified on the host, including compressed-member evidence (contract/3) | released |
-| M4b | Decompiled Java through JADX; needs an approved download | planned |
+| M4b | Decompiled Java through the official JADX 1.5.6 in a locked container, bound to host-verified DEX methods (derived) | release candidate |
 | M5 | JavaScript application analysis | planned |
 | M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
 | M7 | Measured comparison with REA Safe Agent on a known-answer corpus | planned |
@@ -63,12 +65,17 @@ What this buys, and how each point is checked:
 Ask one question about an approved file without executing it:
 
 ```sh
-python3 -m reverseai query FILE --query NAME [--arg KEY=VALUE ...] --out DIR [--with-ghidra]
+python3 -m reverseai query FILE --query NAME [--arg KEY=VALUE ...] --out DIR [--with-ghidra] [--with-jadx]
 ```
 
-Host results are verified from the bytes; Ghidra results remain derived readings.
+Host results are verified from the bytes; Ghidra and JADX results remain derived readings.
 Ghidra queries require `--with-ghidra` and the locally built, pinned image.
-Pages show `rows a..b of N` and the next `start`; a missing row is never evidence of absence.
+`inspect_android_method` adds the method's decompiled Java with `--with-jadx` and the locally
+built, pinned JADX image; without it the Java part is absent and the report says so.
+Each Java page has a form: `java` (decompiled), `fallback` (JADX's own listing when it could
+not decompile), `omitted` (JADX prints no text for the method by design, such as a default
+constructor) or `error` (nothing produced).
+Pages show `rows a..b of N` and the next `start` (Java pages: `characters a..b of N`); a missing row is never evidence of absence.
 
 Query-name coverage: 21 of REA's 22 names (16 native, 5 Android). JavaScript analysis
 is planned for M5; behavioural parity is measured in M7.
@@ -94,7 +101,7 @@ is planned for M5; behavioural parity is measured in M7.
 | `inspect_android_package` | APK members and binary manifest declarations | Verified (host) |
 | `search_android_classes` | DEX classes whose descriptors contain the search text | Verified (host) |
 | `inspect_android_class` | Metadata and declared methods for the exact class; copy its displayed name | Verified (host) |
-| `inspect_android_method` | The class's methods, then the selected method's code references; decompiled Java comes with M4b | Verified (host) |
+| `inspect_android_method` | The class's methods and the selected method's code references; with `--with-jadx`, the method's decompiled Java | Verified (host); Java derived (JADX) |
 | `trace_android_references` | References from or to a method, selected by class, name and optional prototype | Verified (host) |
 | `analyze_javascript_application` | JavaScript application analysis | Planned (M5) |
 
@@ -110,9 +117,19 @@ python3 -B -m unittest discover -s tests -t . -v
 ```
 
 With Docker and the locally built, pinned images (`tools/build_lief_image.py`,
-`tools/build_yarax_image.py`, `tools/build_ghidra_image.py`), add `--with-lief`,
-`--with-yarax` and `--with-ghidra`; the command
-refuses cleanly when an image or Docker is missing. The native containment proof:
+`tools/build_yarax_image.py`, `tools/build_ghidra_image.py`, `tools/build_jadx_image.py`),
+add `--with-lief`, `--with-yarax`, `--with-ghidra` and `--with-jadx`; the command
+refuses cleanly when an image or Docker is missing. The JADX image builds offline from a
+directory that already holds `jadx-1.5.6.zip` (the one approved download, SHA-256
+`545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974`) and the Temurin JDK
+tarball used for Ghidra; the tool checks both and never downloads or pulls:
+
+```sh
+python3 -B tools/build_jadx_image.py --download-dir <private folder with the two files>
+python3 -m reverseai query path/to/approved.apk --query inspect_android_method --arg class='Lcom/example/Main;' --arg method=onCreate --with-jadx --out new-java-report
+```
+
+The native containment proof:
 
 ```sh
 python3 -B tests/verify_m2_runtime.py --tool lief --profile small --offline --lock containers/lief/image.lock.json --receipt <new file>
@@ -129,6 +146,7 @@ Known limits, by design:
 - ELF, PE and thin little-endian Mach-O headers, sections and imports are parsed;
   big-endian and universal Mach-O files are identified only. String indicators and signature rules are
   lexical hints, never proof of behaviour.
+- Decompiled Java is JADX's reading of the method: plausible code is not verified source.
 - A claim type without a rule in `reverseai/claims.py` is never supported. The
   Markdown report states supported findings in the reviewer's own words.
 - In-process handlers have soft time budgets; contained workers have hard wall,
