@@ -44,6 +44,10 @@ class StructureError(ContractError):
     """The input claims a format whose structure is truncated or inconsistent."""
 
 
+class MachoSegmentWidthMismatch(StructureError):
+    """A segment list cannot be complete across incompatible command widths."""
+
+
 def _need(data, offset, length, what):
     if offset < 0 or length < 0 or offset + length > len(data):
         raise StructureError(f"{what} lies outside the input")
@@ -836,14 +840,16 @@ def _segment_records(data):
                     continue
                 width = 64 if command == 0x19 else 32
                 stride = 72 if width == 64 else 56
-                if width != h[0] or size < stride:
+                if width != h[0]:
+                    raise MachoSegmentWidthMismatch("Mach-O segment width disagrees with its header")
+                if size < stride:
                     break
                 name = _name(data[at + 8:at + 24].split(b"\0", 1)[0])
                 address, memsz, offset, filesz = struct.unpack_from("<4Q" if width == 64 else "<4I", data, at + 24)
                 flags = struct.unpack_from("<I", data, at + (60 if width == 64 else 44))[0]
                 yield Location(at, stride), dict(name=name, offset=offset, filesz=filesz, address=address, memsz=memsz,
                     readable=bool(flags & 1), writable=bool(flags & 2), executable=bool(flags & 4))
-    except _QueryLimit:
+    except (_QueryLimit, MachoSegmentWidthMismatch):
         raise
     except StructureError:
         return
