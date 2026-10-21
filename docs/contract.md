@@ -542,8 +542,10 @@ is never cut. Anchors follow the M3a rules (a function's first bytes, at most
 - **Counts**: `total`, `callers_total` and `callees_total` count the rows that pass
   the worker's anchor checks. Instructions are indexed from the entry in address
   order (a body chunk before the entry is not listed). A run that would count more
-  than 65,536 callers, xrefs or functions fails with a fixed error instead of
-  reporting a total cut short. `callers_total` and `callees_total` count call
+  than 65,536 callers, callees, xrefs or functions, or more than 1,000,000
+  instructions in one function, fails with a fixed error instead of reporting a
+  total cut short; these query counts never reuse `ghidra.analyze`'s emission caps
+  (decision `m3d-fix-round`). `callers_total` and `callees_total` count call
   instructions (each once), as the `caller` and `call` rows do. `ghidra.xrefs` rows
   are ordered by `at`, then `type` (ASCII order); one instruction may give several
   rows of different types, never two of the same type. An `instructions` page is
