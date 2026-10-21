@@ -3082,7 +3082,7 @@ class GhidraM3cKnownAnswerTests(unittest.TestCase):
 
 
 def ghidra_lock_fixture():
-    return {"adapter_version": "12.1.4-r5", "platform": "linux/arm64", "image_id": IMAGE_ID,
+    return {"adapter_version": "12.1.4-r6", "platform": "linux/arm64", "image_id": IMAGE_ID,
             "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
             "ghidra_sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",
             "jdk_sha256": "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223"}
@@ -3142,7 +3142,7 @@ class GhidraFakeBoundary(FakeBoundary):
 
 class GhidraProfileAndReceiptTests(unittest.TestCase):
     def test_older_lock_and_receipt_cannot_impersonate_r5(self):
-        for version in ("12.1.4-r1", "12.1.4-r2", "12.1.4-r3", "12.1.4-r4"):
+        for version in ("12.1.4-r1", "12.1.4-r2", "12.1.4-r3", "12.1.4-r4", "12.1.4-r5"):
             lock = ghidra_lock_fixture()
             lock["adapter_version"] = version
             with self.subTest(version=version), self.assertRaises(verifier.VerificationError):
@@ -3470,7 +3470,7 @@ class GhidraNativeProfileTests(unittest.TestCase):
             staging = Path(folder) / "snapshot"
             def factory(lock, *, runner, adapter_version):
                 self.assertEqual(lock, ghidra_lock_fixture())
-                self.assertEqual(adapter_version, "12.1.4-r5")
+                self.assertEqual(adapter_version, "12.1.4-r6")
                 def run(operation, args, data, digest):
                     staging.mkdir()
                     (staging / "input").write_bytes(data)
@@ -3535,7 +3535,7 @@ class GhidraMainTests(unittest.TestCase):
         self.assertEqual(run.receipt["lock_sha256"], sha256_hex(run.raw))
         self.assertEqual(run.receipt["executor_sha256"], sha256_hex(b"inert frozen source"))
         self.assertEqual(run.receipt["verifier_sha256"], sha256_hex(b"inert frozen source"))
-        run.boundary.load_lock.assert_called_once_with(run.lock, adapter_version="12.1.4-r5")
+        run.boundary.load_lock.assert_called_once_with(run.lock, adapter_version="12.1.4-r6")
         run.factory.assert_called_once()
         self.assertEqual(run.factory.call_args.kwargs, {"tool": "ghidra"})
         self.assertEqual(len(run.receipt["checks"]), 20)
