@@ -9,8 +9,10 @@ owner-next-m4b, checked against the publisher's release metadata when it was fet
 digest-pinned python:3.12-slim base must already be present locally: the tool never pulls (decision owner-next-m4b
 reuses it). The image is built with the network off: one internal "build" stage takes the jar and its licence from the
 zip, unpacks the JDK and compiles the fixed driver against the jar, and the final stage copies only /opt/jdk,
-/opt/jadx and /opt/reverseai/driver from it. The Dockerfile check allows exactly that shape. Every docker call is an
-argv list; nothing goes through a shell.
+/opt/jadx and /opt/reverseai/driver from it. The Dockerfile check allows exactly that shape and runs again on the copied
+build context; the lock's driver and worker hashes are those of the copied context, the bytes Docker builds, and the tool
+refuses to write a lock when the repository files differ from them after the build (RD-M4B-CODEX-W M1). Every docker
+call is an argv list; nothing goes through a shell.
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ STAGE = "build"
 ADAPTER_VERSION = "1.5.6-r1"
 CONTEXT_FILES = ("Dockerfile", "worker.py", "unpack.py", "driver")
 STAGE_COPIES = ("/opt/jdk", "/opt/jadx", "/opt/reverseai/driver")
+BUILT_SOURCES = {"driver_sha256": "driver/ReverseAIJadx.java", "worker_sha256": "worker.py"}  # lock key -> context path
 ASSETS = {
     "jadx": {"name": "jadx-1.5.6.zip", "size": 72_646_741,
              "sha256": "545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974"},
@@ -146,6 +149,8 @@ def main(argv=None):
         for name in CONTEXT_FILES:
             source = SOURCE / name
             (shutil.copytree if source.is_dir() else shutil.copy2)(source, context / name)
+        check_dockerfile(context / "Dockerfile")
+        built = {key: file_sha256(context / path) for key, path in BUILT_SOURCES.items()}
         (context / "downloads").mkdir()
         for path in files.values():
             place(path, context / "downloads" / path.name)
@@ -155,10 +160,11 @@ def main(argv=None):
         image_id = iidfile.read_text(encoding="utf-8").strip()
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
         raise SystemExit("docker build returned no image ID")
-    lock = {"adapter_version": ADAPTER_VERSION, "base_digest": BASE_DIGEST, "driver_sha256":
-            file_sha256(SOURCE / "driver" / "ReverseAIJadx.java"), "image_id": image_id,
-            "jadx_jar_sha256": JAR_SHA256, "jadx_zip_sha256": ASSETS["jadx"]["sha256"],
-            "jdk_sha256": ASSETS["jdk"]["sha256"], "platform": PLATFORM, "worker_sha256": file_sha256(SOURCE / "worker.py")}
+    if any(file_sha256(SOURCE / path) != built[key] for key, path in BUILT_SOURCES.items()):
+        raise SystemExit("the worker or driver changed during the build; no lock written")
+    lock = {"adapter_version": ADAPTER_VERSION, "base_digest": BASE_DIGEST, "driver_sha256": built["driver_sha256"],
+            "image_id": image_id, "jadx_jar_sha256": JAR_SHA256, "jadx_zip_sha256": ASSETS["jadx"]["sha256"],
+            "jdk_sha256": ASSETS["jdk"]["sha256"], "platform": PLATFORM, "worker_sha256": built["worker_sha256"]}
     text = json.dumps(lock, indent=2, sort_keys=True) + "\n"
     args.lock.write_text(text, encoding="utf-8")
     print(text, end="")
