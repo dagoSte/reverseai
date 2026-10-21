@@ -616,8 +616,9 @@ class FileMapTests(unittest.TestCase):
         spans = {f["entry"]: f["size"] for f in layout["functions"]}
         offsets = {f["entry"]: f["offset"] for f in layout["functions"]}
         for sample in (data, threaded):
-            def ghidra(format_, args, entry_offset, sample=sample):
+            def ghidra(format_, args, script, sample=sample):
                 q = query(sample, layout, names=["entry", "add_numbers", "compute", "constant"])
+                entry_offset = int(script[3])  # analyze: mode, max_functions, decompile, entry file offset, ...
                 q["pseudocode"].sort(key=lambda p: (offsets[p["entry"]] != entry_offset, -spans[p["entry"]], p["entry"]))
                 return q
             records = worker.run("ghidra.analyze", DEFAULTS, sample, query_of=ghidra)
@@ -951,20 +952,24 @@ class RequestAndCommandTests(unittest.TestCase):
                 worker.parse_request(argv)
 
     def test_the_headless_command_is_fixed_and_takes_only_bounded_numbers(self):
-        argv = worker.ghidra_argv("elf", "/tmp/reverseai-ghidra/query.json", dict(DEFAULTS, max_functions=7, decompile=3), 256)
+        data = elf_code()[0]
+        script = worker.script_args("ghidra.analyze", dict(DEFAULTS, max_functions=7, decompile=3), data)
+        argv = worker.ghidra_argv("elf", "/tmp/reverseai-ghidra/query.json", script)
         self.assertEqual(argv[:2], ["/bin/bash", "/opt/ghidra/support/analyzeHeadless"])
         self.assertEqual(argv[argv.index("-import") + 1], "/snapshot/input")
         for flag in ("-readOnly", "-deleteProject"):
             self.assertIn(flag, argv)
         self.assertEqual(argv[argv.index("-loader") + 1:argv.index("-loader") + 6],
                          ["ElfLoader", "-loader-loadLibraries", "false", "-loader-linkExistingProjectLibraries", "false"])
-        self.assertEqual(worker.ghidra_argv("pe", "q", DEFAULTS, 1)[argv.index("-loader") + 1], "PeLoader")
-        self.assertEqual(worker.ghidra_argv("macho", "q", DEFAULTS, 1)[argv.index("-loader") + 1], "MachoLoader")
+        self.assertEqual(worker.ghidra_argv("pe", "q", script)[argv.index("-loader") + 1], "PeLoader")
+        self.assertEqual(worker.ghidra_argv("macho", "q", script)[argv.index("-loader") + 1], "MachoLoader")
         self.assertEqual(argv[argv.index("-preScript") + 1], "ReverseAIOptions.java")
         post = argv.index("-postScript")
-        self.assertEqual(argv[post + 1:post + 9], ["ReverseAIQuery.java", "/tmp/reverseai-ghidra/query.json", "7", "3", "256", "40", "4", "32"])
-        widened = worker.ghidra_argv("elf", "q", dict(DEFAULTS, assembly=8, max_instructions=64), 256)
-        self.assertEqual(widened[widened.index("-postScript") + 7:widened.index("-postScript") + 9], ["8", "64"])
+        self.assertEqual(argv[post + 1:post + 10],
+                         ["ReverseAIQuery.java", "/tmp/reverseai-ghidra/query.json", "analyze", "7", "3", "256", "40", "4", "32"])
+        widened = worker.script_args("ghidra.analyze", dict(DEFAULTS, assembly=8, max_instructions=64), data)
+        self.assertEqual(widened[-2:], ["8", "64"])
+        self.assertEqual(argv[post + 10:post + 12], ["-log", "/tmp/reverseai-ghidra/ghidra.log"])
         self.assertEqual(argv[argv.index("-scriptPath") + 1], str(worker.SCRIPTS))
         self.assertEqual(argv[argv.index("-max-cpu") + 1], "2")
         self.assertEqual(argv[argv.index("-analysisTimeoutPerFile") + 1], "120")
@@ -1001,8 +1006,9 @@ class RunGhidraTests(unittest.TestCase):
                 patch.object(worker.subprocess, "Popen", process), \
                 patch.object(worker.os, "killpg", side_effect=lambda pid, sig: setattr(process, "killed", (pid, sig))):
             process.expected_env = worker.ghidra_env()
-            process.expected_argv = worker.ghidra_argv("elf", worker.WORK / "query.json", DEFAULTS, 256)
-            return worker.run_ghidra("elf", DEFAULTS, 256)
+            script = worker.script_args("ghidra.analyze", DEFAULTS, elf_code()[0])
+            process.expected_argv = worker.ghidra_argv("elf", worker.WORK / "query.json", script)
+            return worker.run_ghidra("elf", DEFAULTS, script)
 
     def test_the_query_output_is_read_back(self):
         process = FakeProcess(json.dumps({"functions": []}).encode())
@@ -1040,8 +1046,9 @@ class ReplyTests(unittest.TestCase):
         seen = []
         for build in (elf_code, pe_code, macho_code):
             data, layout = build()
-            worker.reply(["ghidra.analyze", '{"decompile": 2}'], data, lambda f, a, o: seen.append((f, a["decompile"], o)) or {})
-        self.assertEqual(seen, [("elf", 2, 0x100), ("pe", 2, 0x200), ("macho", 2, 0x200)])
+            worker.reply(["ghidra.analyze", '{"decompile": 2}'], data, lambda f, a, s: seen.append((f, a["decompile"], s)) or {})
+        self.assertEqual(seen, [(f, 2, ["analyze", "64", "2", offset, "40", "4", "32"])
+                                for f, offset in (("elf", "256"), ("pe", "512"), ("macho", "512"))])
 
     def test_unexpected_failures_become_short_error_names_and_large_replies_are_refused(self):
         def broken(f, a, o):
@@ -1067,7 +1074,7 @@ class BuildInputTests(unittest.TestCase):
     def test_scripts_lock_and_dockerfile_are_pinned_consistently(self):
         lock = json.loads((SOURCE / "image.lock.json").read_text(encoding="utf-8"))
         self.assertEqual(set(lock), {"adapter_version", "base_digest", "ghidra_sha256", "image_id", "jdk_sha256", "platform"})
-        self.assertEqual((lock["adapter_version"], lock["platform"], worker.ADAPTER_VERSION), ("12.1.4-r5", "linux/arm64", "12.1.4-r5"))
+        self.assertEqual((lock["adapter_version"], lock["platform"], worker.ADAPTER_VERSION), ("12.1.4-r6", "linux/arm64", "12.1.4-r6"))
         self.assertEqual(lock["ghidra_sha256"], "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db")
         self.assertEqual(lock["jdk_sha256"], "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223")
         self.assertEqual(lock["base_digest"], json.loads((ROOT / "containers" / "lief" / "image.lock.json").read_text())["base_digest"])
@@ -1084,7 +1091,10 @@ class BuildInputTests(unittest.TestCase):
         rule = re.compile(r'Pattern\.compile\("\(\?i\)\.\*\(pdb\|dwarf\|swift\)\.\*"\)')
         for name in ("ReverseAIOptions.java", "ReverseAIQuery.java"):
             self.assertRegex((SOURCE / "ghidra_scripts" / name).read_text(), rule)
-        self.assertIn("if (args.length != 7)", (SOURCE / "ghidra_scripts" / "ReverseAIQuery.java").read_text())
+        # M3d: each mode takes a fixed number of arguments after the output path and the mode itself.
+        self.assertIn('int expected = mode.equals("analyze") ? 8 : mode.equals("functions") ? 5 : mode.equals("function") ? 9',
+                      query_source)
+        self.assertIn('\t\t\t: mode.equals("xrefs") ? 6 : -1;\n\t\tif (args.length != expected) {', query_source)
         # M3c: references leave calls (their own kind) and non-memory targets out; listings start at the entry and count
         # the whole body, so the worker can tell a cut listing; the listed functions follow the pseudocode order.
         for pin in ("if (refs == MAX_REFS_PER_FUNCTION || !target.isMemoryAddress() || type.isCall()) {",

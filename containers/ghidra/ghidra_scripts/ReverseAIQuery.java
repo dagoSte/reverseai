@@ -1,14 +1,14 @@
 // ReverseAI's fixed Ghidra query (reviewed code baked into the image; requests cannot choose scripts).
-// Arguments: <output JSON path> <max_functions> <decompile> <entry file offset or -1> <decompile seconds> <assembly>
-// <max_instructions>.
-// Writes what Ghidra reports, as plain JSON: memory blocks, functions (address order, at most MAX_FUNCTIONS; size is
+// Arguments: <output JSON path> <mode> and the mode's fixed arguments (see analyze, functions, function and xrefs below).
+// analyze writes what Ghidra reports, as plain JSON: memory blocks, functions (address order, at most MAX_FUNCTIONS; size is
 // the span from the entry to the last body byte, decision m3a-function-span), the calls and the other references
 // (with their reference-type flags) from the instructions of the first max_functions file-backed executable
 // functions, pseudocode for the entry-point function and then the largest of those, and, in the same order, the
 // first instructions of `assembly` of them (M3c). The Python worker checks what the bytes can confirm (each anchor's
 // file offset, bytes and memory-block mapping, one rebase delta, bounds and order) and drops or refuses the rest;
 // names, sizes, call and reference targets, reference types, instruction texts and pseudocode remain Ghidra's
-// interpretation, reported as derived and never as verified.
+// interpretation, reported as derived and never as verified. The M3d modes answer one question each (a page of
+// functions, one function's parts, the references to one address) with the same blocks and the same kind of rows.
 //@category ReverseAI
 
 import java.io.FileOutputStream;
@@ -33,6 +33,7 @@ import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.mem.MemoryBlockSourceInfo;
 import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.ReferenceIterator;
 import ghidra.program.model.symbol.Symbol;
 
 public class ReverseAIQuery extends GhidraScript {
@@ -40,6 +41,7 @@ public class ReverseAIQuery extends GhidraScript {
 	private static final int MAX_CALLS_PER_FUNCTION = 1024;
 	private static final int MAX_REFS_PER_FUNCTION = 1024;
 	private static final int MAX_BODY_INSTRUCTIONS = 1000000;
+	private static final int MAX_ROWS = 65536;  // functions, callers or xrefs counted by one run (decision m3d-seams-w)
 	private static final int MAX_LOCATION = 4096;
 	private static final int MAX_TEXT = 65536;
 	// The same rule as ReverseAIOptions: the worker refuses the run if any of these is still on.
@@ -50,17 +52,35 @@ public class ReverseAIQuery extends GhidraScript {
 	@Override
 	public void run() throws Exception {
 		String[] args = getScriptArgs();
-		if (args.length != 7) {
+		String mode = args.length > 1 ? args[1] : "";
+		int expected = mode.equals("analyze") ? 8 : mode.equals("functions") ? 5 : mode.equals("function") ? 9
+			: mode.equals("xrefs") ? 6 : -1;
+		if (args.length != expected) {
 			throw new IllegalArgumentException("ReverseAIQuery arguments");
 		}
-		int maxFunctions = Integer.parseInt(args[1]);
-		int decompile = Integer.parseInt(args[2]);
-		long entryOffset = Long.parseLong(args[3]);
-		long deadline = System.currentTimeMillis() + 1000L * Integer.parseInt(args[4]);
-		int assembly = Integer.parseInt(args[5]);
-		int maxInstructions = Integer.parseInt(args[6]);
 		memory = currentProgram.getMemory();
+		StringBuilder out = header();
+		out.append(",\"mode\":").append(quote(mode));
+		if (mode.equals("analyze")) {
+			analyze(out, args);
+		}
+		else if (mode.equals("functions")) {
+			functions(out, args);
+		}
+		else if (mode.equals("function")) {
+			function(out, args);
+		}
+		else {
+			xrefs(out, args);
+		}
+		out.append("}");
+		try (Writer writer = new OutputStreamWriter(new FileOutputStream(args[0]), StandardCharsets.UTF_8)) {
+			writer.write(out.toString());
+		}
+	}
 
+	/** The executable format, the analyzer options the worker checks and the loaded memory blocks. */
+	private StringBuilder header() {
 		StringBuilder out = new StringBuilder("{\"format\":").append(quote(currentProgram.getExecutableFormat()))
 			.append(",\"options_off\":{");
 		boolean first = true;
@@ -84,10 +104,21 @@ public class ReverseAIQuery extends GhidraScript {
 				.append(",\"file_offset\":").append(blockFileOffset(block)).append("}");
 			first = false;
 		}
+		return out.append("]");
+	}
+
+	/** analyze: <max_functions> <decompile> <entry file offset or -1> <decompile seconds> <assembly> <max_instructions>. */
+	private void analyze(StringBuilder out, String[] args) throws Exception {
+		int maxFunctions = Integer.parseInt(args[2]);
+		int decompile = Integer.parseInt(args[3]);
+		long entryOffset = Long.parseLong(args[4]);
+		long deadline = System.currentTimeMillis() + 1000L * Integer.parseInt(args[5]);
+		int assembly = Integer.parseInt(args[6]);
+		int maxInstructions = Integer.parseInt(args[7]);
 
 		List<Function> selected = new ArrayList<>();
-		out.append("],\"functions\":[");
-		first = true;
+		out.append(",\"functions\":[");
+		boolean first = true;
 		int count = 0;
 		for (Function function : currentProgram.getFunctionManager().getFunctions(true)) {
 			if (function.isExternal() || count == MAX_FUNCTIONS) {
@@ -140,17 +171,9 @@ public class ReverseAIQuery extends GhidraScript {
 				decompiler.setOptions(new DecompileOptions());
 				decompiler.openProgram(currentProgram);
 				for (Function function : order.subList(0, Math.min(decompile, order.size()))) {
-					int left = (int) ((deadline - System.currentTimeMillis()) / 1000);
-					if (left < 1) {
-						break;
-					}
-					DecompileResults result = decompiler.decompileFunction(function, Math.min(left, 15), monitor);
-					if (result == null || !result.decompileCompleted() || result.getDecompiledFunction() == null) {
+					String text = decompiled(decompiler, function, deadline);
+					if (text == null) {
 						continue;
-					}
-					String text = result.getDecompiledFunction().getC();
-					if (text.length() > MAX_TEXT) {
-						text = text.substring(0, MAX_TEXT);
 					}
 					out.append(first ? "" : ",").append("{\"entry\":").append(function.getEntryPoint().getOffset())
 						.append(",\"text\":").append(quote(text)).append("}");
@@ -168,10 +191,251 @@ public class ReverseAIQuery extends GhidraScript {
 			appendInstructions(out, function, maxInstructions);
 			first = false;
 		}
-		out.append("]}");
-		try (Writer writer = new OutputStreamWriter(new FileOutputStream(args[0]), StandardCharsets.UTF_8)) {
-			writer.write(out.toString());
+		out.append("]");
+	}
+
+	/** functions: <query (x + hex)> <start> <limit>: the page of file-backed executable functions whose name contains
+	 * query, in address order, and how many there are (at most MAX_ROWS, else "overflow"). */
+	private void functions(StringBuilder out, String[] args) throws Exception {
+		String query = text(args[2]);
+		int start = Integer.parseInt(args[3]);
+		int limit = Integer.parseInt(args[4]);
+		out.append(",\"functions\":[");
+		boolean first = true;
+		int total = 0;
+		for (Function function : anchoredFunctions()) {
+			if (!function.getName().contains(query)) {
+				continue;
+			}
+			if (total == MAX_ROWS) {
+				out.append("],\"overflow\":true,\"total\":").append(total);
+				return;
+			}
+			if (total >= start && total - start < limit) {
+				out.append(first ? "" : ",");
+				appendFunction(out, function, total, false);
+				first = false;
+			}
+			total++;
 		}
+		out.append("],\"overflow\":false,\"total\":").append(total);
+	}
+
+	/** function: <select entry|name> <entry file offset or -1> <name (x + hex)> <parts> <start> <limit> <decompile
+	 * seconds>: the target (the function at that entry, or the lowest-entry one with that exact name), how many share
+	 * the name, its calls and references, the calls to it from file-backed executable code, its pseudocode and a page
+	 * of its instructions from the entry. */
+	private void function(StringBuilder out, String[] args) throws Exception {
+		boolean byEntry = args[2].equals("entry");
+		long entryOffset = Long.parseLong(args[3]);
+		String name = text(args[4]);
+		String parts = args[5];
+		int start = Integer.parseInt(args[6]);
+		int limit = Integer.parseInt(args[7]);
+		long deadline = System.currentTimeMillis() + 1000L * Integer.parseInt(args[8]);
+		Function target = null;
+		int matches = 0;
+		for (Function function : anchoredFunctions()) {
+			if (byEntry ? fileOffset(function.getEntryPoint()) == entryOffset : function.getName().equals(name)) {
+				target = target == null ? function : target;  // address order: the first is the lowest entry
+				matches++;
+			}
+		}
+		out.append(",\"matches\":").append(matches).append(",\"target\":");
+		if (target == null) {
+			out.append("null");
+			return;
+		}
+		appendFunction(out, target, 0, true);
+		out.append(",\"callers\":");
+		appendReferencesTo(out, target.getEntryPoint(), true);
+		out.append(",\"pseudocode\":");
+		String text = null;
+		if (parts.equals("pseudocode") || parts.equals("all")) {
+			DecompInterface decompiler = new DecompInterface();
+			try {
+				decompiler.setOptions(new DecompileOptions());
+				decompiler.openProgram(currentProgram);
+				text = decompiled(decompiler, target, deadline);
+			}
+			finally {
+				decompiler.dispose();
+			}
+		}
+		out.append(text == null ? "null" : quote(text)).append(",\"instructions\":");
+		if (parts.equals("assembly") || parts.equals("all")) {
+			appendPage(out, target, start, limit);
+		}
+		else {
+			out.append("null");
+		}
+	}
+
+	/** xrefs: <address file offset or -1> <address> <mapped file offset or -1> <its address>: every reference to the
+	 * address from an instruction in file-backed executable code. An address without file bytes is rebased like the
+	 * mapped pair (Ghidra may load the file at another base). */
+	private void xrefs(StringBuilder out, String[] args) throws Exception {
+		Address target = located(Long.parseLong(args[2]));
+		if (target == null) {
+			Address base = located(Long.parseLong(args[4]));
+			if (base != null) {
+				long address = Long.parseUnsignedLong(args[3]);
+				long delta = base.getOffset() - Long.parseUnsignedLong(args[5]);
+				try {
+					target = base.getAddressSpace().getAddress(address + delta);
+				}
+				catch (Exception e) {
+					target = null;  // outside the address space: no references
+				}
+			}
+		}
+		out.append(",\"to\":").append(target == null ? "null" : Long.toString(target.getOffset()))
+			.append(",\"xrefs\":");
+		if (target == null) {
+			out.append("{\"rows\":[],\"overflow\":false}");
+		}
+		else {
+			appendReferencesTo(out, target, false);
+		}
+	}
+
+	/** The one address a file offset maps to, or null. */
+	private Address located(long offset) {
+		if (offset < 0) {
+			return null;
+		}
+		List<Address> found = memory.locateAddressesForFileOffset(offset);
+		return found != null && found.size() == 1 ? found.get(0) : null;
+	}
+
+	/** File-backed, executable, non-external functions in address order. */
+	private List<Function> anchoredFunctions() {
+		List<Function> found = new ArrayList<>();
+		for (Function function : currentProgram.getFunctionManager().getFunctions(true)) {
+			Address entry = function.getEntryPoint();
+			MemoryBlock block = memory.getBlock(entry);
+			if (!function.isExternal() && fileOffset(entry) >= 0 && block != null && block.isExecute() && block.isInitialized()) {
+				found.add(function);
+			}
+		}
+		return found;
+	}
+
+	/** One function row at its anchor; with edges, its calls and references too. */
+	private void appendFunction(StringBuilder out, Function function, int index, boolean edges) throws Exception {
+		Address entry = function.getEntryPoint();
+		long size = span(function);
+		out.append("{\"index\":").append(index).append(",\"name\":").append(quote(function.getName()))
+			.append(",\"entry\":").append(entry.getOffset())
+			.append(",\"size\":").append(size)
+			.append(",\"file_offset\":").append(fileOffset(entry))
+			.append(",\"anchored\":true")
+			.append(",\"bytes\":").append(quote(hex(entry, memory.getBlock(entry), size)));
+		if (edges) {
+			out.append(",\"calls\":[");
+			appendCalls(out, function);
+			out.append("],\"refs\":[");
+			appendRefs(out, function);
+			out.append("]");
+		}
+		out.append("}");
+	}
+
+	/** References to the address from instructions in file-backed executable code (calls only, tail calls included,
+	 * when onlyCalls), with Ghidra's flags and the containing function; at most MAX_ROWS, else "overflow". */
+	private void appendReferencesTo(StringBuilder out, Address target, boolean onlyCalls) throws Exception {
+		out.append("{\"rows\":[");
+		boolean first = true;
+		int rows = 0;
+		ReferenceIterator references = currentProgram.getReferenceManager().getReferencesTo(target);
+		while (references.hasNext()) {
+			Reference reference = references.next();
+			Address at = reference.getFromAddress();
+			Instruction instruction = currentProgram.getListing().getInstructionAt(at);
+			MemoryBlock block = memory.getBlock(at);
+			if (instruction == null || block == null || !block.isExecute() || !block.isInitialized() || fileOffset(at) < 0) {
+				continue;
+			}
+			RefType type = reference.getReferenceType();
+			boolean call = type.isCall() || (type.isFlow() && instruction.getFlowType().isCall());
+			if (onlyCalls && !call) {
+				continue;
+			}
+			if (rows == MAX_ROWS) {
+				out.append("],\"overflow\":true}");
+				return;
+			}
+			rows++;
+			Function from = getFunctionContaining(at);
+			out.append(first ? "" : ",").append("{\"address\":").append(at.getOffset())
+				.append(",\"length\":").append(instruction.getLength())
+				.append(",\"file_offset\":").append(fileOffset(at))
+				.append(",\"bytes\":").append(quote(toHex(instruction.getBytes())))
+				.append(",\"to\":").append(target.getOffset())
+				.append(",\"from\":").append(from == null ? "null" : Long.toString(from.getEntryPoint().getOffset()))
+				.append(",\"from_file_offset\":").append(from == null ? -1 : fileOffset(from.getEntryPoint()))
+				.append(",\"call\":").append(call)
+				.append(",\"flow\":").append(type.isFlow())
+				.append(",\"jump\":").append(type.isJump())
+				.append(",\"read\":").append(type.isRead())
+				.append(",\"write\":").append(type.isWrite())
+				.append(",\"data\":").append(type.isData()).append("}");
+			first = false;
+		}
+		out.append("],\"overflow\":false}");
+	}
+
+	/** Instructions start..start+limit-1 of the function, counted from its entry in address order, and the count. */
+	private void appendPage(StringBuilder out, Function function, int start, int limit) throws Exception {
+		Address entry = function.getEntryPoint();
+		out.append("{\"start\":").append(start).append(",\"rows\":[");
+		boolean first = true;
+		int index = 0;
+		for (Instruction instruction : currentProgram.getListing().getInstructions(function.getBody(), true)) {
+			if (index == MAX_BODY_INSTRUCTIONS) {
+				break;
+			}
+			if (instruction.getAddress().compareTo(entry) < 0) {
+				continue;
+			}
+			if (index >= start && index - start < limit) {
+				out.append(first ? "" : ",").append("{\"index\":").append(index)
+					.append(",\"address\":").append(instruction.getAddress().getOffset())
+					.append(",\"length\":").append(instruction.getLength())
+					.append(",\"file_offset\":").append(fileOffset(instruction.getAddress()))
+					.append(",\"bytes\":").append(quote(toHex(instruction.getBytes())))
+					.append(",\"text\":").append(quote(instruction.toString())).append("}");
+				first = false;
+			}
+			index++;
+		}
+		out.append("],\"total\":").append(index).append("}");
+	}
+
+	/** Decompiled C for one function within the deadline (at most 15 s), cut at MAX_TEXT; null when it fails. */
+	private String decompiled(DecompInterface decompiler, Function function, long deadline) throws Exception {
+		int left = (int) ((deadline - System.currentTimeMillis()) / 1000);
+		if (left < 1) {
+			return null;
+		}
+		DecompileResults result = decompiler.decompileFunction(function, Math.min(left, 15), monitor);
+		if (result == null || !result.decompileCompleted() || result.getDecompiledFunction() == null) {
+			return null;
+		}
+		String text = result.getDecompiledFunction().getC();
+		return text.length() > MAX_TEXT ? text.substring(0, MAX_TEXT) : text;
+	}
+
+	/** A query string the worker passed as "x" followed by its UTF-8 bytes in hex. */
+	private static String text(String encoded) {
+		if (!encoded.startsWith("x") || encoded.length() % 2 != 1) {
+			throw new IllegalArgumentException("ReverseAIQuery text argument");
+		}
+		byte[] bytes = new byte[(encoded.length() - 1) / 2];
+		for (int i = 0; i < bytes.length; i++) {
+			bytes[i] = (byte) Integer.parseInt(encoded.substring(1 + 2 * i, 3 + 2 * i), 16);
+		}
+		return new String(bytes, StandardCharsets.UTF_8);
 	}
 
 	private void appendCalls(StringBuilder out, Function function) throws Exception {
