@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import copy
 import csv
+from dataclasses import replace
+import hashlib
+import importlib
 import io
 import json
 from pathlib import Path
@@ -24,6 +27,7 @@ from reverseai.contract import (
 from tests import verify_m2_runtime as verifier
 from tests.fixtures_structure import elf, pe
 from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code, elf_refs, pe_refs, macho_refs
+from tests import fixtures_apk
 
 
 IMAGE_ID = "sha256:" + "a" * 64
@@ -3726,6 +3730,648 @@ class GhidraMainTests(unittest.TestCase):
                 verifier.main(base + rest)
             self.assertEqual(caught.exception.code, 2)
             native.assert_not_called()
+
+
+JADX_PINS = {
+    "adapter_version": "1.5.6-r1",
+    "platform": "linux/arm64",
+    "image_id": IMAGE_ID,
+    "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
+    "jadx_zip_sha256": "545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974",
+    "jadx_jar_sha256": "fe3e12c45acf75f92369685fd02d1d7a7323385dc725680a9b98a0dac0ea554b",
+    "jdk_sha256": "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223",
+}
+
+
+JADX_PROFILE = {"pids": 256, "memory": "2g", "cpus": 2,
+                "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=512m", "wall_seconds": 120}
+
+
+class JadxFakeBoundary(GhidraFakeBoundary):
+    JADX_WALL_SECONDS = 120
+
+    @staticmethod
+    def resource_profile(operation):
+        if operation != "jadx.method":
+            raise AssertionError("unexpected JADX profile request")
+        return dict(JADX_PROFILE)
+
+    def run_bounded(self, argv, *, timeout, max_output, profile="default"):
+        if timeout > 45 and profile != "jadx":
+            raise AssertionError("JADX bounded-runner selector missing")
+        self.selectors.append((list(argv), profile))
+        return FakeBoundary.run_bounded(self, argv, timeout=timeout, max_output=max_output)
+
+
+def jadx_probe_fixture(name):
+    value = ghidra_probe_fixture(name)
+    if name == "wall":
+        value.update(timeout=120, elapsed=120.1)
+    return value
+
+
+class JadxNativeContractTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="jadx-inert-sources-")
+        self.addCleanup(temporary.cleanup)
+        self.driver = Path(temporary.name, "ReverseAIJadx.java")
+        self.worker = Path(temporary.name, "worker.py")
+        self.driver.write_bytes(b"// Inert regression-test driver source.\n")
+        self.worker.write_bytes(b"# Inert regression-test worker source.\n")
+        for name, path in (("JADX_DRIVER_PATH", self.driver), ("JADX_WORKER_PATH", self.worker)):
+            replacement = mock.patch.object(verifier, name, path, create=True)
+            replacement.start()
+            self.addCleanup(replacement.stop)
+
+    def api(self, name):
+        value = getattr(verifier, name, None)
+        self.assertTrue(callable(value), name + " is missing from the verifier")
+        return value
+
+    def lock(self):
+        return {**JADX_PINS,
+                "driver_sha256": hashlib.sha256(self.driver.read_bytes()).hexdigest(),
+                "worker_sha256": hashlib.sha256(self.worker.read_bytes()).hexdigest()}
+
+    def checks(self):
+        try:
+            return verifier.required_checks("jadx")
+        except verifier.VerificationError:
+            self.fail("The required-check table has no JADX profile")
+
+    def receipt(self):
+        checks = self.checks()
+        receipt = receipt_fixture()
+        receipt.update(tool="jadx", lock=self.lock(),
+                       checks=[{"id": name, "status": "passed"} for name in checks],
+                       cleanup=[{"container_id": f"{index + 1:064x}", "verified": True,
+                                 "staging_removed": True} for index in range(len(checks) - 3)])
+        return receipt
+
+    def native(self, boundary=None, lock=None):
+        self.api("verify_jadx_lock")
+        boundary = JadxFakeBoundary() if boundary is None else boundary
+        try:
+            native = verifier.NativeVerifier(boundary, self.lock() if lock is None else lock,
+                                              {"checks": [], "cleanup": []}, tool="jadx")
+        except verifier.VerificationError as error:
+            self.fail("The contracted JADX native profile was refused: " + str(error))
+        native.image = image_fixture()
+        return native
+
+    def test_nine_key_lock_pins_approved_archives_and_both_local_sources(self):
+        check = self.api("verify_jadx_lock")
+        lock = self.lock()
+        self.assertEqual(set(lock), {"adapter_version", "platform", "image_id", "base_digest",
+                                     "jadx_zip_sha256", "jadx_jar_sha256", "jdk_sha256",
+                                     "driver_sha256", "worker_sha256"})
+        self.assertEqual(len(lock), 9)
+        check(lock)
+        self.assertNotEqual(lock["driver_sha256"], lock["worker_sha256"])
+
+    def test_every_missing_pin_and_changed_reviewed_pin_is_refused(self):
+        check = self.api("verify_jadx_lock")
+        check(self.lock())
+        for key in self.lock():
+            for mode in ("missing", "changed"):
+                lock = self.lock()
+                if mode == "missing":
+                    del lock[key]
+                else:
+                    lock[key] = "sha256:invalid" if key == "image_id" else "0" * 64
+                with self.subTest(key=key, mode=mode), self.assertRaises(verifier.VerificationError):
+                    check(lock)
+
+    def test_foreign_or_extra_lock_fields_and_malformed_digests_are_refused(self):
+        check = self.api("verify_jadx_lock")
+        check(self.lock())
+        for foreign in (lock_fixture(), ghidra_lock_fixture(),
+                        {**self.lock(), "wheel_sha256": "c" * 64},
+                        {**self.lock(), "ruleset_sha256": "c" * 64},
+                        {**self.lock(), "ghidra_sha256": "c" * 64}):
+            with self.subTest(keys=tuple(foreign)), self.assertRaises(verifier.VerificationError):
+                check(foreign)
+        for key in ("image_id", "driver_sha256", "worker_sha256"):
+            for bad in (None, True, 7, [], {}, "A" * 64, "f" * 63, "f" * 65):
+                with self.subTest(key=key, value=bad), self.assertRaises(verifier.VerificationError):
+                    check({**self.lock(), key: bad})
+
+    def test_driver_and_worker_are_hashed_independently_from_local_bytes(self):
+        check = self.api("verify_jadx_lock")
+        for path in (self.driver, self.worker):
+            old_bytes = path.read_bytes()
+            lock = self.lock()
+            check(lock)
+            path.write_bytes(old_bytes + b"changed\n")
+            with self.subTest(source=path.name), self.assertRaises(verifier.VerificationError):
+                check(lock)
+            check(self.lock())
+            path.write_bytes(old_bytes)
+        swapped = self.lock()
+        swapped["driver_sha256"], swapped["worker_sha256"] = swapped["worker_sha256"], swapped["driver_sha256"]
+        with self.assertRaises(verifier.VerificationError):
+            check(swapped)
+
+    def test_jadx_limits_and_lock_loader_options_are_fixed_independently(self):
+        self.api("verify_jadx_executor_profile")
+        self.assertEqual(verifier.limits("jadx"),
+                         (256, 2 * 1024**3, 2_000_000_000, "rw,noexec,nosuid,nodev,size=512m", 120))
+        self.assertEqual(verifier.lock_options("jadx"), {"adapter_version": "1.5.6-r1"})
+        self.assertEqual(verifier.limits("ghidra")[-1], 240)
+        self.assertEqual(verifier.limits("lief")[-1], 45)
+        self.assertEqual(verifier.limits("yarax")[-1], 45)
+
+    def test_exact_executor_profile_and_wall_constant_are_checked(self):
+        check = self.api("verify_jadx_executor_profile")
+        boundary = SimpleNamespace(JADX_WALL_SECONDS=120,
+                                   resource_profile=lambda operation: dict(JADX_PROFILE))
+        check(boundary)
+        for field in JADX_PROFILE:
+            for mode in ("missing", "changed"):
+                changed = dict(JADX_PROFILE)
+                if mode == "missing":
+                    del changed[field]
+                else:
+                    changed[field] = "unexpected"
+                boundary.resource_profile = lambda operation, changed=changed: changed
+                with self.subTest(field=field, mode=mode), self.assertRaises(verifier.VerificationError):
+                    check(boundary)
+        for field, bad in (("pids", 256.0), ("cpus", 2.0), ("wall_seconds", 120.0)):
+            boundary.resource_profile = lambda operation, field=field, bad=bad: {**JADX_PROFILE, field: bad}
+            with self.subTest(field=field, numeric_type=type(bad)), self.assertRaises(verifier.VerificationError):
+                check(boundary)
+        boundary.resource_profile = lambda operation: dict(JADX_PROFILE)
+        for wall in (45, 240, 120.0, True, None):
+            boundary.JADX_WALL_SECONDS = wall
+            with self.subTest(wall=wall), self.assertRaises(verifier.VerificationError):
+                check(boundary)
+
+    def test_constructor_rejects_profile_drift_and_foreign_lock_before_boundary_calls(self):
+        boundary = JadxFakeBoundary()
+        self.native(boundary)
+        for profile in ({**JADX_PROFILE, "wall_seconds": 240}, {**JADX_PROFILE, "memory": "512m"}):
+            with self.subTest(profile=profile), mock.patch.object(boundary, "resource_profile", return_value=profile), \
+                    self.assertRaises(verifier.VerificationError):
+                verifier.NativeVerifier(boundary, self.lock(), {"checks": [], "cleanup": []}, tool="jadx")
+        with self.assertRaises(verifier.VerificationError):
+            verifier.NativeVerifier(boundary, ghidra_lock_fixture(), {"checks": [], "cleanup": []}, tool="jadx")
+        self.assertEqual(boundary.calls, [])
+
+    def test_stopped_container_has_jadx_resources_and_all_shared_restrictions(self):
+        self.api("verify_jadx_executor_profile")
+        data = JadxFakeBoundary().inspect
+        verifier.verify_container(data, image_fixture(), self.lock(), SNAPSHOT, tool="jadx")
+        mutations = {"PidsLimit": 64, "Memory": 536870912, "MemorySwap": 0,
+                     "NanoCpus": 1_000_000_000, "Tmpfs": {"/tmp": "rw,size=512m"},
+                     "Init": False, "Privileged": True, "ReadonlyRootfs": False,
+                     "AutoRemove": False, "NetworkMode": "bridge", "CapDrop": [],
+                     "SecurityOpt": [], "Devices": [{"PathOnHost": "/dev/mem"}]}
+        for key, bad in mutations.items():
+            changed = copy.deepcopy(data)
+            changed["HostConfig"][key] = bad
+            with self.subTest(field=key), self.assertRaises(verifier.VerificationError):
+                verifier.verify_container(changed, image_fixture(), self.lock(), SNAPSHOT, tool="jadx")
+
+    def test_observed_probes_use_jadx_limits_and_reject_other_wall_profiles(self):
+        self.api("verify_jadx_executor_profile")
+        for name in verifier.CONTROL_NAMES:
+            verifier.validate_probe(name, jadx_probe_fixture(name), tool="jadx")
+        for other in (probe_fixture("wall"), ghidra_probe_fixture("wall")):
+            with self.assertRaises(verifier.VerificationError):
+                verifier.validate_probe("wall", other, tool="jadx")
+        for tool in ("lief", "yarax", "ghidra"):
+            with self.subTest(tool=tool), self.assertRaises(verifier.VerificationError):
+                verifier.validate_probe("wall", jadx_probe_fixture("wall"), tool=tool)
+
+    def test_complete_jadx_receipt_has_24_checks_and_21_distinct_cleanup_rows(self):
+        receipt = self.receipt()
+        self.assertEqual(len(receipt["checks"]), 24)
+        self.assertEqual(len(receipt["cleanup"]), 21)
+        self.assertEqual(verifier.native_runs("jadx"), 21)
+        self.assertTrue(verifier.receipt_passes(receipt))
+
+    def test_foreign_profile_locks_or_check_sets_cannot_impersonate_jadx(self):
+        positive = self.receipt()
+        self.assertTrue(verifier.receipt_passes(positive))
+        for other in (receipt_fixture(), YaraxReceiptTests().receipt(), ghidra_receipt_fixture()):
+            for field in ("tool", "lock", "checks", "cleanup"):
+                changed = copy.deepcopy(positive)
+                changed[field] = copy.deepcopy(other[field])
+                with self.subTest(tool=other["tool"], field=field):
+                    self.assertFalse(verifier.receipt_passes(changed))
+        for extra in ("wheel_sha256", "ruleset_sha256"):
+            changed = {**positive, extra: "c" * 64}
+            self.assertFalse(verifier.receipt_passes(changed))
+
+    def test_incomplete_or_failed_checks_and_bad_cleanup_refuse_receipt(self):
+        positive = self.receipt()
+        self.assertTrue(verifier.receipt_passes(positive))
+        for mode in ("missing_check", "duplicate_check", "failed", "not_run", "missing_cleanup",
+                     "duplicate_container", "unverified", "staging_present", "image_mismatch", "bad_source_hash"):
+            changed = copy.deepcopy(positive)
+            if mode == "missing_check":
+                changed["checks"].pop()
+            elif mode == "duplicate_check":
+                changed["checks"][-1] = changed["checks"][0]
+            elif mode in ("failed", "not_run"):
+                changed["checks"][0]["status"] = mode
+            elif mode == "missing_cleanup":
+                changed["cleanup"].pop()
+            elif mode == "duplicate_container":
+                changed["cleanup"][-1] = changed["cleanup"][0]
+            elif mode == "unverified":
+                changed["cleanup"][0]["verified"] = False
+            elif mode == "staging_present":
+                changed["cleanup"][0]["staging_removed"] = False
+            elif mode == "image_mismatch":
+                changed["image_id"] = "sha256:" + "f" * 64
+            else:
+                changed["executor_sha256"] = "bad"
+            with self.subTest(mode=mode):
+                self.assertFalse(verifier.receipt_passes(changed))
+
+    def test_the_native_bounded_runner_always_selects_the_jadx_profile(self):
+        boundary = JadxFakeBoundary()
+        native = self.native(boundary)
+        self.assertEqual(native.wall, 120)
+        self.assertEqual(native.run_bounded(["docker", "version"], timeout=120, max_output=262144),
+                         b"delegated metadata")
+        self.assertEqual(boundary.selectors, [(["docker", "version"], "jadx")])
+        self.assertEqual(boundary.calls, [(["docker", "version"], 120, 262144)])
+
+    def test_changed_runner_time_or_output_bounds_refuse_before_create(self):
+        boundary = JadxFakeBoundary()
+        native = self.native(boundary)
+        argv = boundary.build_argv(IMAGE_ID, "reverseai-unit-owned", str(SNAPSHOT), "jadx.method", {})
+        for timeout, cap in ((45, 262144), (121, 262144), (120.0, 262144), (120, 262145)):
+            with self.subTest(timeout=timeout, cap=cap), self.assertRaises(verifier.VerificationError):
+                native.runner(argv, timeout=timeout, max_output=cap)
+        self.assertEqual(boundary.calls, [])
+
+    def prepared_cases(self):
+        cases = self.api("jadx_cases")
+        data = fixtures_apk.apk_basic()[0]
+        checked = cases(data)
+        self.assertIsInstance(checked, dict)
+        self.assertTrue(checked)
+        try:
+            host = importlib.import_module("reverseai.tools.jadx_verify")
+        except ImportError:
+            self.fail("The JADX host prepare seam has not landed")
+        result = {}
+        for name, args in checked.items():
+            prepared, _ = host.prepare(data, args)
+            result[name] = prepared
+        return data, checked, result
+
+    def test_request_allowlist_accepts_only_fixed_prepared_fixture_dictionaries(self):
+        data, public, prepared = self.prepared_cases()
+        allowed = self.api("jadx_request_allowed")
+        for name, request in prepared.items():
+            with self.subTest(case=name):
+                self.assertTrue(allowed("jadx.method", copy.deepcopy(request)))
+                self.assertFalse(allowed("jadx.method", public[name]))
+                self.assertFalse(allowed("jadx.shell", request))
+                self.assertFalse(allowed("jadx.method", {**request, "unexpected": 1}))
+        for changed_input in (b"not the approved APK fixture", data + b"\0"):
+            with self.assertRaises(verifier.VerificationError):
+                verifier.jadx_cases(changed_input)
+
+    def test_prepared_request_target_artifact_and_page_changes_are_not_allowlisted(self):
+        _, _, prepared = self.prepared_cases()
+        allowed = self.api("jadx_request_allowed")
+        original = next(request for request in prepared.values() if request["targets"] and request["start"] == 0)
+        self.assertTrue(allowed("jadx.method", original))
+        variants = [{**original, "start": True}, {**original, "start": 1},
+                    {**original, "max_chars": 64}, {**original, "members": original["members"][::-1]}]
+        target = copy.deepcopy(original)
+        target["targets"][0]["class"] = b"Lnot/Approved;".hex()
+        variants.append(target)
+        artifact = copy.deepcopy(original)
+        artifact["members"][0]["sha256"] = "f" * 64
+        variants.append(artifact)
+        for changed in variants:
+            with self.subTest(request=changed):
+                self.assertFalse(allowed("jadx.method", changed))
+
+    def test_fixed_prepared_request_runs_with_jadx_selector_and_cleans_owned_container(self):
+        _, _, prepared = self.prepared_cases()
+        self.api("jadx_request_allowed")
+        boundary = JadxFakeBoundary()
+        native = self.native(boundary)
+        request = next(iter(prepared.values()))
+        argv = boundary.build_argv(IMAGE_ID, "reverseai-unit-owned", str(SNAPSHOT), "jadx.method", request)
+        self.assertEqual(native.runner(argv, timeout=120, max_output=262144), b"canned worker reply")
+        self.assertEqual(native.inspected, 1)
+        starts = [row for row in boundary.calls if row[0][:2] == ["docker", "start"]]
+        self.assertEqual(starts, [(["docker", "start", "--attach", boundary.CID], 120, 262144)])
+        self.assertIn((starts[0][0], "jadx"), boundary.selectors)
+        self.assertTrue(native.receipt["cleanup"][0]["verified"])
+        self.assertEqual(boundary.calls[-2][0], ["docker", "rm", "--force", boundary.CID])
+
+    def test_arbitrary_valid_worker_requests_refuse_before_any_container_create(self):
+        _, public, prepared = self.prepared_cases()
+        allowed = self.api("jadx_request_allowed")
+        request = next(iter(prepared.values()))
+        invalid = (("jadx.method", {}), ("jadx.method", next(iter(public.values()))),
+                   ("jadx.method", {**request, "unexpected": 1}), ("ghidra.analyze", request))
+        for operation, args in invalid:
+            boundary = JadxFakeBoundary()
+            native = self.native(boundary)
+            self.assertFalse(allowed(operation, args))
+            argv = boundary.build_argv(IMAGE_ID, "reverseai-unit-owned", str(SNAPSHOT), operation, args)
+            with self.subTest(operation=operation, args=args), self.assertRaises(verifier.VerificationError):
+                native.runner(argv, timeout=120, max_output=262144)
+            self.assertEqual(boundary.calls, [])
+
+# This is the public request allow-list, not a pin on decompiler-generated text.
+JADX_TARGETS = {
+    "main_init": ("classes.dex", fixtures_apk.MAIN, "<init>", "()V"),
+    "helper_int": ("classes.dex", fixtures_apk.MAIN, "helper", "(I)I"),
+    "helper_string": ("classes.dex", fixtures_apk.MAIN, "helper", "(Ljava/lang/String;)I"),
+    "on_create": ("classes.dex", fixtures_apk.MAIN, "onCreate", "(Landroid/os/Bundle;)V"),
+    "marker_init": ("classes.dex", fixtures_apk.MARKER, "<init>", "(Ljava/lang/String;)V"),
+    "compute": ("classes.dex", fixtures_apk.HELPER, "compute", "(II)I"),
+    "worker_init": ("classes2.dex", fixtures_apk.WORKER, "<init>", "()V"),
+    "run": ("classes2.dex", fixtures_apk.WORKER, "run", "()V"),
+}
+
+
+class JadxKnownAnswerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.data, cls.layout = fixtures_apk.apk_basic()
+
+    def setUp(self):
+        self.assertTrue(callable(getattr(verifier, "jadx_cases", None)), "JADX oracle is not implemented")
+
+    def observation(self, label="helper_int", *, form="java", start=0, total=None, text="opaque method text"):
+        member, owner, name, prototype = JADX_TARGETS["helper_int" if label == "past_end" else label]
+        method, = [m for c in self.layout["dex"][member]["classes"] if c["name"] == owner
+                   for m in c["methods"] if (m["name"], m["prototype"]) == (name, prototype)]
+        artifact = next(m["artifact"] for m in self.layout["members"] if m["name"] == member)
+        value = dict(kind="java", dex=member, **{"class": owner}, name=name, prototype=prototype,
+                     form=form, start=start, total=len(text) if total is None else total, text=text)
+        return Observation(Location(method["code_offset"] + 16, min(method["code_units"] * 2, 4096)),
+                           value, copy.deepcopy(artifact))
+
+    def compare(self, label, rows, *, expected_form=None):
+        if expected_form is not None:
+            with mock.patch.dict(verifier.JADX_FORMS, {label: expected_form}):
+                return verifier.compare_jadx_observations(self.data, verifier.jadx_cases(self.data)[label], rows)
+        return verifier.compare_jadx_observations(self.data, verifier.jadx_cases(self.data)[label], rows)
+
+    def test_public_requests_pin_all_eight_fixture_methods_and_the_past_end_case(self):
+        cases = verifier.jadx_cases(self.data)
+        self.assertEqual(tuple(cases), (*JADX_TARGETS, "past_end"))
+        for label, identity in JADX_TARGETS.items():
+            expected = dict(zip(("member", "class", "method", "prototype"), identity))
+            self.assertEqual(cases[label], {**expected, "start": 0, "max_chars": 1024})
+            # These synthetic pages validate the comparator, not native Java generation.
+            form = verifier.JADX_FORMS[label]
+            if form is None:
+                with self.assertRaises(verifier.VerificationError):
+                    self.compare(label, (self.observation(label),))
+            else:
+                row = self.observation(label, form=form, **({"text": "", "total": 0} if form == "omitted" else {}))
+                self.assertIsNone(self.compare(label, (row,)))
+        declared = {(member, c["name"], m["name"], m["prototype"])
+                    for member, layout in self.layout["dex"].items() for c in layout["classes"]
+                    for m in c["methods"] if m["code_units"]}
+        self.assertEqual(set(JADX_TARGETS.values()), declared)
+        self.assertEqual(len(declared), 8)
+        self.assertEqual(cases["past_end"], {**cases["helper_int"], "start": 1048575, "max_chars": 64})
+        cases["helper_int"]["class"] = "mutated"
+        self.assertEqual(verifier.jadx_cases(self.data)["helper_int"]["class"], fixtures_apk.MAIN)
+
+    def test_all_forms_and_past_end_page_validate_without_native_text_spelling(self):
+        for form in ("java", "fallback", "omitted", "error"):
+            with self.subTest(form=form):
+                row = self.observation(form=form, **({"text": "", "total": 0} if form in ("omitted", "error") else {}))
+                self.assertIsNone(self.compare("helper_int", (row,), expected_form=form))
+        row = self.observation("past_end", start=87, total=87, text="")
+        self.assertIsNone(self.compare("past_end", (row,), expected_form="java"))
+        self.assertIsNone(self.compare("helper_int", (self.observation(text="other opaque text"),)))
+        # A pending measurement never authorizes a green native known answer.
+        with mock.patch.dict(verifier.JADX_FORMS, {"marker_init": None}), self.assertRaises(verifier.VerificationError):
+            self.compare("marker_init", (self.observation("marker_init"),))
+
+    def test_exact_bytes_and_fixed_request_args_are_required(self):
+        cases = verifier.jadx_cases(self.data)
+        args, row = cases["helper_int"], self.observation()
+        for data in (b"", self.data[:-1], self.data + b"x", bytes([self.data[0] ^ 1]) + self.data[1:]):
+            with self.subTest(input_bytes=len(data)), self.assertRaises(verifier.VerificationError):
+                verifier.jadx_cases(data)
+            with self.assertRaises(verifier.VerificationError):
+                verifier.compare_jadx_observations(data, args, (row,))
+        changes = ({"member": ""}, {"class": "Lunknown;"}, {"method": "helper", "prototype": ""},
+                   {"start": 1}, {"start": False}, {"max_chars": 64}, {"extra": "x"})
+        for change in changes:
+            with self.subTest(args=change), self.assertRaises(verifier.VerificationError):
+                verifier.compare_jadx_observations(self.data, {**args, **change}, (row,))
+        for bad in (None, {}, [], {k: v for k, v in args.items() if k != "class"}):
+            with self.assertRaises(verifier.VerificationError):
+                verifier.compare_jadx_observations(self.data, bad, (row,))
+
+    def test_absent_extra_duplicate_or_wrongly_typed_observations_are_refused(self):
+        row = self.observation()
+        for rows in ((), (row, row), (row, self.observation("helper_string")), ({} ,), None, {"row": row}):
+            with self.subTest(rows=repr(rows)), self.assertRaises(verifier.VerificationError):
+                self.compare("helper_int", rows)
+
+    def test_each_identity_field_and_every_artifact_field_is_bound(self):
+        row = self.observation()
+        for field, wrong in (("kind", "method"), ("dex", "classes2.dex"), ("class", fixtures_apk.HELPER),
+                             ("name", "compute"), ("prototype", "()V")):
+            with self.subTest(field=field), self.assertRaises(verifier.VerificationError):
+                self.compare("helper_int", (replace(row, value={**row.value, field: wrong}),))
+        for field in row.artifact:
+            changed = copy.deepcopy(row)
+            old = changed.artifact[field]
+            changed.artifact[field] = "0" * 64 if field == "sha256" else old + "x" if isinstance(old, str) else old + 1
+            with self.subTest(artifact_field=field), self.assertRaises(verifier.VerificationError):
+                self.compare("helper_int", (changed,))
+        for location in (Location(row.location.offset + 1, row.location.length),
+                         Location(row.location.offset, row.location.length - 1)):
+            with self.assertRaises(verifier.VerificationError):
+                self.compare("helper_int", (replace(row, location=location),))
+
+    def test_malformed_or_incomplete_java_pages_are_refused(self):
+        row = self.observation()
+        changes = ({"extra": 0}, {"form": "smali"}, {"form": "error"}, {"form": "omitted"},
+                   {"start": True}, {"total": False}, {"start": 1}, {"total": -1}, {"total": 2**32},
+                   {"total": len(row.value["text"]) - 1}, {"text": "", "total": 3},
+                   {"text": "x", "total": 0}, {"text": "a\rb"}, {"text": "café"},
+                   {"text": "a\x00b"}, {"text": 1}, {"text": "x" * 1025, "total": 1025})
+        for change in changes:
+            with self.subTest(change=change), self.assertRaises(verifier.VerificationError):
+                self.compare("helper_int", (replace(row, value={**row.value, **change}),))
+        for form in ("java", "fallback"):
+            with self.subTest(empty_native_form=form), self.assertRaises(verifier.VerificationError):
+                self.compare("helper_int", (self.observation(form=form, text="", total=0),), expected_form=form)
+        omitted = self.observation(form="omitted", text="", total=0)
+        for change in ({"start": 1, "total": 1}, {"text": "x", "total": 1}):
+            with self.assertRaises(verifier.VerificationError):
+                self.compare("helper_int", (replace(omitted, value={**omitted.value, **change}),))
+        with self.assertRaises(verifier.VerificationError):
+            self.compare("helper_int", (row,), expected_form="omitted")
+        with self.assertRaises(verifier.VerificationError):
+            self.compare("helper_int", (row,), expected_form="unknown")
+        past = self.observation("past_end", start=87, total=87, text="")
+        for change in ({"start": 1048575}, {"start": 86}, {"text": "x"},
+                       {"start": 0, "total": 0},
+                       {"start": 1048575, "total": 1048576, "text": "x"}):
+            with self.subTest(past_end_change=change), self.assertRaises(verifier.VerificationError):
+                self.compare("past_end", (replace(past, value={**past.value, **change}),), expected_form="java")
+
+
+class JadxNativeFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.assertTrue(callable(getattr(verifier, 'jadx_cases', None)), 'JADX verifier is not implemented')
+        self.data, self.layout = fixtures_apk.apk_basic()
+        self.lock = json.loads(verifier.JADX_WORKER_PATH.with_name('image.lock.json').read_text())
+        self.lock['image_id'] = IMAGE_ID
+        self.receipt = {'checks': [], 'cleanup': []}
+        self.native = verifier.NativeVerifier(JadxFakeBoundary(), self.lock, self.receipt, tool='jadx')
+        self.native.image = image_fixture()
+
+    def reply(self, case='compute'):
+        args = verifier.jadx_cases(self.data)[case]
+        method, = [m for c in self.layout['dex'][args['member']]['classes'] if c['name'] == args['class']
+                   for m in c['methods'] if (m['name'], m['prototype']) == (args['method'], args['prototype'])]
+        form = verifier.JADX_FORMS[case]
+        text = 'static int synthetic() { return 1; }'
+        row = {'target': 0, 'status': 'ok', 'code_offset': method['code_offset'],
+               'insns_count': method['code_units'], 'total': len(text),
+               'text': text[args['start']:args['start'] + args['max_chars']]}
+        if form == 'omitted':
+            row.update(status='omitted', code_offset=None, insns_count=None, total=0, text='')
+        return {'protocol': WORKER_PROTOCOL, 'status': 'ok', 'snapshot_sha256': sha256_hex(self.data),
+                'observations': [row]}
+
+    def test_all_nine_cases_use_real_host_admission_and_the_independent_oracle(self):
+        from reverseai.tools import jadx_verify
+        for case, args in verifier.jadx_cases(self.data).items():
+            raw = json.dumps(self.reply(case)).encode()
+            with self.subTest(case=case), mock.patch.object(self.native, 'invoke', return_value=raw) as invoke:
+                evidence = self.native.known_answer(self.data, 'jadx.method', args)
+                self.assertEqual(evidence['observations'], 1)
+                self.assertEqual(evidence['args'], args)
+                invoke.assert_called_once_with(self.data, 'jadx.method', jadx_verify.prepare(self.data, args)[0])
+
+    def test_unknown_public_requests_refuse_before_invoking_the_executor(self):
+        args = verifier.jadx_cases(self.data)['compute']
+        with mock.patch.object(self.native, 'invoke', side_effect=AssertionError('worker ran')) as invoke:
+            for data, operation, checked in ((self.data, 'jadx.shell', args),
+                                              (self.data + b'x', 'jadx.method', args),
+                                              (self.data, 'jadx.method', {**args, 'max_chars': 65})):
+                with self.subTest(operation=operation), self.assertRaises(verifier.VerificationError):
+                    self.native.known_answer(data, operation, checked)
+            invoke.assert_not_called()
+
+    def test_malformed_replies_cannot_bypass_real_host_admission(self):
+        args = verifier.jadx_cases(self.data)['compute']
+        changes = ('protocol', 'input', 'missing', 'extra', 'offset', 'target', 'control')
+        for mode in changes:
+            value = self.reply()
+            if mode == 'protocol':
+                value['protocol'] = 'foreign/1'
+            elif mode == 'input':
+                value['snapshot_sha256'] = '0' * 64
+            elif mode == 'missing':
+                value['observations'] = []
+            elif mode == 'extra':
+                value['observations'][0]['unexpected'] = True
+            elif mode == 'offset':
+                value['observations'][0]['code_offset'] += 4
+            elif mode == 'target':
+                value['observations'][0]['target'] = True
+            else:
+                value['observations'][0]['text'] = '\x1b'
+            with self.subTest(mode=mode), mock.patch.object(self.native, 'invoke', return_value=json.dumps(value).encode()), \
+                    self.assertRaises(ContractError):
+                self.native.known_answer(self.data, 'jadx.method', args)
+        # A host-admissible but incorrect native form must still fail the independent oracle.
+        value = self.reply()
+        value['observations'][0]['status'] = 'fallback'
+        with mock.patch.object(self.native, 'invoke', return_value=json.dumps(value).encode()), \
+                self.assertRaises(verifier.VerificationError):
+            self.native.known_answer(self.data, 'jadx.method', args)
+
+    def test_negative_controls_require_a_healthy_actual_reply_before_corruption(self):
+        args = verifier.jadx_cases(self.data)['compute']
+        for negative in ('shape', 'input'):
+            with self.subTest(negative=negative), \
+                    mock.patch.object(self.native, 'invoke', return_value=json.dumps(self.reply()).encode()) as invoke:
+                result = self.native.jadx_known_answer(self.data, args, negative=negative)
+                self.assertEqual(result['refused'], negative)
+                self.assertEqual(invoke.call_count, 1)
+            unhealthy = self.reply()
+            unhealthy['snapshot_sha256'] = '0' * 64
+            with mock.patch.object(self.native, 'invoke', return_value=json.dumps(unhealthy).encode()), \
+                    self.assertRaises(verifier.VerificationError):
+                self.native.jadx_known_answer(self.data, args, negative=negative)
+
+    def test_full_plan_requires_24_checks_and_21_unique_verified_cleanups(self):
+        calls = []
+
+        def inspected(label):
+            calls.append(label)
+            self.native.inspected += 1
+            self.receipt['cleanup'].append({'container_id': f'{len(calls):064x}',
+                                            'verified': True, 'staging_removed': True})
+            return {'synthetic': label}
+
+        with mock.patch.object(self.native, 'local_daemon', return_value={}), \
+                mock.patch.object(self.native, 'image_check', return_value={}), \
+                mock.patch.object(self.native, 'control', side_effect=lambda name, data: inspected(name)), \
+                mock.patch.object(self.native, 'known_answer', side_effect=lambda data, op, args: inspected(args)), \
+                mock.patch.object(self.native, 'jadx_known_answer',
+                                  side_effect=lambda data, args, negative: inspected(negative)):
+            self.native.run()
+        self.assertEqual([r['id'] for r in self.receipt['checks']],
+                         [name for name in verifier.JADX_REQUIRED_CHECKS if name != 'container'] + ['container'])
+        self.assertEqual({r['status'] for r in self.receipt['checks']}, {'passed'})
+        self.assertEqual(len(calls), 21)
+        self.assertEqual(calls[:10], list(verifier.CONTROL_NAMES))
+        self.assertEqual(calls[10:19], list(verifier.jadx_cases(self.data).values()))
+        self.assertEqual(calls[-2:], ['shape', 'input'])
+        receipt = receipt_fixture()
+        receipt.update(tool='jadx', lock=self.lock, **self.receipt)
+        self.assertTrue(verifier.receipt_passes(receipt))
+        self.native.inspected = 20
+        self.assertFalse(self.native.record('container', lambda: verifier.need(
+            self.native.inspected == self.native.native_runs, 'ContainerInspectionMissing')))
+
+    def test_cli_loads_exact_jadx_profile_and_refuses_bad_lock_before_native_work(self):
+        def finish(native):
+            native.receipt.update(checks=[{'id': name, 'status': 'passed'} for name in verifier.JADX_REQUIRED_CHECKS],
+                cleanup=[{'container_id': f'{i + 1:064x}', 'verified': True, 'staging_removed': True} for i in range(21)],
+                image_id=native.lock['image_id'])
+
+        with tempfile.TemporaryDirectory() as folder:
+            lock, receipt = Path(folder, 'lock.json'), Path(folder, 'receipt.json')
+            lock.write_text(json.dumps(self.lock))
+            argv = ['--tool', 'jadx', '--profile', 'small', '--offline', '--lock', str(lock), '--receipt', str(receipt)]
+            real = verifier.NativeVerifier
+
+            def factory(boundary, checked, result, **kwargs):
+                self.assertEqual(kwargs, {'tool': 'jadx'})
+                native = real(boundary, checked, result, **kwargs)
+                native.run = lambda: finish(native)
+                return native
+
+            with mock.patch.object(verifier, 'NativeVerifier', side_effect=factory):
+                self.assertEqual(verifier.main(argv), 0)
+            self.assertTrue(json.loads(receipt.read_text())['passed'])
+            receipt.unlink()
+            lock.write_text(json.dumps({**self.lock, 'wheel_sha256': 'f' * 64}))
+            with mock.patch.object(verifier, 'NativeVerifier') as native:
+                self.assertEqual(verifier.main(argv), 1)
+                native.assert_not_called()
+            refused = json.loads(receipt.read_text())
+            self.assertFalse(refused['passed'])
+            self.assertIn('JadxLockPins', [r.get('reason') for r in refused['checks']])
 
 
 if __name__ == "__main__":
