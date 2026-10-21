@@ -349,6 +349,9 @@ class DexTests(unittest.TestCase):
             if dex.sections[name][0]:
                 self.assertEqual(by_type[F.MAP_TYPES[name]], dex.sections[name])
         self.assertEqual(by_type[F.MAP_TYPES["map_list"]], (1, dex.map_off))
+        for kind, offsets in (("class_data", [c["class_data_offset"] for c in layout["classes"] if c["class_data_offset"]]),
+                              ("code", [item["offset"] for item in layout["code_items"]])):
+            self.assertEqual(by_type.get(F.MAP_TYPES[kind]), (len(offsets), min(offsets)) if offsets else None)
         # id tables: decoded equal to the layout and in the order the format requires
         strings = [dex.string(i) for i in range(dex.sections["string_ids"][0])]
         self.assertEqual(strings, [s["value"] for s in layout["strings"]])
@@ -377,12 +380,16 @@ class DexTests(unittest.TestCase):
             self.assertEqual((fields_[1], types[fields_[2]], dex.type_list(fields_[3])), (row["access"], row["superclass"], row["interfaces"]))
             self.assertEqual(None if fields_[4] == F.NO_INDEX else strings[fields_[4]], row["source_file"])
             self.assertEqual((fields_[5], fields_[6], fields_[7]), (0, row["class_data_offset"], 0))
-            statics, instances, directs, virtuals = dex.class_data(row["class_data_offset"])
+            statics, instances, directs, virtuals = (dex.class_data(row["class_data_offset"])
+                                                     if row["class_data_offset"] else ([], [], [], []))
             self.assertEqual([(i, a) for i, a, _ in statics + instances],
                              [(f["field_index"], f["access"]) for f in row["fields"]])
             listed = [(i, a, c, d) for d, group in ((True, directs), (False, virtuals)) for i, a, c in group]
-            self.assertEqual(listed, [(m["index"], m["access"], m["code_offset"], m["direct"]) for m in row["methods"]])
+            self.assertEqual(listed, [(m["index"], m["access"], m["code_offset"] or 0, m["direct"]) for m in row["methods"]])
             for method in row["methods"]:
+                if method["code_offset"] is None:  # abstract or native
+                    self.assertEqual((method["code_units"], method["access"] & 0x500 != 0), (None, True))
+                    continue
                 registers, ins, outs, tries, debug, units = struct.unpack_from("<HHHHII", data, method["code_offset"])
                 self.assertEqual((registers, ins, outs, tries, debug, units, method["code_offset"] % 4),
                                  (method["registers"], method["ins"], method["outs"], 0, 0, method["code_units"], 0))
@@ -430,6 +437,28 @@ class DexTests(unittest.TestCase):
         self.assertEqual([(c["name"], c["interfaces"]) for c in layout2["classes"]], [(F.WORKER, [F.RUNNABLE])])
         self.assertEqual([(r["method"], r["target"]) for r in layout2["references"] if r["opcode"] == "invoke-static"],
                          [("run", "Lorg/reverseai/fixture/Helper;->compute(II)I")])
+
+    def test_a_dex_without_code_items_or_class_data(self):
+        # FIX-M4A-F: dex_file builds a valid DEX when no method has code (an interface with an abstract method, a class
+        # with a static field only, and an empty class with no class_data).
+        from reverseai.tools import dex as tool
+        classes = ({"name": "La/Api;", "super": F.OBJECT, "access": 0x601,
+                    "virtual": (F._method("call", "I", (F.STRING,), 0x401, 0, 0, 0),)},
+                   {"name": "La/Constants;", "super": F.OBJECT, "access": 0x11,
+                    "static_fields": (("LIMIT", "I", 0x19),)},
+                   {"name": "La/Empty;", "super": F.OBJECT, "access": 0x1})
+        data, layout = F.dex_file(classes)
+        self.check(data, layout)
+        self.assertNotIn(F.MAP_TYPES["code"], [row["type"] for row in layout["map"]])
+        self.assertEqual([c["class_data_offset"] == 0 for c in layout["classes"]], [False, False, True])
+        self.assertEqual(layout["classes"][0]["methods"][0]["code_offset"], None)
+        parsed = tool.parse(data)
+        self.assertEqual([c["class_descriptor"] for c in parsed["classes"]], ["La/Api;", "La/Constants;", "La/Empty;"])
+        self.assertEqual(parsed["classes"][0]["class_data"]["virtual_methods"][0]["code_off"], 0)
+        self.assertIsNone(parsed["classes"][2]["class_data"])
+        data, layout = F.dex_file(classes[1:])  # no method at all (formerly an IndexError)
+        self.check(data, layout)
+        self.assertEqual(len(tool.parse(data)["methods"]), 0)
 
     def test_mutf8_and_uleb128(self):
         self.assertEqual(F.mutf8("a\0\u00e9\u20ac\U0001F600"),

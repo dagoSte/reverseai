@@ -230,11 +230,11 @@ def _walk(element):
         yield from _walk(child)
 
 
-def _manifest_strings():
+def _manifest_strings(manifest):
     """Attribute names with resource IDs first, in ID order (they index the resource map), then first use."""
-    names = {name for element in _walk(MANIFEST) for android, name, _ in element[3] if android}
+    names = {name for element in _walk(manifest) for android, name, _ in element[3] if android}
     strings = sorted(names, key=ATTRIBUTE_IDS.__getitem__) + ["android", ANDROID_NS]
-    for tag, _, _, attributes, _ in _walk(MANIFEST):
+    for tag, _, _, attributes, _ in _walk(manifest):
         for text in [tag] + [text for _, name, value in attributes for text in (name, value) if isinstance(text, str)]:
             if text not in strings:
                 strings.append(text)
@@ -278,9 +278,12 @@ def _typed(value, index):
     return index[value], TYPE_STRING, index[value], "string", value
 
 
-def manifest_axml(utf8=False):
-    """(data, layout) of AndroidManifest.xml as aapt2 lays it out; the string pool is UTF-16LE unless utf8."""
-    strings = _manifest_strings()
+def manifest_axml(utf8=False, manifest=MANIFEST):
+    """(data, layout) of AndroidManifest.xml as aapt2 lays it out; the string pool is UTF-16LE unless utf8.
+
+    manifest is a tree shaped like MANIFEST; its attribute names must be in ATTRIBUTE_IDS when android ones.
+    """
+    strings = _manifest_strings(manifest)
     index = {text: i for i, text in enumerate(strings)}
     pool, string_offsets = string_pool(strings, utf8)
     ids = [ATTRIBUTE_IDS[text] for text in strings if text in ATTRIBUTE_IDS]  # a prefix of the pool
@@ -314,9 +317,9 @@ def manifest_axml(utf8=False):
         record["end_offset"] = base + len(body)
         node(XML_END_ELEMENT, end_line, struct.pack("<II", NO_ENTRY, index[tag]))
 
-    node(XML_START_NAMESPACE, MANIFEST[1], struct.pack("<II", index["android"], index[ANDROID_NS]))
-    element(MANIFEST, 0)
-    node(XML_END_NAMESPACE, MANIFEST[2], struct.pack("<II", index["android"], index[ANDROID_NS]))
+    node(XML_START_NAMESPACE, manifest[1], struct.pack("<II", index["android"], index[ANDROID_NS]))
+    element(manifest, 0)
+    node(XML_END_NAMESPACE, manifest[2], struct.pack("<II", index["android"], index[ANDROID_NS]))
     data = struct.pack("<HHI", XML, 8, base + len(body)) + pool + resource_map + bytes(body)
 
     def by_tag(tag):
@@ -331,7 +334,10 @@ def manifest_axml(utf8=False):
                                     for i, (text, offset) in enumerate(zip(strings, string_offsets))]},
         "resource_map": {"offset": 8 + len(pool), "size": len(resource_map), "ids": ids},
         "chunks": chunks, "elements": elements, "attributes": attributes,
-        "package": PACKAGE, "version_code": 7, "version_name": "1.0", "min_sdk": 21, "target_sdk": 34,
+        "package": value(elements[0], "package"), "version_code": value(elements[0], "android:versionCode"),
+        "version_name": value(elements[0], "android:versionName"),
+        "min_sdk": value(by_tag("uses-sdk")[0], "android:minSdkVersion"),
+        "target_sdk": value(by_tag("uses-sdk")[0], "android:targetSdkVersion"),
         "permissions": sorted(value(e, "android:name") for e in by_tag("uses-permission")),
         "components": [{"element": e["name"], "name": value(e, "android:name"), "exported": value(e, "android:exported")}
                        for e in by_tag("activity") + by_tag("service")],
@@ -549,6 +555,8 @@ def dex_file(classes, version="035"):
                            key=lambda row: row[0])
         ordered[spec["name"]] = rows
         for method_index, _, method in rows:
+            if not method["code"]:  # abstract or native: code_off 0
+                continue
             align()
             offset, units = len(data), []
             for instruction in method["code"]:
@@ -581,13 +589,15 @@ def dex_file(classes, version="035"):
         units, raw = mutf8(text)
         data += uleb128(units) + raw + b"\0"
 
-    class_data = []
+    class_data = []  # offset per class, 0 for a class with no fields and no methods
     for spec in classes:
-        class_data.append(len(data))
         statics = sorted((fidx[(spec["name"], n, t)], a) for n, t, a in spec.get("static_fields", ()))
         instances = sorted((fidx[(spec["name"], n, t)], a) for n, t, a in spec.get("instance_fields", ()))
         directs = [(i, m) for i, d, m in ordered[spec["name"]] if d]
         virtuals = [(i, m) for i, d, m in ordered[spec["name"]] if not d]
+        class_data.append(len(data) if statics or instances or directs or virtuals else 0)
+        if not class_data[-1]:
+            continue
         data += b"".join(uleb128(len(group)) for group in (statics, instances, directs, virtuals))
         for group in (statics, instances):
             previous = 0
@@ -597,19 +607,24 @@ def dex_file(classes, version="035"):
         for group in (directs, virtuals):
             previous = 0
             for method_index, method in group:
+                code = code_offsets.get(method_index)
                 data += (uleb128(method_index - previous) + uleb128(method["access"])
-                         + uleb128(code_offsets[method_index]["offset"]))
+                         + uleb128(code["offset"] if code else 0))
                 previous = method_index
 
     align()
     map_off = len(data)
     items = [(MAP_TYPES["header"], 1, 0)] + [(MAP_TYPES[name], count, sections[name][1])
                                               for name, count in counts.items() if count]
-    items += [(MAP_TYPES["code"], len(code_items), code_items[0]["offset"])]
+    if code_items:
+        items.append((MAP_TYPES["code"], len(code_items), code_items[0]["offset"]))
     if lists:
         items.append((MAP_TYPES["type_list"], len(lists), list_offsets[lists[0]]))
-    items += [(MAP_TYPES["string_data"], len(string_data), string_data[0]),
-              (MAP_TYPES["class_data"], len(class_data), class_data[0]), (MAP_TYPES["map_list"], 1, map_off)]
+    items.append((MAP_TYPES["string_data"], len(string_data), string_data[0]))
+    with_data = [offset for offset in class_data if offset]
+    if with_data:
+        items.append((MAP_TYPES["class_data"], len(with_data), with_data[0]))
+    items.append((MAP_TYPES["map_list"], 1, map_off))
     data += struct.pack("<I", len(items)) + b"".join(struct.pack("<HHII", kind, 0, count, offset)
                                                      for kind, count, offset in items)
 
@@ -665,7 +680,8 @@ def dex_file(classes, version="035"):
                                 for n, t, a in spec.get(key, ())],
                      "methods": [{**method_rows[(spec["name"], m["name"], m["ret"], m["params"])], "direct": direct,
                                   "access": m["access"], "registers": m["registers"], "ins": m["ins"], "outs": m["outs"],
-                                  "code_offset": code_offsets[i_]["offset"], "code_units": code_offsets[i_]["code_units"]}
+                                  "code_offset": code_offsets[i_]["offset"] if i_ in code_offsets else None,
+                                  "code_units": code_offsets[i_]["code_units"] if i_ in code_offsets else None}
                                  for i_, direct, m in ordered[spec["name"]]]}
                     for i, spec in enumerate(classes)],
         "code_items": code_items, "references": references,
