@@ -774,6 +774,69 @@ class DexOperationTests(unittest.TestCase):
 
 
 class DexChildEvidenceTests(unittest.TestCase):
+    def test_shared_fixture_classes_and_methods_equal_declared_layouts(self):
+        from tests.fixtures_apk import apk_basic
+        data, layout = apk_basic()
+        spec = dex.TOOL.operations['dex.classes']
+        rows = spec.handler(data, spec.validate_args({}))
+        expected = []
+        for member, child in layout['dex'].items():
+            for cls in child['classes']:
+                expected.append((member, cls))
+        self.assertEqual(len(rows), len(expected))
+        for i, (row, (member, cls)) in enumerate(zip(rows, expected)):
+            self.assertEqual((row.location.offset, row.location.length), (cls['offset'], 32))
+            self.assertEqual(row.value, dict(kind='class', index=i, total=len(expected), dex=member,
+                                           **{k: cls[k] for k in ('name', 'access', 'superclass', 'interfaces', 'source_file')}))
+            spec = dex.TOOL.operations['dex.methods']
+            methods = spec.handler(data, spec.validate_args({'member': member, 'class': cls['name']}))
+            self.assertEqual(len(methods), len(cls['methods']))
+            for j, (observed, declared) in enumerate(zip(methods, cls['methods'])):
+                self.assertEqual((observed.location.offset, observed.location.length), (declared['offset'], 8))
+                self.assertEqual(observed.value, dict(kind='method', dex=member, index=j, total=len(methods),
+                                                     **{k: declared[k] for k in ('class', 'name', 'prototype', 'access',
+                                                                                'code_offset', 'code_units')}))
+
+    def test_shared_fixture_every_declared_reference_and_cross_member_incoming(self):
+        from tests.fixtures_apk import HELPER, apk_basic
+        data, layout = apk_basic()
+        spec = dex.TOOL.operations['dex.references']
+        for member, child in layout['dex'].items():
+            for cls in child['classes']:
+                for method in cls['methods']:
+                    args = dict(member=member, **{'class': cls['name'], 'method': method['name'],
+                                                 'prototype': method['prototype']})
+                    rows = spec.handler(data, spec.validate_args(args))
+                    expected = [r for r in child['references'] if (r['class'], r['method'], r['prototype'])
+                                == (cls['name'], method['name'], method['prototype'])]
+                    self.assertEqual(len(rows), len(expected))
+                    for i, (row, ref) in enumerate(zip(rows, expected)):
+                        self.assertEqual((row.location.offset, row.location.length), (ref['at'], ref['length']))
+                        self.assertEqual(row.value, dict(kind='dex_ref', index=i, total=len(expected), dex=member,
+                                                        from_class=ref['class'], from_method=ref['method'],
+                                                        from_prototype=ref['prototype'],
+                                                        **{k: ref[k] for k in ('at', 'ref_kind', 'target', 'target_truncated')}))
+                        self.assertEqual(row.artifact, next(m['artifact'] for m in layout['members'] if m['name'] == member))
+        args = {'class': HELPER, 'method': 'compute', 'prototype': '(II)I', 'direction': 'to'}
+        rows = spec.handler(data, spec.validate_args(args))
+        self.assertEqual([(r.value['dex'], r.value['from_method'], r.value['at']) for r in rows],
+                         [('classes.dex', 'helper', 552), ('classes2.dex', 'run', 308)])
+        self.assertEqual([r.value['total'] for r in rows], [2, 2])
+        page = spec.handler(data, spec.validate_args({**args, 'start': 1, 'limit': 1}))
+        self.assertEqual(page, rows[1:])
+
+    def test_shared_fixture_versions_and_hostile_dex_controls(self):
+        from tests.fixtures_apk import classes_dex, classes2_dex, dex_hostile
+        for version in ('035', '037', '038', '039'):
+            for builder in (classes_dex, classes2_dex):
+                child, layout = builder(version)
+                parsed = dex.parse(child)
+                self.assertEqual(parsed['header']['checksum'], layout['checksum'])
+                self.assertEqual([r['descriptor'] for r in parsed['types']], [r['descriptor'] for r in layout['types']])
+        for defect in ('checksum', 'version_040', 'string_ids'):
+            with self.subTest(defect=defect), self.assertRaisesRegex(dex.DexError, '^Invalid DEX structure$'):
+                dex.parse(dex_hostile(defect)[0])
+
     def test_real_stored_and_deflated_children_flow_through_gateway_and_reviewer(self):
         from reverseai import claims
         from reverseai.contract import (
