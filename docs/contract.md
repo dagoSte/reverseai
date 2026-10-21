@@ -236,7 +236,9 @@ Same container interface and reply protocol as M2a; what differs:
     first bytes (at most 4,096), functions address-sorted, index from 0;
   - `{"kind": "pseudocode", "index", "entry", "text", "truncated"}` at the same
     anchor, for the entry-point function and then the largest functions
-    (ties by lower entry), `decompile` in all, text cut at `max_chars`;
+    (ties by lower entry), `decompile` in all, text cut at `max_chars`
+    characters and, when needed, to the longest prefix whose observation value
+    fits 4,096 bytes (`truncated` true when cut; decision `m3c-pseudocode-fit`);
   - `{"kind": "call", "from", "to", "to_name"}` at the call instruction's bytes.
   `name`/`to_name` are at most 128 printable characters. Values are virtual
   addresses; the host maps each anchor through its own section table and refuses
