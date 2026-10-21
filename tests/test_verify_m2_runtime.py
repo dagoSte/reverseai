@@ -2679,11 +2679,13 @@ def ghidra_worker_records(layout, *, pseudocode=None, names=None, sizes=None):
                       "entry": function["value"]["entry"],
                       "text": "canned derived text; no C spelling is asserted", "truncated": False},
         })
+    expected_calls = sorted(layout["calls"] + [row for row in layout.get("refs", []) if row["type"] == "jump"],
+                            key=lambda row: row["offset"])
     calls = [
         {"location": {"offset": row["offset"], "length": row["length"]},
          "value": {"kind": "call", "from": row["from"], "to": row["to"],
                    "to_name": name_at_entry[row["to"]]}}
-        for row in layout["calls"]
+        for row in expected_calls
     ]
     if "refs" not in layout:
         return records + (calls + texts if default_pseudocode else texts + calls)
@@ -2697,6 +2699,8 @@ def ghidra_worker_records(layout, *, pseudocode=None, names=None, sizes=None):
             "kind": "assembly", "index": value["index"], "entry": value["entry"],
             "instructions": [[*row, "canned instruction"] for row in rows], "truncated": False}})
     for row in layout["refs"]:
+        if row["type"] == "jump":
+            continue
         result.append({"location": {"offset": row["offset"], "length": row["length"]}, "value": {
             "kind": "ref", **{key: row[key] for key in ("from", "to", "type")}, "to_name": row["to_name"] or ""}})
     for row in layout["strings"]:
@@ -3029,7 +3033,8 @@ class GhidraM3cKnownAnswerTests(unittest.TestCase):
             rows = ghidra_worker_records(layout, pseudocode=(0,))
             with self.subTest(format=layout["format"]):
                 self.assertEqual(sum(row["value"]["kind"] == "assembly" for row in rows), 4)
-                self.assertEqual(sum(row["value"]["kind"] == "ref" for row in rows), 6)
+                self.assertEqual(sum(row["value"]["kind"] == "call" for row in rows), 6)
+                self.assertEqual(sum(row["value"]["kind"] == "ref" for row in rows), 5)
                 self.assertEqual([row["value"]["encoding"] for row in rows if row["value"]["kind"] == "string"],
                                  ["ascii", "utf-16le"])
                 self.assertIsNone(verifier.compare_ghidra_observations(data, ghidra_observations(rows)))
@@ -3051,7 +3056,7 @@ class GhidraM3cKnownAnswerTests(unittest.TestCase):
     def test_new_known_answers_refuse_lies_at_otherwise_valid_locations(self):
         for kind, field, bad in (("assembly", "instructions", [[0, 2, "x"]]),
                                 ("assembly", "truncated", True), ("ref", "from", 0),
-                                ("ref", "to", 0), ("ref", "type", "execute"),
+                                ("ref", "to", 0), ("ref", "type", "execute"), ("ref", "type", "write"),
                                 ("string", "text", "forged"), ("string", "encoding", "ascii"),
                                 ("string", "truncated", True), ("string", "from", [0])):
             rows = copy.deepcopy(self.rows)
