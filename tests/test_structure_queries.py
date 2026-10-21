@@ -102,6 +102,21 @@ class StructureQueryTests(unittest.TestCase):
         data, _ = elf(entry=0x999999)
         self.assertIsNone(run('entry', data)[0].value['offset'])
 
+    def test_elf32_entry_anchor_and_mapping_in_both_byte_orders(self):
+        address, delta = 0x8048000, 7
+        for order in ('<', '>'):
+            with self.subTest(order=order):
+                data, layout = elf(width=32, order=order, machine=3, entry=address + delta,
+                                   sections=((b'.text', 1, 0x6, 32),))
+                data = bytearray(data)
+                struct.pack_into(order + 'I', data, layout['shoff'] + layout['entry_size'] + 12, address)
+                data = bytes(data)
+                rows = run('entry', data)
+                value = dict(address=address + delta, offset=layout['offsets'][0] + delta)
+                self.assertEqual([(row.location, row.value) for row in rows],
+                                 [(Location(24, 4), dict(kind='entry', **value))])
+                supported(self, data, 'entry', 'load.entry', rows, value)
+
     def test_entry_thread_field_and_zero_pe_entry(self):
         for flavor, machine, delta in (('x86_thread', 0x1000007, 128), ('arm_thread', 0x100000C, 256)):
             data, layout = macho(entry=flavor, machine=machine)
