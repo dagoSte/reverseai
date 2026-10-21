@@ -287,7 +287,13 @@ def compare_ghidra_observations(data, observations):
         need(type(kind) is str and kind in groups and set(value) == schemas[kind], "KnownAnswerSchema")
         groups[kind].append(item)
     functions, calls = groups["function"], groups["call"]
-    need(len(functions) == len(layout["functions"]) and len(calls) == len(layout["calls"]), "KnownAnswerCount")
+    # The pinned Ghidra reads the refs fixtures' tail jump as CALL_TERMINATOR.
+    entries = {row["entry"] for row in layout["functions"]}
+    tail_calls = [row for row in layout.get("refs", []) if row["type"] == "jump" and row["to"] in entries]
+    expected_calls = sorted(layout["calls"] + tail_calls,
+                            key=lambda row: row["offset"])
+    expected_refs = [row for row in layout.get("refs", []) if row not in tail_calls]
+    need(len(functions) == len(layout["functions"]) and len(calls) == len(expected_calls), "KnownAnswerCount")
     need(not layout["functions"] or groups["pseudocode"], "KnownAnswerPseudocodeMissing")
     for index, (item, expected) in enumerate(zip(functions, layout["functions"])):
         value = item.value
@@ -308,7 +314,7 @@ def compare_ghidra_observations(data, observations):
             need(value["name"] == name,
                  "KnownAnswerELFName" if layout["format"] == "elf" else "KnownAnswerMachOName")
     names = {item.value["entry"]: item.value["name"] for item in functions}
-    for item, expected in zip(calls, layout["calls"]):
+    for item, expected in zip(calls, expected_calls):
         value = item.value
         need(type(value["from"]) is int and type(value["to"]) is int and
              (value["from"], value["to"]) == (expected["from"], expected["to"]) and
@@ -353,13 +359,13 @@ def compare_ghidra_observations(data, observations):
                  "KnownAnswerInstructions")
     need(len(assembly) <= len(selection), "KnownAnswerAssemblyCount")
     refs = groups["ref"]
-    need(len(refs) == len(layout.get("refs", [])), "KnownAnswerRefCount")
-    for item, expected in zip(refs, layout.get("refs", [])):
+    need(len(refs) == len(expected_refs), "KnownAnswerRefCount")
+    for item, expected in zip(refs, expected_refs):
         value = item.value
         need(type(value["from"]) is int and type(value["to"]) is int and
              (value["from"], value["to"]) == (expected["from"], expected["to"]) and
              (item.location.offset, item.location.length) == (expected["offset"], expected["length"]) and
-             value["type"] in ("read", "write", "read_write", "data", "jump") and
+             value["type"] == expected["type"] and
              type(value["to_name"]) is str and len(value["to_name"]) <= 128 and
              all(c.isprintable() for c in value["to_name"]), "KnownAnswerRef")
     strings = groups["string"]
