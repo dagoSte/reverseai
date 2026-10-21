@@ -96,12 +96,59 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("MOV rax", supported)
         for marker in ("### Assembly (derived)", "### References (derived)", "### Referenced strings (derived)",
                        "| File offset | Length | Instruction |", "| `10` | `3` | `MOV rax, [message]` |",
-                       "`message`", "`hello`", "`ascii`", "`4096`", "`8192`"):
+                       "`message`", "`hello`", "`ascii`", "`0x1000`", "`0x2000`"):
             self.assertIn(marker, derived)
         self.assertIn("Truncated: `true`", derived)
         parsed = json.loads(report.to_json(original))
         self.assertEqual([f["value"] for f in parsed["results"][0]["findings"]],
                          [f.value for f in original.results[0].findings])
+
+    def test_code_detail_addresses_are_hex_but_file_offsets_and_lengths_stay_decimal(self):
+        text = report.to_markdown(code_analysis())
+        self.assertIn("#### Function at `0x1000`", text)
+        self.assertIn("| `0x1000` | `read` | `0x2000` | `message` |", text)
+        self.assertIn('| `0x2000` | `ascii` | `hello` | `false` | `["0x1000"]` |', text)
+        self.assertIn("| `10` | `3` | `MOV rax, [message]` |", text)
+
+    def test_generic_m3c_values_format_only_addresses_without_mutating_json(self):
+        original = code_analysis(instruction="MOV rax, 4096", name="8192", text="4096")
+        before = report.to_json(original)
+        generic = report.to_markdown(original).split("### Assembly (derived)")[0]
+        expected = (
+            {"entry": "0x1000", "instructions": [[2, 3, "MOV rax, 4096"]], "truncated": True},
+            [["0x1000", "read", "0x2000", "8192"]],
+            [{"address": "0x2000", "encoding": "ascii", "text": "4096", "truncated": False, "from": ["0x1000"]}],
+        )
+        for value in expected:
+            self.assertIn(report._cell(value), generic)
+        self.assertEqual(report.to_json(original), before)
+        values = [f["value"] for f in json.loads(before)["results"][0]["findings"]]
+        self.assertEqual(values[0]["entry"], 4096)
+        self.assertEqual(values[1][0][2], 8192)
+        self.assertEqual(values[2][0]["from"], [4096])
+
+    def test_legacy_code_values_use_lowercase_hex_including_zero_and_uint64(self):
+        original = code_analysis()
+        result, = original.results
+        values = (
+            ("code.functions", ["4096"]),
+            ("code.calls", [[0xFFFFFFFFFFFFFFFF, "8192"]]),
+            ("code.pseudocode", {"entry": 0, "text": "return 4096;", "truncated": False}),
+        )
+        findings = tuple(make_finding("code", "Tool reading.", key, value, [result.evidence[0].id], "inferred")
+                         for key, value in values)
+        changed = Analysis(original.input, original.tools,
+                           (AnalysisResult(result.task_id, "code", "ok", result.evidence, findings),),
+                           tuple(ReviewVerdict(f.id, "derived", ("Tool reading; not verified.",)) for f in findings))
+        before = report.to_json(changed)
+        text = report.to_markdown(changed)
+        for value in (["4096"], [["0xffffffffffffffff", "8192"]],
+                      {"entry": "0x0", "text": "return 4096;", "truncated": False}):
+            self.assertIn(report._cell(value), text)
+        self.assertEqual(report.to_json(changed), before)
+        parsed = json.loads(before)["results"][0]["findings"]
+        self.assertEqual(parsed[1]["value"], [[18446744073709551615, "8192"]])
+        self.assertEqual(parsed[2]["value"]["entry"], 0)
 
     def test_m3c_detail_cells_keep_hostile_text_inert(self):
         text = report.to_markdown(code_analysis(instruction="`<img src=x>|\nRET", name="[x](https://evil.invalid)",

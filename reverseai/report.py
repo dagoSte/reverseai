@@ -70,6 +70,25 @@ def _cell(value, limit=200):
     return "`" + text.replace("|", "\\|") + "`" if text.strip() else "-"
 
 
+def _address(value):
+    return hex(value) if type(value) is int and value >= 0 else value
+
+
+def _code_value(key, value):
+    """Markdown-only address formatting; leave JSON values and byte offsets intact."""
+    if key in ("code.assembly", "code.pseudocode") and isinstance(value, dict):
+        return {k: _address(v) if k == "entry" else v for k, v in value.items()}
+    if key in ("code.calls", "code.references") and isinstance(value, list):
+        width = 2 if key == "code.calls" else 4
+        return [[_address(v) if i == 0 or (width == 4 and i == 2) else v for i, v in enumerate(row)]
+                if isinstance(row, list) and len(row) == width else row for row in value]
+    if key == "code.strings" and isinstance(value, list):
+        return [{k: _address(v) if k == "address" else [_address(a) for a in v]
+                 if k == "from" and isinstance(v, list) else v for k, v in entry.items()}
+                if isinstance(entry, dict) else entry for entry in value]
+    return value
+
+
 def _code_details(rows):
     """Readable views of derived values; instruction bytes are not carried by Analysis."""
     lines = []
@@ -81,7 +100,7 @@ def _code_details(rows):
             own = {item["id"]: item for item in result["evidence"]}
             anchor = next((own[i]["location"]["offset"] for i in finding["evidence_ids"] if i in own
                            and own[i]["observation"] == {"kind": "assembly", "index": own[i]["observation"].get("index"), **value}), None)
-            lines += ["", f"#### Function at {_cell(value.get('entry'))}", "",
+            lines += ["", f"#### Function at {_cell(_address(value.get('entry')))}", "",
                       f"Truncated: {_cell(value.get('truncated'))}", "",
                       "| File offset | Length | Instruction |", "|---|---|---|"]
             for row in value.get("instructions", []) if isinstance(value.get("instructions"), list) else []:
@@ -93,7 +112,7 @@ def _code_details(rows):
     if refs:
         lines += ["", "### References (derived)", "", "| From function | Type | To address | Symbol |", "|---|---|---|---|"]
         for finding in refs:
-            for row in finding["value"]:
+            for row in _code_value("code.references", finding["value"]):
                 if isinstance(row, list) and len(row) == 4:
                     lines.append("| " + " | ".join(_cell(value) for value in row) + " |")
     strings = [f for _, f in rows if f["claim_key"] == "code.strings" and isinstance(f["value"], list)]
@@ -101,7 +120,7 @@ def _code_details(rows):
         lines += ["", "### Referenced strings (derived)", "", "| Address | Encoding | Text | Truncated | From functions |",
                   "|---|---|---|---|---|"]
         for finding in strings:
-            for entry in finding["value"]:
+            for entry in _code_value("code.strings", finding["value"]):
                 if isinstance(entry, dict):
                     lines.append("| " + " | ".join(_cell(entry.get(key)) for key in
                                                    ("address", "encoding", "text", "truncated", "from")) + " |")
@@ -136,7 +155,8 @@ def to_markdown(analysis):
                 for i in finding["evidence_ids"][:6] if i in evidence)
             more = len(finding["evidence_ids"]) - 6
             cited += f"; +{more} more" if more > 0 else ""
-            out.append(f"| {result['role']} | {finding['statement']} | {_cell(finding['value'])} | {finding['confidence']} | {cited} |")
+            value = _code_value(finding["claim_key"], finding["value"])
+            out.append(f"| {result['role']} | {finding['statement']} | {_cell(value)} | {finding['confidence']} | {cited} |")
         return out
 
     lines += table(supported) if supported else ["No finding was supported by the evidence."]
