@@ -603,7 +603,7 @@ and needs an owner-approved download. Decision `m4a-contract`.
   `flags` a sorted list of refusal reasons (`crc`, `duplicate_name`, `encrypted`,
   `header_mismatch`, `ratio`, `symlink`, `too_large`, `traversing_name`,
   `unsupported_method`), empty when clean; a flagged member is listed but never
-  materialized. The whole archive is refused (no observation) for ZIP64, multiple
+  materialized; an empty name is listed only with `traversing_name`. The whole archive is refused (no observation) for ZIP64, multiple
   disks, an ambiguous end of central directory or bytes before the first local
   header other than none; an APK signing block between the last member and the
   central directory is allowed. Manifest decoding is bounded too: XML depth 256,
