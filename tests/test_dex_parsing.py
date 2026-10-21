@@ -788,8 +788,27 @@ class DexOperationTests(unittest.TestCase):
         rows = self.run_operation('dex.classes', {'class': self.class_name}, children=children)
         self.assertEqual([r.value['name'] for r in rows], [self.class_name])
         self.assertEqual(self.run_operation('dex.classes', {'class': 'Lmissing;'}, children=children), [])
-        with self.assertRaisesRegex(ContractError, '^Invalid DEX structure$'):
+        with self.assertRaisesRegex(ContractError, '^Conflicting class and query arguments$'):
             self.run_operation('dex.classes', {'class': self.class_name, 'query': 'Main'}, children=children)
+
+    def test_class_and_query_conflict_is_reported_before_reading_input(self):
+        spec = dex.TOOL.operations['dex.classes']
+        args = spec.validate_args({'class': self.class_name, 'query': 'Main'})
+        with patch.object(dex, '_dex_files', side_effect=AssertionError('input read')) as read:
+            with self.assertRaisesRegex(ContractError, '^Conflicting class and query arguments$') as raised:
+                spec.handler(b'not an APK or DEX', args)
+            self.assertIs(type(raised.exception), ContractError)
+            read.assert_not_called()
+
+    def test_exact_selectors_do_not_match_a_truncated_escaped_identity(self):
+        for parts, displayed in (
+                (('a' * 255,), 'a' * 255),
+                (('a' * 251, 'é'), 'a' * 251 + r'\xe9')):
+            with self.subTest(displayed=displayed):
+                self.assertTrue(dex._matches(iter(parts), displayed))
+                self.assertFalse(dex._matches(iter((*parts, 'x')), displayed))
+        # Even a display ending partway through an escape is never an identity.
+        self.assertFalse(dex._matches(('a' * 253, 'é'), 'a' * 253 + r'\x'))
 
     def test_displayed_member_class_method_and_prototype_selectors_round_trip(self):
         from tests.test_apk_parsing import zip_bytes
@@ -1331,3 +1350,114 @@ class DexGuardCoverageTests(unittest.TestCase):
                          layout["types"]["Ldemo/Main;"])
         with self.assertRaises(dex.DexError):
             dex.parse(seal(broken))
+
+
+def first_method_declaration(child, layout, *, access, code):
+    """Make method 0 virtual in an abstract class; leave the field ID undeclared."""
+    parsed = dex.parse(child)
+    rows = parsed["classes"][0]["class_data"]["direct_methods"]
+    second = rows[1]
+    declaration = leb(0) + leb(access) + leb(code)
+    direct = leb(1) + leb(second["access_flags"]) + leb(second["code_off"])
+    replacement = b"\0\0\x01\x01" + direct + declaration
+    start = layout["class_data"]
+    assert start + len(replacement) <= layout["map_off"]
+    changed = bytearray(child)
+    changed[start:start + len(replacement)] = replacement
+    struct.pack_into("<I", changed, layout["tables"][6] + 4, 0x401)
+    return seal(changed)
+
+
+def try_guard_dex(*, spans=((0, 2),), handler=b"\0\x01", size=2):
+    """Put one valid handler list and specified tries in reserved code space."""
+    child, layout = guard_dex(first_instructions=(0x000E,) * 32)
+    code = (struct.pack("<4H2I", 1, 0, 0, len(spans), 0, size)
+            + units(*([0x000E] * size))
+            + bytes(2 if size % 2 else 0)
+            + b"".join(struct.pack("<IHH", start, length, 1) for start, length in spans)
+            + b"\x01" + handler)
+    start, next_code = layout["code"]
+    assert start + len(code) <= next_code
+    changed = bytearray(child)
+    changed[start:start + len(code)] = code
+    return seal(changed), layout
+
+
+class DexCarryGuardTests(unittest.TestCase):
+    def test_abstract_and_native_methods_carry_no_code(self):
+        child, layout = minimal_dex()
+        concrete = dex.parse(child)["classes"][0]["class_data"]["direct_methods"][0]
+        self.assertEqual(concrete["code_off"], layout["code"][0])
+        self.assertIn("code", concrete)
+        for flag in (0x100, 0x400):
+            with self.subTest(flag=flag, valid=True):
+                positive = first_method_declaration(child, layout, access=1 | flag, code=0)
+                row = dex.parse(positive)["classes"][0]["class_data"]["virtual_methods"][0]
+                self.assertEqual((row["access_flags"], row["code_off"]), (1 | flag, 0))
+                self.assertNotIn("code", row)
+            with self.subTest(flag=flag, valid=False), self.assertRaises(dex.DexError):
+                dex.parse(first_method_declaration(child, layout, access=1 | flag,
+                                                   code=layout["code"][0]))
+
+    def test_handler_type_indices_are_in_the_parsed_type_table(self):
+        # Catch Ljava/lang/Object; at address 1, the last code unit.
+        child, layout = try_guard_dex(handler=b"\x01\x02\x01")
+        row = dex.parse(child)["classes"][0]["class_data"]["direct_methods"][0]["code"]
+        self.assertEqual(row["handler_type_indices"], (layout["types"]["Ljava/lang/Object;"],))
+        invalid_index = len(layout["types"])
+        broken, bad_layout = try_guard_dex(handler=b"\x01" + leb(invalid_index) + b"\x01")
+        # code_item has no type table; the full parser must enforce this guard.
+        self.assertEqual(dex.code_item(broken, bad_layout["code"][0])["handler_type_indices"],
+                         (invalid_index,))
+        with self.assertRaises(dex.DexError):
+            dex.parse(broken)
+
+    def test_try_items_are_increasing_and_nonoverlapping(self):
+        for spans in (((0, 2), (2, 2)), ((0, 1), (3, 2))):
+            with self.subTest(valid=spans):
+                child, _ = try_guard_dex(spans=spans, handler=b"\0\x05", size=6)
+                code = dex.parse(child)["classes"][0]["class_data"]["direct_methods"][0]["code"]
+                self.assertEqual(code["tries_size"], 2)
+        for spans in (((3, 1), (0, 1)), ((0, 3), (2, 2)), ((0, 1), (0, 1))):
+            # Every try is nonempty, ends inside the code, and uses handler 1.
+            with self.subTest(invalid=spans), self.assertRaises(dex.DexError):
+                dex.parse(try_guard_dex(spans=spans, handler=b"\0\x05", size=6)[0])
+
+    def test_typed_and_catch_all_handler_addresses_stay_inside_code(self):
+        for kind, prefix in (("typed", b"\x01\x02"), ("catch_all", b"\0")):
+            for address in (0, 1):
+                with self.subTest(kind=kind, valid=address):
+                    child, _ = try_guard_dex(handler=prefix + leb(address))
+                    code = dex.parse(child)["classes"][0]["class_data"]["direct_methods"][0]["code"]
+                    self.assertEqual(code["insns_size"], 2)
+            for address in (2, 3):
+                with self.subTest(kind=kind, invalid=address), self.assertRaises(dex.DexError):
+                    dex.parse(try_guard_dex(handler=prefix + leb(address))[0])
+
+    def test_distinct_code_bytes_cannot_exceed_the_child_length(self):
+        child, layout = minimal_dex(extra_code_units=2048)
+        rows = dex.parse(child)["classes"][0]["class_data"]["direct_methods"]
+        self.assertLessEqual(sum(row["code"]["length"] for row in rows), len(child))
+        shared, _ = minimal_dex(extra_code_units=2048, shared_code=True)
+        shared_rows = dex.parse(shared)["classes"][0]["class_data"]["direct_methods"]
+        self.assertIs(shared_rows[0]["code"], shared_rows[1]["code"])
+        self.assertGreater(sum(row["code"]["length"] for row in shared_rows), len(shared))
+
+        # A second header lies in the first method's aligned NOP area. Both
+        # spans fit the mapped code section, but their distinct byte sum is too big.
+        inner = layout["code"][0] + 28
+        first_end = rows[0]["code"]["offset"] + rows[0]["code"]["length"]
+        inner_units = (first_end - inner - 16) // 2
+        changed = bytearray(child)
+        struct.pack_into("<4H2I", changed, inner, 1, 1, 0, 0, 0, inner_units)
+        second = rows[1]
+        code_at = second["offset"] + len(leb(1)) + len(leb(second["access_flags"]))
+        self.assertEqual(len(leb(inner)), len(leb(second["code_off"])))
+        changed[code_at:code_at + len(leb(inner))] = leb(inner)
+        broken = seal(changed)
+        spans = [dex.code_item(broken, offset) for offset in (layout["code"][0], inner)]
+        self.assertEqual(spans[1]["offset"] + spans[1]["length"], first_end)
+        self.assertGreater(sum(row["length"] for row in spans), len(broken))
+        self.assertTrue(all(row["debug_info_off"] == 0 for row in spans))
+        with self.assertRaises(dex.DexError):
+            dex.parse(broken)

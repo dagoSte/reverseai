@@ -682,7 +682,8 @@ def _collect(rows, args):
 
 
 def _class_rows(data, args):
-    _check(not (args["class"] and args["query"]))
+    if args["class"] and args["query"]:
+        raise ContractError("Conflicting class and query arguments")
     for name, _, parsed, artifact in _dex_files(data, args["member"]):
         for row in parsed["classes"]:
             if args["class"] and not _matches((row["class_descriptor"],), args["class"]):
