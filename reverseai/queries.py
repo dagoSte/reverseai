@@ -27,17 +27,19 @@ class QuerySpec:
     role: str = "structural"
     fixed: object = None
     routes: object = None  # operation -> ({operation argument: query argument}, {operation argument: fixed value})
+    optional: tuple = ()  # included only when the tool's operation is registered
 
     def validate(self, raw):
         return OperationSpec("query.arguments", self.args, lambda data, args: ()).validate_args(raw)
 
-    def requests(self, args):
+    def requests(self, args, *, available=()):
         def arguments(name):
             if self.routes:
                 taken, fixed = self.routes[name]
                 return {**{key: args[source] for key, source in taken.items()}, **fixed}
             return {} if name == "structure.entry" else {**args, **(self.fixed or {})}
-        return tuple(OperationRequest(name, arguments(name)) for name in self.operations)
+        return tuple(OperationRequest(name, arguments(name)) for name in self.operations
+                     if name not in self.optional or name in available)
 
 
 def _query(operation, args, *, fixed=None):
@@ -45,18 +47,18 @@ def _query(operation, args, *, fixed=None):
                      MappingProxyType(fixed or {}))
 
 
-def _routed(args, routes):
+def _routed(args, routes, *, optional=()):
     """A query whose operations take different arguments: routes[operation] = ({argument: query argument}, fixed)."""
     return QuerySpec(tuple(routes), MappingProxyType(args), routes=MappingProxyType(
         {name: (MappingProxyType(dict(zip(taken, taken)) if isinstance(taken, tuple) else taken), MappingProxyType(fixed))
-         for name, (taken, fixed) in routes.items()}))
+         for name, (taken, fixed) in routes.items()}), optional=optional)
 
 
 # Android (contract/3): one DEX member by name, or "" for every classes*.dex member (decision m4a-seams-x4);
 # exact descriptors and names, in the escaped form displayed in the rows.
-ANY_DEX = ArgSpec("literal", 0, 255, default="")
-CLASS = ArgSpec("literal", 1, 255)
-METHOD_ARGS = {"class": CLASS, "method": ArgSpec("literal", 1, 255), "prototype": ArgSpec("literal", 0, 255, default="")}
+ANY_DEX = ArgSpec("identity", 0, 255, default="")
+CLASS = ArgSpec("identity", 1, 255)
+METHOD_ARGS = {"class": CLASS, "method": ArgSpec("identity", 1, 255), "prototype": ArgSpec("identity", 0, 255, default="")}
 ANDROID_LIMIT = _integer(1, 256, 128)
 
 
@@ -102,9 +104,12 @@ TABLE = MappingProxyType({
         {"dex.classes": (("member", "class"), {}),
          "dex.methods": (("member", "class", "start", "limit"), {})}),
     "inspect_android_method": _routed(
-        {"member": ANY_DEX, **METHOD_ARGS, "start": START, "limit": ANDROID_LIMIT},
+        {"member": ANY_DEX, **METHOD_ARGS, "start": START, "limit": ANDROID_LIMIT,
+         "java_start": HOST_START, "max_chars": _integer(64, 2048, 1024)},
         {"dex.methods": (("member", "class"), {}),
-         "dex.references": (("member", "class", "method", "prototype", "start", "limit"), {"direction": "from"})}),
+         "dex.references": (("member", "class", "method", "prototype", "start", "limit"), {"direction": "from"}),
+         "jadx.method": ({"member": "member", "class": "class", "method": "method", "prototype": "prototype",
+                          "start": "java_start", "max_chars": "max_chars"}, {})}, optional=("jadx.method",)),
     "trace_android_references": _query("dex.references", {
         "member": ANY_DEX, **METHOD_ARGS, "direction": ArgSpec("enum", choices=("from", "to"), default="from"),
         "start": START, "limit": ANDROID_LIMIT}),

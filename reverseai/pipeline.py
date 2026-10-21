@@ -17,6 +17,8 @@ TOOLS = (structure.TOOL, strings.TOOL, apk.TOOL, dex.TOOL)  # apk and dex: contr
 CONTAINED_BUDGET = Budget(max_wall_seconds=150)
 # Ghidra's single import-and-analyse run may take its full 240 s profile; the code task allows 300 s.
 GHIDRA_BUDGET = Budget(max_wall_seconds=330)
+# JADX's fixed 120 s worker profile plus host work; the query task allows 150 s.
+JADX_BUDGET = Budget(max_wall_seconds=180)
 
 
 def _budget(tools):
@@ -66,15 +68,19 @@ def query_bytes(data, ref, name, args, tools=TOOLS):
     """One typed query on frozen bytes, through the same gateway and reviewer."""
     spec, checked = queries.resolve(name, args)
     tools = tuple(tools)
-    requests = spec.requests(checked)
     registered = {operation: tool for tool in tools for operation in tool.operations}
+    requests = spec.requests(checked, available=registered)
     if any(request.operation not in registered for request in requests):
         raise ContractError("Query operation unavailable")
     if spec.role == "code" and any(registered[request.operation].ref != query.REFS["ghidra"] for request in requests):
         raise ContractError("Query Ghidra version unavailable")
-    budget = GHIDRA_BUDGET if spec.role == "code" else Budget()
+    with_jadx = any(request.operation == "jadx.method" for request in requests)
+    if with_jadx and registered["jadx.method"].ref != query.REFS["jadx"]:
+        raise ContractError("Query JADX version unavailable")
+    budget = GHIDRA_BUDGET if spec.role == "code" else JADX_BUDGET if with_jadx else Budget()
+    task_seconds = 300 if spec.role == "code" else 150 if with_jadx else 30
     task = AnalysisTask(content_id("tk", {"input": ref.sha256, "query": name, "args": checked}), spec.role, ref,
-                        requests, Budget(max_concurrency=1, max_wall_seconds=300) if spec.role == "code" else Budget(max_concurrency=1))
+                        requests, Budget(max_concurrency=1, max_wall_seconds=task_seconds))
     partial = Gateway(tools, budget).run(task, data)
     findings = query.conclude(task, copy.deepcopy(partial.evidence)) if partial.evidence else ()
     result = AnalysisResult(task.id, task.role, partial.status, partial.evidence, tuple(findings), partial.errors)

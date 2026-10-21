@@ -162,7 +162,7 @@ SHAPES = {
                        and isinstance(o.get("text"), str) and len(o["text"]) <= 2048
                        and all(" " <= char <= "~" or char in "\n\t" for char in o["text"])
                        and o["start"] + len(o["text"]) <= o["total"]
-                       and (o["form"] != "error" or (o["text"] == "" and o["start"] == o["total"] == 0))),
+                       and (o["form"] not in ("error", "omitted") or (o["text"] == "" and o["start"] == o["total"] == 0))),
     "string": lambda o: (_uint(o.get("address")) and o.get("encoding") in ("ascii", "utf-16le")
                          and _ascii(o.get("text"), 2, 128) and type(o.get("truncated")) is bool
                          and (not o["truncated"] or len(o["text"]) == 128) and _sources(o.get("from"))),
@@ -181,7 +181,7 @@ FIELDS = {
     "string": {"kind", "address", "encoding", "text", "truncated", "from"},
     "java": {"kind", "dex", "class", "name", "prototype", "form", "start", "total", "text"},
 }
-JAVA_FORMS = ("java", "fallback", "error")
+JAVA_FORMS = ("java", "fallback", "error", "omitted")
 REFERENCE_TYPES = ("read", "write", "read_write", "data", "jump")
 
 
