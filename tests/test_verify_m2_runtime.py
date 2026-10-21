@@ -2679,7 +2679,9 @@ def ghidra_worker_records(layout, *, pseudocode=None, names=None, sizes=None):
                       "entry": function["value"]["entry"],
                       "text": "canned derived text; no C spelling is asserted", "truncated": False},
         })
-    expected_calls = sorted(layout["calls"] + [row for row in layout.get("refs", []) if row["type"] == "jump"],
+    entries = {row["entry"] for row in functions}
+    tail_calls = [row for row in layout.get("refs", []) if row["type"] == "jump" and row["to"] in entries]
+    expected_calls = sorted(layout["calls"] + tail_calls,
                             key=lambda row: row["offset"])
     calls = [
         {"location": {"offset": row["offset"], "length": row["length"]},
@@ -2699,7 +2701,7 @@ def ghidra_worker_records(layout, *, pseudocode=None, names=None, sizes=None):
             "kind": "assembly", "index": value["index"], "entry": value["entry"],
             "instructions": [[*row, "canned instruction"] for row in rows], "truncated": False}})
     for row in layout["refs"]:
-        if row["type"] == "jump":
+        if row in tail_calls:
             continue
         result.append({"location": {"offset": row["offset"], "length": row["length"]}, "value": {
             "kind": "ref", **{key: row[key] for key in ("from", "to", "type")}, "to_name": row["to_name"] or ""}})
@@ -3038,6 +3040,18 @@ class GhidraM3cKnownAnswerTests(unittest.TestCase):
                 self.assertEqual([row["value"]["encoding"] for row in rows if row["value"]["kind"] == "string"],
                                  ["ascii", "utf-16le"])
                 self.assertIsNone(verifier.compare_ghidra_observations(data, ghidra_observations(rows)))
+
+    def test_measured_tail_calls_and_five_data_references_are_admitted(self):
+        for builder in (elf_refs, pe_refs, macho_refs):
+            data, layout = builder()
+            rows = ghidra_worker_records(layout, pseudocode=(0,))
+            try:
+                verifier.compare_ghidra_observations(data, ghidra_observations(rows))
+                admitted = True
+            except verifier.VerificationError:
+                admitted = False
+            with self.subTest(format=layout["format"]):
+                self.assertTrue(admitted)
 
     def test_omitted_duplicate_reordered_or_moved_new_observations_fail_the_oracle(self):
         for kind in ("assembly", "ref", "string"):

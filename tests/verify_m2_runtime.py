@@ -288,9 +288,11 @@ def compare_ghidra_observations(data, observations):
         groups[kind].append(item)
     functions, calls = groups["function"], groups["call"]
     # The pinned Ghidra reads the refs fixtures' tail jump as CALL_TERMINATOR.
-    expected_calls = sorted(layout["calls"] + [row for row in layout.get("refs", []) if row["type"] == "jump"],
+    entries = {row["entry"] for row in layout["functions"]}
+    tail_calls = [row for row in layout.get("refs", []) if row["type"] == "jump" and row["to"] in entries]
+    expected_calls = sorted(layout["calls"] + tail_calls,
                             key=lambda row: row["offset"])
-    expected_refs = [row for row in layout.get("refs", []) if row["type"] != "jump"]
+    expected_refs = [row for row in layout.get("refs", []) if row not in tail_calls]
     need(len(functions) == len(layout["functions"]) and len(calls) == len(expected_calls), "KnownAnswerCount")
     need(not layout["functions"] or groups["pseudocode"], "KnownAnswerPseudocodeMissing")
     for index, (item, expected) in enumerate(zip(functions, layout["functions"])):
