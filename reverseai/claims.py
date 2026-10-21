@@ -270,10 +270,12 @@ PAGES = {
                lambda o: (_text(o["dex"]) and _text(o["class"]) and _text(o["name"]) and _text(o["prototype"])
                           and _uint(o["access"]) and _maybe_uint(o["code_offset"]) and _maybe_uint(o["code_units"])
                           and (o["code_offset"] is None) == (o["code_units"] is None))),
-    "dex_ref": (("dex", "from_class", "from_method", "from_prototype", "at", "ref_kind", "target"),
+    "dex_ref": (("dex", "from_class", "from_method", "from_prototype", "at", "ref_kind", "target", "target_truncated"),
                 lambda o: (_text(o["dex"]) and _text(o["from_class"]) and _text(o["from_method"])
                            and _text(o["from_prototype"]) and _uint(o["at"]) and o["ref_kind"] in REF_KINDS
-                           and isinstance(o["target"], str) and len(o["target"]) <= 512 and o["target"].isprintable())),
+                           and isinstance(o["target"], str) and len(o["target"]) <= 512 and o["target"].isprintable()
+                           and _bool(o["target_truncated"])
+                           and (not o["target_truncated"] or (o["ref_kind"] == "string" and len(o["target"]) == 256)))),
 }
 # Fields a page row carries besides its claimed columns, index and total.
 PAGE_EXTRA = {"xref": {"to"}, "class": {"interfaces", "source_file"}}
