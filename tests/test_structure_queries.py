@@ -78,6 +78,9 @@ class StructureQueryTests(unittest.TestCase):
             data, _ = builder()
             rows = run('segments', data)
             self.assertEqual([o.value['name'] for o in rows], expected)
+            permissions = [(o.value['readable'], o.value['writable'], o.value['executable']) for o in rows]
+            self.assertEqual(permissions, [(True, False, True), (True, True, False)] if builder is pe_code else
+                             [(False, False, False), (True, False, True), (True, False, False)])
             page = run('segments', data, start=1, limit=1)
             self.assertEqual(page, rows[1:2])
             self.assertEqual(page[0].value['total'], len(expected))
@@ -92,7 +95,7 @@ class StructureQueryTests(unittest.TestCase):
             rows = run('entry', data)
             expected = dict(kind='entry', address=layout['entry'], offset=layout['text']['offset'])
             self.assertEqual(rows[0].value, expected)
-            self.assertEqual(rows[0].location.offset, field)
+            self.assertEqual(rows[0].location, Location(field, 4 if builder is pe_code else 8))
             supported(self, data, 'entry', 'load.entry', rows, {k: expected[k] for k in ('address', 'offset')})
         data, _ = elf(entry=0)
         self.assertEqual(run('entry', data), [])
@@ -187,6 +190,19 @@ class StructureQueryTests(unittest.TestCase):
         self.assertEqual(run('read_bytes', b'abc', at=3), [])
         self.assertEqual(run('read_bytes', b'', at=0), [])
         self.assertEqual(run('read_bytes', b'x' * 3000, length=2000)[0].location.length, 2000)
+
+    def test_invalid_file_extents_are_not_addressable_sections(self):
+        data, layout = elf_code(); changed = bytearray(data)
+        struct.pack_into('<Q', changed, layout['shoff'] + 64 + 32, len(data) + 1)
+        self.assertEqual(structure.file_sections(bytes(changed)), [])
+        self.assertEqual(run('read_bytes', bytes(changed), mode='address', at=layout['entry']), [])
+        data, layout = pe_code(); changed = bytearray(data)
+        pe = structure._pe_offset(data); table = pe + 24 + struct.unpack_from('<H', data, pe + 20)[0]
+        struct.pack_into('<I', changed, table + 20, len(data) + 1)
+        self.assertEqual([s['name'] for s in structure.file_sections(bytes(changed))], ['.data'])
+        data, layout = macho_code(); changed = bytearray(data)
+        struct.pack_into('<I', changed, 104 + 72 + 48, layout['linkedit'])
+        self.assertEqual(structure.file_sections(bytes(changed)), [])
 
     def test_ambiguous_mappings_and_nested_intervals(self):
         data, layout = elf_refs(); changed = bytearray(data)
