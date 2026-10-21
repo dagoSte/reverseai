@@ -71,10 +71,19 @@ def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tool
             # Provenance first; then the claim must follow from what it cites.
             reasons.extend(local or claims.check(finding, cited))
     # Only verified findings contradict each other: neither an unsupported nor a derived claim can cancel a verified one.
-    values = {}
+    # Pages of one list (contract M3d) contradict only by a different total or a different row at the same index.
+    values, pages = {}, {}
     for finding_id, finding in findings.items():
-        if not problems[finding_id] and finding_id not in derived:
+        if problems[finding_id] or finding_id in derived:
+            continue
+        if finding.claim_key in claims.PAGE_CLAIMS:
+            family = pages.setdefault((finding.claim_key, canonical_json(finding.value.get("to"))), ({}, set()))
+            family[1].add(finding.value["total"])
+            for index, row in enumerate(finding.value["rows"], finding.value["start"]):
+                family[0].setdefault(index, set()).add(canonical_json(row))
+        else:
             values.setdefault(finding.claim_key, set()).add(canonical_json(finding.value))
+    clashing = {key for key, (rows, totals) in pages.items() if len(totals) > 1 or any(len(r) > 1 for r in rows.values())}
     verdicts = []
     for finding_id in sorted(findings):
         finding, reasons = findings[finding_id], tuple(dict.fromkeys(problems[finding_id]))
@@ -82,6 +91,11 @@ def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tool
             verdicts.append(ReviewVerdict(finding_id, "unsupported", reasons))
         elif finding_id in derived:
             verdicts.append(ReviewVerdict(finding_id, "derived", ("cites a derived operation: the tool's reading, not verified against the bytes",)))
+        elif finding.claim_key in claims.PAGE_CLAIMS:
+            if (finding.claim_key, canonical_json(finding.value.get("to"))) in clashing:
+                verdicts.append(ReviewVerdict(finding_id, "contradicted", (f"another page of {finding.claim_key} gives a different total or row",)))
+            else:
+                verdicts.append(ReviewVerdict(finding_id, "supported"))
         elif len(values[finding.claim_key]) > 1:
             verdicts.append(ReviewVerdict(finding_id, "contradicted", (f"another finding gives {finding.claim_key} a different value",)))
         else:

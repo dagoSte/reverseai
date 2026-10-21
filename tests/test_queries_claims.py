@@ -43,7 +43,7 @@ def segment(index, total=3, /, **change):
     row = dict(kind="segment", index=index, total=total, name="LOAD", offset=index * 64, filesz=64,
                address=0x400000 + index * 0x1000, memsz=64, readable=True, writable=False, executable=index == 0)
     row.update(change)
-    return observed(STRUCTURE, "structure.segments", 64 + index * 56, 56, **row)
+    return observed(STRUCTURE, "structure.segments", (64 + index * 56) % 800, 56, **row)
 
 
 def text_row(operation, index, total, offset, encoding, text, truncated=False, length=None):
@@ -194,3 +194,32 @@ class QueryClaimTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PageReviewTests(unittest.TestCase):
+    """Pages of one verified list are compatible; a different total or row at one index contradicts (m3d-seams-paging)."""
+
+    def verdicts(self, pages):
+        findings, evidence = [], []
+        for rows in pages:
+            value = {"start": rows[0].observation["index"], "total": rows[0].observation["total"],
+                     "rows": [[r.observation[k] for k in ("name", "offset", "filesz", "address", "memsz", "readable",
+                                                         "writable", "executable")] for r in rows]}
+            findings.append(make_finding("structural", "Segments.", "segments.list", value, [r.id for r in rows], "observed"))
+            evidence.extend(rows)
+        result = AnalysisResult(content_id("tk", {"t": "pages"}), "structural", "ok", tuple({item.id: item for item in evidence}.values()),
+                                tuple(findings))
+        judged = {v.finding_id: v.status for v in review(DATA, INPUT, [result], tools())}
+        return [judged[f.id] for f in findings]
+
+    def test_contiguous_chunks_of_one_list_are_all_supported(self):
+        rows = [segment(i, 130) for i in range(130)]
+        self.assertEqual(self.verdicts([rows[:64], rows[64:128], rows[128:]]), ["supported"] * 3)
+        self.assertEqual(self.verdicts([rows[:64], rows[10:20]]), ["supported"] * 2)  # overlapping, same rows
+
+    def test_a_different_row_or_total_contradicts(self):
+        first = [segment(0, 3), segment(1, 3)]
+        other = [segment(1, 3, name="TEXT")]
+        self.assertEqual(self.verdicts([first, other]), ["contradicted"] * 2)
+        longer = [segment(2, 4)]
+        self.assertEqual(self.verdicts([first, longer]), ["contradicted"] * 2)
