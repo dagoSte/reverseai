@@ -45,7 +45,7 @@ import subprocess
 import sys
 
 PROTOCOL = "reverseai.worker/1"
-ADAPTER_VERSION = "12.1.4-r5"
+ADAPTER_VERSION = "12.1.4-r6"
 SNAPSHOT = "/snapshot/input"
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 MAX_REPLY_BYTES = 262_144
@@ -58,6 +58,20 @@ MAX_STRING_CHARS = 128
 MAX_STRING_FROM = 8
 ARGS = {"max_functions": (1, 128, 64), "decompile": (0, 16, 8), "max_chars": (64, 2048, 1024), "max_calls": (0, 256, 128),
         "assembly": (0, 8, 4), "max_instructions": (1, 64, 32), "max_refs": (0, 128, 64), "max_strings": (0, 64, 32)}
+MAX_ADDRESS = 2**64 - 1
+# Every operation's arguments with the host's ArgSpec bounds (decision m3d-contract): ("int", min, max, default),
+# ("enum", choices, default) or ("str", default); a None default means required.
+OPERATIONS = {
+    "ghidra.analyze": {name: ("int", *bounds) for name, bounds in ARGS.items()},
+    "ghidra.functions": {"query": ("str", ""), "start": ("int", 0, 65535, 0), "limit": ("int", 1, 128, 64)},
+    "ghidra.function": {"select": ("enum", ("entry", "name"), "entry"), "entry": ("int", 0, MAX_ADDRESS, 0), "name": ("str", ""),
+                        "parts": ("enum", ("info", "pseudocode", "assembly", "callees", "callers", "all"), "all"),
+                        "start": ("int", 0, 65535, 0), "limit": ("int", 1, 256, 64), "max_chars": ("int", 64, 2048, 1024),
+                        "max_calls": ("int", 0, 256, 64), "max_refs": ("int", 0, 128, 64)},
+    "ghidra.xrefs": {"address": ("int", 0, MAX_ADDRESS, None), "start": ("int", 0, 65535, 0), "limit": ("int", 1, 256, 64)},
+}
+MAX_OBSERVATIONS = {"ghidra.analyze": 600, "ghidra.functions": 128, "ghidra.function": 643, "ghidra.xrefs": 256}
+MAX_STRING_ARG = 256
 GHIDRA = Path("/opt/ghidra")
 SCRIPTS = Path(__file__).resolve().parent / "ghidra_scripts"
 WORK = Path("/tmp/reverseai-ghidra")
@@ -117,6 +131,10 @@ class InconsistentAnchor(WorkerFailure):
 
 class ReplyTooLarge(WorkerFailure):
     pass
+
+
+class TooManyRows(WorkerFailure):
+    """More than 65,536 functions, callers or references to count: the run fails instead of a total cut short."""
 
 
 # ---- The file's own sections: offset <-> virtual address -----------------------------------------
@@ -290,30 +308,61 @@ def parse_request(argv):
         args = json.loads(text, object_pairs_hook=lambda pairs: dict(pairs) if len({k for k, _ in pairs}) == len(pairs) else None)
     except ValueError:
         raise InvalidRequest() from None
-    if operation != "ghidra.analyze" or not isinstance(args, dict) or not set(args) <= set(ARGS):
+    specs = OPERATIONS.get(operation)
+    if specs is None or not isinstance(args, dict) or not set(args) <= set(specs):
         raise InvalidRequest()
     checked = {}
-    for name, (minimum, maximum, default) in ARGS.items():
-        value = args.get(name, default)
-        if type(value) is not int or not minimum <= value <= maximum:
+    for name, spec in specs.items():
+        value = args.get(name, spec[-1])
+        if value is None or not _allowed(spec, value):
             raise InvalidRequest()
         checked[name] = value
     return operation, checked
 
 
+def _allowed(spec, value):
+    """The host's ArgSpec.check: int in range, enum choice, or a short str with no NUL, slash, backslash or leading dash."""
+    if spec[0] == "int":
+        return type(value) is int and spec[1] <= value <= spec[2]
+    if spec[0] == "enum":
+        return isinstance(value, str) and value in spec[1]
+    return (isinstance(value, str) and len(value) <= MAX_STRING_ARG and "\x00" not in value and "/" not in value
+            and "\\" not in value and not value.startswith("-"))
+
+
 # ---- Ghidra ------------------------------------------------------------------------------------
 
-def ghidra_argv(format_, out, args, entry_offset):
-    """The one fixed headless command; the request contributes only bounded integers."""
+def ghidra_argv(format_, out, script):
+    """The one fixed headless command; the request contributes only the query's mode and its bounded arguments."""
     loader = LOADERS[format_]
     return ["/bin/bash", str(GHIDRA / "support" / "analyzeHeadless"), str(WORK / "project"), "reverseai",
             "-import", SNAPSHOT, "-readOnly", "-deleteProject", "-max-cpu", "2",
             "-analysisTimeoutPerFile", str(ANALYSIS_SECONDS),
             "-loader", loader, "-loader-loadLibraries", "false", "-loader-linkExistingProjectLibraries", "false",
             "-scriptPath", str(SCRIPTS), "-preScript", "ReverseAIOptions.java",
-            "-postScript", "ReverseAIQuery.java", str(out), str(args["max_functions"]), str(args["decompile"]),
-            str(entry_offset), str(DECOMPILE_SECONDS), str(args["assembly"]), str(args["max_instructions"]),
+            "-postScript", "ReverseAIQuery.java", str(out), *script,
             "-log", str(WORK / "ghidra.log"), "-scriptlog", str(WORK / "script.log")]
+
+
+def script_args(operation, args, data):
+    """ReverseAIQuery's arguments after the output path: the mode, then its fixed arguments in a fixed order. Strings go
+    as "x" + UTF-8 hex; file positions come from this file's own section table."""
+    entry_va, sections = FILE_MAPS[kind(data)](data)
+
+    def offset(address):
+        found = offset_of(sections, address)
+        return str(-1 if found is None else found)
+
+    if operation == "ghidra.analyze":
+        return ["analyze", str(args["max_functions"]), str(args["decompile"]), offset(entry_va), str(DECOMPILE_SECONDS),
+                str(args["assembly"]), str(args["max_instructions"])]
+    if operation == "ghidra.functions":
+        return ["functions", "x" + args["query"].encode().hex(), str(args["start"]), str(args["limit"])]
+    if operation == "ghidra.function":
+        return ["function", args["select"], offset(args["entry"]) if args["select"] == "entry" else "-1",
+                "x" + args["name"].encode().hex(), args["parts"], str(args["start"]), str(args["limit"]), str(DECOMPILE_SECONDS)]
+    base = sections[0] if sections else (-1, -1, 0)
+    return ["xrefs", offset(args["address"]), str(args["address"]), str(base[0]), str(base[2])]
 
 
 def ghidra_env():
@@ -323,14 +372,14 @@ def ghidra_env():
             "GHIDRA_HEADLESS_MAXMEM": HEAP, "JAVA_TOOL_OPTIONS": f"-Duser.home={home} -Djava.io.tmpdir={WORK}"}
 
 
-def run_ghidra(format_, args, entry_offset):
-    """Run the fixed headless analysis and return the query's parsed JSON."""
+def run_ghidra(format_, args, script):
+    """Run the fixed headless analysis with the query's mode and arguments and return the query's parsed JSON."""
     shutil.rmtree(WORK, ignore_errors=True)
     for folder in ("home", "project"):
         (WORK / folder).mkdir(parents=True, mode=0o700)
     out = WORK / "query.json"
     with open(WORK / "headless.out", "wb") as log:
-        process = subprocess.Popen(ghidra_argv(format_, out, args, entry_offset), env=ghidra_env(), cwd=WORK,
+        process = subprocess.Popen(ghidra_argv(format_, out, script), env=ghidra_env(), cwd=WORK,
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             process.wait(timeout=GHIDRA_SECONDS)
@@ -414,35 +463,49 @@ class Anchors:
         return va, section
 
 
-def observations(data, query, args):
-    """The reply's observations from the query output, after every check; pure and testable without Ghidra."""
-    format_ = kind(data)
-    entry_va, sections = FILE_MAPS[format_](data)
-    if not isinstance(query, dict) or not isinstance(query.get("blocks"), list) or not isinstance(query.get("functions"), list):
+def _prelude(data, query, mode=None):
+    """(entry VA, sections, anchors) for a query output of the expected mode; analysis options are checked first."""
+    entry_va, sections = FILE_MAPS[kind(data)](data)
+    if not isinstance(query, dict) or not isinstance(query.get("blocks"), list) or (mode and query.get("mode") != mode):
         raise InvalidQueryOutput()
     options = query.get("options_off")
     if not isinstance(options, dict) or not all(isinstance(v, str) for v in options.values()):
         raise InvalidQueryOutput()
     if any(value.lower() == "true" for value in options.values()):
         raise AnalysisOptionOn()
-    anchors = Anchors(data, sections, query["blocks"])
-    if not all(isinstance(item, dict) for item in query["functions"]):
+    return entry_va, sections, Anchors(data, sections, query["blocks"])
+
+
+def _function(anchors, sections, item):
+    """A query function as {address, va, offset, length, size, name, raw_name, calls, refs}, or None when the query did
+    not anchor it or its first bytes are not inside one executable section of this file."""
+    if not isinstance(item, dict):
+        raise InvalidQueryOutput()
+    address, size, offset = _int(item.get("entry")), _int(item.get("size"), 1), item.get("file_offset")
+    if item.get("anchored") is not True or type(offset) is not int or offset < 0:
+        return None  # the query anchors only file-backed executable functions
+    section = section_at(sections, offset)
+    if section is None:
+        return None
+    length = min(size, MAX_LOCATION, section[1] - offset)
+    mapped = anchors.anchor(address, offset, _hex(item.get("bytes"), MAX_LOCATION), length)
+    if mapped is None:
+        return None
+    return {"address": address, "va": mapped[0], "offset": offset, "length": length, "size": size,
+            "name": printable_name(item.get("name")), "raw_name": item.get("name"), "calls": item.get("calls", []),
+            "refs": item.get("refs", [])}
+
+
+def observations(data, query, args):
+    """The reply's observations from the query output, after every check; pure and testable without Ghidra."""
+    entry_va, sections, anchors = _prelude(data, query)
+    if not isinstance(query.get("functions"), list):
         raise InvalidQueryOutput()
     functions = []
-    for item in sorted(query["functions"], key=lambda item: _int(item.get("entry"))):
-        address, size, offset = item["entry"], _int(item.get("size"), 1), item.get("file_offset")
-        if item.get("anchored") is not True or type(offset) is not int or offset < 0 or len(functions) == args["max_functions"]:
-            continue  # the query anchors only file-backed executable functions, the first max_functions of them
-        section = section_at(sections, offset)
-        if section is None:
-            continue
-        length = min(size, MAX_LOCATION, section[1] - offset)
-        mapped = anchors.anchor(address, offset, _hex(item.get("bytes"), MAX_LOCATION), length)
-        if mapped is None:
-            continue
-        functions.append({"address": address, "va": mapped[0], "offset": offset, "length": length, "size": size,
-                          "name": printable_name(item.get("name")), "calls": item.get("calls", []),
-                          "refs": item.get("refs", [])})
+    for item in sorted(query["functions"], key=lambda item: _int(item.get("entry") if isinstance(item, dict) else None)):
+        function = _function(anchors, sections, item) if len(functions) < args["max_functions"] else None
+        if function is not None:  # the first max_functions anchored ones
+            functions.append(function)
     functions.sort(key=lambda f: f["va"])
     result = []
     for index, function in enumerate(functions):
@@ -463,18 +526,21 @@ def observations(data, query, args):
 
 
 class Fit:
-    """Observations added in order only while the encoded reply stays within MAX_REPLY_BYTES; one never cut."""
+    """Observations added in order only while the encoded reply stays within MAX_REPLY_BYTES and the operation's
+    observation cap; one is never cut. add() says whether the item went in."""
 
-    def __init__(self, items):
-        self.items = list(items)
+    def __init__(self, items, limit=MAX_OBSERVATIONS["ghidra.analyze"]):
+        self.items, self.limit = list(items), limit
         envelope = len(encode({"protocol": PROTOCOL, "status": "ok", "snapshot_sha256": "0" * 64, "observations": []}))
         self.size = envelope + sum(map(_size, self.items)) + max(0, len(self.items) - 1)
 
     def add(self, item):
         grown = self.size + _size(item) + (1 if self.items else 0)
-        if grown <= MAX_REPLY_BYTES:
-            self.items.append(item)
-            self.size = grown
+        if grown > MAX_REPLY_BYTES or len(self.items) >= self.limit:
+            return False
+        self.items.append(item)
+        self.size = grown
+        return True
 
 
 def ranked(functions, entry_va):
@@ -524,10 +590,10 @@ def _instruction(anchors, function, item):
     return mapped[0], offset, length
 
 
-def _target(anchors, item):
-    """A call or reference target as a file VA: through its file offset when one section holds it, else Ghidra's
-    address less the rebase delta; None below zero."""
-    target, target_offset = _int(item.get("to")), item.get("to_file_offset")
+def _target(anchors, item, key="to"):
+    """A call or reference target (or another address the query gives with its file offset) as a file VA: through its
+    file offset when one section holds it, else Ghidra's address less the rebase delta; None below zero."""
+    target, target_offset = _int(item.get(key)), item.get(key + "_file_offset")
     if type(target_offset) is int and target_offset >= 0:
         section = section_at(anchors.sections, target_offset)
         if section:
@@ -671,13 +737,174 @@ def strings(data, sections, refs, args):
     return result
 
 
+# ---- M3d targeted queries (decisions m3d-contract, m3d-seams-w) -------------------------------------
+
+def xref_type(row):
+    """The contract type of a reference to an address: call (tail calls included), jump, read_write, read, write, data;
+    None for other flow."""
+    flags = [row.get(name) for name in ("call", "flow", "jump", "read", "write", "data")]
+    if not all(type(flag) is bool for flag in flags):
+        raise InvalidQueryOutput()
+    call, flow, jump, read, write, data = flags
+    if call or flow:
+        return "call" if call else "jump" if jump else None
+    if read and write:
+        return "read_write"
+    return "read" if read else "write" if write else "data" if data else None
+
+
+def references_to(anchors, block, to, calls_only):
+    """The query's references to `to` (a file VA) from instructions in executable sections of this file, as
+    (at, type, file offset, length, from) rows: unique by (at, type), in address order. More than 65,536 fails the run."""
+    if not isinstance(block, dict) or not isinstance(block.get("rows"), list) or type(block.get("overflow")) is not bool:
+        raise InvalidQueryOutput()
+    if block["overflow"]:
+        raise TooManyRows()
+    found = {}
+    for row in block["rows"]:
+        if not isinstance(row, dict):
+            raise InvalidQueryOutput()
+        kind_ = xref_type(row)
+        address, length, offset = _int(row.get("address")), _int(row.get("length"), 1), row.get("file_offset")
+        if kind_ is None or (calls_only and kind_ != "call") or length > 16 or type(offset) is not int or offset < 0:
+            continue
+        mapped = anchors.anchor(address, offset, _hex(row.get("bytes"), 16), length)
+        if mapped is None:
+            continue
+        if _int(row.get("to")) - anchors.delta != to:
+            raise InconsistentAnchor()
+        source = None if row.get("from") is None else _target(anchors, row, "from")
+        found[mapped[0], kind_] = min(found.get((mapped[0], kind_), (mapped[0], kind_, offset, length, source)),
+                                      (mapped[0], kind_, offset, length, source), key=lambda r: (r[2], r[3], -1 if r[4] is None else r[4]))
+    return [found[key] for key in sorted(found)]
+
+
+def _rows(query, key):
+    items = query.get(key)
+    if not isinstance(items, list):
+        raise InvalidQueryOutput()
+    return items
+
+
+def function_rows(data, query, args):
+    """ghidra.functions: the page start.. of anchored functions whose name contains query, index and total from the
+    query's full count; the page stops at the first row this file cannot anchor or that does not fit."""
+    _, sections, anchors = _prelude(data, query, "functions")
+    items, total = _rows(query, "functions"), _int(query.get("total"))
+    if type(query.get("overflow")) is not bool:
+        raise InvalidQueryOutput()
+    if query["overflow"]:
+        raise TooManyRows()
+    reply = Fit([], MAX_OBSERVATIONS["ghidra.functions"])
+    for position, item in enumerate(items[:args["limit"]]):
+        index = args["start"] + position
+        if not isinstance(item, dict) or item.get("index") != index or index >= total:
+            raise InvalidQueryOutput()
+        function = _function(anchors, sections, item)
+        if function is not None and (not isinstance(function["raw_name"], str) or args["query"] not in function["raw_name"]):
+            raise InvalidQueryOutput()
+        if function is None or not reply.add({"location": {"offset": function["offset"], "length": function["length"]},
+                                              "value": {"kind": "function_row", "index": index, "total": total,
+                                                        "name": function["name"], "entry": function["va"], "size": function["size"]}}):
+            break
+    return reply.items
+
+
+def instruction_page(anchors, function, page, args):
+    """The instructions observation: rows start.. (indexed from the entry) inside the function's span, each one's bytes
+    confirmed, at the bytes from the first row to the end of the last (at most 4,096); None when nothing is listed."""
+    if not isinstance(page, dict) or not isinstance(page.get("rows"), list):
+        raise InvalidQueryOutput()
+    total, start, rows = _int(page.get("total")), args["start"], page["rows"]
+    if _int(page.get("start")) != start or len(rows) > args["limit"] or (rows and start + len(rows) > total):
+        raise InvalidQueryOutput()
+    value = {"kind": "instructions", "entry": function["va"], "start": start, "total": total, "rows": [], "truncated": False}
+    first = after = None
+    for position, row in enumerate(rows):
+        if not isinstance(row, dict) or row.get("index") != start + position:
+            raise InvalidQueryOutput()
+        mapped = _instruction(anchors, function, row)
+        if mapped is None or (after is not None and mapped[1] < after) or mapped[1] + mapped[2] - (first or mapped[1]) > MAX_LOCATION:
+            break
+        value["rows"].append([mapped[0] - function["va"], mapped[2], printable_name(row.get("text"))[:MAX_INSTRUCTION_TEXT] or "?"])
+        if _size(value) > MAX_OBSERVATION_BYTES:
+            value["rows"].pop()
+            break
+        first, after = mapped[1] if first is None else first, mapped[1] + mapped[2]
+    if not value["rows"]:
+        return None
+    value["truncated"] = len(value["rows"]) < min(args["limit"], total - start)
+    return {"location": {"offset": first, "length": after - first}, "value": value}
+
+
+def function_parts(data, query, args):
+    """ghidra.function: the target (by entry, or the lowest entry with that exact name) with its counts, then the parts
+    asked for, each added only while the reply fits; nothing when there is no target."""
+    _, sections, anchors = _prelude(data, query, "function")
+    if query.get("target") is None:
+        return []
+    matches = _int(query.get("matches"), 1)
+    function = _function(anchors, sections, query["target"])
+    if function is None:
+        return []
+    if (function["va"] != args["entry"] or matches != 1) if args["select"] == "entry" else function["raw_name"] != args["name"]:
+        raise InvalidQueryOutput()  # the query answered another question
+    function["index"] = 0
+    callers = references_to(anchors, query.get("callers"), function["va"], True)
+    callees = calls([function], anchors, {"max_calls": len(function["calls"]) if isinstance(function["calls"], list) else 0})
+    anchor = {"offset": function["offset"], "length": function["length"]}
+    reply = Fit([{"location": anchor, "value": {"kind": "target", "name": function["name"], "entry": function["va"],
+                                               "size": function["size"], "matches": matches,
+                                               "callers_total": len(callers), "callees_total": len(callees)}}],
+                MAX_OBSERVATIONS["ghidra.function"])
+    parts = args["parts"]
+    text = query.get("pseudocode")
+    if parts in ("pseudocode", "all") and text is not None:
+        for item in pseudocode([{"entry": function["address"], "text": text}], [function], function["va"],
+                               {"decompile": 1, "max_chars": args["max_chars"]}):
+            reply.add(item)
+    if parts in ("assembly", "all") and query.get("instructions") is not None:
+        page = instruction_page(anchors, function, query["instructions"], args)
+        if page is not None:
+            reply.add(page)
+    rows = []
+    if parts in ("callees", "all"):
+        rows += callees[:args["max_calls"]]
+    if parts in ("callers", "all"):
+        rows += [{"location": {"offset": offset, "length": length},
+                  "value": {"kind": "caller", "at": at, "from": source, "to": function["va"]}}
+                 for at, _, offset, length, source in callers[:args["max_calls"]]]
+    if parts == "all":
+        rows += references([function], anchors, args)
+    for item in rows:
+        if not reply.add(item):
+            break
+    return reply.items
+
+
+def xref_rows(data, query, args):
+    """ghidra.xrefs: the page start.. of every reference to address from instructions in executable sections, in
+    address order, index and total over all of them."""
+    _, _, anchors = _prelude(data, query, "xrefs")
+    rows = references_to(anchors, query.get("xrefs"), args["address"], False)
+    reply = Fit([], MAX_OBSERVATIONS["ghidra.xrefs"])
+    for index in range(args["start"], min(len(rows), args["start"] + args["limit"])):
+        at, kind_, offset, length, source = rows[index]
+        if not reply.add({"location": {"offset": offset, "length": length},
+                          "value": {"kind": "xref", "index": index, "total": len(rows), "at": at, "from": source,
+                                    "to": args["address"], "type": kind_}}):
+            break
+    return reply.items
+
+
+HANDLERS = {"ghidra.analyze": observations, "ghidra.functions": function_rows, "ghidra.function": function_parts,
+            "ghidra.xrefs": xref_rows}
+
+
 def run(operation, args, data, query_of=None):
-    """Observations for ghidra.analyze; query_of(format, args, entry offset) defaults to the headless Ghidra run."""
-    format_ = kind(data)
-    entry_va, sections = FILE_MAPS[format_](data)
-    entry_offset = offset_of(sections, entry_va)
-    query = (query_of or run_ghidra)(format_, args, -1 if entry_offset is None else entry_offset)
-    return observations(data, query, args)
+    """Observations for one operation; query_of(format, args, script arguments) defaults to the headless Ghidra run."""
+    query = (query_of or run_ghidra)(kind(data), args, script_args(operation, args, data))
+    return HANDLERS[operation](data, query, args)
 
 
 # ---- Reply --------------------------------------------------------------------------------------
