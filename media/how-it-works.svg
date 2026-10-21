@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 680" width="1280" height="680" role="img" aria-labelledby="title desc">
   <title id="title">How ReverseAI works</title>
-  <desc id="desc">An approved file is frozen and hashed. A gateway runs only allowlisted operations within budgets: in-process parsers on the host, and pinned tools (LIEF, YARA-X, Ghidra) in a locked container per run. The host re-derives every value a contained tool reports from the input bytes. Evidence records bind input hash, tool, operation and byte range. Analysts make claims, a reviewer re-checks bytes and claim rules, and the report sorts findings into supported, derived, unsupported and contradicted.</desc>
+  <desc id="desc">An approved file is frozen and hashed. A gateway runs only allowlisted operations within budgets: in-process parsers on the host, and pinned tools (LIEF, YARA-X, Ghidra) in a locked container per run. The host re-derives every LIEF and YARA-X value and every Ghidra anchor from the input bytes, and re-reads referenced string contents. The code analyst also yields assembly, cross-references and referenced strings: Ghidra interpretations and reference relationships stay derived. Evidence records bind input hash, tool, operation and byte range. A reviewer re-checks bytes and claim rules, and the report sorts findings into supported, derived, unsupported and contradicted.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0b1220"/>
@@ -32,7 +32,7 @@
 
   <rect width="1280" height="680" rx="22" fill="url(#bg)"/>
   <text x="40" y="52" style="font-size:26px;font-weight:800;fill:#f8fafc">How ReverseAI works</text>
-  <text x="40" y="78" class="s" style="font-size:14px">Static reverse engineering in which every conclusion is checked against the bytes it claims to come from.</text>
+  <text x="40" y="78" class="s" style="font-size:14px">Static reverse engineering with byte-anchored evidence and clearly labelled tool interpretations.</text>
 
   <!-- Row 1 -->
   <g>
@@ -83,7 +83,7 @@
     <text x="1155" y="282" class="h" text-anchor="middle" style="font-size:15px">Host re-derivation</text>
     <text x="1155" y="302" class="s" text-anchor="middle" style="fill:#bbf7d0">LIEF, YARA-X: every value</text>
     <text x="1155" y="319" class="s" text-anchor="middle" style="fill:#bbf7d0">Ghidra: every anchor</text>
-    <text x="1155" y="334" class="s" text-anchor="middle" style="fill:#bbf7d0;font-size:11px">re-read from the input bytes</text>
+    <text x="1155" y="334" class="s" text-anchor="middle" style="fill:#bbf7d0;font-size:11px">string bytes re-read too</text>
   </g>
 
   <!-- Row 1 arrows -->
@@ -112,10 +112,12 @@
     <rect class="box" x="330" y="412" width="220" height="150" rx="14"/>
     <circle cx="352" cy="434" r="12" fill="#7dd3fc"/><text x="352" y="438" class="n" text-anchor="middle">7</text>
     <text x="375" y="439" class="h">Analysts</text>
-    <text x="352" y="468" class="k">structural</text>
-    <text x="352" y="488" class="k">capability</text>
-    <text x="352" y="508" class="k">code (Ghidra)</text>
-    <text x="352" y="538" class="s" style="font-size:11.5px">each claim cites its evidence</text>
+    <text x="352" y="463" class="k">structural</text>
+    <text x="352" y="481" class="k">capability</text>
+    <text x="352" y="499" class="k">code (Ghidra)</text>
+    <text x="352" y="517" class="s">assembly · cross-references</text>
+    <text x="352" y="535" class="s">referenced strings</text>
+    <text x="352" y="551" class="s" style="font-size:11.5px">each claim cites its evidence</text>
   </g>
   <g>
     <rect class="box" x="590" y="412" width="260" height="150" rx="14"/>
