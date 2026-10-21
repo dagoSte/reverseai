@@ -209,6 +209,33 @@ class ZipParsingTests(unittest.TestCase):
             bad = changed(desc, offsets['rows'][0]['end'] - 4, '<I', 999)
             self.assertIn('header_mismatch', apk.members(bad)[0].flags)
 
+    def test_descriptor_ambiguity_is_refused_even_when_both_forms_match(self):
+        signature = 0x08074b50
+        data = struct.pack('<4I', *([signature] * 4))
+        # Both layouts require these three equal values, beyond the archive/child limits.
+        # Test the bounded descriptor decision directly without allocating that payload.
+        self.assertEqual(struct.unpack_from('<3I', data, 0), (signature,) * 3)
+        self.assertEqual(struct.unpack_from('<3I', data, 4), (signature,) * 3)
+        with self.assertRaises(apk.ApkError):
+            apk._descriptor_end(data, 0, len(data), (signature,) * 3)
+
+    def test_exact_ratio_boundary_is_admitted_and_one_byte_over_is_flagged(self):
+        for size, flags in ((1000, []), (1001, ['ratio'])):
+            data, _ = shared.zip_archive([shared.member('zeros', bytes(size))])
+            member, = apk.members(data)
+            with self.subTest(size=size):
+                self.assertEqual(member.compressed_size, 10)
+                self.assertEqual(list(member.flags), flags)
+                row, = run('inventory', data)
+                self.assertEqual(row.value['flags'], flags)
+                if flags:
+                    self.assertIsNone(row.value['sha256'])
+                    with self.assertRaises(apk.ApkError):
+                        apk.materialize(data, member)
+                else:
+                    self.assertEqual(apk.materialize(data, member)[0], bytes(size))
+                    self.assertEqual(materialize(data, apk.artifact(member, bytes(size))), bytes(size))
+
     def test_whole_archive_refusals_zip64_multidisk_sfx_ambiguity_and_limits(self):
         data, layout = zip_bytes([('x', b'value')])
         cd, end = layout['cd'], layout['end']
@@ -457,6 +484,31 @@ class BinaryManifestTests(unittest.TestCase):
 
 
 class ApkOperationTests(unittest.TestCase):
+    def test_inventory_reuses_one_parse_and_preserves_rows_on_clean_and_hostile_pages(self):
+        for builder in (shared.apk_basic, lambda: shared.apk_hostile('crc'),
+                        lambda: shared.apk_hostile('descriptor_mismatch'), shared.apk_signing_block):
+            data, _ = builder()
+            parsed = apk.members(data)
+            # Expected rows use the existing public identity-checking path, independent of reuse.
+            expected = []
+            for index, member in enumerate(parsed):
+                digest, flags = None, list(member.flags)
+                if not flags:
+                    try:
+                        _, digest = apk.materialize(data, member)
+                    except apk.ApkError:
+                        flags = ['crc']
+                expected.append((Location(member.central_offset, min(member.central_length, 4096)),
+                                 dict(kind='member', index=index, total=len(parsed), name=apk.escape(member.name),
+                                      method=member.method, compressed_size=member.compressed_size, size=member.size,
+                                      crc32=member.crc32, sha256=digest, flags=flags)))
+            for start, limit in ((0, 256), (1, 2), (len(parsed), 1)):
+                with self.subTest(builder=builder, start=start, limit=limit):
+                    with patch.object(apk, 'members', wraps=apk.members) as parse:
+                        rows = run('inventory', data, start=start, limit=limit)
+                    self.assertEqual([(o.location, o.value) for o in rows], expected[start:start + limit])
+                    self.assertEqual(parse.call_count, 1)
+
     def test_shared_fixture_members_and_manifest_match_declared_layouts(self):
         for builder in (shared.apk_basic, lambda: shared.apk_basic(True), shared.apk_signing_block):
             data, layout = builder()
