@@ -6,7 +6,7 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M4a released: Android packages verified on the host.** Deterministic
+**Status: M4a release candidate: Android packages verified on the host.** Deterministic
 analysts read file structure (ELF, PE and Mach-O), imports and string indicators in-process,
 alongside APK members, binary manifest attributes, DEX classes, methods and code references.
 The gateway and reviewer independently re-derive bytes inside stored or compressed
@@ -51,7 +51,7 @@ What this buys, and how each point is checked:
 | M3b | Mach-O host decoder, verified imports for ELF, PE and Mach-O, Ghidra on Mach-O | released |
 | M3c | Ghidra assembly, references from code and referenced strings as derived evidence | released |
 | M3d | Targeted queries by name, address or text with paging; REA's 16 native query names | released |
-| M4a | APK members, binary manifest and DEX classes, methods and code references verified on the host, including compressed-member evidence (contract/3) | released |
+| M4a | APK members, binary manifest and DEX classes, methods and code references verified on the host, including compressed-member evidence (contract/3) | release candidate |
 | M4b | Decompiled Java through JADX; needs an approved download | planned |
 | M5 | JavaScript application analysis | planned |
 | M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
@@ -69,6 +69,9 @@ python3 -m reverseai query FILE --query NAME [--arg KEY=VALUE ...] --out DIR [--
 Host results are verified from the bytes; Ghidra results remain derived readings.
 Ghidra queries require `--with-ghidra` and the locally built, pinned image.
 Pages show `rows a..b of N` and the next `start`; a missing row is never evidence of absence.
+
+Query-name coverage: 21 of REA's 22 names (16 native, 5 Android). JavaScript analysis
+is planned for M5; behavioural parity is measured in M7.
 
 | Query | Question | Result |
 | --- | --- | --- |
@@ -90,9 +93,10 @@ Pages show `rows a..b of N` and the next `start`; a missing row is never evidenc
 | `xrefs` | References to the selected address | Derived (Ghidra) |
 | `inspect_android_package` | APK members and binary manifest declarations | Verified (host) |
 | `search_android_classes` | DEX classes whose descriptors contain the search text | Verified (host) |
-| `inspect_android_class` | Class metadata and declared methods | Verified (host) |
-| `inspect_android_method` | Method metadata and code references; decompiled Java comes with M4b | Verified (host) |
+| `inspect_android_class` | Metadata and declared methods for the exact class; copy its displayed name | Verified (host) |
+| `inspect_android_method` | The class's methods, then the selected method's code references; decompiled Java comes with M4b | Verified (host) |
 | `trace_android_references` | References from or to a method, selected by class, name and optional prototype | Verified (host) |
+| `analyze_javascript_application` | JavaScript application analysis | Planned (M5) |
 
 ## Try it
 
