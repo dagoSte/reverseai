@@ -113,6 +113,27 @@ def _indicators(data, args):
     return sorted(observations, key=lambda item: (item.location.offset, item.value["rule"]))
 
 
+def _page(data, args):
+    encodings = ("ascii", "utf16le") if args["encoding"] == "any" else (args["encoding"],)
+    regions = heapq.merge(*(_ranges(data, encoding) for encoding in encodings))
+    minimum, query = args.get("min_length", 4), args.get("query")
+    if query is not None and not query.isascii():
+        return []  # Both scanners admit only printable ASCII code points.
+    page, total = [], 0
+    for offset, width, length in regions:
+        if length < minimum:
+            continue
+        encoding = "ascii" if width == 1 else "utf-16le"
+        if query is not None and data.find(query.encode(encoding), offset, offset + width * length) < 0:
+            continue
+        if args["start"] <= total < args["start"] + args["limit"]:
+            value = dict(kind="string", index=total, offset=offset, encoding=encoding,
+                         text=data[offset:offset + min(length, 256) * width].decode(encoding), truncated=length > 256)
+            page.append((Location(offset, min(length * width, MAX_EXCERPT_BYTES)), value))
+        total += 1
+    return [Observation(location, {**value, "total": total}) for location, value in page]
+
+
 TOOL = ToolSpec(ToolRef("strings", "0.1.0"), {
     "strings.extract": OperationSpec("strings.extract", {
         "min_length": ArgSpec("int", 4, 64, default=6),
@@ -122,4 +143,14 @@ TOOL = ToolSpec(ToolRef("strings", "0.1.0"), {
     "strings.indicators": OperationSpec("strings.indicators", {
         "ruleset": ArgSpec("enum", choices=("default",), default="default"),
     }, _indicators, max_observations=_MAX_INDICATORS),
+    "strings.list": OperationSpec("strings.list", {
+        "encoding": ArgSpec("enum", choices=("any", "ascii", "utf16le"), default="any"),
+        "min_length": ArgSpec("int", 4, 64, default=6),
+        "start": ArgSpec("int", 0, 1048575, default=0), "limit": ArgSpec("int", 1, 256, default=128),
+    }, _page, max_observations=256),
+    "strings.search": OperationSpec("strings.search", {
+        "query": ArgSpec("literal", 1, 128),
+        "encoding": ArgSpec("enum", choices=("any", "ascii", "utf16le"), default="any"),
+        "start": ArgSpec("int", 0, 1048575, default=0), "limit": ArgSpec("int", 1, 256, default=64),
+    }, _page, max_observations=256),
 })

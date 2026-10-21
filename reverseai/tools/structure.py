@@ -9,6 +9,7 @@ Malformed input raises StructureError, a ValueError with a short message.
 from __future__ import annotations
 
 import struct
+from bisect import bisect_left, bisect_right
 
 from reverseai.contract import (
     MAX_OBSERVATION_BYTES, ArgSpec, ContractError, Location, Observation, OperationSpec, ToolRef, ToolSpec, canonical_json,
@@ -670,6 +671,394 @@ def imports(data, args):
     return found
 
 
+class _QueryLimit(StructureError):
+    pass
+
+
+def _charge(budget, count):
+    if count > budget[0]:
+        raise _QueryLimit("Query tables exceed the walk limit")
+    budget[0] -= count
+
+
+def _query_count(data, offset, count, stride, budget):
+    count = min(count, max(0, (len(data) - offset) // stride)) if 0 <= offset <= len(data) else 0
+    _charge(budget, count)
+    return count
+
+
+def _query_elf_table(data, budget):
+    width, order, _, h = _elf_layout(data)
+    stride = 40 if width == 32 else 64
+    rows = []
+    if h["shoff"] and h["shentsize"] == stride:
+        layout = order + ("10I" if width == 32 else "IIQQQQIIQQ")
+        if h["shoff"] + stride <= len(data):
+            count = h["shnum"] or struct.unpack_from(layout, data, h["shoff"])[5]
+            rows = [struct.unpack_from(layout, data, h["shoff"] + index * stride)
+                    for index in range(_query_count(data, h["shoff"], count, stride, budget))]
+    return width, order, h, rows
+
+
+def _query_pe(data, pe, budget):
+    h = _pe_layout(data, pe)
+    width = {0x10B: 32, 0x20B: 64}.get(h["magic"])
+    if width is None or h["optional_size"] < 32:
+        return h, None, []
+    _need(data, h["optional"], h["optional_size"], "PE optional header")
+    base = struct.unpack_from("<I" if width == 32 else "<Q", data, h["optional"] + (28 if width == 32 else 24))[0]
+    table = h["optional"] + h["optional_size"]
+    count = _query_count(data, table, h["sections"], 40, budget)
+    return h, base, _pe_sections(data, pe, count) if count else []
+
+
+def _query_name(data, start, end):
+    value = _import_name(data, start, end)
+    return value[0] if value else ""
+
+
+def file_sections(data):
+    """File-backed sections in table order, with bounded names and extents wholly inside the input."""
+    return _file_sections(data, [MAX_TABLE_ENTRIES])
+
+
+def _file_sections(data, budget):
+    kind, pe, _ = _format(data)
+    found = []
+    try:
+        if kind == "elf":
+            width, _, h, rows = _query_elf_table(data, budget)
+            index = rows[0][6] if rows and h["shstrndx"] == SHN_XINDEX else h["shstrndx"]
+            names = rows[index] if 0 < index < len(rows) else None
+            for row in rows:
+                name, type_, flags, address, offset, size = row[:6]
+                if type_ != 8 and flags & 2 and size and offset + size <= len(data) and address + size <= 2**width:
+                    label = _query_name(data, names[4] + name, names[4] + names[5]) if names and name < names[5] else ""
+                    found.append(dict(name=label, address=address, offset=offset, size=size, executable=bool(flags & 4)))
+        elif kind == "pe":
+            _, base, rows = _query_pe(data, pe, budget)
+            for item in rows:
+                row = item.value
+                size = min(row["size"], row["virtual_size"]) if row["virtual_size"] else row["size"]
+                address, offset = base + row["virtual_address"], row["offset"]
+                if size and offset + size <= len(data) and address + size <= 2**64:
+                    found.append(dict(name=row["name"], address=address, offset=offset, size=size,
+                                      executable=row["executable"]))
+        elif kind == "macho":
+            h = _macho_layout(data)
+            if h is not None:
+                _charge(budget, h[4])
+                for _, row, backed in _macho_section_rows(data, h):
+                    _charge(budget, 1)
+                    if backed and row["size"] and row["addr"] + row["size"] <= 2**h[0]:
+                        found.append(dict(name=row["name"], address=row["addr"], offset=row["offset"], size=row["size"],
+                                          executable=row["executable"]))
+    except _QueryLimit:
+        raise
+    except StructureError:
+        pass
+    return found
+
+
+class _SectionMap:
+    """An interval index: overlapping/aliased ranges map to nothing, without a table scan per lookup."""
+    def __init__(self, rows, axis):
+        self.axis = axis
+        self.rows = sorted((r for r in rows if r["size"]), key=lambda r: r[axis])
+        self.starts = [r[axis] for r in self.rows]
+        self.ends = sorted(r[axis] + r["size"] for r in self.rows)
+        self.covering = []
+        longest = None
+        for row in self.rows:
+            if longest is None or row[axis] + row["size"] > longest[axis] + longest["size"]:
+                longest = row
+            self.covering.append(longest)
+
+    def row(self, at, length=1):
+        right = bisect_left(self.starts, at + length)
+        if right - bisect_right(self.ends, at) != 1:
+            return None
+        row = self.covering[right - 1]
+        return row if row[self.axis] <= at and at + length <= row[self.axis] + row["size"] else None
+
+
+def _query_page(records, args, kind):
+    page, total = [], 0
+    for location, value in records:
+        if args.get("query", "") not in value.get("name", ""):
+            continue
+        if args["start"] <= total < args["start"] + args["limit"]:
+            page.append((location, value, total))
+        total += 1
+    return [Observation(location, {"kind": kind, "index": index, "total": total, **value})
+            for location, value, index in page]
+
+
+def _segment_records(data):
+    kind, pe, _ = _format(data)
+    budget = [MAX_TABLE_ENTRIES]
+    try:
+        if kind == "elf":
+            width, order, _, h = _elf_layout(data)
+            stride = 32 if width == 32 else 56
+            if not h["phoff"] or h["phentsize"] != stride:
+                return
+            count = h["phnum"]
+            if count == 0xFFFF:
+                _, _, _, rows = _query_elf_table(data, budget)
+                count = rows[0][7] if rows else 0
+            names = {1: "LOAD", 2: "DYNAMIC", 3: "INTERP", 4: "NOTE", 6: "PHDR", 7: "TLS",
+                     0x6474E550: "GNU_EH_FRAME", 0x6474E551: "GNU_STACK", 0x6474E552: "GNU_RELRO"}
+            for i in range(_query_count(data, h["phoff"], count, stride, budget)):
+                at = h["phoff"] + i * stride
+                row = struct.unpack_from(order + ("8I" if width == 32 else "II6Q"), data, at)
+                type_, offset, address, filesz, memsz, flags = ((row[0], row[1], row[2], row[4], row[5], row[6])
+                    if width == 32 else (row[0], row[2], row[3], row[5], row[6], row[1]))
+                yield Location(at, stride), dict(name=names.get(type_, f"0x{type_:x}"), offset=offset, filesz=filesz,
+                    address=address, memsz=memsz, readable=bool(flags & 4), writable=bool(flags & 2), executable=bool(flags & 1))
+        elif kind == "pe":
+            _, base, rows = _query_pe(data, pe, budget)
+            for item in rows:
+                row = item.value
+                address = base + row["virtual_address"]
+                if address >= 2**64:
+                    break
+                yield item.location, dict(name=row["name"], offset=row["offset"], filesz=row["size"], address=address,
+                    memsz=row["virtual_size"], readable=bool(row["characteristics"] & 0x40000000),
+                    writable=row["writable"], executable=row["executable"])
+        elif kind == "macho":
+            h = _macho_layout(data)
+            if h is None:
+                return
+            _charge(budget, h[4])
+            for command, at, size in _macho_commands(data, h):
+                if command not in (1, 0x19):
+                    continue
+                width = 64 if command == 0x19 else 32
+                stride = 72 if width == 64 else 56
+                if width != h[0] or size < stride:
+                    break
+                name = _name(data[at + 8:at + 24].split(b"\0", 1)[0])
+                address, memsz, offset, filesz = struct.unpack_from("<4Q" if width == 64 else "<4I", data, at + 24)
+                flags = struct.unpack_from("<I", data, at + (60 if width == 64 else 44))[0]
+                yield Location(at, stride), dict(name=name, offset=offset, filesz=filesz, address=address, memsz=memsz,
+                    readable=bool(flags & 1), writable=bool(flags & 2), executable=bool(flags & 4))
+    except _QueryLimit:
+        raise
+    except StructureError:
+        return
+
+
+def segments(data, args):
+    return _query_page(_segment_records(data), args, "segment")
+
+
+def _entry_field(data, budget):
+    kind, pe, _ = _format(data)
+    if kind == "elf":
+        width, _, _, h = _elf_layout(data)
+        return (h["entry"], Location(24, width // 8)) if h["entry"] else None
+    if kind == "pe":
+        h, base, _ = _query_pe(data, pe, budget)
+        if base is not None and h["entry"] and base + h["entry"] < 2**64:
+            return base + h["entry"], Location(h["optional"] + 16, 4)
+    if kind == "macho":
+        h = _macho_layout(data)
+        if h is None:
+            return None
+        _charge(budget, h[4])
+        threads, mains, segments = [], [], []
+        for command, at, size in _macho_commands(data, h):
+            if command == 0x80000028:
+                if size < 24:
+                    return None
+                mains.append((struct.unpack_from("<Q", data, at + 8)[0], Location(at + 8, 8)))
+            elif command in (1, 0x19):
+                width = 64 if command == 0x19 else 32
+                prefix, stride = (72, 80) if width == 64 else (56, 68)
+                if width != h[0] or size < prefix:
+                    return None
+                count = struct.unpack_from("<I", data, at + (64 if width == 64 else 48))[0]
+                if count > (size - prefix) // stride:
+                    return None
+                segments.append(struct.unpack_from("<4Q" if width == 64 else "<4I", data, at + 24))
+            elif command == 5:
+                cursor, end = at + 8, at + size
+                while cursor < end:
+                    _charge(budget, 1)
+                    if cursor + 8 > end:
+                        return None
+                    flavor, count = struct.unpack_from("<II", data, cursor)
+                    if count > (end - cursor - 8) // 4:
+                        return None
+                    expected = (4, 42, 128) if h[2] == 0x1000007 else (6, 68, 256) if h[2] == 0x100000C else None
+                    if expected and flavor == expected[0]:
+                        if count != expected[1]:
+                            return None
+                        location = Location(cursor + 8 + expected[2], 8)
+                        threads.append((struct.unpack_from("<Q", data, location.offset)[0], location))
+                    cursor += 8 + count * 4
+        if mains:
+            if len(mains) != 1:
+                return None
+            _charge(budget, len(segments))
+            entryoff, location = mains[0]
+            values = [address + entryoff - offset for address, memsz, offset, filesz in segments
+                      if offset + filesz <= len(data) and 0 <= entryoff - offset < min(filesz, memsz)
+                      and address + memsz <= 2**h[0]]
+            return (values[0], location) if len(values) == 1 else None
+        return threads[0] if len(threads) == 1 else None
+    return None
+
+
+def entry(data, args):
+    budget = [MAX_TABLE_ENTRIES]
+    try:
+        declared = _entry_field(data, budget)
+    except _QueryLimit:
+        raise
+    except StructureError:
+        return []
+    if declared is None:
+        return []
+    address, location = declared
+    row = _SectionMap(_file_sections(data, budget), "address").row(address)
+    return [Observation(location, dict(kind="entry", address=address,
+                                      offset=row["offset"] + address - row["address"] if row else None))]
+
+
+def read_bytes(data, args):
+    rows, at = file_sections(data), args["at"]
+    physical, virtual = _SectionMap(rows, "offset"), _SectionMap(rows, "address")
+    end = len(data)
+    if args["mode"] == "address":
+        row = virtual.row(at)
+        if row is None:
+            return []
+        at, end = row["offset"] + at - row["address"], row["offset"] + row["size"]
+    length = min(args["length"], end - at)
+    if length <= 0:
+        return []
+    row = physical.row(at)
+    return [Observation(Location(at, length), dict(kind="bytes", offset=at,
+        address=row["address"] + at - row["offset"] if row else None, hex=data[at:at + length].hex()))]
+
+
+def _symbol_records(data):
+    kind, pe, _ = _format(data)
+    budget = [MAX_TABLE_ENTRIES]
+    try:
+        if kind == "elf":
+            width, order, _, rows = _query_elf_table(data, budget)
+            selected = 2 if any(r[1] == 2 for r in rows) else 11
+            stride = 16 if width == 32 else 24
+            types = {0: "notype", 1: "object", 2: "func", 5: "common", 6: "tls", 10: "ifunc"}
+            for row in rows:
+                if row[1] != selected or row[9] != stride or row[6] >= len(rows):
+                    continue
+                strings = rows[row[6]]
+                if strings[1] != 3:
+                    continue
+                count = _query_count(data, row[4], row[5] // stride, stride, budget)
+                for index in range(1, count):
+                    at = row[4] + stride * index
+                    record = struct.unpack_from(order + ("IIIBBH" if width == 32 else "IBBHQQ"), data, at)
+                    name, address, info, section = ((record[0], record[1], record[3], record[5]) if width == 32
+                                                   else (record[0], record[4], record[1], record[3]))
+                    if info & 15 in (3, 4) or name == 0 or name >= strings[5]:
+                        continue
+                    named = _import_name(data, strings[4] + name, strings[4] + strings[5])
+                    if named:
+                        label, location = named
+                        yield location, dict(name=label, address=address, type=types.get(info & 15, "other"),
+                            binding={0: "local", 1: "global", 2: "weak"}.get(info >> 4, "other"), defined=section != 0)
+        elif kind == "macho":
+            h = _macho_layout(data)
+            if h is None:
+                return
+            _charge(budget, h[4])
+            stride = 16 if h[0] == 64 else 12
+            for command, at, size in _macho_commands(data, h):
+                if command != 2:
+                    continue
+                if size < 24:
+                    break
+                offset, count, strings, strings_size = struct.unpack_from("<4I", data, at + 8)
+                for index in range(_query_count(data, offset, count, stride, budget)):
+                    name, type_, _, flags, address = struct.unpack_from("<IBBHQ" if h[0] == 64 else "<IBBHI",
+                                                                      data, offset + stride * index)
+                    if type_ & 0xE0 or not 0 < name < strings_size:
+                        continue
+                    named = _import_name(data, strings + name, strings + strings_size)
+                    if named:
+                        label, location = named
+                        yield location, dict(name=label, address=address, type="symbol",
+                            binding="weak" if flags & 0xC0 else "global" if type_ & 1 else "local",
+                            defined=type_ & 0xE not in (0, 0xC))
+        elif kind == "pe":
+            h, base, sections = _query_pe(data, pe, budget)
+            directories = 112 if h["magic"] == 0x20B else 96
+            if base is None or h["optional_size"] < directories + 8:
+                return
+            if not struct.unpack_from("<I", data, h["optional"] + directories - 4)[0]:
+                return
+            rva, size = struct.unpack_from("<II", data, h["optional"] + directories)
+            if not rva or size < 40:
+                return
+            rows = []
+            header_size = struct.unpack_from("<I", data, h["optional"] + 60)[0]
+            if header_size:
+                rows.append(dict(address=0, offset=0, size=min(header_size, len(data))))
+            for item in sections:
+                row = item.value
+                extent = min(row["size"], row["virtual_size"]) if row["virtual_size"] else row["size"]
+                extent = min(extent, max(0, len(data) - row["offset"]))
+                if extent and row["virtual_address"] + extent <= 2**32:
+                    rows.append(dict(address=row["virtual_address"], offset=row["offset"], size=extent))
+            mapping = _SectionMap(rows, "address")
+
+            def mapped(address, length=1):
+                row = mapping.row(address, length)
+                return (row["offset"] + address - row["address"], row["offset"] + row["size"]) if row else None
+
+            directory = mapped(rva, 40)
+            if directory is None:
+                return
+            functions, count, entries, names, ordinals = struct.unpack_from("<5I", data, directory[0] + 20)
+            table = mapped(names, 4) if names else None
+            if table is None:
+                return
+            count = _query_count(data, table[0], min(count, (table[1] - table[0]) // 4), 4, budget)
+            for index in range(count):
+                _charge(budget, 2)
+                ordinal = mapped(ordinals + index * 2, 2) if ordinals else None
+                if ordinal is None:
+                    break
+                number = struct.unpack_from("<H", data, ordinal[0])[0]
+                if number >= functions:
+                    break
+                function = mapped(entries + number * 4, 4) if entries else None
+                name = mapped(struct.unpack_from("<I", data, table[0] + index * 4)[0])
+                if function is None or name is None:
+                    break
+                named = _import_name(data, *name)
+                address = base + struct.unpack_from("<I", data, function[0])[0]
+                if address >= 2**64:
+                    break
+                if named:
+                    label, location = named
+                    yield location, dict(name=label, address=address, type="export", binding="global",
+                                         defined=address != base)
+    except _QueryLimit:
+        raise
+    except StructureError:
+        return
+
+
+def symbols(data, args):
+    return _query_page(_symbol_records(data), args, "symbol")
+
+
 TOOL = ToolSpec(REF, {
     "structure.identify": OperationSpec("structure.identify", {}, identify, max_observations=1),
     "structure.headers": OperationSpec("structure.headers", {}, headers, max_observations=1),
@@ -679,4 +1068,16 @@ TOOL = ToolSpec(REF, {
     "structure.imports": OperationSpec("structure.imports",
                                        {"max_imports": ArgSpec("int", minimum=1, maximum=MAX_IMPORTS, default=128)},
                                        imports, max_observations=MAX_IMPORTS),
+    "structure.segments": OperationSpec("structure.segments", {
+        "start": ArgSpec("int", 0, 65535, default=0), "limit": ArgSpec("int", 1, 256, default=64),
+    }, segments, max_observations=256),
+    "structure.entry": OperationSpec("structure.entry", {}, entry, max_observations=1),
+    "structure.read_bytes": OperationSpec("structure.read_bytes", {
+        "mode": ArgSpec("enum", choices=("offset", "address"), default="offset"),
+        "at": ArgSpec("int", 0, 2**64 - 1, default=0), "length": ArgSpec("int", 1, 2000, default=256),
+    }, read_bytes, max_observations=1),
+    "structure.symbols": OperationSpec("structure.symbols", {
+        "query": ArgSpec("literal", 0, 128, default=""),
+        "start": ArgSpec("int", 0, 1048575, default=0), "limit": ArgSpec("int", 1, 256, default=128),
+    }, symbols, max_observations=256),
 })
