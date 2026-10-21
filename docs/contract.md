@@ -498,8 +498,8 @@ is never cut. Anchors follow the M3a rules (a function's first bytes, at most
   int 0..2^64-1 default 0, `name` str default "", `parts` enum
   `info`|`pseudocode`|`assembly`|`callees`|`callers`|`all` default `all`, `start`
   0..65535 default 0, `limit` 1..256 default 64, `max_chars` 64..2048 default
-  1024, `max_calls` 0..256 default 64, `max_refs` 0..128 default 64; at most 600
-  observations. The target is the function whose entry is `entry`, or the
+  1024, `max_calls` 0..256 default 64, `max_refs` 0..128 default 64; at most 643
+  observations (1 + 1 + 1 + 256 + 256 + 128, every part at its maximum). The target is the function whose entry is `entry`, or the
   lowest-entry function named exactly `name`; no observation when there is none.
   - always `{"kind": "target", "name", "entry", "size", "matches", "callers_total",
     "callees_total"}` at the function's anchor (`matches`: functions with that name,
@@ -530,8 +530,13 @@ is never cut. Anchors follow the M3a rules (a function's first bytes, at most
   address order: `{"kind": "xref", "index", "total", "at", "from", "to", "type"}`
   at the instruction's bytes; `type` `call` (tail calls included), `jump`, `read`,
   `write`, `read_write` or `data`; `from` the containing function's entry or null;
-  `to` equals `address`. Claim `code.xrefs` (derived) =
-  `{"to", "start", "total", "rows": [[at, from, type], ...]}`.
+  `to` equals `address` (also when `address` has no file bytes). Claim
+  `code.xrefs` (derived) = `{"to", "start", "total", "rows": [[at, from, type], ...]}`.
+- **Counts**: `total`, `callers_total` and `callees_total` count the rows that pass
+  the worker's anchor checks. Instructions are indexed from the entry in address
+  order (a body chunk before the entry is not listed). A run that would count more
+  than 65,536 callers, xrefs or functions fails with a fixed error instead of
+  reporting a total cut short.
 - **Host check** (`ghidra_verify`): per mode, exact field sets and types, anchors
   as above (an instruction's `at` must be the virtual address its offset maps to;
   `to` the target entry or `address`), indexes contiguous from `start`, one
