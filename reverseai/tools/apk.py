@@ -116,6 +116,17 @@ def _eocd(data):
     return count, offset, at
 
 
+def _descriptor_end(data, at, end, expected):
+    possible = []
+    for prefix in (0, 4):
+        if prefix and data[at:at + 4] != b'PK\x07\x08':
+            continue
+        if at + prefix + 12 <= end and _unpack('<3I', data, at + prefix, end) == expected:
+            possible.append(at + prefix + 12)
+    _check(len(possible) == 1, 'APK data descriptor is missing or ambiguous')
+    return possible[0]
+
+
 def members(data):
     """Central-directory order; per-member refusal flags prevent any materialization."""
     _check(isinstance(data, bytes) and len(data) <= MAX_INPUT_BYTES, 'APK input exceeds its limit')
@@ -171,16 +182,7 @@ def members(data):
                 flags.add('header_mismatch')
             record_end = data_offset + packed
             if bits & 8:
-                possible = []
-                for prefix in (0, 4):
-                    if prefix and data[record_end:record_end + 4] != b'PK\x07\x08':
-                        continue
-                    if record_end + prefix + 12 <= directory and _unpack('<3I', data, record_end + prefix) == (crc, packed, size):
-                        possible.append(record_end + prefix + 12)
-                if len(possible) == 1:
-                    record_end = possible[0]
-                else:
-                    flags.add('header_mismatch')
+                record_end = _descriptor_end(data, record_end, directory, (crc, packed, size))
         except ApkError as exc:
             if str(exc) == 'ZIP64 is unsupported':
                 raise
@@ -221,6 +223,11 @@ def materialize(data, member):
     """Revalidate identity, then inflate in bounded chunks; declared sizes are never allocation hints."""
     _check(isinstance(member, ZipMember) and member in members(data) and not member.flags,
            'APK member is refused')
+    return _materialize(data, member)
+
+
+def _materialize(data, member):
+    """Only callers holding a clean member from a parse of these same bytes may use this core."""
     raw = memoryview(data)[member.data_offset:member.data_offset + member.compressed_size]
     if member.method == 0:
         child = bytes(raw)
@@ -404,7 +411,7 @@ def inventory(data, args):
         flags, digest = list(member.flags), None
         if not flags:
             try:
-                _, digest = materialize(data, member)
+                _, digest = _materialize(data, member)
             except ApkError:
                 flags = ['crc']
         result.append(Observation(Location(member.central_offset, min(member.central_length, 4096)),
