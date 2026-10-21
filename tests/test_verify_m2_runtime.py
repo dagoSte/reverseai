@@ -3119,7 +3119,7 @@ class GhidraFakeBoundary(FakeBoundary):
 
     @staticmethod
     def resource_profile(operation):
-        if operation != "ghidra.analyze":
+        if operation not in ("ghidra.analyze", "ghidra.functions", "ghidra.function", "ghidra.xrefs"):
             raise AssertionError("unexpected profile request")
         return {"pids": 256, "memory": "2g", "cpus": 2,
                 "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=512m", "wall_seconds": 240}
@@ -3339,6 +3339,39 @@ class GhidraNativeProfileTests(unittest.TestCase):
             with self.subTest(operation=operation, args=args), self.assertRaises(verifier.VerificationError):
                 self.native.runner(argv, timeout=240, max_output=262144)
         self.assertEqual(self.boundary.calls, [])
+
+    def test_query_requests_are_a_fixed_table_on_the_three_refs_fixtures(self):
+        for builder in (elf_refs, pe_refs, macho_refs):
+            data, layout = builder()
+            requests = verifier.ghidra_query_requests(data)
+            self.assertEqual(set(requests), {'functions_page', 'function_add', 'function_constant', 'xrefs_counter'})
+            self.assertEqual(requests['function_add'][1]['entry'], layout['text']['address'] + 0x20)
+            self.assertEqual(requests['function_constant'][1]['entry'], layout['text']['address'] + 0x50)
+            self.assertEqual(requests['xrefs_counter'][1]['address'], layout['data']['address'] + 0x40)
+            for operation, args in requests.values():
+                self.assertTrue(verifier.ghidra_request_allowed(operation, args))
+                self.assertFalse(verifier.ghidra_request_allowed(operation, {**args, 'unexpected': 1}))
+                self.assertFalse(verifier.ghidra_request_allowed(operation, {**args, 'start': True}))
+        self.assertFalse(verifier.ghidra_request_allowed('ghidra.shell', {}))
+        with self.assertRaises(verifier.VerificationError):verifier.ghidra_query_requests(b'not a fixture')
+
+    def test_all_query_modes_keep_the_same_profile_and_exact_builder(self):
+        for operation, args in verifier.ghidra_query_requests(elf_refs()[0]).values():
+            self.setUp()
+            argv = self.boundary.build_argv(IMAGE_ID, 'reverseai-unit-owned', str(SNAPSHOT), operation, args)
+            self.assertEqual(self.native.runner(argv, timeout=240, max_output=262144), b'canned worker reply')
+            self.assertEqual(self.native.inspected, 1)
+            self.assertTrue(self.receipt['cleanup'][0]['verified'])
+
+    def test_drift_in_any_query_mode_profile_is_refused_before_native_work(self):
+        original = self.boundary.resource_profile
+        for changed in ('ghidra.functions', 'ghidra.function', 'ghidra.xrefs'):
+            def drift(operation):
+                profile = original(operation)
+                return {**profile, 'wall_seconds': 45} if operation == changed else profile
+            with self.subTest(operation=changed), mock.patch.object(self.boundary, 'resource_profile', side_effect=drift), \
+                    self.assertRaises(verifier.VerificationError):
+                verifier.NativeVerifier(self.boundary, ghidra_lock_fixture(), {'checks': [], 'cleanup': []}, tool='ghidra')
 
     def test_wrong_stopped_profile_never_starts_and_still_cleans_owned_id(self):
         self.boundary.inspect["HostConfig"]["PidsLimit"] = 64

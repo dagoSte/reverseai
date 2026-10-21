@@ -24,7 +24,7 @@ import time
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from reverseai.contract import MAX_WORKER_REPLY_BYTES, Observation, parse_worker_reply, sha256_hex
+from reverseai.contract import MAX_WORKER_REPLY_BYTES, Observation, canonical_json, parse_worker_reply, sha256_hex
 from reverseai.tools import structure, ghidra_verify
 from tests.fixtures_structure import elf, pe
 from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code, elf_refs, pe_refs, macho_refs
@@ -60,6 +60,7 @@ GHIDRA_FIXTURE_NAMES = ("elf_code", "pe_code", "elf_data_only", "macho_code", "e
 GHIDRA_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                           *(f"{name}.analyze" for name in GHIDRA_FIXTURE_NAMES))
 GHIDRA_NATIVE_RUNS = len(CONTROL_NAMES) + len(GHIDRA_FIXTURE_NAMES)
+GHIDRA_OPERATIONS = ("ghidra.analyze", "ghidra.functions", "ghidra.function", "ghidra.xrefs")
 
 
 class VerificationError(ValueError):
@@ -97,12 +98,13 @@ def lock_options(tool):
 
 
 def verify_ghidra_executor_profile(boundary):
-    profile = boundary.resource_profile("ghidra.analyze")
     expected = {"pids": 256, "memory": "2g", "cpus": 2,
                 "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=512m", "wall_seconds": 240}
-    need(dict(profile) == expected and all(type(profile[key]) is type(value) for key, value in expected.items()) and
-         type(boundary.GHIDRA_WALL_SECONDS) is int and boundary.GHIDRA_WALL_SECONDS == 240,
-         "ExecutorGhidraProfile")
+    for operation in GHIDRA_OPERATIONS:
+        profile = boundary.resource_profile(operation)
+        need(dict(profile) == expected and all(type(profile[key]) is type(value) for key, value in expected.items()) and
+             type(boundary.GHIDRA_WALL_SECONDS) is int and boundary.GHIDRA_WALL_SECONDS == 240,
+             "ExecutorGhidraProfile")
 
 
 def _unique(pairs):
@@ -265,6 +267,30 @@ def ghidra_fixtures():
 def ghidra_args():
     return {"max_functions": 64, "decompile": 8, "max_chars": 1024, "max_calls": 128,
             "assembly": 4, "max_instructions": 32, "max_refs": 64, "max_strings": 32}
+
+
+def ghidra_query_requests(data):
+    """Fixed requests on the declared refs-fixture addresses; these do not assert Ghidra's readings."""
+    layout = next((layout for sample, layout in (elf_refs(), pe_refs(), macho_refs()) if sample == data), None)
+    need(layout is not None, "KnownAnswerFixture")
+    base = layout["text"]["address"]
+    function = {"select": "entry", "entry": base + 0x20, "name": "", "parts": "all", "start": 1,
+                "limit": 2, "max_chars": 1024, "max_calls": 64, "max_refs": 64}
+    return {
+        "functions_page": ("ghidra.functions", {"query": "", "start": 1, "limit": 2}),
+        "function_add": ("ghidra.function", function),
+        "function_constant": ("ghidra.function", {**function, "entry": base + 0x50, "parts": "callers",
+                                                  "start": 0, "limit": 64}),
+        "xrefs_counter": ("ghidra.xrefs", {"address": layout["data"]["address"] + 0x40, "start": 0, "limit": 64}),
+    }
+
+
+def ghidra_request_allowed(operation, args):
+    expected = [("ghidra.analyze", ghidra_args())]
+    if operation != "ghidra.analyze":
+        expected = [request for data in (elf_refs()[0], pe_refs()[0], macho_refs()[0])
+                    for request in ghidra_query_requests(data).values()]
+    return any(operation == name and canonical_json(args) == canonical_json(checked) for name, checked in expected)
 
 
 def compare_ghidra_observations(data, observations):
@@ -692,7 +718,7 @@ class NativeVerifier:
         at = argv.index(self.lock["image_id"])
         operation, args = argv[at + 1], decode(argv[at + 2])
         if self.tool == "ghidra":
-            need(operation == "ghidra.analyze" and args == ghidra_args(), "GhidraRequestChanged")
+            need(ghidra_request_allowed(operation, args), "GhidraRequestChanged")
         need(argv == self.boundary.build_argv(self.lock["image_id"], name, snapshot, operation, args), "BuilderMismatch")
         code = probe_code(self.active, tool=self.tool) if self.active is not None else None
         created = derive_control_argv(argv, self.lock["image_id"], code)
