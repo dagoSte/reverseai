@@ -397,16 +397,48 @@ class BinaryManifestTests(unittest.TestCase):
             apk.binary_manifest(nested)
         with patch.object(apk, 'MAX_XML_ENTRIES', 2), self.assertRaises(apk.ApkError):
             apk.binary_manifest(nested)
-        many = xml_bytes(strings, [start_element(0, [(NONE, 1, NONE, 16, 1)]),
-                                  start_element(0, [(NONE, 1, NONE, 16, 1)]), end_element(0), end_element(0)])
-        with patch.object(apk, 'MAX_XML_ENTRIES', 1), self.assertRaises(apk.ApkError):
+        # Reach the aggregate attribute guard before the independent string/chunk guards.
+        attrs = [(NONE, index, NONE, 16, index) for index in range(1, 5)]
+        many = xml_bytes(['manifest', 'a', 'b', 'c', 'd'],
+                         [start_element(0, attrs)] * 3 + [end_element(0)] * 3)
+        with patch.object(apk, 'MAX_XML_ENTRIES', 8), self.assertRaisesRegex(apk.ApkError, 'Too many.*attributes'):
             apk.binary_manifest(many)
+        pool = xml_bytes(['manifest', 'a', 'b'], [start_element(0), end_element(0)])
+        with patch.object(apk, 'MAX_XML_ENTRIES', 2), self.assertRaisesRegex(apk.ApkError, 'Too many.*strings'):
+            apk.binary_manifest(pool)
         data = xml_bytes(['manifest', '\u0800' * 180], [start_element(0), end_element(0)], False)
         self.assertLess(len(data), 512)
         with patch.object(apk, 'MAX_CHILD_BYTES', 512), self.assertRaisesRegex(apk.ApkError, 'strings exceed'):
             apk.binary_manifest(data)
         with patch.object(apk, 'MAX_CHILD_BYTES', len(data) - 1), self.assertRaises(apk.ApkError):
             apk.binary_manifest(data)
+
+    def test_resource_maps_pool_shape_and_declared_utf16_units_are_checked(self):
+        simple = xml_bytes(['manifest'], [start_element(0), end_element(0)])
+        start = 8 + 28 + 4
+        with self.assertRaisesRegex(apk.ApkError, 'length differs'):
+            apk.binary_manifest(changed(simple, start, '<B', 7))
+        for offset, fmt, value in ((8 + 8, '<I', 65537), (8 + 20, '<I', 27), (8 + 24, '<I', len(simple)),
+                                   (8 + 12, '<I', 1), (8 + 28, '<I', NONE)):
+            with self.subTest(offset=offset), self.assertRaises(apk.ApkError):
+                apk.binary_manifest(changed(simple, offset, fmt, value))
+        # A resource map may occur once, before elements, and cannot exceed its string pool.
+        mapping = struct.pack('<HHII', 0x180, 8, 12, 0x01010000)
+        for chunks in ([mapping, mapping, start_element(0), end_element(0)],
+                       [start_element(0), mapping, end_element(0)],
+                       [mapping + bytes(4), start_element(0), end_element(0)]):
+            with self.subTest(chunks=chunks), self.assertRaises(apk.ApkError):
+                apk.binary_manifest(xml_bytes(['manifest'], chunks))
+
+    def test_string_pool_aliases_are_decoded_once_with_bounded_scan(self):
+        raw = b'\x08\x08manifest\x00\x00'
+        start = 28 + 40 * 4
+        pool = struct.pack('<HHI5I', 1, 28, start + len(raw), 40, 0, 0x100, start, 0) + bytes(40 * 4) + raw
+        body = pool + start_element(0) + end_element(0)
+        data = struct.pack('<HHI', 3, 8, 8 + len(body)) + body
+        # Forty offsets alias one string; charging each alias would exceed this 280-byte input.
+        with patch.object(apk, 'MAX_CHILD_BYTES', len(data)):
+            self.assertEqual(apk.binary_manifest(data)[0]['name'], 'manifest')
 
     def test_seeded_mutations_only_return_bounded_rows_or_contract_errors(self):
         rng = random.Random(71)
