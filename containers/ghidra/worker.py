@@ -71,6 +71,8 @@ OPERATIONS = {
     "ghidra.xrefs": {"address": ("int", 0, MAX_ADDRESS, None), "start": ("int", 0, 65535, 0), "limit": ("int", 1, 256, 64)},
 }
 MAX_OBSERVATIONS = {"ghidra.analyze": 600, "ghidra.functions": 128, "ghidra.function": 643, "ghidra.xrefs": 256}
+MAX_ROWS = 65536  # functions, callers, callees or references to an address one query run may count (m3d-seams-w, m3d-fix-round)
+MAX_FUNCTION_INSTRUCTIONS = 1_000_000  # instructions one function may count (m3d-fix-round)
 MAX_STRING_ARG = 256
 GHIDRA = Path("/opt/ghidra")
 SCRIPTS = Path(__file__).resolve().parent / "ghidra_scripts"
@@ -134,7 +136,8 @@ class ReplyTooLarge(WorkerFailure):
 
 
 class TooManyRows(WorkerFailure):
-    """More than 65,536 functions, callers or references to count: the run fails instead of a total cut short."""
+    """More than MAX_ROWS functions, callers, callees or references, or more than MAX_FUNCTION_INSTRUCTIONS instructions,
+    to count: the run fails instead of reporting a total cut short."""
 
 
 # ---- The file's own sections: offset <-> virtual address -----------------------------------------
@@ -758,7 +761,7 @@ def references_to(anchors, block, to, calls_only):
     (at, type, file offset, length, from) rows: unique by (at, type), in address order. More than 65,536 fails the run."""
     if not isinstance(block, dict) or not isinstance(block.get("rows"), list) or type(block.get("overflow")) is not bool:
         raise InvalidQueryOutput()
-    if block["overflow"]:
+    if block["overflow"] or len(block["rows"]) > MAX_ROWS:
         raise TooManyRows()
     found = {}
     for row in block["rows"]:
@@ -793,7 +796,7 @@ def function_rows(data, query, args):
     items, total = _rows(query, "functions"), _int(query.get("total"))
     if type(query.get("overflow")) is not bool:
         raise InvalidQueryOutput()
-    if query["overflow"]:
+    if query["overflow"] or total > MAX_ROWS:
         raise TooManyRows()
     reply = Fit([], MAX_OBSERVATIONS["ghidra.functions"])
     for position, item in enumerate(items[:args["limit"]]):
@@ -818,6 +821,10 @@ def instruction_page(anchors, function, page, args):
     total, start, rows = _int(page.get("total")), args["start"], page["rows"]
     if _int(page.get("start")) != start or len(rows) > args["limit"] or (rows and start + len(rows) > total):
         raise InvalidQueryOutput()
+    if type(page.get("overflow")) is not bool:
+        raise InvalidQueryOutput()
+    if page["overflow"] or total > MAX_FUNCTION_INSTRUCTIONS:
+        raise TooManyRows()
     value = {"kind": "instructions", "entry": function["va"], "start": start, "total": total, "rows": [], "truncated": False}
     first = after = None
     for position, row in enumerate(rows):
@@ -850,8 +857,12 @@ def function_parts(data, query, args):
     if (function["va"] != args["entry"] or matches != 1) if args["select"] == "entry" else function["raw_name"] != args["name"]:
         raise InvalidQueryOutput()  # the query answered another question
     function["index"] = 0
+    if not isinstance(function["calls"], list) or type(query["target"].get("calls_overflow")) is not bool:
+        raise InvalidQueryOutput()
+    if query["target"]["calls_overflow"] or len(function["calls"]) > MAX_ROWS:
+        raise TooManyRows()  # callees_total counts every call instruction, never analyze's 1,024-row prefix
     callers = references_to(anchors, query.get("callers"), function["va"], True)
-    callees = calls([function], anchors, {"max_calls": len(function["calls"]) if isinstance(function["calls"], list) else 0})
+    callees = calls([function], anchors, {"max_calls": len(function["calls"])})
     anchor = {"offset": function["offset"], "length": function["length"]}
     reply = Fit([{"location": anchor, "value": {"kind": "target", "name": function["name"], "entry": function["va"],
                                                "size": function["size"], "matches": matches,
