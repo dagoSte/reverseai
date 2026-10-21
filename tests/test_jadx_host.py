@@ -1,6 +1,7 @@
 """JADX stand-ins: all identities, instructions and child provenance come from DEX bytes."""
 
 import copy
+import json
 import os
 from pathlib import Path
 import struct
@@ -151,8 +152,10 @@ class HostTests(unittest.TestCase):
                 self.invoke(change=lambda r: [{**r[0], "status": status}, r[1]])
 
     def test_worker_envelope_and_json_bounds_are_strict(self):
+        _, executor = self.invoke()
+        honest = json.loads(Executor(self.layout).run('jadx.method', executor.calls[0], self.data, sha256_hex(self.data)))
         def valid(data):
-            return {"protocol": WORKER_PROTOCOL, "status": "ok", "snapshot_sha256": sha256_hex(data), "observations": []}
+            return {**copy.deepcopy(honest), "snapshot_sha256": sha256_hex(data)}
         raws = [lambda d: b'\xff', lambda d: b'{', lambda d: b'[]', lambda d: b'0' * 262145,
                 lambda d: b'{"protocol":1,"protocol":2}',
                 lambda d: b'{"protocol":NaN}', lambda d: b'[' * 2000 + b']' * 2000,
@@ -161,7 +164,7 @@ class HostTests(unittest.TestCase):
                 lambda d: canonical_json({**valid(d), "extra": 1}).encode(),
                 lambda d: canonical_json({**valid(d), "observations": [None] * 17}).encode()]
         for raw in raws:
-            with self.subTest(raw=raw), self.assertRaises(ContractError):
+            with self.subTest(raw=raw), self.assertRaisesRegex(ContractError, jadx_verify.REFUSED):
                 self.invoke(raw=raw)
         for error in ("memory", "timeout", "input"):
             with self.subTest(error=error), self.assertRaises(WorkerError):
