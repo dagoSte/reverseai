@@ -311,6 +311,19 @@ class M3cAnchorTests(unittest.TestCase):
         items = copy.deepcopy(self.items); items[3]["value"]["instructions"] = [[0, 16, "x" * 64]]
         self.check(items)
 
+    def test_instruction_length_bounds_are_independent_of_the_function_anchor(self):
+        # A 17-byte row fits this 32-byte anchor, so only the row-length guard rejects it.
+        for length in (0, 17):
+            items = copy.deepcopy(self.items[:3] + [self.items[4]])
+            items[3]["value"]["instructions"] = [[0, length, "x"]]
+            with self.subTest(length=length):
+                self.refuse(items)
+        for length in (1, 16):
+            items = copy.deepcopy(self.items[:3] + [self.items[4]])
+            items[3]["value"]["instructions"] = [[0, length, "x"]]
+            with self.subTest(length=length):
+                self.check(items)
+
     def test_reference_types_instruction_span_order_uniqueness_and_emitted_origin(self):
         for key, value in (("from", True), ("from", 0x9999), ("to", -1),
                            ("type", "call"), ("type", []), ("to_name", "x\x1b"), ("to_name", "x" * 129)):
