@@ -12,7 +12,7 @@ from unittest.mock import patch
 from reverseai import contained
 from reverseai.contract import (
     AnalysisResult, AnalysisTask, Budget, ContractError, InputRef, Location, OperationRequest,
-    WORKER_PROTOCOL, WorkerError, canonical_json, content_id, make_finding, sha256_hex,
+    MAX_OBSERVATION_BYTES, WORKER_PROTOCOL, WorkerError, canonical_json, content_id, make_finding, sha256_hex,
 )
 from reverseai.gateway import Gateway
 from reverseai.review import review
@@ -62,6 +62,12 @@ class HostTests(unittest.TestCase):
         checked = spec.validate_args({"class": F.MAIN, "method": "helper", **(args or {})})
         return spec.handler(self.data if data is None else data, checked), executor
 
+    def admitted(self, *args, **kwargs):
+        try:
+            return self.invoke(*args, **kwargs)
+        except ContractError as error:
+            self.fail(f"Valid Java page was refused: {error}")
+
     def test_honest_overloads_have_exact_instruction_anchors_and_derived_verdicts(self):
         rows, executor = self.invoke()
         methods = sorted((m for m in self.layout["dex"]["classes.dex"]["classes"][0]["methods"]
@@ -89,7 +95,7 @@ class HostTests(unittest.TestCase):
         self.assertEqual(executor.calls[0]["targets"][0]["member"], 1)
         rows, _ = self.invoke({"prototype": "(I)I"})
         self.assertEqual([o.value["prototype"] for o in rows], ["(I)I"])
-        for args in ({"method": "absent"}, {"class": "Lmissing;"}, {"member": "missing.dex"}, {"prototype": "()V"}):
+        for args in ({"method": "absent"}, {"class": "Lmissing;"}, {"prototype": "()V"}):
             rows, executor = self.invoke(args)
             self.assertEqual((rows, executor.calls), ((), []))
 
@@ -171,7 +177,7 @@ class HostTests(unittest.TestCase):
                 self.invoke(raw=lambda d: canonical_json({"protocol": WORKER_PROTOCOL, "status": "error",
                             "snapshot_sha256": sha256_hex(d), "error": error}).encode())
 
-    def test_longest_instruction_prefix_is_capped_and_large_observations_are_refused(self):
+    def test_longest_instruction_prefix_is_capped(self):
         cls = {"name": "La;", "super": F.OBJECT, "access": 1,
                "direct": (F._method("large", "V", (), 9, 0, 0, 0, *([("return-void",)] * 2200)),)}
         child, layout = F.dex_file((cls,))
@@ -179,10 +185,69 @@ class HostTests(unittest.TestCase):
         executor = Executor({"dex": {"classes.dex": layout}})
         rows, _ = self.invoke({"class": "La;", "method": "large"}, executor=executor, data=data)
         self.assertEqual(rows[0].location, Location(layout["code_items"][0]["offset"] + 16, 4096))
-        def oversized(rows):
-            return [{**r, "total": 2048, "text": '"' * 2048} for r in rows]
-        with self.assertRaises(ContractError):
-            self.invoke({"max_chars": 2048}, change=oversized)
+
+    def test_escaping_heavy_pages_fit_the_longest_prefix_and_keep_paging(self):
+        # Decision m4b-fix-round replaces oversized-page refusal with clipping.
+        for char in ('"', '\\'):
+            for maximum in (1024, 2048):
+                for status in ('ok', 'fallback'):
+                    with self.subTest(char=char, maximum=maximum, status=status):
+                        text = char * maximum
+                        def page(rows):
+                            return [{**r, 'status': status, 'total': 7 + maximum, 'text': text} for r in rows]
+                        rows, _ = self.admitted({'start': 7, 'max_chars': maximum}, change=page)
+                        for row in rows:
+                            fitting = [i for i in range(maximum + 1) if len(canonical_json(
+                                {**row.value, 'text': text[:i]}).encode()) <= MAX_OBSERVATION_BYTES]
+                            self.assertEqual(row.value['text'], text[:max(fitting)])
+                            self.assertEqual((row.value['start'], row.value['total']), (7, 7 + maximum))
+                            self.assertEqual(row.value['form'], 'java' if status == 'ok' else 'fallback')
+                            self.assertLessEqual(len(canonical_json(row.value).encode()), MAX_OBSERVATION_BYTES)
+                            if maximum == 1024:
+                                self.assertEqual(row.value['text'], text)
+                        if maximum == 2048:
+                            kept = len(rows[0].value['text'])
+                            self.assertLess(kept, maximum)
+                            following, _ = self.admitted({'prototype': '(I)I', 'start': 7 + kept, 'max_chars': maximum},
+                                change=lambda r: [{**r[0], 'total': 7 + maximum, 'text': text[kept:]}])
+                            self.assertEqual(following[0].value['start'], 7 + kept)
+                            self.assertEqual(rows[0].value['text'] + following[0].value['text'], text)
+
+    def test_byte_clipping_keeps_a_complete_unicode_escape(self):
+        args = {'prototype': '(I)I', 'start': 7, 'max_chars': 2048}
+        base, _ = self.admitted(args, change=lambda r: [{**r[0], 'total': 2055, 'text': '\\' * 2048}])
+        begin = len(base[0].value['text']) - 2
+        text = '\\' * begin + r'\u1234' + '\\' * (2048 - begin - 6)
+        plain_cut = max(i for i in range(len(text) + 1) if len(canonical_json(
+            {**base[0].value, 'text': text[:i]}).encode()) <= MAX_OBSERVATION_BYTES)
+        self.assertLess(begin, plain_cut)
+        self.assertLess(plain_cut, begin + 6)
+        rows, _ = self.admitted(args, change=lambda r: [{**r[0], 'total': 2055, 'text': text}])
+        self.assertEqual(rows[0].value['text'], text[:begin])
+        self.assertEqual((rows[0].value['start'], rows[0].value['total']), (7, 2055))
+
+    def test_clipping_cannot_hide_invalid_worker_text_after_the_retained_prefix(self):
+        with self.assertRaisesRegex(ContractError, jadx_verify.REFUSED):
+            self.invoke({'max_chars': 2048}, change=lambda rows: [
+                {**r, 'total': 2048, 'text': '"' * 2047 + '\x1b'} for r in rows])
+
+    def test_ok_and_fallback_require_a_positive_total(self):
+        for status in ('ok', 'fallback'):
+            for start in (0, 7):
+                with self.subTest(status=status, start=start), self.assertRaisesRegex(ContractError, jadx_verify.REFUSED):
+                    self.invoke({'start': start}, change=lambda rows: [
+                        {**r, 'status': status, 'total': 0, 'text': ''} for r in rows])
+
+    def test_explicit_member_must_name_a_classes_dex_member(self):
+        child, _ = F.classes_dex()
+        data, _ = zip_bytes([('classes.dex', child), ('assets/x.dex', child)])
+        for member in ('assets/x.dex', 'missing.dex', 'classes3.dex'):
+            executor = Executor(self.layout)
+            with self.subTest(member=member), self.assertRaisesRegex(ContractError, jadx_verify.REFUSED):
+                self.invoke({'member': member}, executor=executor, data=data)
+            self.assertEqual(executor.calls, [])
+        rows, executor = self.invoke({'member': 'classes.dex', 'method': 'absent'})
+        self.assertEqual((rows, executor.calls), ((), []))
 
     def test_abstract_native_and_zero_instruction_methods_are_not_targets(self):
         for access in (0x401, 0x101):

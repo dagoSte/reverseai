@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import json
+import re
 
 from reverseai.contract import (
     ContractError, Location, MAX_EXCERPT_BYTES, MAX_OBSERVATION_BYTES, MAX_WORKER_REPLY_BYTES,
@@ -31,6 +32,7 @@ class _Anchor:
 def prepare(data, args):
     """Resolve once, using the DEX tool's limits and exact escaped comparisons."""
     members, targets, anchors = [], [], []
+    selected = not args["member"]
     try:
         for name, _, parsed, artifact in dex._dex_files(data, ""):
             _check(len(members) < 16)
@@ -38,6 +40,7 @@ def prepare(data, args):
             members.append(dict(artifact))
             if args["member"] and not dex._matches((name,), args["member"]):
                 continue
+            selected = True
             methods = sorted(dex._defined_methods(parsed), key=lambda pair: pair[1]["index"])
             for declaration, method in methods:
                 code = declaration.get("code")
@@ -58,6 +61,7 @@ def prepare(data, args):
                     dict(artifact), declaration["code_off"], code["insns_size"]))
     except (ContractError, UnicodeError):
         raise ContractError(REFUSED) from None
+    _check(selected)
     return {"members": members, "targets": targets, "start": args["start"], "max_chars": args["max_chars"]}, tuple(anchors)
 
 
@@ -102,7 +106,7 @@ def anchor(rows, args, anchors):
                and len(text) <= args["max_chars"]
                and all(" " <= char <= "~" or char in "\n\t" for char in text))
         if status in ("ok", "fallback"):
-            _check(type(row["code_offset"]) is int and row["code_offset"] == expected.code_offset
+            _check(total > 0 and type(row["code_offset"]) is int and row["code_offset"] == expected.code_offset
                    and type(row["insns_count"]) is int and row["insns_count"] == expected.insns_count)
             start = min(args["start"], total)
             _check(start + len(text) <= total)
@@ -111,6 +115,20 @@ def anchor(rows, args, anchors):
             _check(row["code_offset"] is None and row["insns_count"] is None and total == 0 and text == "")
             start, form = 0, "omitted" if status == "omitted" else "error"
         value = {"kind": "java", **expected.identity, "form": form, "start": start, "total": total, "text": text}
+        if len(canonical_json(value).encode()) > MAX_OBSERVATION_BYTES:
+            low, high = 0, len(text)
+            while low < high:
+                middle = (low + high + 1) // 2
+                value["text"] = text[:middle]
+                if len(canonical_json(value).encode()) <= MAX_OBSERVATION_BYTES:
+                    low = middle
+                else:
+                    high = middle - 1
+            for escape in re.finditer(r"\\u[0-9a-fA-F]{4}", text):
+                if escape.start() < low < escape.end():
+                    low = escape.start()
+                    break
+            value["text"] = text[:low]
         _check(len(canonical_json(value).encode()) <= MAX_OBSERVATION_BYTES)
         result.append(Observation(expected.location, value, dict(expected.artifact)))
     return tuple(result)
