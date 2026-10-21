@@ -17,6 +17,7 @@ from reverseai.contract import (
 from tests.fixtures_strings import KNOWN, clean_control, known_strings
 from tests.fixtures_structure import elf, pe
 from tests.fixtures_code import elf_refs, pe_refs, macho_refs
+from tests import fixtures_apk
 
 
 def ref(data, name="sample.bin"):
@@ -466,6 +467,36 @@ class CliTests(unittest.TestCase):
             code, _, err = self.run_cli("analyze", str(sample), "--out", str(Path(temporary, "missing", "report")))
             self.assertEqual(code, 1)
             self.assertEqual(err, "reverseai: output refused: --out cannot be created\n")
+
+
+class AndroidPipelineTests(unittest.TestCase):
+    def test_apk_and_dex_tools_are_registered_and_the_analyze_run_does_not_use_them(self):
+        self.assertEqual([tool.ref for tool in pipeline.TOOLS][-2:], [ToolRef("apk", "0.1.0"), ToolRef("dex", "0.1.0")])
+        self.assertEqual(pipeline._budget(pipeline.TOOLS), Budget())
+        data, _ = fixtures_apk.apk_basic()
+        analysis = pipeline.analyze_bytes(data, ref(data, "fixture.apk"))
+        self.assertFalse([f for r in analysis.results for f in r.findings if f.claim_key.startswith("android.")])
+        self.assertFalse([e for r in analysis.results for e in r.evidence if e.tool.name in ("apk", "dex")])
+        self.assertIn(("apk", "0.1.0"), [(t["name"], t["version"]) for t in report.to_dict(analysis)["tools"]])
+
+    def test_android_query_from_the_command_line(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sample, out = Path(temporary, "fixture.apk"), Path(temporary, "report")
+            sample.write_bytes(fixtures_apk.apk_basic()[0])
+            code, stdout, stderr = CliTests.run_cli(self, "query", str(sample), "--query", "trace_android_references",
+                                                    "--arg", "class=" + fixtures_apk.HELPER, "--arg", "method=compute",
+                                                    "--arg", "direction=to", "--out", str(out))
+            self.assertEqual(code, 0, stderr)
+            parsed = json.loads((out / "report.json").read_text())
+            finding, = parsed["results"][0]["findings"]
+            self.assertEqual((finding["claim_key"], finding["verdict"]), ("android.references", "supported"))
+            self.assertEqual([row[:3] for row in finding["value"]["rows"]],
+                             [["classes.dex", fixtures_apk.MAIN, "helper"], ["classes2.dex", fixtures_apk.WORKER, "run"]])
+            self.assertEqual({e["artifact"]["member"] for e in parsed["results"][0]["evidence"]},
+                             {"classes.dex", "classes2.dex"})
+            text = (out / "report.md").read_text()
+            self.assertIn("dex.references in `classes2.dex` @ 0x", text)
+            self.assertNotIn(temporary, text)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Closed query names, typed arguments and fixed operation requests (contract M3d)."""
+"""Closed query names, typed arguments and fixed operation requests (contract M3d; Android names M4a)."""
 
 from dataclasses import dataclass
 import re
@@ -26,18 +26,38 @@ class QuerySpec:
     args: object
     role: str = "structural"
     fixed: object = None
+    routes: object = None  # operation -> ({operation argument: query argument}, {operation argument: fixed value})
 
     def validate(self, raw):
         return OperationSpec("query.arguments", self.args, lambda data, args: ()).validate_args(raw)
 
     def requests(self, args):
-        return tuple(OperationRequest(name, {} if name == "structure.entry" else {**args, **(self.fixed or {})})
-                     for name in self.operations)
+        def arguments(name):
+            if self.routes:
+                taken, fixed = self.routes[name]
+                return {**{key: args[source] for key, source in taken.items()}, **fixed}
+            return {} if name == "structure.entry" else {**args, **(self.fixed or {})}
+        return tuple(OperationRequest(name, arguments(name)) for name in self.operations)
 
 
 def _query(operation, args, *, fixed=None):
     return QuerySpec((operation,), MappingProxyType(args), "code" if operation.startswith("ghidra.") else "structural",
                      MappingProxyType(fixed or {}))
+
+
+def _routed(args, routes):
+    """A query whose operations take different arguments: routes[operation] = ({argument: query argument}, fixed)."""
+    return QuerySpec(tuple(routes), MappingProxyType(args), routes=MappingProxyType(
+        {name: (MappingProxyType(dict(zip(taken, taken)) if isinstance(taken, tuple) else taken), MappingProxyType(fixed))
+         for name, (taken, fixed) in routes.items()}))
+
+
+# Android (contract/3): one DEX member by name, or "" for every classes*.dex member (decision m4a-seams-x4);
+# exact descriptors and names.
+ANY_DEX = ArgSpec("literal", 0, 255, default="")
+CLASS = ArgSpec("literal", 1, 255)
+METHOD_ARGS = {"class": CLASS, "method": ArgSpec("literal", 1, 255), "prototype": ArgSpec("literal", 0, 255, default="")}
+ANDROID_LIMIT = _integer(1, 256, 128)
 
 
 TABLE = MappingProxyType({
@@ -69,6 +89,25 @@ TABLE = MappingProxyType({
            ("analyze_function", "all", {"start": START, "limit": LIMIT, "max_chars": _integer(64, 2048, 1024),
                                          "max_calls": _integer(0, 256, 64), "max_refs": _integer(0, 128, 64)}))},
     "xrefs": _query("ghidra.xrefs", {"address": _integer(0, 2**64 - 1), "start": START, "limit": LIMIT}),
+    "inspect_android_package": _routed(
+        {"member_start": START, "member_limit": ANDROID_LIMIT, "attribute_start": START,
+         "attribute_limit": _integer(1, 256, 256)},
+        {"apk.inventory": ({"start": "member_start", "limit": "member_limit"}, {}),
+         "apk.manifest": ({"start": "attribute_start", "limit": "attribute_limit"}, {})}),
+    "search_android_classes": _query("dex.classes", {"member": ANY_DEX, "query": ArgSpec("literal", 0, 128, default=""),
+                                                     "start": HOST_START, "limit": ANDROID_LIMIT}),
+    # dex.classes takes the exact class as its query (at most 128 characters), then the class's methods
+    "inspect_android_class": _routed(
+        {"member": ANY_DEX, "class": ArgSpec("literal", 1, 128), "start": START, "limit": ANDROID_LIMIT},
+        {"dex.classes": ({"member": "member", "query": "class"}, {}),
+         "dex.methods": (("member", "class", "start", "limit"), {})}),
+    "inspect_android_method": _routed(
+        {"member": ANY_DEX, **METHOD_ARGS, "start": START, "limit": ANDROID_LIMIT},
+        {"dex.methods": (("member", "class"), {}),
+         "dex.references": (("member", "class", "method", "prototype", "start", "limit"), {"direction": "from"})}),
+    "trace_android_references": _query("dex.references", {
+        "member": ANY_DEX, **METHOD_ARGS, "direction": ArgSpec("enum", choices=("from", "to"), default="from"),
+        "start": START, "limit": ANDROID_LIMIT}),
 })
 
 

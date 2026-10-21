@@ -102,6 +102,35 @@ def _code_value(key, value):
     return value
 
 
+# DEX access flags (dex-format access_flags), for readable Markdown only
+CLASS_ACCESS = ((0x1, "public"), (0x2, "private"), (0x4, "protected"), (0x8, "static"), (0x10, "final"),
+                (0x200, "interface"), (0x400, "abstract"), (0x1000, "synthetic"), (0x2000, "annotation"), (0x4000, "enum"))
+METHOD_ACCESS = ((0x1, "public"), (0x2, "private"), (0x4, "protected"), (0x8, "static"), (0x10, "final"),
+                 (0x20, "synchronized"), (0x40, "bridge"), (0x80, "varargs"), (0x100, "native"), (0x400, "abstract"),
+                 (0x800, "strict"), (0x1000, "synthetic"), (0x10000, "constructor"), (0x20000, "declared-synchronized"))
+METHODS = {0: "stored", 8: "deflate"}
+
+
+def _access(value, names):
+    if type(value) is not int or value < 0:
+        return value
+    return " ".join([hex(value)] + [name for bit, name in names if value & bit])
+
+
+def _android_value(key, value):
+    """Markdown-only views of Android page rows: methods, CRCs, access flags and offsets inside a child in hex."""
+    if not isinstance(value, dict) or not isinstance(value.get("rows"), list):
+        return value
+    views = {"android.members": {1: lambda v: METHODS.get(v, v), 4: lambda v: f"0x{v:08x}" if type(v) is int else v,
+                                 6: lambda v: (", ".join(v) or "-") if isinstance(v, list)
+                                 and all(isinstance(flag, str) for flag in v) else v},
+             "android.classes": {2: lambda v: _access(v, CLASS_ACCESS)},
+             "android.methods": {4: lambda v: _access(v, METHOD_ACCESS), 5: _address},
+             "android.references": {4: _address}}.get(key, {})
+    return {**value, "rows": [[views[i](cell) if i in views else cell for i, cell in enumerate(row)]
+                              if isinstance(row, list) else row for row in value["rows"]]}
+
+
 def _query_details(rows):
     columns = {
         "segments.list": ("Name", "File offset", "File size", "Address", "Memory size", "Readable", "Writable", "Executable"),
@@ -110,10 +139,20 @@ def _query_details(rows):
         "strings.matches": ("File offset", "Encoding", "Text", "Truncated"),
         "code.function_list": ("Name", "Entry", "Size"),
         "code.xrefs": ("At", "From function", "Type"),
+        "android.members": ("Name", "Method", "Compressed size", "Size", "CRC-32", "SHA-256", "Flags"),
+        "android.manifest": ("Element index", "Element", "Attribute", "Type", "Value"),
+        "android.classes": ("DEX", "Class", "Access", "Superclass"),
+        "android.methods": ("DEX", "Class", "Name", "Prototype", "Access", "Code offset", "Code units"),
+        "android.references": ("DEX", "From class", "From method", "From prototype", "At", "Kind", "Target",
+                               "Truncated"),
     }
     lines = []
     for _, finding in rows:
         key, raw = finding["claim_key"], finding["value"]
+        if key == "android.permissions":
+            lines += ["", f"### {claims.statement(key)}", ""]
+            lines += [f"- {_cell(name, limit=512)}" for name in raw] if isinstance(raw, list) else []
+            continue
         if key == "bytes.read":
             lines += ["", "### Bytes read from the input", "", "| File offset | Address | Bytes (hex) |", "|---|---|---|",
                       f"| {_cell(raw['offset'])} | {_cell(_address(raw['address']))} | {_cell(raw['hex'], limit=8192)} |"]
@@ -139,7 +178,7 @@ def _query_details(rows):
             continue
         if not isinstance(raw, dict) or not all(field in raw for field in ("start", "total", "rows")) or not raw["rows"]:
             continue
-        value = _code_value(key, raw)
+        value = _android_value(key, _code_value(key, raw))
         start, end, total = raw["start"], raw["start"] + len(raw["rows"]) - 1, raw["total"]
         lines += ["", f"### {claims.statement(key)}", "", f"rows {start}..{end} of {total}"]
         if end + 1 < total:
@@ -218,12 +257,18 @@ def to_markdown(analysis):
     derived = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] == "derived"]
     rejected = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] not in ("supported", "derived")]
 
+    def cite(item):
+        """operation @ offset+length in the input; inside a child artifact, its member and the offset in hex."""
+        location = item["location"]
+        if "artifact" in item:
+            member = item["artifact"].get("member") if isinstance(item["artifact"], dict) else None
+            return f"{item['operation']} in {_cell(member, limit=64)} @ {_address(location['offset'])}+{location['length']}"
+        return f"{item['operation']} @ {location['offset']}+{location['length']}"
+
     def table(rows):
         out = ["| Analyst | Checked statement | Value | Confidence | Evidence (operation @ offset+length) |", "|---|---|---|---|---|"]
         for result, finding in rows:
-            cited = "; ".join(
-                f"{evidence[i]['operation']} @ {evidence[i]['location']['offset']}+{evidence[i]['location']['length']}"
-                for i in finding["evidence_ids"][:6] if i in evidence)
+            cited = "; ".join(cite(evidence[i]) for i in finding["evidence_ids"][:6] if i in evidence)
             more = len(finding["evidence_ids"]) - 6
             cited += f"; +{more} more" if more > 0 else ""
             value = _code_value(finding["claim_key"], finding["value"])
