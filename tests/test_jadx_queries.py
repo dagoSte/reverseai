@@ -13,9 +13,11 @@ import unittest
 from unittest.mock import patch
 
 from reverseai import cli, pipeline, queries, report
+from reverseai.analysts import query
 from reverseai.contained import ContainedError
 from reverseai.contract import (
-    ArgSpec, ContractError, InputRef, Location, Observation, OperationSpec, ToolRef, ToolSpec, sha256_hex,
+    AnalysisTask, ArgSpec, ContractError, InputRef, Location, Observation, OperationRequest,
+    OperationSpec, ToolRef, ToolSpec, make_evidence, sha256_hex,
 )
 from reverseai.gateway import Gateway
 from tests import fixtures_apk
@@ -141,6 +143,25 @@ class JadxQuerySurfaceTests(unittest.TestCase):
         for finding in result.findings:
             if finding.claim_key != "android.java":
                 self.assertEqual(judged[finding.id], "supported")
+
+    def test_analyst_ignores_non_java_kinds_from_jadx_method(self):
+        result, = self.query().results
+        good, = [item for item in result.evidence if item.operation == "jadx.method"]
+        task = AnalysisTask(result.task_id, result.role, self.ref,
+                            (OperationRequest("jadx.method", {}),))
+        accepted = query.conclude(task, (good,))
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual((accepted[0].claim_key, accepted[0].evidence_ids),
+                         ("android.java", (good.id,)))
+        for kind in ("not_java", None):
+            with self.subTest(kind=kind):
+                value = {**good.observation, "kind": kind}
+                if kind is None:
+                    del value["kind"]
+                other = make_evidence(self.data, good.tool, good.operation,
+                                      Observation(good.location, value, good.artifact))
+                self.assertEqual(query.conclude(task, (other,)), ())
+                self.assertEqual(query.conclude(task, (other, good)), accepted)
 
     def test_query_task_and_gateway_allow_the_fixed_120_second_worker(self):
         tasks = []
