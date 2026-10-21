@@ -560,6 +560,104 @@ is never cut. Anchors follow the M3a rules (a function's first bytes, at most
 - All `code.*` claims stay in `DERIVED_CLAIMS` (every claim whose operations are
   all `ghidra.*`).
 
+## Child artifacts and Android packages (M4a, contract/3)
+
+M4a reads Android packages on the host, stdlib only: the ZIP container, the binary
+manifest and the DEX files, all verified evidence. Decompiled Java (JADX) is M4b
+and needs an owner-approved download. Decision `m4a-contract`.
+
+- **Child artifacts** (`reverseai.contract/3`): an observation may name an
+  `artifact`, a member stored or deflated inside the input:
+  `{"member", "method" (0 stored or 8 deflate), "data_offset", "compressed_size",
+  "size", "crc32", "sha256"}`. Its location and excerpt hash are then inside the
+  child's bytes. `contract.materialize(data, artifact)` re-derives the child from
+  the input: the compressed range inside the input, raw deflate inflated to
+  exactly `size` with nothing left over, CRC-32 and SHA-256 equal; at most 32 MiB
+  per child and 100:1 expansion; stored members have equal sizes. The gateway
+  materializes each child once per operation (at most 128 MiB of distinct
+  children, else `budget_exceeded`); the reviewer re-materializes it independently
+  once per review (same budget) and refuses evidence whose child does not match
+  the input. Evidence without an artifact keeps its contract/2 ID and meaning.
+  Worker replies (contained tools) cannot name artifacts yet.
+- **Tools** `apk` 0.1.0 and `dex` 0.1.0 (in-process): `reverseai/tools/apk.py` (ZIP,
+  manifest; operations `apk.*`) and `reverseai/tools/dex.py` (DEX; operations
+  `dex.*`), both using `contract.materialize` for members. Limits: input at most 64 MiB (intake), at most
+  2,048 members, methods 0 and 8 only; encrypted members, ZIP64, multi-disk
+  archives, duplicate or traversing names, and local headers or data descriptors
+  that disagree with the central directory are refused or flagged; DEX versions
+  035, 037, 038 and 039 (036 was never released) in little-endian order with a
+  right checksum and signature; at most 65,536 type, proto, field, method and
+  class entries per DEX and 1,048,576 string entries (strings decoded only when
+  used, each scan at most 65,536 bytes), at most 262,144 `class_data` and
+  `type_list` entries in all per DEX; references decoded as a stream, never a
+  list of every instruction; a DEX past these limits is refused with a fixed
+  error, never cut to a total that looks complete. ZIP tables keep their valid
+  prefix when malformed, never read past the buffer. Member names are escaped as import names (at most 255 printable
+  characters); DEX strings are decoded from MUTF-8 and escaped the same way (at
+  most 256 characters, `truncated` when longer).
+- `apk.inventory`: args `start` 0..65535 default 0, `limit` 1..256 default 128.
+  Central directory entries in order: `{"kind": "member", "index", "total",
+  "name", "method", "compressed_size", "size", "crc32", "sha256", "flags"}` at the
+  central directory entry (at most 4,096 bytes, in the input itself); `sha256` is
+  the materialized child's hash, or null when the member cannot be materialized;
+  `flags` a sorted list of refusal reasons (`encrypted`, `unsupported_method`,
+  `duplicate_name`, `traversing_name`, `header_mismatch`, `too_large`,
+  `ratio`, `crc`), empty when clean. Claim `android.members` (observed) page rows
+  `[name, method, compressed_size, size, crc32, sha256, flags]`.
+- `apk.manifest`: args `start` 0..65535 default 0, `limit` 1..256 default 256.
+  The attributes of `AndroidManifest.xml` in document order, each
+  `{"kind": "manifest_attribute", "index", "total", "element_index", "element",
+  "attribute", "type", "value"}` at its 20-byte attribute record inside the child
+  (artifact = that member). `element_index` counts start tags from 0, `element`
+  is the tag name, `attribute` the name with `android:` when in the Android
+  namespace, `type` one of `string`, `int`, `bool`, `reference`, `other`, and
+  `value` a string (`string`; `reference` as `@0x7f...`; `other` as `0x` hex), an
+  int or a bool. Claims (observed): `android.manifest` page rows `[element_index,
+  element, attribute, type, value]`; `android.permissions` = sorted unique values
+  of the cited `uses-permission` (and `uses-permission-sdk-23`) `android:name`
+  string attributes.
+- `dex.classes`: args `member` literal 0..255 default "" (one DEX member by name;
+  "" for every `classes*.dex` member in central directory order), `query` literal
+  0..128 default "" (substring of the class descriptor), `start` 0..1048575
+  default 0, `limit` 1..256 default 128. `{"kind": "class", "index", "total",
+  "dex", "name", "access", "superclass", "interfaces", "source_file"}` at the
+  32-byte `class_def_item` inside the DEX child; `dex` is the member name,
+  `name` and `superclass` descriptors (`superclass` null for none), `interfaces`
+  a list (at most 64), `source_file` or null, `access` the flags as an int.
+  Claim `android.classes` (observed) page rows `[dex, name, access, superclass]`.
+- `dex.methods`: args `member` literal 0..255 (required, one DEX member),
+  `class` literal 1..255 (exact descriptor), `start` 0..65535 default 0, `limit`
+  1..256 default 128. The class's direct then virtual methods in `class_data`
+  order: `{"kind": "method", "index", "total", "dex", "class", "name",
+  "prototype", "access", "code_offset", "code_units"}` at the 8-byte
+  `method_id_item`; `prototype` as `(params)return` descriptors, `code_offset`
+  and `code_units` null without code. Claim `android.methods` (observed) page
+  rows `[dex, class, name, prototype, access, code_offset, code_units]`.
+- `dex.references`: args `member` literal 0..255 default "" (as `dex.classes`),
+  `class` literal 1..255, `method` literal 1..255, `prototype` literal 0..255
+  default "" (exact; "" for every overload), `direction` enum `from`|`to` default
+  `from`, `start` 0..65535 default 0, `limit` 1..256 default 128. `from`: the
+  references the method's code makes, in code order; `to`: every instruction in
+  the selected DEX members that references the method, in member and code order.
+  `{"kind": "dex_ref", "index", "total", "dex", "from_class", "from_method",
+  "from_prototype", "at", "ref_kind", "target"}` at the instruction's code units
+  inside the DEX child; `at` the instruction's offset inside the child; `ref_kind`
+  `method`, `field`, `string` or `type`; `target` `Lcls;->name(params)ret`,
+  `Lcls;->name:Type`, the string (escaped, at most 256 characters) or a type
+  descriptor. Only references decoded from complete, valid instructions count;
+  a method whose code cannot be decoded gives no rows and the run fails with a
+  fixed error rather than a total cut short. Claim `android.references`
+  (observed) page rows `[dex, from_class, from_method, from_prototype, at,
+  ref_kind, target]`.
+- These are declarations in the bytes: a reference in code is not evidence that
+  it runs, and a permission declared is not evidence that it is used.
+- **Queries** (`reverseai/queries.py`), REA's Android names: `inspect_android_package`
+  (`apk.inventory`, `apk.manifest`), `search_android_classes` (`dex.classes`),
+  `inspect_android_class` (`dex.classes` with the exact class as `query`,
+  `dex.methods`), `inspect_android_method` (`dex.methods`, `dex.references`
+  `from`; decompiled Java comes with M4b), `trace_android_references`
+  (`dex.references`; `direction` from the arguments).
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under

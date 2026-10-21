@@ -50,7 +50,7 @@ class ReportTests(unittest.TestCase):
         first, second = report.to_json(analysis()), report.to_json(analysis())
         self.assertEqual(first, second)
         data = json.loads(first)
-        self.assertEqual(data["contract"], "reverseai.contract/2")
+        self.assertEqual(data["contract"], "reverseai.contract/3")  # decision m4a-contract
         self.assertEqual(data["input"]["sha256"], sha256_hex(DATA))
         self.assertEqual(data["summary"], {"supported": 1, "derived": 0, "unsupported": 1, "contradicted": 0, "unreviewed": 0})
         verdicts = {f["claim_key"]: f["verdict"] for f in data["results"][0]["findings"]}
