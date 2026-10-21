@@ -743,8 +743,13 @@ Java is the decompiler's reading, kept **derived** like Ghidra's pseudocode.
   otherwise; it requires JADX's `code_offset` and `insns_count` to equal the
   verified `code_offset` and `code_units` of that method (for `ok` and
   `fallback`), and anchors the observation at the method's instructions (the
-  `insns` of its `code_item`) inside the member's child artifact. A reply for
-  other methods, in another order, or with other counts fails the operation.
+  `insns` of its `code_item`, at most their first 4,096 bytes) inside the
+  member's child artifact. A reply for other methods, in another order, or with
+  other counts fails the operation. Other statuses carry null `code_offset` and
+  `insns_count`, `total` 0 and `text` "" and become `form` `error`. A `start` at
+  or past the end gives an empty page at `start` = `total`. A method whose code
+  has no instructions counts as without code. Any flagged `classes*.dex` member
+  refuses the whole operation, as for `dex.*` (decision `m4b-host-bounds`).
 - **Claim** `android.java` (inferred, derived): the observation's fields but
   `kind`, one finding per method page. It never contradicts and is never
   contradicted.
