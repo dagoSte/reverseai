@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+import copy
 import hashlib
 import json
 import re
+import zlib
 
-CONTRACT_VERSION = "reverseai.contract/2"
+CONTRACT_VERSION = "reverseai.contract/3"
 
 MAX_EXCERPT_BYTES = 4096
 MAX_OBSERVATION_BYTES = 4096
@@ -115,16 +117,66 @@ class Location:
 
 @dataclass(frozen=True)
 class Observation:
-    """What a tool handler returns: a byte range and a bounded JSON description."""
+    """What a tool handler returns: a byte range and a bounded JSON description.
+
+    contract/3: with an artifact, the location is inside that child artifact (a member of the input, such as
+    classes.dex in an APK), which the gateway and the reviewer re-materialize from the input bytes.
+    """
 
     location: Location
     value: dict
+    artifact: dict | None = None
 
     def __post_init__(self):
         require(isinstance(self.location, Location), "Observation location must be a Location")
         require(isinstance(self.value, dict), "Observation value must be a dict")
         check_json_value(self.value)
         require(len(canonical_json(self.value).encode()) <= MAX_OBSERVATION_BYTES, "Observation value too large")
+        if self.artifact is not None:
+            check_artifact(self.artifact)
+
+
+# contract/3 child artifacts: bytes stored or deflated inside the input, bound by size, CRC-32 and SHA-256.
+MAX_CHILD_BYTES = 32 * 1024 * 1024
+MAX_CHILD_RATIO = 100
+ARTIFACT_KEYS = frozenset({"member", "method", "data_offset", "compressed_size", "size", "crc32", "sha256"})
+
+
+def check_artifact(artifact):
+    require(isinstance(artifact, dict) and set(artifact) == ARTIFACT_KEYS, "Invalid child artifact")
+    member = artifact["member"]
+    require(isinstance(member, str) and 0 < len(member) <= 255 and member.isprintable(), "Invalid child artifact member")
+    require(type(artifact["method"]) is int and artifact["method"] in (0, 8), "Unsupported child artifact method")
+    require(all(type(artifact[key]) is int and 0 <= artifact[key] < 2**64
+                for key in ("data_offset", "compressed_size", "size", "crc32")), "Invalid child artifact field")
+    require(0 < artifact["size"] <= MAX_CHILD_BYTES and artifact["crc32"] < 2**32, "Invalid child artifact size")
+    require(isinstance(artifact["sha256"], str) and _SHA256.match(artifact["sha256"]), "Invalid child artifact sha256")
+    if artifact["method"] == 0:
+        require(artifact["compressed_size"] == artifact["size"], "Stored child artifact sizes differ")
+    else:
+        require(0 < artifact["compressed_size"] and artifact["size"] <= MAX_CHILD_RATIO * artifact["compressed_size"],
+                "Child artifact expands past the ratio limit")
+
+
+def materialize(data, artifact) -> bytes:
+    """The child's bytes, re-derived from the input: in range, fully inflated to exactly its size, CRC and hash equal."""
+    check_artifact(artifact)
+    start, length, size = artifact["data_offset"], artifact["compressed_size"], artifact["size"]
+    require(start + length <= len(data), "Child artifact outside the input")
+    raw = bytes(data[start:start + length])
+    if artifact["method"] == 0:
+        child = raw
+    else:
+        inflater = zlib.decompressobj(-15)
+        try:
+            child = inflater.decompress(raw, size + 1)
+        except zlib.error:
+            raise ContractError("Child artifact does not inflate") from None
+        require(len(child) == size and inflater.eof and not inflater.unused_data and not inflater.unconsumed_tail,
+                "Child artifact does not inflate to its size")
+    require(zlib.crc32(child) == artifact["crc32"] and sha256_hex(child) == artifact["sha256"],
+            "Child artifact does not match its declared bytes")
+    return child
 
 
 @dataclass(frozen=True)
@@ -136,6 +188,7 @@ class Evidence:
     location: Location
     excerpt_sha256: str
     observation: dict
+    artifact: dict | None = None  # contract/3: the location and excerpt are inside this child artifact
 
     def __post_init__(self):
         require(isinstance(self.input_sha256, str) and _SHA256.match(self.input_sha256), "Invalid evidence input sha256")
@@ -144,12 +197,12 @@ class Evidence:
         require(self.operation.split(".", 1)[0] == self.tool.name, "Evidence operation must belong to its tool")
         require(isinstance(self.location, Location), "Evidence location must be a Location")
         require(isinstance(self.excerpt_sha256, str) and _SHA256.match(self.excerpt_sha256), "Invalid excerpt sha256")
-        Observation(self.location, self.observation)
-        require(self.id == evidence_id(self.input_sha256, self.tool, self.operation, self.location, self.excerpt_sha256, self.observation),
-                "Evidence ID does not match its content")
+        Observation(self.location, self.observation, self.artifact)
+        require(self.id == evidence_id(self.input_sha256, self.tool, self.operation, self.location, self.excerpt_sha256,
+                                       self.observation, self.artifact), "Evidence ID does not match its content")
 
     def to_dict(self):
-        return {
+        record = {
             "id": self.id,
             "input_sha256": self.input_sha256,
             "tool": {"name": self.tool.name, "version": self.tool.version},
@@ -158,36 +211,50 @@ class Evidence:
             "excerpt_sha256": self.excerpt_sha256,
             "observation": self.observation,
         }
+        if self.artifact is not None:
+            record["artifact"] = self.artifact
+        return record
 
 
-def evidence_id(input_sha256, tool, operation, location, excerpt_sha256, observation) -> str:
-    return content_id("ev", {
+def evidence_id(input_sha256, tool, operation, location, excerpt_sha256, observation, artifact=None) -> str:
+    content = {
         "input_sha256": input_sha256,
         "tool": [tool.name, tool.version],
         "operation": operation,
         "location": [location.offset, location.length],
         "excerpt_sha256": excerpt_sha256,
         "observation": observation,
-    })
+    }
+    if artifact is not None:  # contract/2 evidence keeps its ID
+        content["artifact"] = artifact
+    return content_id("ev", content)
 
 
-def make_evidence(data: bytes, tool: ToolRef, operation: str, observation: Observation, *, input_sha256=None) -> Evidence:
+def make_evidence(data: bytes, tool: ToolRef, operation: str, observation: Observation, *, input_sha256=None,
+                  child=None) -> Evidence:
     """The only constructor the gateway uses: binds an observation to the frozen bytes.
 
     A caller that already hashed the input once per run passes input_sha256; the
-    reviewer recomputes it from the bytes either way.
+    reviewer recomputes it from the bytes either way. For an observation inside a child
+    artifact, the gateway may pass the child it already materialized for this run; the
+    reviewer re-materializes it from the input either way.
     """
     require(isinstance(data, (bytes, bytearray)), "Evidence needs the frozen input bytes")
     require(isinstance(observation, Observation), "Evidence needs an Observation")
     location = observation.location
-    require(location.within(len(data)), "Observation location is outside the input")
+    target = data
+    if observation.artifact is not None:
+        target = materialize(data, observation.artifact) if child is None else child
+        require(len(target) == observation.artifact["size"], "Child artifact size mismatch")
+    require(location.within(len(target)), "Observation location is outside the input")
     fields = {
         "input_sha256": input_sha256 or sha256_hex(bytes(data)),
         "tool": tool,
         "operation": operation,
         "location": location,
-        "excerpt_sha256": sha256_hex(bytes(data[location.offset:location.offset + location.length])),
+        "excerpt_sha256": sha256_hex(bytes(target[location.offset:location.offset + location.length])),
         "observation": observation.value,
+        "artifact": copy.deepcopy(observation.artifact),
     }
     return Evidence(id=evidence_id(**fields), **fields)
 
@@ -201,8 +268,8 @@ def evidence_intact(evidence) -> bool:
 
 
 def evidence_from_dict(raw) -> Evidence:
-    require(isinstance(raw, dict) and set(raw) == {"id", "input_sha256", "tool", "operation", "location", "excerpt_sha256", "observation"},
-            "Invalid evidence fields")
+    fields = {"id", "input_sha256", "tool", "operation", "location", "excerpt_sha256", "observation"}
+    require(isinstance(raw, dict) and set(raw) in (fields, fields | {"artifact"}), "Invalid evidence fields")
     require(isinstance(raw["tool"], dict) and set(raw["tool"]) == {"name", "version"}, "Invalid evidence tool")
     require(isinstance(raw["location"], dict) and set(raw["location"]) == {"offset", "length"}, "Invalid evidence location")
     return Evidence(
@@ -213,6 +280,7 @@ def evidence_from_dict(raw) -> Evidence:
         location=Location(**raw["location"]),
         excerpt_sha256=raw["excerpt_sha256"],
         observation=raw["observation"],
+        artifact=raw.get("artifact"),
     )
 
 
