@@ -6,7 +6,7 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M3c released: assembly, references from code and referenced strings.** Deterministic
+**Status: M3d released: targeted queries.** Deterministic
 analysts read file structure (ELF, PE and Mach-O), imports and string indicators in-process, and three pinned
 open-source tools, LIEF, YARA-X and Ghidra, run in locked containers. Every value
 LIEF and YARA-X report is re-derived by the host from the input bytes before it can
@@ -21,7 +21,7 @@ Model-driven agents are not part of the current releases.
 ## How it works
 
 <p align="center">
-  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway runs allowlisted operations in host parsers and in a locked container per run (LIEF, YARA-X, Ghidra); the host re-derives every LIEF and YARA-X value and every Ghidra anchor, and re-reads referenced string contents; evidence binds hash, tool, operation and byte range; analysts make claims, including Ghidra assembly, references from code and referenced strings as derived readings; a reviewer re-checks bytes and rules; the report sorts findings into supported, derived, unsupported and contradicted.">
+  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway serves whole-file analysis or one targeted query at a time, running allowlisted operations in host parsers and in a locked container per run (LIEF, YARA-X, Ghidra); the host re-derives every LIEF and YARA-X value and every Ghidra anchor, and re-reads referenced string contents; evidence binds hash, tool, operation and byte range; analysts make claims, including Ghidra assembly, references from code and referenced strings as derived readings; a reviewer re-checks bytes and rules; the report sorts findings into supported, derived, unsupported and contradicted.">
 </p>
 
 What this buys, and how each point is checked:
@@ -45,11 +45,43 @@ What this buys, and how each point is checked:
 | M3a | Ghidra 12.1.4 headless on ELF and PE: functions, pseudocode, calls as derived evidence (contract/2) | released |
 | M3b | Mach-O host decoder, verified imports for ELF, PE and Mach-O, Ghidra on Mach-O | released |
 | M3c | Ghidra assembly, references from code and referenced strings as derived evidence | released |
+| M3d | Targeted queries by name, address or text with paging; REA's 16 native query names | released |
 | M4 | JADX for Android packages | planned |
 | M5 | JavaScript application analysis | planned |
 | M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
 | M7 | Measured comparison with REA Safe Agent on a known-answer corpus | planned |
 | M8 | Clean-room kit: evidence-cited functional specification, contamination check, auditable separation of analysis and implementation rooms, conformance tests | planned |
+
+## Queries
+
+Ask one question about an approved file without executing it:
+
+```sh
+python3 -m reverseai query FILE --query NAME [--arg KEY=VALUE ...] --out DIR [--with-ghidra]
+```
+
+Host results are verified from the bytes; Ghidra results remain derived readings.
+Ghidra queries require `--with-ghidra` and the locally built, pinned image.
+Pages show `rows a..b of N` and the next `start`; a missing row is never evidence of absence.
+
+| Query | Question | Result |
+| --- | --- | --- |
+| `binary_overview` | Overview of format, layout, imports and entry point | Verified (host) |
+| `list_segments` | Declared segments and their permissions | Verified (host) |
+| `inspect_native_load_image` | Segments and declared entry point | Verified (host) |
+| `list_names` | Declared symbols, optionally filtered by name | Verified (host) |
+| `read_bytes` | A bounded range by file offset or address | Verified (host) |
+| `list_strings` | Printable ASCII and UTF-16LE runs | Verified (host) |
+| `search_strings` | Printable runs containing literal text | Verified (host) |
+| `list_procedures` | File-backed executable functions | Derived (Ghidra) |
+| `search_procedures` | Functions whose names contain text | Derived (Ghidra) |
+| `procedure_info` | A function selected by entry or exact name | Derived (Ghidra) |
+| `procedure_pseudo_code` | The selected function's decompiled text | Derived (Ghidra) |
+| `procedure_assembly` | An instruction page for the selected function | Derived (Ghidra) |
+| `procedure_callees` | Functions called by the selected function | Derived (Ghidra) |
+| `procedure_callers` | Call sites targeting the selected function | Derived (Ghidra) |
+| `analyze_function` | Function info, pseudocode, assembly, calls and references | Derived (Ghidra) |
+| `xrefs` | References to the selected address | Derived (Ghidra) |
 
 ## Try it
 
@@ -57,6 +89,7 @@ Python 3.12 or later, no Python dependencies:
 
 ```sh
 python3 -m reverseai analyze path/to/approved-file --out new-report-dir
+python3 -m reverseai query path/to/approved-file --query list_segments --arg limit=16 --out new-query-dir
 python3 -B -m unittest discover -s tests -t . -v
 ```
 
