@@ -417,7 +417,10 @@ declare it (a contained `ToolSpec` refuses one), so Ghidra's `query` and `name`
 keep the `str` rule (no `/`, `\`, leading `-`, at most 256 characters).
 
 Rows are re-derived by the host from the bytes, as in M1; names are escaped and
-cut as section and import names are (at most 128 printable characters).
+cut as section and import names are (at most 128 printable characters). A table
+walk reads at most 65,536 entries in all; a file whose otherwise valid tables
+need more is refused (`StructureError`, no observation), so `total` is never a
+count cut short. Malformed or truncated tables keep their valid prefix.
 `structure.file_sections(data)` is a public helper: the file-backed sections of
 ELF (`SHF_ALLOC`, not `SHT_NOBITS`), PE (raw data within `min(SizeOfRawData,
 VirtualSize)`, `SizeOfRawData` when `VirtualSize` is 0) and thin Mach-O (not
@@ -453,8 +456,8 @@ zero-fill) as `{"name", "address", "offset", "size", "executable"}` rows.
   `weak` or `other` (Mach-O external is `global`, PE `global`); `defined` bool.
   Claim `symbols.list` (observed) rows `[name, address, type, binding, defined]`.
 - `structure.read_bytes`: args `mode` enum `offset`|`address` default `offset`,
-  `at` int 0..2^64-1 default 0, `length` 1..4096 default 256; at most 1
-  observation. `offset`: bytes `[at, min(at + length, size))`, none when `at` is at
+  `at` int 0..2^64-1 default 0, `length` 1..2000 default 256 (the hex must fit the
+  4,096-byte observation limit); at most 1 observation. `offset`: bytes `[at, min(at + length, size))`, none when `at` is at
   or past the end. `address`: `at` must map into exactly one `file_sections` row;
   the range is cut at that row's file end; none otherwise. `{"kind": "bytes",
   "offset", "address", "hex"}` at exactly those bytes; `address` is the virtual
