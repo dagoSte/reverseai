@@ -6,12 +6,13 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M3c released: assembly, cross-references and referenced strings.** Deterministic
+**Status: M3c released: assembly, references from code and referenced strings.** Deterministic
 analysts read file structure (ELF, PE and Mach-O), imports and string indicators in-process, and three pinned
 open-source tools, LIEF, YARA-X and Ghidra, run in locked containers. Every value
 LIEF and YARA-X report is re-derived by the host from the input bytes before it can
 become evidence, and a reviewer re-checks each claim against those bytes. Ghidra's
-functions, pseudocode, calls, assembly and cross-references are its own reading.
+functions, pseudocode, calls, assembly and references from code are its own reading.
+References come from instructions in the listed functions.
 The host re-derives every anchor from exact file bytes (code in executable
 sections, strings in file-backed sections) and re-reads referenced string contents.
 The report shows all these Ghidra findings as *derived*, never as verified.
@@ -20,7 +21,7 @@ Model-driven agents are not part of the current releases.
 ## How it works
 
 <p align="center">
-  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway runs allowlisted operations in host parsers and in a locked container per run (LIEF, YARA-X, Ghidra); the host re-derives every LIEF and YARA-X value and every Ghidra anchor, and re-reads referenced string contents; evidence binds hash, tool, operation and byte range; analysts make claims, including Ghidra assembly, cross-references and referenced strings as derived readings; a reviewer re-checks bytes and rules; the report sorts findings into supported, derived, unsupported and contradicted.">
+  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway runs allowlisted operations in host parsers and in a locked container per run (LIEF, YARA-X, Ghidra); the host re-derives every LIEF and YARA-X value and every Ghidra anchor, and re-reads referenced string contents; evidence binds hash, tool, operation and byte range; analysts make claims, including Ghidra assembly, references from code and referenced strings as derived readings; a reviewer re-checks bytes and rules; the report sorts findings into supported, derived, unsupported and contradicted.">
 </p>
 
 What this buys, and how each point is checked:
@@ -30,7 +31,7 @@ What this buys, and how each point is checked:
 | A supported finding is backed by exact bytes | The reviewer recomputes the input hash, the byte range and its hash for every cited item, and the claim rule must yield exactly the claimed value. |
 | A compromised tool can hide evidence but not invent verified evidence | The host re-derives every value LIEF and YARA-X report (headers, sections, signature matches) from its own copy of the bytes and refuses the whole reply on any mismatch; for Ghidra it re-derives every anchor, and Ghidra's interpretations can only ever be reported as derived. |
 | Tools cannot reach the host or the network | One container per run: no network, read-only root, non-root user, every capability dropped, no new privileges, CPU, memory, process and time limits, a single read-only snapshot mount, image pinned by ID. `tests/verify_m2_runtime.py` proves these limits against the real engine. |
-| Interpretations stay labelled | Ghidra's function lists, pseudocode, calls, assembly, cross-references and referenced strings are *derived*: the host checks every anchor and re-reads string contents, while interpretations and reference relationships remain Ghidra's reading. The reviewer re-checks citations and the report lists these findings apart; they never count as verified and never contradict a verified finding. |
+| Interpretations stay labelled | Ghidra's function lists, pseudocode, calls, assembly, references from code and referenced strings are *derived*: the host checks every anchor and re-reads string contents, while interpretations and reference relationships remain Ghidra's reading. The reviewer re-checks citations and the report lists these findings apart; they never count as verified and never contradict a verified finding. |
 | One claim cannot cancel a verified one | Only findings whose evidence all verifies can contradict each other. |
 | Reports are reproducible | Same input and budget, same report; the report names each tool version and container image. |
 
@@ -43,7 +44,7 @@ What this buys, and how each point is checked:
 | M2b | YARA-X 1.21.0 in a container, reviewed literal ruleset, verified signature matches | released |
 | M3a | Ghidra 12.1.4 headless on ELF and PE: functions, pseudocode, calls as derived evidence (contract/2) | released |
 | M3b | Mach-O host decoder, verified imports for ELF, PE and Mach-O, Ghidra on Mach-O | released |
-| M3c | Ghidra assembly, cross-references and referenced strings as derived evidence | released |
+| M3c | Ghidra assembly, references from code and referenced strings as derived evidence | released |
 | M4 | JADX for Android packages | planned |
 | M5 | JavaScript application analysis | planned |
 | M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
