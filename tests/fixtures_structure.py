@@ -384,3 +384,54 @@ def elf_dynamic_hash_product(*, chains=True, tables=200, entries=2000):
     out[dynamic:strings] = tags * tables
     out[strings:] = b"x\0"
     return bytes(out), {"counted_start": chain_start if chains else bucket_start, "counted_end": chain_start + entries * 4 if chains else chain_start}
+
+
+def pe_exports(*, plus=True, names=(b"hello", b"world", b"slash/name")):
+    """Named exports in .edata, with independent RVA/name/ordinal/function tables."""
+    data, layout = pe(plus=plus, sections=((b".text", 0x60000020, 0x200), (b".edata", 0x40000040, 0x800)))
+    data = bytearray(data)
+    optional = layout["lfanew"] + 24
+    base = 0x140000000 if plus else 0x400000
+    struct.pack_into("<Q" if plus else "<I", data, optional + (24 if plus else 28), base)
+    struct.pack_into("<I", data, optional + 60, layout["raw_offsets"][0])
+    directories = 112 if plus else 96
+    struct.pack_into("<I", data, optional + directories - 4, 16)
+    struct.pack_into("<II", data, optional + directories, 0x2000, 0x800)
+    export = layout["raw_offsets"][1]
+    entries, pointers, ordinals, cursor = 0x40, 0x100, 0x180, 0x200
+    struct.pack_into("<IIHH7I", data, export, 0, 0, 0, 0, 0, 1, len(names), len(names),
+                     0x2000 + entries, 0x2000 + pointers, 0x2000 + ordinals)
+    symbols = []
+    for index, name in enumerate(names):
+        struct.pack_into("<I", data, export + entries + 4 * index, 0x1000 + index * 8)
+        struct.pack_into("<I", data, export + pointers + 4 * index, 0x2000 + cursor)
+        struct.pack_into("<H", data, export + ordinals + 2 * index, index)
+        data[export + cursor:export + cursor + len(name) + 1] = name + b"\0"
+        symbols.append(dict(name=name, offset=export + cursor, address=base + 0x1000 + index * 8))
+        cursor += len(name) + 1
+    layout.update(image_base=base, export=export, optional=optional, symbols=symbols,
+                  entries=export + entries, pointers=export + pointers, ordinals=export + ordinals)
+    return bytes(data), layout
+
+
+def elf_symbols(*, width=64, order="<", dynamic=False):
+    """A symbol table with a function, object, weak undefined import and skipped section/file entries."""
+    names = b"\0main\0object\0weak_import\0section\0file\0"
+    offsets = [names.index(name) for name in (b"main", b"object", b"weak_import", b"section", b"file")]
+    declared = [(offsets[0], 0x1000, 2, 1, 1), (offsets[1], 0x2000, 1, 0, 1),
+                (offsets[2], 0, 0, 2, 0), (offsets[3], 0, 3, 0, 1), (offsets[4], 0, 4, 0, 0)]
+    stride = 24 if width == 64 else 16
+    data, layout = elf(width=width, order=order, sections=((b".dynsym" if dynamic else b".symtab", 11 if dynamic else 2, 0,
+                                                           stride * (len(declared) + 1)), (b".strtab", 3, 0, len(names))))
+    data = bytearray(data)
+    symbols, strings = layout["offsets"]
+    data[strings:strings + len(names)] = names
+    sh = layout["shoff"] + layout["entry_size"]
+    struct.pack_into(order + "I", data, sh + (40 if width == 64 else 24), 2)
+    struct.pack_into(order + ("Q" if width == 64 else "I"), data, sh + (56 if width == 64 else 36), stride)
+    for index, (name, address, type_, binding, section) in enumerate(declared, 1):
+        values = (name, binding * 16 + type_, 0, section, address, 1) if width == 64 else (name, address, 1,
+                                                                                     binding * 16 + type_, 0, section)
+        struct.pack_into(order + ("IBBHQQ" if width == 64 else "IIIBBH"), data, symbols + stride * index, *values)
+    layout.update(symbols=symbols, strings=strings)
+    return bytes(data), layout
