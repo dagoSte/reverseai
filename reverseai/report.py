@@ -70,6 +70,44 @@ def _cell(value, limit=200):
     return "`" + text.replace("|", "\\|") + "`" if text.strip() else "-"
 
 
+def _code_details(rows):
+    """Readable views of derived values; instruction bytes are not carried by Analysis."""
+    lines = []
+    listings = [(r, f) for r, f in rows if f["claim_key"] == "code.assembly" and isinstance(f["value"], dict)]
+    if listings:
+        lines += ["", "### Assembly (derived)"]
+        for result, finding in listings:
+            value = finding["value"]
+            own = {item["id"]: item for item in result["evidence"]}
+            anchor = next((own[i]["location"]["offset"] for i in finding["evidence_ids"] if i in own
+                           and own[i]["observation"] == {"kind": "assembly", "index": own[i]["observation"].get("index"), **value}), None)
+            lines += ["", f"#### Function at {_cell(value.get('entry'))}", "",
+                      f"Truncated: {_cell(value.get('truncated'))}", "",
+                      "| File offset | Length | Instruction |", "|---|---|---|"]
+            for row in value.get("instructions", []) if isinstance(value.get("instructions"), list) else []:
+                if isinstance(row, list) and len(row) == 3:
+                    delta, length, text = row
+                    offset = anchor + delta if anchor is not None and type(delta) is int else ""
+                    lines.append(f"| {_cell(offset)} | {_cell(length)} | {_cell(text)} |")
+    refs = [f for _, f in rows if f["claim_key"] == "code.references" and isinstance(f["value"], list)]
+    if refs:
+        lines += ["", "### References (derived)", "", "| From function | Type | To address | Symbol |", "|---|---|---|---|"]
+        for finding in refs:
+            for row in finding["value"]:
+                if isinstance(row, list) and len(row) == 4:
+                    lines.append("| " + " | ".join(_cell(value) for value in row) + " |")
+    strings = [f for _, f in rows if f["claim_key"] == "code.strings" and isinstance(f["value"], list)]
+    if strings:
+        lines += ["", "### Referenced strings (derived)", "", "| Address | Encoding | Text | Truncated | From functions |",
+                  "|---|---|---|---|---|"]
+        for finding in strings:
+            for entry in finding["value"]:
+                if isinstance(entry, dict):
+                    lines.append("| " + " | ".join(_cell(entry.get(key)) for key in
+                                                   ("address", "encoding", "text", "truncated", "from")) + " |")
+    return lines
+
+
 def to_markdown(analysis):
     report = to_dict(analysis)
     evidence = {e["id"]: e for r in report["results"] for e in r["evidence"]}
@@ -105,6 +143,7 @@ def to_markdown(analysis):
     if derived:
         # contract/2: the tool's reading, anchored in the input but not verified against it
         lines += ["", "## Derived by analysis tools (not verified against the bytes)", ""] + table(derived)
+        lines += _code_details(derived)
     lines += ["", "## Rejected or unreviewed claims", ""]
     if rejected:
         lines += ["| Analyst | Claim (analyst wording, unchecked) | Verdict | Reasons |", "|---|---|---|---|"]

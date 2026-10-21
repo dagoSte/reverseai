@@ -16,6 +16,7 @@ from reverseai.contract import (
 )
 from tests.fixtures_strings import KNOWN, clean_control, known_strings
 from tests.fixtures_structure import elf, pe
+from tests.fixtures_code import elf_refs, pe_refs, macho_refs
 
 
 def ref(data, name="sample.bin"):
@@ -151,9 +152,11 @@ class ContainedToolWiringTests(unittest.TestCase):
     @staticmethod
     def fake_ghidra(observations):
         args = {"max_functions": ArgSpec("int", 1, 128, default=64), "decompile": ArgSpec("int", 0, 16, default=8),
-                "max_chars": ArgSpec("int", 64, 2048, default=1024), "max_calls": ArgSpec("int", 0, 256, default=128)}
-        op = OperationSpec("ghidra.analyze", args, lambda data, checked: observations, max_observations=400, derived=True)
-        return ToolSpec(ToolRef("ghidra", "12.1.4-r4"), {"ghidra.analyze": op}, contained=True,
+                "max_chars": ArgSpec("int", 64, 2048, default=1024), "max_calls": ArgSpec("int", 0, 256, default=128),
+                "assembly": ArgSpec("int", 0, 8, default=4), "max_instructions": ArgSpec("int", 1, 64, default=32),
+                "max_refs": ArgSpec("int", 0, 128, default=64), "max_strings": ArgSpec("int", 0, 64, default=32)}
+        op = OperationSpec("ghidra.analyze", args, lambda data, checked: observations, max_observations=600, derived=True)
+        return ToolSpec(ToolRef("ghidra", "12.1.4-r5"), {"ghidra.analyze": op}, contained=True,
                         runtime={"image": "sha256:" + "2" * 64, "platform": "linux/arm64"})
 
     def test_ghidra_findings_are_reported_as_derived_and_get_the_ghidra_budget(self):
@@ -176,6 +179,75 @@ class ContainedToolWiringTests(unittest.TestCase):
         analysis = pipeline.analyze_bytes(data, ref(data))
         self.assertEqual([r.role for r in analysis.results], ["structural", "capability"])
         self.assertEqual(pipeline._budget(pipeline.TOOLS), Budget())
+
+    def test_m3c_fake_run_keeps_new_kinds_derived_in_json_and_readable_markdown(self):
+        data = elf()[0]
+        observations = [
+            Observation(Location(0, 16), {"kind": "function", "index": 0, "name": "entry", "entry": 0x400000, "size": 16}),
+            Observation(Location(0, 16), {"kind": "assembly", "index": 0, "entry": 0x400000,
+                                         "instructions": [[0, 1, "RET"]], "truncated": False}),
+            Observation(Location(0, 1), {"kind": "ref", "from": 0x400000, "to": 0x500000,
+                                        "type": "read", "to_name": "message"}),
+            Observation(Location(4, 3), {"kind": "string", "address": 0x500000, "encoding": "ascii",
+                                        "text": "abc", "truncated": False, "from": [0x400000]}),
+        ]
+        analysis = pipeline.analyze_bytes(data, ref(data), tools=pipeline.TOOLS + (self.fake_ghidra(observations),))
+        results = [r for r in analysis.results if r.role == "code"]
+        self.assertEqual(len(results), 1)
+        result = results[0]
+        self.assertEqual({f.claim_key for f in result.findings},
+                         {"code.functions", "code.assembly", "code.references", "code.strings"})
+        judged = verdicts(analysis)
+        self.assertEqual({judged[f.id].status for f in result.findings}, {"derived"})
+        json_findings = next(r for r in report.to_dict(analysis)["results"] if r["role"] == "code")["findings"]
+        self.assertEqual({f["verdict"] for f in json_findings}, {"derived"})
+        markdown = report.to_markdown(analysis)
+        supported, derived = markdown.split("## Derived by analysis tools (not verified against the bytes)")
+        self.assertNotIn("RET", supported)
+        for text in ("### Assembly (derived)", "### References (derived)", "### Referenced strings (derived)", "`RET`", "`abc`"):
+            self.assertIn(text, derived)
+
+    def test_m3c_shared_fixtures_round_trip_through_the_analyst_reviewer_and_reports(self):
+        # Declared fake readings exercise wiring; they are not native Ghidra oracles.
+        for builder in (elf_refs, pe_refs, macho_refs):
+            with self.subTest(format=builder.__name__):
+                data, layout = builder()
+                functions = layout["functions"]
+                observations = [Observation(Location(f["offset"], f["size"]), {
+                    "kind": "function", "index": i, "entry": f["entry"], "size": f["size"], "name": f["name"] or f"f{i}"})
+                    for i, f in enumerate(functions)]
+                selection = sorted(range(len(functions)), key=lambda i: (
+                    functions[i]["entry"] != layout["entry"], -functions[i]["size"], functions[i]["entry"]))[:4]
+                observations += [Observation(Location(functions[i]["offset"], functions[i]["size"]), {
+                    "kind": "assembly", "index": i, "entry": functions[i]["entry"], "truncated": False,
+                    "instructions": [[delta, length, f"instruction {n}"]
+                                     for n, (delta, length) in enumerate(functions[i]["instructions"])]}) for i in selection]
+                observations += [Observation(Location(r["offset"], r["length"]), {
+                    "kind": "ref", "from": r["from"], "to": r["to"], "type": r["type"], "to_name": r["to_name"] or ""})
+                    for r in layout["refs"]]
+                observations += [Observation(Location(s["offset"], s["length"]), {
+                    "kind": "string", **{key: s[key] for key in ("address", "encoding", "text", "truncated", "from")}})
+                    for s in layout["strings"]]
+                analysis = pipeline.analyze_bytes(data, ref(data), tools=pipeline.TOOLS + (self.fake_ghidra(observations),))
+                code, = [r for r in analysis.results if r.role == "code"]
+                judged = verdicts(analysis)
+                self.assertEqual({judged[f.id].status for f in code.findings}, {"derived"})
+                listings = [f for f in code.findings if f.claim_key == "code.assembly"]
+                self.assertEqual([f.value["entry"] for f in listings], [functions[i]["entry"] for i in sorted(selection)])
+                refs = next(f for f in code.findings if f.claim_key == "code.references")
+                self.assertEqual(refs.value, [list(row) for row in sorted({
+                    (r["from"], r["type"], r["to"], r["to_name"] or "") for r in layout["refs"]})])
+                strings = next(f for f in code.findings if f.claim_key == "code.strings")
+                self.assertEqual(strings.value, [{k: s[k] for k in ("address", "encoding", "text", "truncated", "from")}
+                                                 for s in layout["strings"]])
+                markdown = report.to_markdown(analysis)
+                for s in layout["strings"]:
+                    self.assertEqual(data[s["offset"]:s["offset"] + s["length"]].decode(s["encoding"]), s["text"])
+                    self.assertIn(f"`{s['text']}`", markdown)
+                first = functions[0]
+                self.assertIn(f"| `{first['offset']}` | `{first['instructions'][0][1]}` | `instruction 0` |", markdown)
+                self.assertEqual(report.to_json(analysis), report.to_json(pipeline.analyze_bytes(
+                    data, ref(data), tools=pipeline.TOOLS + (self.fake_ghidra(observations),))))
 
     def test_contained_findings_agree_with_the_stdlib_parser_and_name_the_image(self):
         data, layout = pe()
