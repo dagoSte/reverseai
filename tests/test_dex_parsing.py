@@ -31,13 +31,15 @@ def seal(data):
     return bytes(data)
 
 
-def minimal_dex(*, version=35, extra_strings=(), extra_code_units=0, shared_code=False):
-    names = sorted({"I", "Ldemo/Main;", "Ljava/lang/Object;", "Main.java", "V", "VI",
-                    "field", "hello", "method", *extra_strings})
+def minimal_dex(*, version=35, extra_strings=(), extra_code_units=0, shared_code=False,
+                class_name="Ldemo/Main;", method_name="method", parameter="I", interfaces=()):
+    shorty = "V" + ("L" if parameter.startswith(("L", "[")) else parameter)
+    names = sorted({"I", class_name, "Ljava/lang/Object;", "Main.java", "V", shorty,
+                    "field", "hello", method_name, *interfaces, *extra_strings})
     ids = {s: i for i, s in enumerate(names)}
-    types = ("I", "Ldemo/Main;", "Ljava/lang/Object;", "V")
+    types = tuple(sorted({"I", class_name, "Ljava/lang/Object;", "V", *interfaces}))
     t = {s: i for i, s in enumerate(types)}
-    widths = ((1, len(names), 4), (2, 4, 4), (3, 2, 12), (4, 1, 8), (5, 2, 8), (6, 1, 32))
+    widths = ((1, len(names), 4), (2, len(types), 4), (3, 2, 12), (4, 1, 8), (5, 2, 8), (6, 1, 32))
     position, tables, map_rows = 112, {}, [(0, 1, 0)]
     for kind, count, width in widths:
         tables[kind] = position
@@ -57,8 +59,13 @@ def minimal_dex(*, version=35, extra_strings=(), extra_code_units=0, shared_code
     map_rows.append((0x2002, len(names), string_offsets[0]))
     align()
     params = len(data)
-    data.extend(struct.pack("<IH", 1, t["I"]))
-    map_rows.append((0x1001, 1, params))
+    data.extend(struct.pack("<IH", 1, t[parameter]))
+    interface_list = 0
+    if interfaces:
+        align()
+        interface_list = len(data)
+        data.extend(struct.pack("<I", len(interfaces)) + b"".join(struct.pack("<H", t[i]) for i in interfaces))
+    map_rows.append((0x1001, 2 if interfaces else 1, params))
     align()
     code0 = len(data)
     ins0 = (0x001A, ids["hello"], 0x1071, 1, 0, 0x000E) + (0,) * extra_code_units
@@ -66,7 +73,7 @@ def minimal_dex(*, version=35, extra_strings=(), extra_code_units=0, shared_code
                 + struct.pack("<" + str(len(ins0)) + "H", *ins0))
     align()
     code1 = len(data)
-    ins1 = (0x0060, 0, 0x0022, t["Ldemo/Main;"], 0x000E)
+    ins1 = (0x0060, 0, 0x0022, t[class_name], 0x000E)
     data.extend(struct.pack("<4H2I", 1, 1, 0, 0, 0, len(ins1)) + struct.pack("<5H", *ins1))
     map_rows.append((0x2001, 2, code0))
     class_data = len(data)
@@ -85,12 +92,12 @@ def minimal_dex(*, version=35, extra_strings=(), extra_code_units=0, shared_code
         struct.pack_into("<I", data, tables[1] + 4 * i, offset)
     for i, name in enumerate(types):
         struct.pack_into("<I", data, tables[2] + 4 * i, ids[name])
-    struct.pack_into("<6I", data, tables[3], ids["V"], t["V"], 0, ids["VI"], t["V"], params)
-    struct.pack_into("<HHI", data, tables[4], t["Ldemo/Main;"], t["I"], ids["field"])
+    struct.pack_into("<6I", data, tables[3], ids["V"], t["V"], 0, ids[shorty], t["V"], params)
+    struct.pack_into("<HHI", data, tables[4], t[class_name], t["I"], ids["field"])
     for i in range(2):
-        struct.pack_into("<HHI", data, tables[5] + 8 * i, t["Ldemo/Main;"], i, ids["method"])
-    struct.pack_into("<8I", data, tables[6], t["Ldemo/Main;"], 1, t["Ljava/lang/Object;"],
-                     0, ids["Main.java"], 0, class_data, 0)
+        struct.pack_into("<HHI", data, tables[5] + 8 * i, t[class_name], i, ids[method_name])
+    struct.pack_into("<8I", data, tables[6], t[class_name], 1, t["Ljava/lang/Object;"],
+                     interface_list, ids["Main.java"], 0, class_data, 0)
     data[:8] = b"dex\n" + f"{version:03}".encode() + b"\0"
     fields = [len(data), 112, 0x12345678, 0, 0, map_off]
     for kind, count, _ in widths:
@@ -586,6 +593,7 @@ class DexOperationTests(unittest.TestCase):
         self.class_name = 'Ldemo/Main;'
 
     def run_operation(self, name, args, *, children=None, encrypted=()):
+        from reverseai.tools.apk import escape
         children = {'classes.dex': self.child} if children is None else children
         members = [SimpleNamespace(name=key, flags=('encrypted',) if key in encrypted else (), size=len(value))
                    for key, value in children.items()]
@@ -593,7 +601,7 @@ class DexOperationTests(unittest.TestCase):
             members=lambda _: members,
             materialize=lambda _, member: (children[member.name], hashlib.sha256(children[member.name]).hexdigest()),
             artifact=lambda member, child: {
-                'member': member.name, 'method': 0, 'data_offset': 0,
+                'member': escape(member.name), 'method': 0, 'data_offset': 0,
                 'compressed_size': len(child), 'size': len(child),
                 'crc32': zlib.crc32(child) & 0xFFFFFFFF, 'sha256': hashlib.sha256(child).hexdigest(),
             },
@@ -611,7 +619,7 @@ class DexOperationTests(unittest.TestCase):
         self.assertEqual((row.location.offset, row.location.length), (self.layout['tables'][6], 32))
         self.assertEqual(row.value, {'kind': 'class', 'dex': 'classes.dex', 'name': self.class_name,
                                     'access': 1, 'superclass': 'Ljava/lang/Object;', 'interfaces': [],
-                                    'source_file': 'Main.java', 'index': 0, 'total': 1})
+                                    'interfaces_total': 0, 'source_file': 'Main.java', 'index': 0, 'total': 1})
         self.assertEqual(row.artifact['member'], 'classes.dex')
         self.assertEqual(row.artifact['sha256'], hashlib.sha256(self.child).hexdigest())
 
@@ -728,7 +736,8 @@ class DexOperationTests(unittest.TestCase):
     def test_operation_defaults_caps_and_closed_argument_schemas(self):
         specs = dex.TOOL.operations
         self.assertEqual(set(specs), {'dex.classes', 'dex.methods', 'dex.references'})
-        self.assertEqual(specs['dex.classes'].validate_args({}), {'member': '', 'query': '', 'start': 0, 'limit': 128})
+        self.assertEqual(specs['dex.classes'].validate_args({}),
+                         {'member': '', 'query': '', 'class': '', 'start': 0, 'limit': 128})
         args = specs['dex.references'].validate_args({'class': self.class_name, 'method': 'method'})
         self.assertEqual(args, {'member': '', 'class': self.class_name, 'method': 'method', 'prototype': '',
                                 'direction': 'from', 'start': 0, 'limit': 128})
@@ -772,8 +781,167 @@ class DexOperationTests(unittest.TestCase):
                 self.run_operation('dex.classes', {'limit': 1},
                                    children={'classes.dex': self.child, 'classes2.dex': self.child})
 
+    def test_class_selector_is_exact_and_cannot_be_combined_with_a_substring(self):
+        nested, _ = minimal_dex(class_name='Lcopy/Ldemo/Main;')
+        children = {'classes.dex': self.child, 'classes2.dex': nested}
+        self.assertEqual(len(self.run_operation('dex.classes', {'query': self.class_name}, children=children)), 2)
+        rows = self.run_operation('dex.classes', {'class': self.class_name}, children=children)
+        self.assertEqual([r.value['name'] for r in rows], [self.class_name])
+        self.assertEqual(self.run_operation('dex.classes', {'class': 'Lmissing;'}, children=children), [])
+        with self.assertRaisesRegex(ContractError, '^Invalid DEX structure$'):
+            self.run_operation('dex.classes', {'class': self.class_name, 'query': 'Main'}, children=children)
+
+    def test_displayed_member_class_method_and_prototype_selectors_round_trip(self):
+        from tests.test_apk_parsing import zip_bytes
+        raw_class, raw_method, raw_member = 'Ldemo/é\u200b;', 'mé\u200b', 'classesé.dex'
+        child, _ = minimal_dex(class_name=raw_class, method_name=raw_method, parameter=raw_class)
+        data, _ = zip_bytes([(raw_member, child)])
+
+        def run(operation, args):
+            spec = dex.TOOL.operations[operation]
+            return spec.handler(data, spec.validate_args(args))
+
+        listed, = run('dex.classes', {})
+        self.assertEqual((listed.value['dex'], listed.value['name']),
+                         (r'classes\xe9.dex', r'Ldemo/\xe9\u200b;'))
+        selected = {'member': listed.value['dex'], 'class': listed.value['name']}
+        self.assertEqual(run('dex.classes', selected), [listed])
+        self.assertEqual(run('dex.classes', {'member': selected['member'], 'query': r'\xe9\u200b'}), [listed])
+        self.assertEqual(run('dex.classes', {'query': 'é'}), [])  # selectors address the displayed form
+        methods = run('dex.methods', selected)
+        self.assertEqual([r.value['name'] for r in methods], [r'm\xe9\u200b'] * 2)
+        self.assertEqual([r.value['prototype'] for r in methods], ['()V', r'(Ldemo/\xe9\u200b;)V'])
+        for method in methods:
+            args = {**selected, 'method': method.value['name'], 'prototype': method.value['prototype']}
+            outgoing = run('dex.references', args)
+            self.assertEqual(len(outgoing), 2)
+            self.assertTrue(all(r.value['from_method'] == method.value['name']
+                                and r.value['from_prototype'] == method.value['prototype'] for r in outgoing))
+        incoming = run('dex.references', {**args, 'direction': 'to'})
+        self.assertEqual(len(incoming), 1)
+        self.assertEqual(incoming[0].value['target'], r'Ldemo/\xe9\u200b;->m\xe9\u200b(Ldemo/\xe9\u200b;)V')
+
+    def test_literal_backslash_and_escaped_unicode_names_do_not_alias(self):
+        from tests.test_apk_parsing import zip_bytes
+        entries = [(name, minimal_dex(class_name=cls)[0]) for name, cls in
+                   [('classes.dex', 'Ldemo/é;'), ('classes2.dex', r'Ldemo/\xe9;')]]
+        data, _ = zip_bytes(entries)
+        spec = dex.TOOL.operations['dex.classes']
+        rows = spec.handler(data, spec.validate_args({}))
+        self.assertEqual([r.value['name'] for r in rows], [r'Ldemo/\xe9;', r'Ldemo/\x5cxe9;'])
+        for row in rows:
+            selected = spec.handler(data, spec.validate_args({'member': row.value['dex'], 'class': row.value['name']}))
+            self.assertEqual([r.value['name'] for r in selected], [row.value['name']])
+
+    def test_escaped_nonprintable_member_selector_at_the_explicitly_unflagged_apk_seam(self):
+        # Only a substituted APK producer can expose this unflagged name; the real refusal is below.
+        name, displayed = 'classesé\u200b.dex', r'classes\xe9\u200b.dex'
+        children = {name: self.child}
+        listed, = self.run_operation('dex.classes', {}, children=children)
+        self.assertEqual(listed.value['dex'], displayed)
+        for operation, args in (('dex.classes', {}), ('dex.methods', {'class': self.class_name}),
+                                ('dex.references', {'class': self.class_name, 'method': 'method'})):
+            with self.subTest(operation=operation):
+                rows = self.run_operation(operation, {'member': displayed, **args}, children=children)
+                self.assertTrue(rows)
+                self.assertTrue(all(r.value['dex'] == displayed and r.artifact['member'] == displayed for r in rows))
+
+    def test_real_apk_nonprintable_and_backslash_member_names_stay_refused(self):
+        from reverseai.tools import apk
+        from tests.test_apk_parsing import zip_bytes
+        for name in ('classesé\u200b.dex', r'classes\xe9.dex'):
+            with self.subTest(name=name):
+                data, _ = zip_bytes([(name, self.child)])
+                member, = apk.members(data)
+                self.assertIn('traversing_name', member.flags)
+                spec = dex.TOOL.operations['dex.classes']
+                with self.assertRaisesRegex(dex.DexError, '^Invalid DEX structure$'):
+                    spec.handler(data, spec.validate_args({}))
+
+    def test_class_interfaces_keep_the_longest_prefix_that_fits_the_complete_row(self):
+        from reverseai import claims
+        from reverseai.contract import canonical_json, MAX_OBSERVATION_BYTES
+        interfaces = tuple(f'L{i:03}' + 'a' * 63 + ';' for i in range(64))
+        child, _ = minimal_dex(interfaces=interfaces)
+        row, = self.run_operation('dex.classes', {}, children={'classes.dex': child})
+        value = row.value
+        self.assertEqual(value['interfaces_total'], 64)
+        self.assertTrue(0 < len(value['interfaces']) < 64)
+        self.assertEqual(value['interfaces'], list(interfaces[:len(value['interfaces'])]))
+        self.assertLessEqual(len(canonical_json(value).encode()), MAX_OBSERVATION_BYTES)
+        extended = {**value, 'interfaces': [*value['interfaces'], interfaces[len(value['interfaces'])]]}
+        self.assertGreater(len(canonical_json(extended).encode()), MAX_OBSERVATION_BYTES)
+        derive = claims.RULES['android.classes'][1]['dex.classes']
+        self.assertIsNotNone(derive([value]))
+        for invalid in (-1, 65, True, '64', len(value['interfaces']) - 1):
+            with self.subTest(total=invalid):
+                self.assertIsNone(derive([{**value, 'interfaces_total': invalid}]))
+        small, = self.run_operation('dex.classes', {})
+        self.assertEqual(small.value['interfaces_total'], len(small.value['interfaces']))
+        for invalid in (True, '0', -1, 65, None):
+            with self.subTest(empty_interfaces_total=invalid):
+                self.assertIsNone(derive([{**small.value, 'interfaces_total': invalid}]))
+
+    def test_more_than_64_declared_interfaces_is_refused_before_paging(self):
+        interfaces = tuple(f'Li{i};' for i in range(65))
+        child, _ = minimal_dex(interfaces=interfaces)
+        with self.assertRaisesRegex(dex.DexError, '^Invalid DEX structure$'):
+            self.run_operation('dex.classes', {'start': 1}, children={'classes.dex': child})
+
+    def test_interface_type_ids_cannot_be_duplicated(self):
+        child, _ = minimal_dex(interfaces=('Li;', 'Lj;'))
+        self.assertEqual(len(dex.parse(child)['classes'][0]['interface_type_indices']), 2)
+        duplicate, _ = minimal_dex(interfaces=('Li;', 'Li;'))
+        with self.assertRaisesRegex(dex.DexError, '^Invalid DEX structure$'):
+            dex.parse(duplicate)
+
+    def test_exact_prototype_does_not_accept_a_longer_selector_with_the_same_prefix(self):
+        self.assertEqual(len(self.references(prototype='(I)V')), 2)
+        self.assertEqual(self.references(prototype='(I)Vx'), [])
+
+    def test_default_dex_member_pattern_ignores_nonmatching_files(self):
+        children = {'classes.dex': self.child, 'classes2.dex': self.child, 'classesfeature.dex': self.child,
+                    'notclasses.dex': self.child, 'classes.dex.bak': self.child, 'res/classes.dex': self.child,
+                    'classes/evil.dex': self.child}
+        rows = self.run_operation('dex.classes', {}, children=children)
+        self.assertEqual([r.value['dex'] for r in rows], ['classes.dex', 'classes2.dex', 'classesfeature.dex'])
+
+    def test_selected_children_have_an_aggregate_byte_cap_before_the_next_inflate(self):
+        from reverseai.tools import apk
+        from tests.test_apk_parsing import zip_bytes
+        # Small fixed limits exercise the production counter without large allocations.
+        children = [('classes.dex', self.child), ('classes2.dex', self.child)]
+        spec = dex.TOOL.operations['dex.classes']
+        with patch.object(dex, 'MAX_CHILDREN_BYTES', 2 * len(self.child)):
+            data, _ = zip_bytes(children)
+            self.assertEqual(len(spec.handler(data, spec.validate_args({}))), 2)
+            data, _ = zip_bytes([*children, ('classes3.dex', self.child)])
+            with patch.object(apk, 'materialize', wraps=apk.materialize) as inflate:
+                with self.assertRaisesRegex(dex.DexError, '^Invalid DEX structure$'):
+                    spec.handler(data, spec.validate_args({'limit': 1}))
+                self.assertEqual(inflate.call_count, 2)
+
 
 class DexChildEvidenceTests(unittest.TestCase):
+    def test_inspect_class_uses_an_exact_255_character_selector(self):
+        from reverseai import pipeline, queries
+        from reverseai.contract import InputRef, sha256_hex
+        from tests.test_apk_parsing import zip_bytes
+        name = 'L' + 'a' * 253 + ';'
+        data, _ = zip_bytes([('classes.dex', minimal_dex(class_name=name)[0]),
+                             ('classes2.dex', minimal_dex(class_name='Lcopy/' + name)[0])])
+        # The longer second identity is not needed to inspect the requested class.
+        spec, args = queries.resolve('inspect_android_class', {'class': name})
+        self.assertEqual(dict(spec.requests(args)[0].args), {'member': '', 'class': name})
+        with self.assertRaises(ContractError):
+            queries.resolve('inspect_android_class', {'class': name + 'x'})
+        ref = InputRef(sha256_hex(data), len(data), 'synthetic.apk')
+        result = pipeline.query_bytes(data, ref, 'inspect_android_class', {'class': name})
+        self.assertEqual(result.results[0].status, 'ok')
+        classes = [f.value['rows'] for f in result.results[0].findings if f.claim_key == 'android.classes']
+        self.assertEqual(classes, [[['classes.dex', name, 1, 'Ljava/lang/Object;']]])
+        self.assertEqual({v.status for v in result.verdicts}, {'supported'})
+
     def test_shared_fixture_classes_and_methods_equal_declared_layouts(self):
         from tests.fixtures_apk import apk_basic
         data, layout = apk_basic()
@@ -787,6 +955,7 @@ class DexChildEvidenceTests(unittest.TestCase):
         for i, (row, (member, cls)) in enumerate(zip(rows, expected)):
             self.assertEqual((row.location.offset, row.location.length), (cls['offset'], 32))
             self.assertEqual(row.value, dict(kind='class', index=i, total=len(expected), dex=member,
+                                           interfaces_total=len(cls['interfaces']),
                                            **{k: cls[k] for k in ('name', 'access', 'superclass', 'interfaces', 'source_file')}))
             spec = dex.TOOL.operations['dex.methods']
             methods = spec.handler(data, spec.validate_args({'member': member, 'class': cls['name']}))
@@ -901,3 +1070,264 @@ class DexChildEvidenceTests(unittest.TestCase):
         self.assertEqual(result.evidence, ())
         spec = dex.TOOL.operations['dex.classes']
         self.assertEqual(len(spec.handler(data, spec.validate_args({'member': 'classes.dex'}))), 1)
+
+
+def guard_dex(*, version=35, extra_types=(), field_names=("field",),
+              class_descriptors=("Ldemo/Main;",), fixed_kinds=(), data_kinds=(), prefix_data_kinds=(),
+              first_instructions=None):
+    """Small complete DEX, with optional unused rows to isolate ordering guards."""
+    types = tuple(sorted({"I", "Ldemo/Main;", "Ljava/lang/Object;", "V", *extra_types}))
+    names = sorted({*types, "Main.java", "VI", "hello", "method", *field_names})
+    ids, type_ids = {s: i for i, s in enumerate(names)}, {s: i for i, s in enumerate(types)}
+    widths = ((1, len(names), 4), (2, len(types), 4), (3, 2, 12),
+              (4, len(field_names), 8), (5, 2, 8), (6, len(class_descriptors), 32))
+    position, tables, map_rows = 112, {}, [(0, 1, 0)]
+    for kind, count, width in widths:
+        tables[kind] = position
+        map_rows.append((kind, count, position))
+        position += count * width
+    for kind in fixed_kinds:
+        tables[kind] = position
+        map_rows.append((kind, 1, position))
+        position += {7: 4, 8: 8}[kind]
+    data_off = position
+    data = bytearray(position)
+
+    def align():
+        data.extend(bytes(-len(data) % 4))
+
+    for kind in prefix_data_kinds:
+        map_rows.append((kind, 1, len(data)))
+        data.extend(bytes(4))
+    string_offsets = []
+    for text in names:
+        string_offsets.append(len(data))
+        raw = text.encode("utf-8", "surrogatepass").replace(b"\0", b"\xc0\x80")
+        data.extend(leb(len(text)) + raw + b"\0")
+    map_rows.append((0x2002, len(names), string_offsets[0]))
+    align()
+    params = len(data)
+    data.extend(struct.pack("<IH", 1, type_ids["I"]))
+    map_rows.append((0x1001, 1, params))
+    align()
+    code0 = len(data)
+    instructions = ((0x001A, ids["hello"], 0x1071, 1, 0, 0x000E)
+                    if first_instructions is None else first_instructions)
+    data.extend(struct.pack("<4H2I", 1, 0, 1, 0, 0, len(instructions))
+                + struct.pack("<" + str(len(instructions)) + "H", *instructions))
+    align()
+    code1 = len(data)
+    data.extend(struct.pack("<4H2I5H", 1, 1, 0, 0, 0, 5,
+                            0x0060, 0, 0x0022, type_ids["Ldemo/Main;"], 0x000E))
+    map_rows.append((0x2001, 2, code0))
+    class_data = len(data)
+    data.extend(leb(len(field_names)) + b"\0\x02\0")
+    for i in range(len(field_names)):
+        data.extend(leb(bool(i)) + leb(9))
+    data.extend(leb(0) + leb(9) + leb(code0) + leb(1) + leb(9) + leb(code1))
+    map_rows.append((0x2000, 1, class_data))
+    for kind in data_kinds:
+        align()
+        map_rows.append((kind, 1, len(data)))
+        data.extend(bytes(4))
+    align()
+    map_off = len(data)
+    map_rows.append((0x1000, 1, map_off))
+    map_rows.sort(key=lambda row: row[2])
+    data.extend(struct.pack("<I", len(map_rows)))
+    map_positions = {}
+    for kind, count, offset in map_rows:
+        map_positions[kind] = len(data)
+        data.extend(struct.pack("<HHII", kind, 0, count, offset))
+    align()
+    for i, offset in enumerate(string_offsets):
+        struct.pack_into("<I", data, tables[1] + 4 * i, offset)
+    for i, name in enumerate(types):
+        struct.pack_into("<I", data, tables[2] + 4 * i, ids[name])
+    struct.pack_into("<6I", data, tables[3], ids["V"], type_ids["V"], 0,
+                     ids["VI"], type_ids["V"], params)
+    for i, name in enumerate(field_names):
+        struct.pack_into("<HHI", data, tables[4] + 8 * i,
+                         type_ids["Ldemo/Main;"], type_ids["I"], ids[name])
+    for i in range(2):
+        struct.pack_into("<HHI", data, tables[5] + 8 * i,
+                         type_ids["Ldemo/Main;"], i, ids["method"])
+    for i, name in enumerate(class_descriptors):
+        struct.pack_into("<8I", data, tables[6] + 32 * i, type_ids[name], 1,
+                         type_ids["Ljava/lang/Object;"] if i == 0 else 0xFFFFFFFF,
+                         0, ids["Main.java"], 0, class_data if i == 0 else 0, 0)
+    data[:8] = b"dex\n" + f"{version:03}".encode() + b"\0"
+    header_fields = [len(data), 112, 0x12345678, 0, 0, map_off]
+    for kind, count, _ in widths:
+        header_fields.extend((count, tables[kind]))
+    header_fields.extend((len(data) - data_off, data_off))
+    struct.pack_into("<20I", data, 32, *header_fields)
+    return seal(data), {"tables": tables, "types": type_ids, "strings": ids,
+                        "code": (code0, code1), "class_data": class_data,
+                        "map_positions": map_positions, "params": params,
+                        "item_offsets": {kind: offset for kind, _, offset in map_rows}}
+
+
+class DexGuardCoverageTests(unittest.TestCase):
+    def test_negative_handler_size_includes_typed_handler_and_catch_all(self):
+        # Two return-void instructions, one try, one typed handler plus catch-all.
+        data = (struct.pack("<4H2I2HIHH", 1, 0, 0, 1, 0, 2,
+                            0xE, 0xE, 0, 2, 1) + b"\x01\x7f\x02\0\x01")
+        parsed = dex.code_item(data, 0)
+        self.assertEqual(parsed["handler_type_indices"], (2,))
+        self.assertEqual(parsed["length"], len(data))
+        broken = data[:-1] + b"\x02"
+        with self.assertRaises(dex.DexError):
+            dex.code_item(broken, 0)
+
+    def test_class_data_members_must_belong_to_declaring_class(self):
+        child, layout = guard_dex()
+        parsed = dex.parse(child)
+        self.assertEqual(len(parsed["classes"][0]["class_data"]["static_fields"]), 1)
+        self.assertEqual(len(parsed["classes"][0]["class_data"]["direct_methods"]), 2)
+        for kind in (4, 5):
+            broken = bytearray(child)
+            count = 1 if kind == 4 else 2
+            for i in range(count):
+                struct.pack_into("<H", broken, layout["tables"][kind] + 8 * i,
+                                 layout["types"]["Ljava/lang/Object;"])
+            with self.subTest(kind=kind), self.assertRaises(dex.DexError):
+                dex.parse(seal(broken))
+
+    def test_type_descriptors_require_valid_core_and_array_syntax(self):
+        valid = ("Z", "[I", "[[Ljava/lang/String;", "[" * 255 + "I", "Lgood/name;")
+        for descriptor in valid:
+            child, _ = guard_dex(extra_types=(descriptor,))
+            with self.subTest(valid=descriptor):
+                self.assertIn(descriptor, [row["descriptor"] for row in dex.parse(child)["types"]])
+        invalid = ("", "[", "Q", "[V", "L;", "Lbad.name;", "Lbad//name;",
+                   "Lbad/name[;", "Lbad/name\0;", "[" * 256 + "I")
+        for descriptor in invalid:
+            child, _ = guard_dex(extra_types=(descriptor,))
+            with self.subTest(invalid=descriptor), self.assertRaises(dex.DexError):
+                dex.parse(child)
+
+    def test_data_items_must_stay_in_their_own_map_sections(self):
+        child, layout = guard_dex(prefix_data_kinds=(0x2003,))
+        index = layout["strings"]["hello"]
+        parsed = dex.parse(child)
+        self.assertEqual(parsed["strings"][index]["text"], "hello")
+        self.assertEqual(parsed["protos"][1]["parameters"], ("I",))
+        # A valid empty string_data_item before its section, in debug_info_item.
+        foreign = layout["item_offsets"][0x2003]
+        self.assertEqual(dex.mutf8(child, foreign)[0], "")
+        broken = bytearray(child)
+        struct.pack_into("<I", broken, layout["tables"][1] + 4 * index, foreign)
+        strings = dex.parse(seal(broken))["strings"]
+        with self.assertRaises(dex.DexError):
+            strings[index]
+        # A valid one-element type_list after its section, in the code header.
+        foreign = layout["code"][0] + 4
+        self.assertEqual(struct.unpack_from("<IH", child, foreign), (1, 0))
+        broken = bytearray(child)
+        struct.pack_into("<I", broken, layout["tables"][3] + 20, foreign)
+        with self.assertRaises(dex.DexError):
+            dex.parse(seal(broken))
+
+    def test_field_target_accepts_512_bytes_and_refuses_513(self):
+        row = {"class_descriptor": "L" + "a" * 251 + ";",
+               "name": "n" * 255, "type_descriptor": "I"}
+        target, truncated = dex._target("field", row)
+        self.assertEqual(len(target), 512)
+        self.assertFalse(truncated)
+        row["class_descriptor"] = "L" + "a" * 252 + ";"
+        with self.assertRaises(dex.DexError):
+            dex._target("field", row)
+
+    def test_invoke_custom_reference_requires_an_existing_call_site_index(self):
+        child, layout = guard_dex(version=38, fixed_kinds=(7,),
+                                  first_instructions=(0x00FC, 0, 0, 0x000E))
+        args = {"member": "", "class": "Ldemo/Main;", "method": "method",
+                "prototype": "()V", "direction": "from"}
+
+        def references(data):
+            parsed = dex.parse(data)
+            with patch.object(dex, "_dex_files", return_value=iter([("classes.dex", data, parsed, {})])):
+                return list(dex._reference_rows(b"", args))
+
+        self.assertEqual(references(child), [])
+        broken = bytearray(child)
+        struct.pack_into("<H", broken, layout["code"][0] + 18, 1)
+        with self.assertRaises(dex.DexError):
+            references(seal(broken))
+
+    def test_sleb_fifth_byte_must_extend_a_signed_32_bit_value(self):
+        for raw, value in ((b"\xff\xff\xff\xff\x07", 0x7FFFFFFF),
+                           (b"\x80\x80\x80\x80\x78", -0x80000000)):
+            with self.subTest(valid=raw):
+                self.assertEqual(dex._sleb128(raw, 0, len(raw)), (value, 5))
+        for last in (0x08, 0x3F, 0x40, 0x77):
+            raw = b"\x80\x80\x80\x80" + bytes([last])
+            with self.subTest(invalid=raw), self.assertRaises(dex.DexError):
+                dex._sleb128(raw, 0, len(raw))
+
+    def test_zero_table_and_link_counts_require_zero_offsets(self):
+        child, _ = guard_dex()
+        self.assertEqual(dex.header(child)["link_off"], 0)
+        for count_at in (56, 64, 72, 80, 88, 96, 44):
+            positive = bytearray(child)
+            struct.pack_into("<II", positive, count_at, 0, 0)
+            with self.subTest(valid=count_at):
+                dex.header(seal(positive))
+            broken = bytearray(positive)
+            struct.pack_into("<I", broken, count_at + 4, 112)
+            with self.subTest(invalid=count_at), self.assertRaises(dex.DexError):
+                dex.header(seal(broken))
+
+    def test_map_types_are_unique_and_rows_follow_file_order(self):
+        child, layout = guard_dex(data_kinds=(0x1002, 0x1003))
+        rows = dex.parse(child)["map"]
+        self.assertEqual([row["item_offset"] for row in rows],
+                         sorted(row["item_offset"] for row in rows))
+        a, b = layout["map_positions"][0x1002], layout["map_positions"][0x1003]
+        duplicate = bytearray(child)
+        struct.pack_into("<H", duplicate, b, 0x1002)
+        with self.assertRaises(dex.DexError):
+            dex.parse(seal(duplicate))
+        reversed_rows = bytearray(child)
+        reversed_rows[a:a + 12], reversed_rows[b:b + 12] = child[b:b + 12], child[a:a + 12]
+        with self.assertRaises(dex.DexError):
+            dex.parse(seal(reversed_rows))
+
+    def test_call_site_and_method_handle_maps_require_version_038(self):
+        for kind in (7, 8):
+            for version in (38, 39):
+                child, _ = guard_dex(version=version, fixed_kinds=(kind,))
+                with self.subTest(valid=(kind, version)):
+                    self.assertIn(kind, [row["type"] for row in dex.parse(child)["map"]])
+            for version in (35, 37):
+                child, _ = guard_dex(version=version, fixed_kinds=(kind,))
+                with self.subTest(invalid=(kind, version)), self.assertRaises(dex.DexError):
+                    dex.parse(child)
+
+    def test_id_tables_require_strict_order_and_unique_keys(self):
+        child, layout = guard_dex(extra_types=("Lunused/A;", "Lunused/B;"),
+                                  field_names=("field", "otherfield"))
+        parsed = dex.parse(child)
+        self.assertEqual((len(parsed["types"]), len(parsed["protos"]),
+                          len(parsed["fields"]), len(parsed["methods"])), (6, 2, 2, 2))
+        for kind, width, first in ((2, 4, layout["types"]["Lunused/A;"]),
+                                    (3, 12, 0), (4, 8, 0), (5, 8, 0)):
+            a = layout["tables"][kind] + width * first
+            b = a + width
+            for duplicate in (False, True):
+                broken = bytearray(child)
+                broken[a:a + width] = child[b:b + width]
+                if not duplicate:
+                    broken[b:b + width] = child[a:a + width]
+                with self.subTest(kind=kind, duplicate=duplicate), self.assertRaises(dex.DexError):
+                    dex.parse(seal(broken))
+
+    def test_class_definition_ids_are_unique(self):
+        child, layout = guard_dex(class_descriptors=("Ldemo/Main;", "Ljava/lang/Object;"))
+        self.assertEqual(len(dex.parse(child)["classes"]), 2)
+        broken = bytearray(child)
+        struct.pack_into("<I", broken, layout["tables"][6] + 32,
+                         layout["types"]["Ldemo/Main;"])
+        with self.assertRaises(dex.DexError):
+            dex.parse(seal(broken))

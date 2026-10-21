@@ -53,7 +53,7 @@ def _routed(args, routes):
 
 
 # Android (contract/3): one DEX member by name, or "" for every classes*.dex member (decision m4a-seams-x4);
-# exact descriptors and names.
+# exact descriptors and names, in the escaped form displayed in the rows.
 ANY_DEX = ArgSpec("literal", 0, 255, default="")
 CLASS = ArgSpec("literal", 1, 255)
 METHOD_ARGS = {"class": CLASS, "method": ArgSpec("literal", 1, 255), "prototype": ArgSpec("literal", 0, 255, default="")}
@@ -96,10 +96,10 @@ TABLE = MappingProxyType({
          "apk.manifest": ({"start": "attribute_start", "limit": "attribute_limit"}, {})}),
     "search_android_classes": _query("dex.classes", {"member": ANY_DEX, "query": ArgSpec("literal", 0, 128, default=""),
                                                      "start": HOST_START, "limit": ANDROID_LIMIT}),
-    # dex.classes takes the exact class as its query (at most 128 characters), then the class's methods
+    # Exact displayed descriptor for the class row and its methods; search remains a separate query.
     "inspect_android_class": _routed(
-        {"member": ANY_DEX, "class": ArgSpec("literal", 1, 128), "start": START, "limit": ANDROID_LIMIT},
-        {"dex.classes": ({"member": "member", "query": "class"}, {}),
+        {"member": ANY_DEX, "class": CLASS, "start": START, "limit": ANDROID_LIMIT},
+        {"dex.classes": (("member", "class"), {}),
          "dex.methods": (("member", "class", "start", "limit"), {})}),
     "inspect_android_method": _routed(
         {"member": ANY_DEX, **METHOD_ARGS, "start": START, "limit": ANDROID_LIMIT},

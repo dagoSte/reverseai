@@ -159,11 +159,11 @@ class AndroidClaimTests(unittest.TestCase):
             return make_evidence(DATA, dex, "dex.classes", observation(offset=offset, length=4, **value))
 
         cls = row(0, kind="class", index=0, total=1, dex="classes.dex", name="Lorg/reverseai/fixture/Marker;",
-                  access=1, superclass="Ljava/lang/Object;", interfaces=[], source_file=None)
+                  access=1, superclass="Ljava/lang/Object;", interfaces=[], interfaces_total=0, source_file=None)
         value = {"start": 0, "total": 1, "rows": [["classes.dex", "Lorg/reverseai/fixture/Marker;", 1, "Ljava/lang/Object;"]]}
         self.assertEqual(judge("android.classes", value, [cls]), "supported")
         odd = row(0, kind="class", index=0, total=1, dex="classes.dex", name="Lx;", access=1, superclass=None,
-                  interfaces="Ly;", source_file=None)
+                  interfaces="Ly;", interfaces_total=1, source_file=None)
         self.assertEqual(judge("android.classes", {"start": 0, "total": 1, "rows": [["classes.dex", "Lx;", 1, None]]},
                                [odd]), "unsupported")
 
@@ -205,7 +205,7 @@ class AndroidReviewerFixTests(unittest.TestCase):
 
     def test_an_empty_source_file_is_a_valid_dex_value(self):
         row = make_evidence(DATA, self.dex, "dex.classes", observation(offset=0, length=4, kind="class", index=0, total=1,
-            dex="classes.dex", name="Lx;", access=1, superclass=None, interfaces=[], source_file=""))
+            dex="classes.dex", name="Lx;", access=1, superclass=None, interfaces=[], interfaces_total=0, source_file=""))
         finding = make_finding("structural", "Classes.", "android.classes",
                                {"start": 0, "total": 1, "rows": [["classes.dex", "Lx;", 1, None]]}, [row.id], "observed")
         self.assertEqual(self.judge([finding], [row]), ["supported"])
