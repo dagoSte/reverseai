@@ -15,7 +15,7 @@ from reverseai.review import review
 
 DATA = bytes(range(256)) * 32
 INPUT = InputRef(sha256_hex(DATA), len(DATA), "inline.bin")
-REF = ToolRef("ghidra", "12.1.4-r5")
+REF = ToolRef("ghidra", "12.1.4-r6")
 
 
 def tool(*, ref=REF, derived=True, operation="ghidra.analyze"):

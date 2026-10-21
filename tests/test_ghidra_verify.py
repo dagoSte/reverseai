@@ -734,3 +734,476 @@ class AnchorTests(unittest.TestCase):
         changed = bytearray(data)
         struct.pack_into("<I", changed, 0x40 + 24 + 240 + 20, len(data) - 1)
         self.refuse([], data=bytes(changed))
+
+
+def query_function_records(layout, index=1):
+    function = layout["functions"][index]
+    target = {"location": {"offset": function["offset"], "length": function["size"]}, "value": {
+        "kind": "target", "name": function["name"] or "selected", "entry": function["entry"],
+        "size": function["size"], "matches": 1, "callers_total": 2, "callees_total": 2}}
+    return target
+
+
+class TargetedAnchorTests(unittest.TestCase):
+    def setUp(self):
+        self.data, self.layout = elf_refs()
+
+    def check(self, items, operation="ghidra.function", args=None, data=None):
+        return ghidra_verify.verify(self.data if data is None else data, observations(items),
+                                   {} if args is None else args, operation=operation)
+
+    def refuse(self, items, **kwargs):
+        with self.assertRaisesRegex(ContractError, "^" + ghidra_verify.REFUSED + "$"):
+            self.check(items, **kwargs)
+
+    def target(self, index=1):
+        return query_function_records(self.layout, index)
+
+    def function_rows(self, start=0, stop=3):
+        rows = []
+        for index in range(start, stop):
+            function = self.layout["functions"][index]
+            rows.append({"location": {"offset": function["offset"], "length": function["size"]}, "value": {
+                "kind": "function_row", "index": index, "total": len(self.layout["functions"]),
+                "name": function["name"], "entry": function["entry"], "size": function["size"]}})
+        return rows
+
+    def instruction_page(self, target, *, start=0, limit=2, total=4):
+        value = target["value"]
+        return {"location": {"offset": target["location"]["offset"] + 1, "length": 4}, "value": {
+            "kind": "instructions", "entry": value["entry"], "start": start, "total": total,
+            "rows": [[1, 1, "PUSH RBP"], [3, 2, "MOV RBP,RSP"]], "truncated": False}}
+
+    def caller_rows(self):
+        target = self.target()
+        rows = []
+        for call in self.layout["calls"]:
+            if call["to"] == target["value"]["entry"]:
+                rows.append({"location": {"offset": call["offset"], "length": call["length"]}, "value": {
+                    "kind": "caller", "at": call["address"], "from": call["from"], "to": call["to"]}})
+        return target, rows
+
+    def xref_rows(self):
+        refs = [ref for ref in self.layout["refs"] if ref["to_name"] == "counter"]
+        self.assertEqual(len(refs), 2)
+        rows = [{"location": {"offset": ref["offset"], "length": ref["length"]}, "value": {
+            "kind": "xref", "index": index, "total": 2, "at": ref["address"], "from": ref["from"],
+            "to": ref["to"], "type": ref["type"]}} for index, ref in enumerate(refs)]
+        return rows[0]["value"]["to"], rows
+
+    def test_functions_pages_check_indexes_total_filter_order_and_exact_anchors(self):
+        rows = self.function_rows(1, 3)
+        args = {"start": 1, "limit": 2}
+        self.check(rows, "ghidra.functions", args)
+        self.check([], "ghidra.functions", {"start": 65535})
+        self.check(rows[:1], "ghidra.functions", {"start": 1, "query": "add"})
+        for row_index, key, value in ((0, "index", True), (0, "index", 0), (1, "index", 3),
+                (1, "total", 6), (1, "total", 2), (0, "total", True), (0, "name", "bad\nname"),
+                (0, "name", "X" * 129), (0, "entry", True), (0, "size", 0), (0, "size", 2**64 - 1)):
+            changed = copy.deepcopy(rows)
+            changed[row_index]["value"][key] = value
+            with self.subTest(row=row_index, key=key, value=value):
+                self.refuse(changed, operation="ghidra.functions", args=args)
+        self.refuse(rows, operation="ghidra.functions", args={"start": 1, "limit": 1})
+        self.refuse(rows, operation="ghidra.functions", args={"start": 1, "query": "absent"})
+        changed = copy.deepcopy(rows)
+        changed[1]["value"].update(entry=rows[0]["value"]["entry"], size=rows[0]["value"]["size"])
+        changed[1]["location"] = dict(rows[0]["location"])
+        self.refuse(changed, operation="ghidra.functions", args=args)
+        changed = copy.deepcopy(rows)
+        changed[1]["location"]["offset"] += 1
+        self.refuse(changed, operation="ghidra.functions", args=args)
+
+    def test_target_selection_exact_fields_order_counts_and_atomic_refusal(self):
+        target = self.target()
+        args = {"entry": target["value"]["entry"], "parts": "info"}
+        self.check([target], args=args)
+        self.check([target], args={"select": "name", "name": target["value"]["name"], "parts": "info"})
+        self.check([], args=args)
+        for key, value in (("name", "x" * 129), ("entry", True), ("size", 0), ("matches", 0),
+                           ("matches", 2), ("callers_total", True), ("callees_total", -1), ("size", 2**64 - 1)):
+            changed = copy.deepcopy(target)
+            changed["value"][key] = value
+            with self.subTest(key=key, value=value): self.refuse([changed], args=args)
+        changed = copy.deepcopy(target)
+        changed["value"]["matches"] = 3
+        self.check([changed], args={"select": "name", "name": target["value"]["name"], "parts": "info"})
+        self.refuse([target], args={"entry": target["value"]["entry"] + 1})
+        self.refuse([target], args={"select": "name", "name": "another"})
+        self.refuse([target, target], args=args)
+        for kind, keys in ghidra_verify._QUERY_FIELDS.items():
+            source = target if kind == "target" else None
+            if source:
+                for missing in keys:
+                    changed = copy.deepcopy(source)
+                    del changed["value"][missing]
+                    with self.subTest(missing=missing): self.refuse([changed], args=args)
+        changed = copy.deepcopy(target)
+        changed["value"]["extra"] = "hidden"
+        self.refuse([changed], args=args)
+        changed = copy.deepcopy(target)
+        changed["location"]["offset"] += 1
+        self.refuse([changed], args=args)
+
+    def test_target_pseudocode_has_index_zero_same_anchor_and_selected_part(self):
+        target = self.target()
+        pseudo = {"location": dict(target["location"]), "value": {"kind": "pseudocode", "index": 0,
+                  "entry": target["value"]["entry"], "text": "return a + b;\n", "truncated": False}}
+        args = {"entry": target["value"]["entry"], "parts": "pseudocode"}
+        self.check([target, pseudo], args=args)
+        for key, value in (("index", True), ("index", 1), ("entry", 0), ("text", []),
+                           ("text", "x" * 1025), ("truncated", 1)):
+            changed = copy.deepcopy(pseudo)
+            changed["value"][key] = value
+            with self.subTest(key=key): self.refuse([target, changed], args=args)
+        for parts in ("info", "assembly", "callers", "callees"):
+            self.refuse([target, pseudo], args={**args, "parts": parts})
+        self.refuse([pseudo, target], args=args)
+        self.refuse([target, pseudo, pseudo], args=args)
+        changed = copy.deepcopy(pseudo)
+        changed["location"]["length"] -= 1
+        self.refuse([target, changed], args=args)
+
+    def test_instruction_page_checks_virtual_start_exact_span_and_function_extent(self):
+        target = self.target()
+        page = self.instruction_page(target)
+        args = {"entry": target["value"]["entry"], "parts": "assembly", "limit": 2}
+        self.check([target, page], args=args)
+        for key, value in (("entry", 0), ("start", True), ("start", 1), ("total", 1),
+                           ("total", True), ("rows", []), ("rows", [[True, 1, "NOP"]]),
+                           ("rows", [[1, True, "NOP"]]), ("rows", [[1, 17, "NOP"]]),
+                           ("rows", [[1, 1, "bad\n"]]), ("rows", [[1, 1, ""]]),
+                           ("rows", [[1, 4, "A"], [3, 1, "B"]]), ("truncated", 1)):
+            changed = copy.deepcopy(page)
+            changed["value"][key] = value
+            with self.subTest(key=key, value=value): self.refuse([target, changed], args=args)
+        for location in ({"offset": page["location"]["offset"] - 1, "length": 4},
+                         {"offset": page["location"]["offset"], "length": 5}):
+            changed = copy.deepcopy(page)
+            changed["location"] = location
+            self.refuse([target, changed], args=args)
+        changed = copy.deepcopy(page)
+        changed["value"]["rows"][-1][0] = target["value"]["size"]
+        self.refuse([target, changed], args=args)
+        self.refuse([target, page], args={**args, "limit": 1})
+        self.refuse([target, page, page], args=args)
+        changed = copy.deepcopy(page)
+        changed["value"]["start"] = 2
+        self.check([target, changed], args={**args, "start": 2})
+
+    def test_incoming_reference_origins_are_derived_uint64_or_null_without_mapping(self):
+        target, callers = self.caller_rows()
+        address, xrefs = self.xref_rows()
+        args = {"entry": target["value"]["entry"], "parts": "callers"}
+        for origin in (None, 0, 1, 2**64 - 1):
+            changed = copy.deepcopy(callers)
+            changed[0]["value"]["from"] = origin
+            self.check([target, *changed], args=args)
+            changed = copy.deepcopy(xrefs)
+            changed[0]["value"]["from"] = origin
+            self.check(changed, "ghidra.xrefs", {"address": address})
+        for origin in (True, False, -1, "0", []):
+            changed = copy.deepcopy(callers)
+            changed[0]["value"]["from"] = origin
+            self.refuse([target, *changed], args=args)
+            changed = copy.deepcopy(xrefs)
+            changed[0]["value"]["from"] = origin
+            self.refuse(changed, operation="ghidra.xrefs", args={"address": address})
+
+    def test_callers_bind_instruction_address_target_and_optional_origin(self):
+        target, callers = self.caller_rows()
+        args = {"entry": target["value"]["entry"], "parts": "callers"}
+        self.assertEqual(len(callers), 2)
+        self.check([target, *callers], args=args)
+        changed = copy.deepcopy(callers)
+        changed[0]["value"]["from"] = None
+        self.check([target, *changed], args=args)
+        for key, value in (("at", True), ("at", callers[0]["value"]["at"] + 1),
+                           ("to", 0), ("from", True), ("from", -1)):
+            changed = copy.deepcopy(callers)
+            changed[0]["value"][key] = value
+            with self.subTest(key=key, value=value): self.refuse([target, *changed], args=args)
+        self.refuse([target, *reversed(callers)], args=args)
+        self.refuse([target, callers[0], callers[0]], args=args)
+        self.refuse([target, *callers], args={**args, "max_calls": 1})
+        self.refuse([target, *callers], args={**args, "parts": "info"})
+        changed = copy.deepcopy(callers)
+        changed[-1]["location"]["length"] = 17
+        self.refuse([target, *changed], args=args)
+
+    def test_callees_and_references_from_only_the_target_fit_its_span(self):
+        target = self.target(2)
+        calls = [row for row in records(self.layout) if row["value"]["kind"] == "call"
+                 and row["value"]["from"] == target["value"]["entry"]]
+        args = {"entry": target["value"]["entry"], "parts": "callees"}
+        self.check([target, *calls], args=args)
+        self.refuse([target, *calls], args={**args, "max_calls": 1})
+        changed = copy.deepcopy(calls)
+        changed[0]["value"]["from"] = self.layout["entry"]
+        self.refuse([target, *changed], args=args)
+        changed = copy.deepcopy(calls)
+        changed[0]["location"]["offset"] = target["location"]["offset"] + target["value"]["size"] - 1
+        self.refuse([target, *changed], args=args)
+        changed = copy.deepcopy(calls)
+        changed[0]["value"]["to_name"] = "x\n"
+        self.refuse([target, *changed], args=args)
+        target = self.target(4)
+        refs = [row for row in reference_records(self.layout) if row["value"]["kind"] == "ref"]
+        args = {"entry": target["value"]["entry"], "parts": "all"}
+        self.check([target, *refs], args=args)
+        self.refuse([target, *refs], args={**args, "max_refs": 1})
+        self.refuse([target, *reversed(refs)], args=args)
+        self.refuse([target, *refs], args={**args, "parts": "callees"})
+        changed = copy.deepcopy(refs)
+        changed[0]["value"]["type"] = "call"
+        self.refuse([target, *changed], args=args)
+
+    def test_xrefs_page_checks_indexes_targets_types_at_maps_and_page_counts(self):
+        address, rows = self.xref_rows()
+        args = {"address": address}
+        self.check(rows, "ghidra.xrefs", args)
+        self.check(rows[1:], "ghidra.xrefs", {**args, "start": 1})
+        self.check([], "ghidra.xrefs", {**args, "start": 65535})
+        for key, value in (("index", True), ("index", 1), ("total", 0), ("total", True),
+                           ("at", rows[0]["value"]["at"] + 1), ("at", True), ("to", address + 1),
+                           ("to", True), ("from", []), ("from", True), ("type", "execute")):
+            changed = copy.deepcopy(rows)
+            changed[0]["value"][key] = value
+            with self.subTest(key=key, value=value): self.refuse(changed, operation="ghidra.xrefs", args=args)
+        changed = copy.deepcopy(rows)
+        changed[1]["value"]["total"] += 1
+        self.refuse(changed, operation="ghidra.xrefs", args=args)
+        self.refuse(rows, operation="ghidra.xrefs", args={**args, "limit": 1})
+        changed = list(reversed(copy.deepcopy(rows)))
+        for index, row in enumerate(changed): row["value"]["index"] = index
+        self.refuse(changed, operation="ghidra.xrefs", args=args)
+        for kind in ("function", "ref", ["xref"]):
+            changed = copy.deepcopy(rows)
+            changed[0]["value"]["kind"] = kind
+            self.refuse(changed, operation="ghidra.xrefs", args=args)
+
+    def test_each_mode_refuses_foreign_kinds_and_unknown_operation(self):
+        target = self.target()
+        rows = self.function_rows()
+        address, xrefs = self.xref_rows()
+        self.refuse(rows, args={"entry": target["value"]["entry"]})
+        self.refuse([target], operation="ghidra.functions")
+        self.refuse(xrefs, operation="ghidra.functions")
+        self.refuse(rows, operation="ghidra.xrefs", args={"address": address})
+        self.refuse([], operation="ghidra.unknown")
+        self.refuse([], operation="ghidra.xrefs", args={})
+        self.refuse([], operation="ghidra.functions", args={"limit": True})
+        self.refuse([], args={"parts": "outside"})
+
+    def test_new_modes_share_execute_permission_nobits_and_both_direction_alias_refusals(self):
+        target = self.target()
+        args = {"entry": target["value"]["entry"]}
+        row = self.function_rows(1, 2)
+        for field, value in ((4, 8), (8, 2)):
+            changed = bytearray(self.data)
+            struct.pack_into("<I" if field == 4 else "<Q", changed, self.layout["shoff"] + 64 + field, value)
+            self.refuse([target], args=args, data=bytes(changed))
+            self.refuse(row, operation="ghidra.functions", args={"start": 1}, data=bytes(changed))
+        for field, value in ((16, target["value"]["entry"] + 1),
+                             (24, target["location"]["offset"] + 1)):
+            changed = bytearray(self.data)
+            at = self.layout["shoff"] + 2 * 64
+            struct.pack_into("<Q", changed, at + 8, 2)
+            struct.pack_into("<Q", changed, at + field, value)
+            self.refuse([target], args=args, data=bytes(changed))
+            self.refuse(row, operation="ghidra.functions", args={"start": 1}, data=bytes(changed))
+
+    def test_indexed_mapping_matches_linear_overlap_oracle_including_nested_and_zero_spans(self):
+        import random
+        rng = random.Random(314159)
+        rows = [ghidra_verify._Section(rng.randrange(60), rng.randrange(60), rng.randrange(9), rng.randrange(12),
+                                      bool(rng.randrange(2))) for _ in range(80)]
+        # The virtual interval may include memory-only bytes; file lookup must never do so.
+        index = ghidra_verify._SectionIndex(rows)
+        for virtual, backed in ((True, False), (False, False), (True, True)):
+            lookup = index.backed_virtual if backed else index.virtual if virtual else index.file
+            for start in range(75):
+                for length in (1, 2, 7, 13):
+                    matches = [row for row in rows
+                               if (row.size if backed or not virtual else row.span) > 0
+                               and start < (row.va if virtual else row.offset) + (row.size if backed or not virtual else row.span)
+                               and start + length > (row.va if virtual else row.offset)]
+                    with self.subTest(virtual=virtual, backed=backed, start=start, length=length):
+                        if len(matches) == 1:
+                            self.assertIs(lookup.single(start, length), matches[0])
+                        else:
+                            with self.assertRaises(ContractError): lookup.single(start, length)
+
+
+    def test_query_modes_accept_valid_declared_readings(self):
+        target = self.target()
+        address, xrefs = self.xref_rows()
+        cases = (("ghidra.functions", self.function_rows(), {}),
+                 ("ghidra.function", [target], {"entry": target["value"]["entry"]}),
+                 ("ghidra.xrefs", xrefs, {"address": address}))
+        for operation, items, args in cases:
+            try:
+                self.check(items, operation, args)
+                accepted = True
+            except (ContractError, TypeError):
+                accepted = False
+            with self.subTest(operation=operation):
+                self.assertTrue(accepted, "The declared query mode must admit its valid anchored reading")
+
+    def test_xref_ties_are_unique_and_ascii_sorted_by_instruction_then_type(self):
+        address, rows = self.xref_rows()
+        first = copy.deepcopy(rows[0])
+        first["value"].update(type="data", total=2)
+        second = copy.deepcopy(first)
+        second["value"].update(index=1, type="read")
+        args = {"address": address}
+        self.check([first, second], "ghidra.xrefs", args)
+        reversed_types = [copy.deepcopy(second), copy.deepcopy(first)]
+        for index, row in enumerate(reversed_types): row["value"]["index"] = index
+        self.refuse(reversed_types, operation="ghidra.xrefs", args=args)
+        second["value"]["type"] = first["value"]["type"]
+        self.refuse([first, second], operation="ghidra.xrefs", args=args)
+        second["value"]["from"] = None
+        self.refuse([first, second], operation="ghidra.xrefs", args=args)
+        # The destination does not need to be mapped: unresolved and memory-only targets are readings too.
+        for row in (first, second): row["value"]["to"] = 2**64 - 1
+        second["value"]["type"] = "write"
+        self.check([first, second], "ghidra.xrefs", {"address": 2**64 - 1})
+
+    def test_instruction_truncation_is_exact_and_empty_pages_have_no_observation(self):
+        target = self.target()
+        page = self.instruction_page(target)
+        args = {"entry": target["value"]["entry"], "parts": "assembly", "limit": 3}
+        changed = copy.deepcopy(page)
+        changed["value"]["truncated"] = True
+        self.check([target, changed], args=args)
+        self.refuse([target, page], args=args)
+        self.refuse([target, changed], args={**args, "limit": 2})
+        changed["value"]["total"] = 2
+        self.refuse([target, changed], args=args)
+        changed["value"]["truncated"] = False
+        self.check([target, changed], args=args)
+        self.check([target], args={**args, "start": 65535})
+        changed["value"]["start"] = 2
+        self.refuse([target, changed], args={**args, "start": 2})
+
+    def test_declared_totals_bound_reported_call_instructions_and_query_walk_counts(self):
+        target, callers = self.caller_rows()
+        args = {"entry": target["value"]["entry"], "parts": "callers"}
+        for total in (0, 1, 65537):
+            changed = copy.deepcopy(target)
+            changed["value"]["callers_total"] = total
+            self.refuse([changed, *callers], args=args)
+        target = self.target(2)
+        calls = [row for row in records(self.layout) if row["value"]["kind"] == "call"
+                 and row["value"]["from"] == target["value"]["entry"]]
+        args = {"entry": target["value"]["entry"], "parts": "callees"}
+        self.refuse([target, calls[0], calls[0]], args=args)
+        target["value"]["callees_total"] = 1
+        self.refuse([target, *calls], args=args)
+        rows = self.function_rows()
+        for row in rows: row["value"]["total"] = 65537
+        self.refuse(rows, operation="ghidra.functions")
+        address, xrefs = self.xref_rows()
+        for row in xrefs: row["value"]["total"] = 65537
+        self.refuse(xrefs, operation="ghidra.xrefs", args={"address": address})
+
+    def test_all_mode_admits_643_observations_with_every_part_at_its_maximum(self):
+        data, layout = elf(entry=0x1000, sections=((b".text", 1, 6, 4096),))
+        data = bytearray(data)
+        struct.pack_into("<Q", data, layout["shoff"] + 64 + 16, 0x1000)
+        offset = layout["offsets"][0]
+        anchor = {"offset": offset, "length": 4096}
+        target = {"location": anchor, "value": {"kind": "target", "name": "large", "entry": 0x1000,
+                  "size": 4096, "matches": 1, "callers_total": 256, "callees_total": 256}}
+        pseudo = {"location": anchor, "value": {"kind": "pseudocode", "index": 0, "entry": 0x1000,
+                  "text": "return;", "truncated": False}}
+        page = {"location": {"offset": offset, "length": 256}, "value": {"kind": "instructions", "entry": 0x1000,
+                "start": 0, "total": 256, "rows": [[i, 1, "N"] for i in range(256)], "truncated": False}}
+        calls = [{"location": {"offset": offset + i, "length": 1}, "value": {
+                 "kind": "call", "from": 0x1000, "to": 0x1000, "to_name": "large"}} for i in range(256)]
+        callers = [{"location": {"offset": offset + i, "length": 1}, "value": {
+                   "kind": "caller", "at": 0x1000 + i, "from": 0x1000, "to": 0x1000}} for i in range(256)]
+        refs = [{"location": {"offset": offset + i, "length": 1}, "value": {
+                "kind": "ref", "from": 0x1000, "to": 0x5000 + i, "type": "data", "to_name": ""}} for i in range(128)]
+        items = [target, pseudo, page, *calls, *callers, *refs]
+        self.assertEqual(len(items), 643)
+        args = {"entry": 0x1000, "limit": 256, "max_calls": 256, "max_refs": 128}
+        self.check(items, args=args, data=bytes(data))
+        self.refuse(items + [refs[-1]], args=args, data=bytes(data))
+
+    def test_query_modes_preserve_elf_pe_macho_function_and_instruction_mapping(self):
+        for builder in (elf_code, pe_code, macho_code):
+            data, layout = builder()
+            target = query_function_records(layout)
+            args = {"entry": target["value"]["entry"], "parts": "info"}
+            with self.subTest(format=layout["format"]):
+                self.check([target], args=args, data=data)
+                changed = copy.deepcopy(target)
+                changed["location"]["offset"] += 1
+                self.refuse([changed], args=args, data=data)
+
+    def test_each_query_kind_requires_all_and_only_its_declared_fields(self):
+        target, callers = self.caller_rows()
+        page = self.instruction_page(target)
+        pseudo = {"location": dict(target["location"]), "value": {
+            "kind": "pseudocode", "index": 0, "entry": target["value"]["entry"], "text": "return;", "truncated": False}}
+        address, xrefs = self.xref_rows()
+        cases = [("ghidra.functions", self.function_rows(0, 1), {}, 0),
+                 ("ghidra.function", [target], {"entry": target["value"]["entry"]}, 0),
+                 ("ghidra.function", [target, pseudo], {"entry": target["value"]["entry"]}, 1),
+                 ("ghidra.function", [target, page], {"entry": target["value"]["entry"], "limit": 2}, 1),
+                 ("ghidra.function", [target, *callers], {"entry": target["value"]["entry"]}, 1),
+                 ("ghidra.xrefs", xrefs, {"address": address}, 0)]
+        for operation, items, args, index in cases:
+            for field in (*items[index]["value"], "extra"):
+                changed = copy.deepcopy(items)
+                if field == "extra": changed[index]["value"][field] = 1
+                else: del changed[index]["value"][field]
+                with self.subTest(operation=operation, kind=items[index]["value"]["kind"], field=field):
+                    self.refuse(changed, operation=operation, args=args)
+
+    def test_interval_index_keeps_virtual_only_ambiguity_and_half_open_boundaries(self):
+        rows = [ghidra_verify._Section(10, 100, 20, 20, True),
+                ghidra_verify._Section(15, 200, 2, 2, False),
+                ghidra_verify._Section(17, 300, 0, 4, True)]
+        index = ghidra_verify._SectionIndex(rows)
+        self.assertEqual(ghidra_verify._map(index, 10, 5, virtual=True)[0], 100)
+        for start, length in ((9, 2), (14, 2), (17, 1), (20, 2), (29, 2), (30, 1)):
+            with self.subTest(start=start, length=length), self.assertRaises(ContractError):
+                ghidra_verify._map(index, start, length, virtual=True)
+        self.assertEqual(ghidra_verify._file_map(index, 17, 1, virtual=True)[0], 107)
+        self.assertEqual(ghidra_verify._map(index, 21, 9, virtual=True)[0], 111)
+        self.assertEqual(ghidra_verify._map(index, 107, 1, virtual=False)[0], 17)
+        extreme = ghidra_verify._SectionIndex([ghidra_verify._Section(2**64 - 4, 0, 4, 4, True)])
+        self.assertEqual(ghidra_verify._map(extreme, 2**64 - 1, 1, virtual=True)[0], 3)
+
+
+    def test_incoming_references_may_belong_to_a_body_chunk_before_its_function_entry(self):
+        target, callers = self.caller_rows()
+        args = {"entry": target["value"]["entry"], "parts": "callers"}
+        changed = copy.deepcopy(callers)
+        changed[0]["value"]["from"] = self.layout["functions"][2]["entry"]
+        self.assertGreater(changed[0]["value"]["from"], changed[0]["value"]["at"])
+        self.check([target, *changed], args=args)
+        address, xrefs = self.xref_rows()
+        for row in xrefs: row["value"]["from"] = row["value"]["at"] + 1
+        self.check(xrefs, "ghidra.xrefs", {"address": address})
+        for row in xrefs: row["value"]["from"] = None
+        self.check(xrefs, "ghidra.xrefs", {"address": address})
+
+
+    def test_gapped_instruction_page_anchor_accepts_4096_but_refuses_a_4097_byte_span(self):
+        data, layout = elf(entry=0x1000, sections=((b".text", 1, 6, 8192),))
+        data = bytearray(data)
+        struct.pack_into("<Q", data, layout["shoff"] + 64 + 16, 0x1000)
+        offset = layout["offsets"][0]
+        anchor = {"offset": offset, "length": 4096}
+        target = {"location": anchor, "value": {"kind": "target", "name": "sparse", "entry": 0x1000,
+                  "size": 8192, "matches": 1, "callers_total": 0, "callees_total": 0}}
+        page = {"location": anchor, "value": {"kind": "instructions", "entry": 0x1000,
+                "start": 0, "total": 2, "rows": [[0, 1, "NOP"], [4095, 1, "RET"]], "truncated": False}}
+        args = {"entry": 0x1000, "parts": "assembly", "limit": 2}
+        self.check([target, page], args=args, data=bytes(data))
+        page["value"]["rows"][-1][0] = 4096
+        self.refuse([target, page], args=args, data=bytes(data))

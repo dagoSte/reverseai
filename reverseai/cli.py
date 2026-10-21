@@ -6,7 +6,7 @@ from pathlib import Path
 import stat
 import sys
 
-from reverseai import intake, pipeline, report
+from reverseai import intake, pipeline, queries, report
 
 # Reports hold text taken from untrusted samples: private to the user.
 DIRECTORY_MODE = 0o700
@@ -60,7 +60,21 @@ def main(argv=None):
                          help="Also run the pinned YARA-X worker with the reviewed ruleset in its container (M2b)")
     analyze.add_argument("--with-ghidra", action="store_true",
                          help="Also run pinned Ghidra headless in its container; its findings are derived, not verified (M3)")
+    query = commands.add_parser("query", help="Ask one targeted static-analysis question")
+    query.add_argument("file", type=Path)
+    query.add_argument("--query", required=True, metavar="NAME", help="One of: " + ", ".join(queries.TABLE))
+    query.add_argument("--arg", action="append", default=[], metavar="KEY=VALUE")
+    query.add_argument("--out", type=Path, required=True, help="New or empty directory for report.json and report.md")
+    query.add_argument("--with-ghidra", action="store_true", help="Enable the pinned contained Ghidra query worker")
     args = parser.parse_args(argv)
+
+    if args.command == "query":
+        try:
+            checked = queries.parse_args(args.query, args.arg)
+        except ValueError as error:
+            parser.exit(1, f"reverseai: query refused: {type(error).__name__}\n")
+        if queries.TABLE[args.query].role == "code" and not args.with_ghidra:
+            parser.exit(1, "reverseai: this query requires --with-ghidra\n")
 
     try:
         unusable = args.out.is_symlink() or (args.out.exists() and (not args.out.is_dir() or any(args.out.iterdir())))
@@ -69,7 +83,8 @@ def main(argv=None):
     if unusable:
         parser.exit(1, "reverseai: --out must be a new or empty directory\n")
     tools = pipeline.TOOLS
-    for wanted, module, label in ((args.with_lief, "lief_tool", "LIEF"), (args.with_yarax, "yarax_tool", "YARA-X"),
+    for wanted, module, label in ((getattr(args, "with_lief", False), "lief_tool", "LIEF"),
+                                  (getattr(args, "with_yarax", False), "yarax_tool", "YARA-X"),
                                   (args.with_ghidra, "ghidra_tool", "Ghidra")):
         if not wanted:
             continue
@@ -95,7 +110,10 @@ def main(argv=None):
     written = []
     try:
         try:
-            analysis = pipeline.analyze_bytes(data, ref, tools=tools)
+            analysis = (pipeline.query_bytes(data, ref, args.query, checked, tools=tools) if args.command == "query"
+                        else pipeline.analyze_bytes(data, ref, tools=tools))
+            if args.command == "query" and any(result.status == "error" for result in analysis.results):
+                raise ValueError("Query operation failed")
         except ValueError as error:
             parser.exit(1, f"reverseai: analysis failed: {type(error).__name__}\n")
         for name, render in zip(REPORTS, (report.to_json, report.to_markdown)):

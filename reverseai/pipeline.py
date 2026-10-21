@@ -4,9 +4,9 @@ from concurrent.futures import ThreadPoolExecutor
 import copy
 import inspect
 
-from reverseai import intake, review
-from reverseai.analysts import capability, code, structural
-from reverseai.contract import AnalysisResult, Budget
+from reverseai import intake, queries, review
+from reverseai.analysts import capability, code, structural, query
+from reverseai.contract import AnalysisResult, AnalysisTask, Budget, ContractError, content_id
 from reverseai.gateway import Gateway
 from reverseai.report import Analysis
 from reverseai.tools import strings, structure
@@ -60,3 +60,27 @@ def analyze_bytes(data, ref, *, budget=None, analysts=ANALYSTS, tools=TOOLS):
 def analyze_path(path, *, budget=None, tools=TOOLS):
     data, ref = intake.snapshot(path)
     return analyze_bytes(data, ref, budget=budget, tools=tools)
+
+
+def query_bytes(data, ref, name, args, tools=TOOLS):
+    """One typed query on frozen bytes, through the same gateway and reviewer."""
+    spec, checked = queries.resolve(name, args)
+    tools = tuple(tools)
+    requests = spec.requests(checked)
+    registered = {operation: tool for tool in tools for operation in tool.operations}
+    if any(request.operation not in registered for request in requests):
+        raise ContractError("Query operation unavailable")
+    if spec.role == "code" and any(registered[request.operation].ref != query.REFS["ghidra"] for request in requests):
+        raise ContractError("Query Ghidra version unavailable")
+    budget = GHIDRA_BUDGET if spec.role == "code" else Budget()
+    task = AnalysisTask(content_id("tk", {"input": ref.sha256, "query": name, "args": checked}), spec.role, ref,
+                        requests, Budget(max_concurrency=1, max_wall_seconds=300) if spec.role == "code" else Budget(max_concurrency=1))
+    partial = Gateway(tools, budget).run(task, data)
+    findings = query.conclude(task, copy.deepcopy(partial.evidence)) if partial.evidence else ()
+    result = AnalysisResult(task.id, task.role, partial.status, partial.evidence, tuple(findings), partial.errors)
+    registry = {tool.ref.name: tool for tool in tools}
+    verdicts = review.review(data, ref, (result,), registry)
+    ordered = sorted(registry.values(), key=lambda tool: tool.ref.name)
+    runtimes = tuple((tool.ref.name, dict(tool.runtime)) for tool in ordered if tool.contained)
+    return Analysis(ref, tuple(tool.ref for tool in ordered), (result,), verdicts, runtimes,
+                    {"name": name, "args": copy.deepcopy(checked)})
