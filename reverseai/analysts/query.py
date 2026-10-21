@@ -4,7 +4,7 @@ from reverseai.analysts import structural
 from reverseai.contract import MAX_EVIDENCE_PER_FINDING, ToolRef, evidence_intact, make_finding
 
 REFS = {"structure": ToolRef("structure", "0.1.0"), "strings": ToolRef("strings", "0.1.0"),
-        "ghidra": ToolRef("ghidra", "12.1.4-r6")}
+        "ghidra": ToolRef("ghidra", "12.1.4-r6"), "apk": ToolRef("apk", "0.1.0"), "dex": ToolRef("dex", "0.1.0")}
 PAGES = {
     "structure.segments": ("segment", "segments.list", ("name", "offset", "filesz", "address", "memsz", "readable", "writable", "executable")),
     "structure.symbols": ("symbol", "symbols.list", ("name", "address", "type", "binding", "defined")),
@@ -12,7 +12,15 @@ PAGES = {
     "strings.search": ("string", "strings.matches", ("offset", "encoding", "text", "truncated")),
     "ghidra.functions": ("function_row", "code.function_list", ("name", "entry", "size")),
     "ghidra.xrefs": ("xref", "code.xrefs", ("at", "from", "type")),
+    # contract/3, M4a: Android packages
+    "apk.inventory": ("member", "android.members", ("name", "method", "compressed_size", "size", "crc32", "sha256", "flags")),
+    "apk.manifest": ("manifest_attribute", "android.manifest", ("element_index", "element", "attribute", "type", "value")),
+    "dex.classes": ("class", "android.classes", ("dex", "name", "access", "superclass")),
+    "dex.methods": ("method", "android.methods", ("dex", "class", "name", "prototype", "access", "code_offset", "code_units")),
+    "dex.references": ("dex_ref", "android.references",
+                       ("dex", "from_class", "from_method", "from_prototype", "at", "ref_kind", "target", "target_truncated")),
 }
+PERMISSION_ELEMENTS = ("uses-permission", "uses-permission-sdk-23")
 SINGLES = {
     ("structure.entry", "entry"): ("load.entry", ("address", "offset")),
     ("structure.read_bytes", "bytes"): ("bytes.read", ("offset", "address", "hex")),
@@ -27,11 +35,16 @@ def _chunks(items):
         yield items[start:start + MAX_EVIDENCE_PER_FINDING]
 
 
+def _within(item, task):
+    """Inside the input, or inside the child artifact the evidence names (contract/3)."""
+    return item.location.within(task.input.size if item.artifact is None else item.artifact["size"])
+
+
 def conclude(task, evidence):
     allowed = {request.operation for request in task.operations}
     own = {item.id: item for item in evidence if evidence_intact(item)
            and item.input_sha256 == task.input.sha256 and item.operation in allowed
-           and item.tool == REFS.get(item.tool.name) and item.location.within(task.input.size)}
+           and item.tool == REFS.get(item.tool.name) and _within(item, task)}
     findings = []
 
     def emit(key, value, items):
@@ -77,6 +90,17 @@ def conclude(task, evidence):
                     name for item in selected for name in item.observation.get("names", [])]
                 if names and all(isinstance(name, str) for name in names):
                     emit(key, sorted(set(names)), selected)
+        if operation == "apk.manifest":
+            # One finding: the permissions of the page's first 64 uses-permission names, in document order.
+            selected = sorted((item for item in items if item.observation.get("kind") == "manifest_attribute"
+                               and item.observation.get("element") in PERMISSION_ELEMENTS
+                               and item.observation.get("attribute") == "android:name"
+                               and item.observation.get("type") == "string"
+                               and isinstance(item.observation.get("value"), str) and item.observation["value"]
+                               and type(item.observation.get("index")) is int),
+                              key=lambda item: item.observation["index"])[:MAX_EVIDENCE_PER_FINDING]
+            if selected:
+                emit("android.permissions", sorted({item.observation["value"] for item in selected}), selected)
         if operation == "ghidra.function":
             for kind, key, fields in (("call", "code.calls", ("from", "to_name")),
                                        ("ref", "code.references", ("from", "type", "to", "to_name"))):

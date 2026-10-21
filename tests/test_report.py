@@ -1,7 +1,8 @@
+from dataclasses import replace
 import json
 import unittest
 
-from reverseai import report
+from reverseai import pipeline, report
 from reverseai.report import Analysis
 from reverseai.contract import (
     AnalysisResult, InputRef, Location, Observation, ReviewVerdict, ToolRef, make_evidence, make_finding, sha256_hex,
@@ -43,6 +44,16 @@ def code_analysis(*, status="derived", instruction="MOV rax, [message]", name="m
     result = AnalysisResult("tk-0123456789abcdef", "code", "ok", evidence, findings)
     return Analysis(InputRef(sha256_hex(DATA), len(DATA), "inline"), (tool,), (result,),
                     tuple(ReviewVerdict(f.id, status, ("Tool reading; not verified.",)) for f in findings))
+
+
+def android_query(name, args, layout_change=None):
+    from tests import fixtures_apk
+    from tests.test_queries import android_standins
+    data, layout = fixtures_apk.apk_basic()
+    if layout_change:
+        layout_change(layout)
+    ref = InputRef(sha256_hex(data), len(data), "fixture.apk")
+    return pipeline.query_bytes(data, ref, name, args, tools=android_standins(layout))
 
 
 class ReportTests(unittest.TestCase):
@@ -216,6 +227,60 @@ class ReportTests(unittest.TestCase):
         self.assertIn("rows 9..9 of 10", text)
         self.assertNotIn("Next start:", text)
         self.assertIn("| 9 | `<img src=x>\\|'` | `0x2000` | `func` | `global` | `true` |", text)
+
+    def test_android_evidence_names_its_member_and_child_offset(self):
+        analysis = android_query("inspect_android_package", {})
+        text = report.to_markdown(analysis)
+        self.assertIn("apk.inventory @ ", text)  # central directory entries are in the input itself
+        self.assertIn("apk.manifest in `AndroidManifest.xml` @ 0x", text)
+        evidence = report.to_dict(analysis)["results"][0]["evidence"]
+        manifest = [e for e in evidence if e["operation"] == "apk.manifest"]
+        self.assertEqual({e["artifact"]["member"] for e in manifest}, {"AndroidManifest.xml"})
+        self.assertIn(f"apk.manifest in `AndroidManifest.xml` @ {hex(manifest[0]['location']['offset'])}+20", text)
+        self.assertTrue(all("artifact" not in e for e in evidence if e["operation"] == "apk.inventory"))
+
+    def test_android_pages_are_readable_and_json_keeps_raw_values(self):
+        analysis = android_query("inspect_android_package", {})
+        text = report.to_markdown(analysis)
+        self.assertIn("### Members the package's ZIP central directory declares (one page)", text)
+        self.assertIn("| Index | Name | Method | Compressed size | Size | CRC-32 | SHA-256 | Flags |", text)
+        self.assertRegex(text, r"\| 1 \| `classes.dex` \| `deflate` \| `730` \| `1228` \| `0x[0-9a-f]{8}` \| `[0-9a-f]{64}` \| `-` \|")
+        self.assertRegex(text, r"\| 2 \| `classes2.dex` \| `stored` \|")
+        self.assertIn("### Permissions the Android manifest declares (not evidence of use)", text)
+        self.assertIn("- `android.permission.INTERNET`", text)
+        self.assertIn("| 7 | `4` | `application` | `android:label` | `reference` | `@0x7f010000` |", text)
+        self.assertIn("| 11 | `6` | `service` | `android:exported` | `bool` | `false` |", text)
+        members = [f for f in report.to_dict(analysis)["results"][0]["findings"] if f["claim_key"] == "android.members"]
+        self.assertEqual(members[0]["value"]["rows"][1][1:3], [8, 730])
+
+        text = report.to_markdown(android_query("inspect_android_class", {"member": "classes.dex",
+                                                                          "class": "Lorg/reverseai/fixture/MainActivity;"}))
+        self.assertIn("| 0 | `classes.dex` | `Lorg/reverseai/fixture/MainActivity;` | `0x1 public` | `Landroid/app/Activity;` |",
+                      text)
+        self.assertRegex(text, r"\| 0 \| `classes.dex` \| `Lorg/reverseai/fixture/MainActivity;` \| `<init>` \| `\(\)V` \| "
+                               r"`0x10001 public constructor` \| `0x[0-9a-f]+` \| `4` \|")
+        self.assertIn("`0x4 protected`", text)
+
+        text = report.to_markdown(android_query("trace_android_references", {
+            "class": "Lorg/reverseai/fixture/Helper;", "method": "compute", "direction": "to"}))
+        self.assertIn("| Index | DEX | From class | From method | From prototype | At | Kind | Target | Truncated |", text)
+        self.assertRegex(text, r"\| 1 \| `classes2.dex` \| `Lorg/reverseai/fixture/Worker;` \| `run` \| `\(\)V` \| "
+                               r"`0x[0-9a-f]+` \| `method` \| `Lorg/reverseai/fixture/Helper;->compute\(II\)I` \| `false` \|")
+
+    def test_flagged_members_show_their_flags_and_no_hash(self):
+        from tests import fixtures_apk
+        data, _ = fixtures_apk.apk_hostile("crc")
+        analysis = pipeline.query_bytes(data, InputRef(sha256_hex(data), len(data), "hostile.apk"),
+                                        "inspect_android_package", {})
+        self.assertRegex(report.to_markdown(analysis),
+                         r"\| 5 \| `assets/hostile.txt` \| `deflate` \| `[0-9]+` \| `264` \| `0x[0-9a-f]{8}` \| `null` \| `crc` \|")
+
+    def test_hostile_android_text_stays_inert(self):
+        def rename(layout):
+            layout["members"][4] = {**layout["members"][4], "name": "META-INF/a|b`<img src=x>`"}
+        text = report.to_markdown(android_query("inspect_android_package", {}, rename))
+        self.assertIn("`META-INF/a\\|b'<img src=x>'`", text)
+        self.assertNotIn("a|b`", text)
 
 
 if __name__ == "__main__":
