@@ -6,7 +6,7 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M4a release candidate: Android packages verified on the host.** Deterministic
+**Status: M4a released: Android packages verified on the host.** Deterministic
 analysts read file structure (ELF, PE and Mach-O), imports and string indicators in-process,
 alongside APK members, binary manifest attributes, DEX classes, methods and code references.
 The gateway and reviewer independently re-derive bytes inside stored or compressed
@@ -51,7 +51,7 @@ What this buys, and how each point is checked:
 | M3b | Mach-O host decoder, verified imports for ELF, PE and Mach-O, Ghidra on Mach-O | released |
 | M3c | Ghidra assembly, references from code and referenced strings as derived evidence | released |
 | M3d | Targeted queries by name, address or text with paging; REA's 16 native query names | released |
-| M4a | APK members, binary manifest and DEX classes, methods and code references verified on the host, including compressed-member evidence (contract/3) | release candidate |
+| M4a | APK members, binary manifest and DEX classes, methods and code references verified on the host, including compressed-member evidence (contract/3) | released |
 | M4b | Decompiled Java through JADX; needs an approved download | planned |
 | M5 | JavaScript application analysis | planned |
 | M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
