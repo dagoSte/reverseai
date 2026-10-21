@@ -7,8 +7,9 @@ The worker accepts ELF, PE and thin little-endian Mach-O only and runs one headl
 the snapshot into a project under /tmp, with a fixed loader per format (libraries never loaded), the
 reviewed scripts baked into
 the image (ReverseAIOptions turns off the analyzers that could look outside the input; ReverseAIQuery
-writes functions, calls and pseudocode as JSON), a fixed heap and timeouts below the 240 s wall
-limit. Requests choose only the four bounded counts: never a script, loader or option.
+writes functions, calls, other references, pseudocode and instruction listings as JSON), a fixed heap
+and timeouts below the 240 s wall limit. Requests choose only the eight bounded counts: never a script,
+loader or option.
 
 Ghidra's addresses may be rebased, so every anchor is mapped again here with this file's own
 section table (stdlib decoding; only file-mapped bytes count: ELF SHF_ALLOC sections, PE
@@ -22,9 +23,14 @@ Each anchor is cross-checked: Ghidra's bytes there equal the snapshot's, Ghidra'
 its address back to the same file offset, and every anchor has the same Ghidra-to-file address
 delta; anything else is InconsistentAnchor. What stays Ghidra's reading, reported as derived and
 never as verified: names, a function's size (its span from the entry to the last body byte), call
-targets and pseudocode. Observations follow the M3a seams: functions in address order, pseudocode
-for the entry-point function and then the largest, calls from emitted functions only, inside
-their span. Errors are class names only. Nothing but the one JSON object is written, to stdout only.
+and reference targets, reference types, instruction texts and pseudocode. Observations follow the M3a
+seams: functions in address order, pseudocode for the entry-point function and then the largest (cut
+to fit the 4,096-byte observation limit, decision m3c-pseudocode-fit), calls from emitted functions
+only, inside their span. Then the M3c kinds (decision m3c-contract), each added only while the encoded
+reply stays within its limit: instruction listings in the pseudocode order, each instruction's bytes
+confirmed; non-call references with their contract type; and the strings the referenced bytes hold,
+decoded here from the snapshot by the contract rule. Errors are class names only. Nothing but the
+one JSON object is written, to stdout only.
 """
 
 import hashlib
@@ -39,14 +45,19 @@ import subprocess
 import sys
 
 PROTOCOL = "reverseai.worker/1"
-ADAPTER_VERSION = "12.1.4-r4"
+ADAPTER_VERSION = "12.1.4-r5"
 SNAPSHOT = "/snapshot/input"
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 MAX_REPLY_BYTES = 262_144
 MAX_QUERY_BYTES = 32 * 1024 * 1024
 MAX_LOCATION = 4096
+MAX_OBSERVATION_BYTES = 4096  # an observation value's canonical JSON, as the host's Observation bounds it
 MAX_NAME = 128
-ARGS = {"max_functions": (1, 128, 64), "decompile": (0, 16, 8), "max_chars": (64, 2048, 1024), "max_calls": (0, 256, 128)}
+MAX_INSTRUCTION_TEXT = 64
+MAX_STRING_CHARS = 128
+MAX_STRING_FROM = 8
+ARGS = {"max_functions": (1, 128, 64), "decompile": (0, 16, 8), "max_chars": (64, 2048, 1024), "max_calls": (0, 256, 128),
+        "assembly": (0, 8, 4), "max_instructions": (1, 64, 32), "max_refs": (0, 128, 64), "max_strings": (0, 64, 32)}
 GHIDRA = Path("/opt/ghidra")
 SCRIPTS = Path(__file__).resolve().parent / "ghidra_scripts"
 WORK = Path("/tmp/reverseai-ghidra")
@@ -301,7 +312,7 @@ def ghidra_argv(format_, out, args, entry_offset):
             "-loader", loader, "-loader-loadLibraries", "false", "-loader-linkExistingProjectLibraries", "false",
             "-scriptPath", str(SCRIPTS), "-preScript", "ReverseAIOptions.java",
             "-postScript", "ReverseAIQuery.java", str(out), str(args["max_functions"]), str(args["decompile"]),
-            str(entry_offset), str(DECOMPILE_SECONDS),
+            str(entry_offset), str(DECOMPILE_SECONDS), str(args["assembly"]), str(args["max_instructions"]),
             "-log", str(WORK / "ghidra.log"), "-scriptlog", str(WORK / "script.log")]
 
 
@@ -366,6 +377,11 @@ def printable_text(value):
     return "".join(c if c.isprintable() or c in "\n\t" else "?" for c in value)
 
 
+def _size(value):
+    """Bytes of value's JSON as encode() and the host's canonical_json write it (UTF-8, sorted keys, no spaces)."""
+    return len(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+
 class Anchors:
     """Maps Ghidra addresses to this file's offsets and VAs, and checks every anchor against the bytes."""
 
@@ -425,7 +441,8 @@ def observations(data, query, args):
         if mapped is None:
             continue
         functions.append({"address": address, "va": mapped[0], "offset": offset, "length": length, "size": size,
-                          "name": printable_name(item.get("name")), "calls": item.get("calls", [])})
+                          "name": printable_name(item.get("name")), "calls": item.get("calls", []),
+                          "refs": item.get("refs", [])})
     functions.sort(key=lambda f: f["va"])
     result = []
     for index, function in enumerate(functions):
@@ -435,11 +452,40 @@ def observations(data, query, args):
                                  "size": function["size"]}})
     result += pseudocode(query.get("pseudocode", []), functions, entry_va, args)
     result += calls(functions, anchors, args)
-    return result
+    reply = Fit(result)
+    for item in assembly(query.get("assembly", []), functions, entry_va, anchors, args):
+        reply.add(item)
+    for item in references(functions, anchors, args):
+        reply.add(item)
+    for item in strings(data, sections, [o["value"] for o in reply.items if o["value"]["kind"] == "ref"], args):
+        reply.add(item)
+    return reply.items
+
+
+class Fit:
+    """Observations added in order only while the encoded reply stays within MAX_REPLY_BYTES; one never cut."""
+
+    def __init__(self, items):
+        self.items = list(items)
+        envelope = len(encode({"protocol": PROTOCOL, "status": "ok", "snapshot_sha256": "0" * 64, "observations": []}))
+        self.size = envelope + sum(map(_size, self.items)) + max(0, len(self.items) - 1)
+
+    def add(self, item):
+        grown = self.size + _size(item) + (1 if self.items else 0)
+        if grown <= MAX_REPLY_BYTES:
+            self.items.append(item)
+            self.size = grown
+
+
+def ranked(functions, entry_va):
+    """The pseudocode order: the entry-point function first if emitted, then the largest (ties: lower entry)."""
+    first = [f for f in functions if f["va"] == entry_va]
+    return first + sorted((f for f in functions if f["va"] != entry_va), key=lambda f: (-f["size"], f["va"]))
 
 
 def pseudocode(items, functions, entry_va, args):
-    """Entry-point function first if emitted, then the largest (ties: lower entry), at most `decompile`."""
+    """Texts in the ranked order, at most `decompile`; each cut at max_chars and, if its observation value would pass
+    MAX_OBSERVATION_BYTES, to the longest prefix that fits (decision m3c-pseudocode-fit)."""
     if not isinstance(items, list):
         raise InvalidQueryOutput()
     texts = {}
@@ -447,17 +493,46 @@ def pseudocode(items, functions, entry_va, args):
         if not isinstance(item, dict):
             raise InvalidQueryOutput()
         texts[_int(item.get("entry"))] = printable_text(item.get("text"))  # texts of functions not emitted are ignored
-    first = [f for f in functions if f["va"] == entry_va]
-    order = first + sorted((f for f in functions if f["va"] != entry_va), key=lambda f: (-f["size"], f["va"]))
     result = []
-    for function in order[:args["decompile"]]:
+    for function in ranked(functions, entry_va)[:args["decompile"]]:
         text = texts.get(function["address"])
         if text is None:
             continue  # a failed decompilation is omitted
-        result.append({"location": {"offset": function["offset"], "length": function["length"]},
-                       "value": {"kind": "pseudocode", "index": function["index"], "entry": function["va"],
-                                 "text": text[:args["max_chars"]], "truncated": len(text) > args["max_chars"]}})
+        value = {"kind": "pseudocode", "index": function["index"], "entry": function["va"],
+                 "text": text[:args["max_chars"]], "truncated": len(text) > args["max_chars"]}
+        if _size(value) > MAX_OBSERVATION_BYTES:
+            whole, low, high = value["text"], 0, len(value["text"])
+            value["truncated"] = True
+            while low < high:  # the longest prefix that fits; the size grows with the prefix
+                value["text"] = whole[:(low + high + 1) // 2]
+                low, high = (len(value["text"]), high) if _size(value) <= MAX_OBSERVATION_BYTES else (low, len(value["text"]) - 1)
+            value["text"] = whole[:low]
+        result.append({"location": {"offset": function["offset"], "length": function["length"]}, "value": value})
     return result
+
+
+def _instruction(anchors, function, item):
+    """(file VA, file offset, length) of a query instruction whose whole bytes lie inside the function's span."""
+    if not isinstance(item, dict):
+        raise InvalidQueryOutput()
+    address, length, offset = _int(item.get("address")), _int(item.get("length"), 1), item.get("file_offset")
+    if length > 16 or type(offset) is not int or offset < 0:
+        return None
+    mapped = anchors.anchor(address, offset, _hex(item.get("bytes"), 16), length)
+    if mapped is None or mapped[0] < function["va"] or mapped[0] + length > function["va"] + function["size"]:
+        return None
+    return mapped[0], offset, length
+
+
+def _target(anchors, item):
+    """A call or reference target as a file VA: through its file offset when one section holds it, else Ghidra's
+    address less the rebase delta; None below zero."""
+    target, target_offset = _int(item.get("to")), item.get("to_file_offset")
+    if type(target_offset) is int and target_offset >= 0:
+        section = section_at(anchors.sections, target_offset)
+        if section:
+            return section[2] + (target_offset - section[0])
+    return target - anchors.delta if target >= anchors.delta else None
 
 
 def calls(functions, anchors, args):
@@ -467,27 +542,125 @@ def calls(functions, anchors, args):
         if not isinstance(function["calls"], list):
             raise InvalidQueryOutput()
         for item in function["calls"]:
-            if not isinstance(item, dict):
-                raise InvalidQueryOutput()
-            address, length, offset = _int(item.get("address")), _int(item.get("length"), 1), item.get("file_offset")
-            target, target_offset = _int(item.get("to")), item.get("to_file_offset")
-            if length > 16 or type(offset) is not int or offset < 0:
-                continue
-            mapped = anchors.anchor(address, offset, _hex(item.get("bytes"), 16), length)
-            if mapped is None or mapped[0] < function["va"] or mapped[0] + length > function["va"] + function["size"]:
-                continue
-            to = None
-            if type(target_offset) is int and target_offset >= 0:
-                section = section_at(anchors.sections, target_offset)
-                to = section[2] + (target_offset - section[0]) if section else None
-            if to is None:
-                to = target - anchors.delta
-            if to < 0:
-                continue
-            found.add((mapped[0], offset, length, function["va"], to, printable_name(item.get("to_name", ""))))
+            mapped = _instruction(anchors, function, item)
+            to = _target(anchors, item) if mapped else None
+            if to is not None:
+                found.add((mapped[0], mapped[1], mapped[2], function["va"], to, printable_name(item.get("to_name", ""))))
     return [{"location": {"offset": offset, "length": length},
              "value": {"kind": "call", "from": start, "to": to, "to_name": name}}
             for _, offset, length, start, to, name in sorted(found)[:args["max_calls"]]]
+
+
+def assembly(items, functions, entry_va, anchors, args):
+    """Instruction listings for the first `assembly` functions in the ranked order, each at the function's anchor:
+    [delta, length, text] rows in address order, non-overlapping and wholly inside the anchor, each one's bytes
+    confirmed; at most max_instructions rows and 4,096 bytes of value; truncated when any instruction of the function
+    is not listed. A function with no listable instruction is omitted."""
+    if not isinstance(items, list):
+        raise InvalidQueryOutput()
+    listings = {}
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("instructions"), list):
+            raise InvalidQueryOutput()
+        if _int(item.get("count")) < len(item["instructions"]):
+            raise InvalidQueryOutput()
+        listings[_int(item.get("entry"))] = item
+    result = []
+    for function in ranked(functions, entry_va)[:args["assembly"]]:
+        item = listings.get(function["address"])
+        if item is None:
+            continue  # a failed listing is omitted
+        value = {"kind": "assembly", "index": function["index"], "entry": function["va"], "instructions": [], "truncated": False}
+        end, after = function["offset"] + function["length"], function["offset"]
+        for row in item["instructions"][:args["max_instructions"]]:
+            mapped = _instruction(anchors, function, row)
+            if mapped is None or mapped[1] < after or mapped[1] + mapped[2] > end:
+                break  # outside the anchor, before the previous row's end, or not in an executable section
+            text = printable_name(row.get("text"))[:MAX_INSTRUCTION_TEXT] or "?"
+            value["instructions"].append([mapped[1] - function["offset"], mapped[2], text])
+            if _size(value) > MAX_OBSERVATION_BYTES:
+                value["instructions"].pop()
+                break
+            after = mapped[1] + mapped[2]
+        if value["instructions"]:
+            value["truncated"] = len(value["instructions"]) < item["count"]
+            result.append({"location": {"offset": function["offset"], "length": function["length"]}, "value": value})
+    return result
+
+
+def ref_type(item):
+    """The contract type of one query reference from Ghidra's flags, None when it is not reported."""
+    flags = [item.get(name) for name in ("flow", "jump", "read", "write", "data", "inside")]
+    if not all(type(flag) is bool for flag in flags):
+        raise InvalidQueryOutput()
+    flow, jump, read, write, data, inside = flags
+    if flow:
+        return "jump" if jump and not inside else None  # flow inside the body is not reported
+    if read and write:
+        return "read_write"
+    return "read" if read else "write" if write else "data" if data else None
+
+
+def references(functions, anchors, args):
+    """Non-call references from emitted functions' instructions inside their span; unique, sorted by (instruction file
+    offset, to, type), at most max_refs."""
+    found = set()
+    for function in functions:
+        if not isinstance(function["refs"], list):
+            raise InvalidQueryOutput()
+        for item in function["refs"]:
+            kind = ref_type(item) if isinstance(item, dict) else None
+            mapped = _instruction(anchors, function, item) if kind else None
+            to = _target(anchors, item) if mapped else None
+            if to is not None:
+                found.add((mapped[1], to, kind, mapped[2], function["va"], printable_name(item.get("to_name", ""))))
+    return [{"location": {"offset": offset, "length": length},
+             "value": {"kind": "ref", "from": start, "to": to, "type": kind, "to_name": name}}
+            for offset, to, kind, length, start, name in sorted(found)[:args["max_refs"]]]
+
+
+def decode_string(data, sections, address):
+    """(file offset, encoded length, encoding, text, truncated) of the string at address under the contract rule, or
+    None: ascii when 2..128 bytes in 0x20..0x7e start there, then a zero byte; else utf-16le with XX 00 units and a
+    00 00 terminator; a run that reaches 128 characters with the next one still matching is truncated instead. All of
+    it lies inside the one section whose file bytes map address."""
+    found = [s for s in sections if s[2] <= address < s[2] + (s[1] - s[0])]
+    if len(found) != 1:
+        return None
+    start, end = found[0][0] + (address - found[0][2]), found[0][1]
+
+    def run(step, matches):
+        count = 0
+        while count <= MAX_STRING_CHARS and start + (count + 1) * step <= end and matches(start + count * step):
+            count += 1
+        return count
+
+    for encoding, step in (("ascii", 1), ("utf-16le", 2)):
+        count = run(step, lambda at: 0x20 <= data[at] <= 0x7E and (step == 1 or data[at + 1] == 0))
+        truncated = count > MAX_STRING_CHARS
+        count = min(count, MAX_STRING_CHARS)
+        terminated = start + (count + 1) * step <= end and not any(data[start + count * step:start + (count + 1) * step])
+        if count >= 2 and (truncated or terminated):
+            return start, count * step, encoding, data[start:start + count * step].decode(encoding), truncated
+    return None
+
+
+def strings(data, sections, refs, args):
+    """Strings at the distinct `to` of the reply's references, by address, at most max_strings; `from` the sorted
+    referencing functions, the lowest MAX_STRING_FROM."""
+    sources = {}
+    for ref in refs:
+        sources.setdefault(ref["to"], set()).add(ref["from"])
+    result = []
+    for address in sorted(sources):
+        decoded = decode_string(data, sections, address) if len(result) < args["max_strings"] else None
+        if decoded is None:
+            continue
+        offset, length, encoding, text, truncated = decoded
+        result.append({"location": {"offset": offset, "length": length},
+                       "value": {"kind": "string", "address": address, "encoding": encoding, "text": text,
+                                 "truncated": truncated, "from": sorted(sources[address])[:MAX_STRING_FROM]}})
+    return result
 
 
 def run(operation, args, data, query_of=None):

@@ -22,14 +22,22 @@ from unittest.mock import patch
 
 from reverseai.contract import Location, Observation, WorkerError, parse_worker_reply, sha256_hex
 from reverseai.tools import ghidra_verify, structure
-from tests.fixtures_code import TEXT_SIZE, elf_code, elf_data_only, macho_code, pe_code
+from reverseai.contract import MAX_WORKER_REPLY_BYTES, canonical_json
+from tests.fixtures_code import (
+    DATA_SIZE, REFS_TEXT_SIZE, TEXT_SIZE, elf_code, elf_data_only, elf_refs, macho_code, macho_refs, pe_code, pe_refs,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "containers" / "ghidra"
 SPEC = importlib.util.spec_from_file_location("ghidra_worker", SOURCE / "worker.py")
 worker = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(worker)
-DEFAULTS = {"max_functions": 64, "decompile": 8, "max_chars": 1024, "max_calls": 128}
+DEFAULTS = {"max_functions": 64, "decompile": 8, "max_chars": 1024, "max_calls": 128,
+            "assembly": 4, "max_instructions": 32, "max_refs": 64, "max_strings": 32}
+MINIMA = {"max_functions": 1, "decompile": 0, "max_chars": 64, "max_calls": 0, "assembly": 0, "max_instructions": 1, "max_refs": 0,
+          "max_strings": 0}
+MAXIMA = {"max_functions": 128, "decompile": 16, "max_chars": 2048, "max_calls": 256, "assembly": 8, "max_instructions": 64,
+          "max_refs": 128, "max_strings": 64}
 PE_NAMES = ("entry", "FUN_140001020", "FUN_140001030", "FUN_140001050")
 
 
@@ -121,6 +129,91 @@ def macho_text_and_main(data):
     commands = macho_commands(data)
     return (next(body for command, body in commands if command == 0x19 and body[8:14] == b"__TEXT"),
             next(body for command, body in commands if command == 0x80000028))
+
+
+# M3c: what a correct ReverseAIQuery writes for the refs fixtures; Ghidra's reference-type flags per x86 access.
+FLAGS = {"data": (False, False, False, False, True), "read": (False, False, True, False, True), "write": (False, False, False, True, True),
+         "read_write": (False, False, True, True, True), "jump": (True, True, False, False, False)}
+
+
+def ranked(layout):
+    first = [f for f in layout["functions"] if f["entry"] == layout["entry"]]
+    return first + sorted((f for f in layout["functions"] if f["entry"] != layout["entry"]), key=lambda f: (-f["size"], f["entry"]))
+
+
+def file_offset(layout, address):
+    for block in (layout["text"], layout["data"]):
+        if block["address"] <= address < block["address"] + block["size"]:
+            return block["offset"] + address - block["address"]
+    return -1
+
+
+def refs_query(data, layout, *, delta=0, names=None, flags=None, listing=None):
+    """query() for a refs fixture plus its data block, each function's references and every function's listing;
+    instruction texts are INSN_<delta>, unless listing(function, rows) returns other rows."""
+    names = names or [f["name"] or f"FUN_{f['entry']:x}" for f in layout["functions"]]
+    q = query(data, layout, delta=delta, names=names)
+    q["blocks"][0]["size"] = layout.get("text_raw_size", REFS_TEXT_SIZE)
+    q["blocks"].append({"name": ".data", "start": layout["data"]["address"] + delta, "size": DATA_SIZE, "execute": False,
+                        "initialized": True, "file_offset": layout["data"]["offset"]})
+    by_entry = {f["entry"]: name for f, name in zip(layout["functions"], names)}
+    for function, item in zip(layout["functions"], q["functions"]):
+        item["refs"] = []
+        for ref in (r for r in layout["refs"] if r["from"] == function["entry"]):
+            flow, jump, read, write, is_data = (flags or FLAGS)[ref["type"]]
+            item["refs"].append({"address": ref["address"] + delta, "length": ref["length"], "file_offset": ref["offset"],
+                                 "bytes": data[ref["offset"]:ref["offset"] + ref["length"]].hex(), "to": ref["to"] + delta,
+                                 "to_file_offset": file_offset(layout, ref["to"]), "to_name": ref["to_name"] or by_entry.get(ref["to"], ""),
+                                 "type": ref["type"].upper(), "flow": flow, "jump": jump, "read": read, "write": write, "data": is_data,
+                                 "inside": False})
+    q["assembly"] = []
+    for function in layout["functions"]:
+        rows = [{"address": function["entry"] + d + delta, "length": n, "file_offset": function["offset"] + d,
+                 "bytes": data[function["offset"] + d:function["offset"] + d + n].hex(), "text": f"INSN_{d:x}"}
+                for d, n in function["instructions"]]
+        rows = listing(function, rows) if listing else rows
+        q["assembly"].append({"entry": function["entry"] + delta, "instructions": rows, "count": len(function["instructions"])})
+    return q
+
+
+def expected_m3c(layout, names=None, *, args=DEFAULTS):
+    """The M3c observations for a refs fixture: listings in the ranked order, the six references, the two strings."""
+    names = names or [f["name"] or f"FUN_{f['entry']:x}" for f in layout["functions"]]
+    index = {f["entry"]: i for i, f in enumerate(layout["functions"])}
+    by_entry = {f["entry"]: name for f, name in zip(layout["functions"], names)}
+    end = layout["text"]["offset"] + REFS_TEXT_SIZE
+    result = []
+    for f in ranked(layout)[:args["assembly"]]:
+        rows = [[d, n, f"INSN_{d:x}"] for d, n in f["instructions"]][:args["max_instructions"]]
+        result.append({"location": {"offset": f["offset"], "length": min(f["size"], 4096, end - f["offset"])},
+                       "value": {"kind": "assembly", "index": index[f["entry"]], "entry": f["entry"], "instructions": rows,
+                                 "truncated": len(rows) < len(f["instructions"])}})
+    refs = sorted(layout["refs"], key=lambda r: (r["offset"], r["to"], r["type"]))[:args["max_refs"]]
+    result += [{"location": {"offset": r["offset"], "length": r["length"]},
+                "value": {"kind": "ref", "from": r["from"], "to": r["to"], "type": r["type"], "to_name": r["to_name"] or by_entry.get(r["to"], "")}}
+               for r in refs]
+    targets = {r["to"] for r in refs}
+    result += [{"location": {"offset": s["offset"], "length": s["length"]},
+                "value": {"kind": "string", "address": s["address"], "encoding": s["encoding"], "text": s["text"],
+                          "truncated": s["truncated"], "from": s["from"]}}
+               for s in layout["strings"] if s["address"] in targets][:args["max_strings"]]
+    return result
+
+
+def code_elf(text, rodata, *, entry_offset=0):
+    """A minimal ELF64 x86-64 with an AX .text at 0x400100 and an A .rodata right after it; no program headers."""
+    text_offset, base = 0x100, 0x400000
+    rodata_offset = text_offset + len(text)
+    shstrtab, shnames = b"\0.text\0.rodata\0.shstrtab\0", (1, 7, 15)
+    shoff = (rodata_offset + len(rodata) + len(shstrtab) + 7) & ~7
+    sections = (bytes(64)
+                + struct.pack("<IIQQQQIIQQ", shnames[0], 1, 0x6, base + text_offset, text_offset, len(text), 0, 0, 16, 0)
+                + struct.pack("<IIQQQQIIQQ", shnames[1], 1, 0x2, base + rodata_offset, rodata_offset, len(rodata), 0, 0, 1, 0)
+                + struct.pack("<IIQQQQIIQQ", shnames[2], 3, 0, 0, rodata_offset + len(rodata), len(shstrtab), 0, 0, 1, 0))
+    header = (b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8)
+              + struct.pack("<HHIQQQIHHHHHH", 2, 62, 1, base + text_offset + entry_offset, 0, shoff, 0, 64, 0, 0, 64, 4, 3))
+    data = header + bytes(text_offset - len(header)) + text + rodata + shstrtab
+    return data + bytes(shoff - len(data)) + sections, {"text": (text_offset, base + text_offset), "rodata": (rodata_offset, base + rodata_offset)}
 
 
 class KnownAnswerTests(unittest.TestCase):
@@ -549,19 +642,269 @@ class FileMapTests(unittest.TestCase):
             worker.pe_map(pe[:0x100])
 
 
+class M3cTests(unittest.TestCase):
+    """Decision m3c-contract: assembly, ref and string observations after the M3a kinds."""
+
+    def m3c(self, data, q, **args):
+        return [o for o in observe(data, q, **args) if o["value"]["kind"] in ("assembly", "ref", "string")]
+
+    def test_refs_fixtures_give_listings_references_and_strings_exactly(self):
+        for build in (elf_refs, pe_refs, macho_refs):
+            data, layout = build()
+            with self.subTest(build.__name__):
+                self.assertEqual(self.m3c(data, refs_query(data, layout)), expected_m3c(layout))
+                self.assertEqual([o["value"]["type"] for o in self.m3c(data, refs_query(data, layout)) if o["value"]["kind"] == "ref"],
+                                 ["data", "data", "read", "write", "read_write", "jump"])
+                for delta in (0x10000, -0x1000):  # rebased by Ghidra: values stay the file's addresses
+                    self.assertEqual(self.m3c(data, refs_query(data, layout, delta=delta)), expected_m3c(layout))
+        data, layout = elf_refs()
+        for args in (dict(assembly=0, max_refs=0, max_strings=0), dict(assembly=1, max_instructions=1), dict(max_refs=2, max_strings=1),
+                     dict(MAXIMA)):
+            with self.subTest(args=args):
+                self.assertEqual(self.m3c(data, refs_query(data, layout), **args), expected_m3c(layout, args=dict(DEFAULTS, **args)))
+        self.assertEqual([o["value"]["kind"] for o in observe(data, refs_query(data, layout))][-12:],
+                         ["assembly"] * 4 + ["ref"] * 6 + ["string"] * 2)
+
+    def test_listings_follow_the_ranked_order_and_skip_what_is_missing(self):
+        data, layout = elf_refs()
+        q = refs_query(data, layout)
+        order = [f["entry"] for f in ranked(layout)]
+        self.assertEqual([o["value"]["entry"] for o in self.m3c(data, q) if o["value"]["kind"] == "assembly"], order[:4])
+        q["assembly"] = [item for item in q["assembly"] if item["entry"] != order[1]]  # a failed listing
+        self.assertEqual([o["value"]["entry"] for o in self.m3c(data, q) if o["value"]["kind"] == "assembly"], [order[0], *order[2:4]])
+        q["assembly"][0]["instructions"] = []  # nothing listable: omitted, never empty
+        self.assertNotIn(order[0], [o["value"]["entry"] for o in self.m3c(data, q) if o["value"]["kind"] == "assembly"])
+        for broken in ({"entry": 1}, {"entry": 1, "instructions": {}, "count": 0}, {"entry": 1, "instructions": [], "count": -1},
+                       {"entry": 1, "instructions": [{}], "count": 0}, "listing"):
+            q = refs_query(data, layout)
+            q["assembly"].append(broken)
+            with self.subTest(broken=broken), self.assertRaises(worker.InvalidQueryOutput):
+                self.m3c(data, q)
+
+    def test_listing_rows_stay_inside_the_anchor_in_order_and_confirmed(self):
+        data, layout = elf_refs()
+        describe = next(f for f in layout["functions"] if f["name"] == "describe")
+
+        def listed(listing=None, **args):
+            q = refs_query(data, layout, listing=lambda f, rows: listing(rows) if listing and f is describe else rows)
+            return next(o for o in self.m3c(data, q, **args) if o["value"]["entry"] == describe["entry"] and o["value"]["kind"] == "assembly")
+
+        self.assertEqual(listed()["value"]["instructions"], [[d, n, f"INSN_{d:x}"] for d, n in describe["instructions"]])
+        self.assertFalse(listed()["value"]["truncated"])
+        cut = listed(max_instructions=2)["value"]
+        self.assertEqual((len(cut["instructions"]), cut["truncated"]), (2, True))
+        overlapping = listed(lambda rows: [rows[0], dict(rows[1], address=rows[1]["address"] - 1, file_offset=rows[1]["file_offset"] - 1,
+                                                          bytes=data[rows[1]["file_offset"] - 1:rows[1]["file_offset"] + 6].hex())] + rows[2:])
+        self.assertEqual((len(overlapping["value"]["instructions"]), overlapping["value"]["truncated"]), (1, True))
+        texts = listed(lambda rows: [dict(row, text=text) for row, text in zip(rows, ["\u00e9" + "x" * 80, "", "a\tb"] + ["ok"] * 3)])
+        self.assertEqual([row[2] for row in texts["value"]["instructions"]], ["?" + "x" * 63, "?", "a?b", "ok", "ok", "ok"])
+        with self.assertRaises(worker.InconsistentAnchor):  # Ghidra's bytes must be the snapshot's
+            listed(lambda rows: [dict(rows[0], bytes="90" * rows[0]["length"])] + rows[1:])
+        for change in (dict(length=17), dict(file_offset=-1), dict(file_offset=None)):
+            with self.subTest(change=change):
+                self.assertEqual(len(listed(lambda rows: [rows[0], dict(rows[1], **change)] + rows[2:])["value"]["instructions"]), 1)
+        for change in (dict(length=0), dict(address=-1), dict(bytes="zz")):
+            with self.subTest(change=change), self.assertRaises(worker.InvalidQueryOutput):
+                listed(lambda rows: [rows[0], dict(rows[1], **change)] + rows[2:])
+
+    def test_a_listing_past_its_anchor_or_its_value_limit_is_cut_and_truncated(self):
+        data, layout = elf_refs()
+        describe = next(f for f in layout["functions"] if f["name"] == "describe")
+        q = refs_query(data, layout)
+        next(item for item in q["functions"] if item["entry"] == describe["entry"])["size"] = 20  # the anchor ends inside row 4
+        value = next(o["value"] for o in self.m3c(data, q) if o["value"]["kind"] == "assembly" and o["value"]["entry"] == describe["entry"])
+        self.assertEqual(([row[:2] for row in value["instructions"]], value["truncated"]), ([[0, 7], [7, 7], [14, 6]], True))
+        text = "\"" * 64
+        rows = [{"address": layout["text"]["address"] + i, "length": 1, "file_offset": layout["text"]["offset"] + i,
+                 "bytes": data[layout["text"]["offset"] + i:layout["text"]["offset"] + i + 1].hex(), "text": text} for i in range(64)]
+        q = refs_query(data, layout)
+        q["assembly"][0] = {"entry": layout["functions"][0]["entry"], "instructions": rows, "count": 64}
+        q["functions"][0].update(size=REFS_TEXT_SIZE, bytes=data[layout["text"]["offset"]:layout["text"]["offset"] + REFS_TEXT_SIZE].hex())
+        value = next(o["value"] for o in self.m3c(data, q, max_instructions=64) if o["value"]["kind"] == "assembly")
+        self.assertLessEqual(len(canonical_json(value).encode()), 4096)
+        self.assertTrue(value["truncated"])
+        self.assertGreater(len(canonical_json(dict(value, instructions=value["instructions"] + [[64, 1, text]])).encode()), 4096)
+        self.assertLess(len(value["instructions"]), 64)
+
+    def test_a_listing_stops_at_the_4096_byte_anchor_of_a_longer_function(self):
+        data, places = code_elf(bytes(0x90 for _ in range(5000)), b"")
+        offset, va = places["text"]
+        rows = [{"address": va + d, "length": n, "file_offset": offset + d, "bytes": data[offset + d:offset + d + n].hex(), "text": "NOP"}
+                for d, n in ((0, 1), (4094, 4), (4098, 1))]
+        q = {"format": "x", "options_off": {}, "pseudocode": [], "assembly": [{"entry": va, "instructions": rows, "count": 3}],
+             "blocks": [{"name": ".text", "start": va, "size": 5000, "execute": True, "initialized": True, "file_offset": offset}],
+             "functions": [{"name": "long", "entry": va, "size": 5000, "file_offset": offset, "anchored": True,
+                            "bytes": data[offset:offset + 4096].hex(), "calls": [], "refs": []}]}
+        value = next(o for o in observe(data, q) if o["value"]["kind"] == "assembly")
+        self.assertEqual((value["location"], value["value"]["instructions"], value["value"]["truncated"]),
+                         ({"offset": offset, "length": 4096}, [[0, 1, "NOP"]], True))
+
+    def test_reference_types_come_from_ghidras_flags_and_inner_flow_is_not_reported(self):
+        cases = {(False, False, False, False, True): "data", (False, False, True, False, True): "read", (False, False, False, True, True): "write",
+                 (False, False, True, True, True): "read_write", (False, False, True, True, False): "read_write",
+                 (True, True, False, False, False): "jump", (True, False, False, False, False): None, (False, False, False, False, False): None}
+        for (flow, jump, read, write, is_data), kind in cases.items():
+            item = {"flow": flow, "jump": jump, "read": read, "write": write, "data": is_data, "inside": False}
+            with self.subTest(item=item):
+                self.assertEqual(worker.ref_type(item), kind)
+        self.assertIsNone(worker.ref_type({"flow": True, "jump": True, "read": False, "write": False, "data": False, "inside": True}))
+        for bad in ({"flow": 1, "jump": True, "read": False, "write": False, "data": False, "inside": False}, {"flow": False}):
+            with self.subTest(bad=bad), self.assertRaises(worker.InvalidQueryOutput):
+                worker.ref_type(bad)
+
+    def test_references_are_anchored_unique_sorted_capped_and_strings_follow_them(self):
+        data, layout = elf_refs()
+        q = refs_query(data, layout)
+        describe = next(item for item in q["functions"] if item["name"] == "describe")
+        describe["refs"] += describe["refs"][:2]  # duplicates collapse
+        self.assertEqual(self.m3c(data, q), expected_m3c(layout))
+        outside = dict(describe["refs"][0], address=q["functions"][0]["entry"], file_offset=q["functions"][0]["file_offset"],
+                       bytes=data[q["functions"][0]["file_offset"]:q["functions"][0]["file_offset"] + 7].hex())
+        describe["refs"].append(outside)  # an instruction before describe's entry is not inside its span
+        self.assertEqual(self.m3c(data, q), expected_m3c(layout))
+        q = refs_query(data, layout)
+        for item in q["functions"]:
+            item["refs"].reverse()
+        self.assertEqual(self.m3c(data, q), expected_m3c(layout))
+        values = [o["value"] for o in self.m3c(data, refs_query(data, layout), max_refs=1)]
+        self.assertEqual([v["kind"] for v in values][-2:], ["ref", "string"])
+        self.assertEqual(values[-1]["text"], "ReverseAI ascii string")  # only strings referenced by the reply's refs
+        self.assertNotIn("string", [o["value"]["kind"] for o in self.m3c(data, refs_query(data, layout), max_refs=1, max_strings=0)])
+        q = refs_query(data, layout)
+        for item in q["functions"]:
+            for ref in item["refs"]:
+                ref["to_file_offset"] = -1  # no file offset from Ghidra: its address less the rebase delta
+        self.assertEqual(self.m3c(data, q), expected_m3c(layout))
+        with self.assertRaises(worker.InvalidQueryOutput):
+            self.m3c(data, dict(q, functions=[dict(q["functions"][0], refs={})] + q["functions"][1:]))
+
+    def test_string_rule_ascii_first_utf16le_then_terminator_or_truncation_inside_the_section(self):
+        def decode(raw, at=0, section_end=None):
+            data = bytes(raw)
+            return worker.decode_string(data, [(0, len(data) if section_end is None else section_end, 0x1000, False)], 0x1000 + at)
+
+        self.assertEqual(decode(b"ab\0"), (0, 2, "ascii", "ab", False))
+        self.assertEqual(decode(b"a\0"), None)  # one character is not a string
+        self.assertEqual(decode("hi".encode("utf-16le") + b"\0\0"), (0, 4, "utf-16le", "hi", False))
+        self.assertEqual(decode(b"ab"), None)  # no terminator inside the section
+        self.assertEqual(decode(b"ab\0", section_end=2), None)
+        self.assertEqual(decode(b"ab\x01"), None)
+        self.assertEqual(decode(b"A" * 128 + b"\0"), (0, 128, "ascii", "A" * 128, False))
+        self.assertEqual(decode(b"A" * 129), (0, 128, "ascii", "A" * 128, True))  # the 129th still matches inside the section
+        self.assertEqual(decode(b"A" * 128), None)  # 128, then neither a terminator nor a match
+        self.assertEqual(decode(b"A" * 129 + b"\0", section_end=128), None)
+        wide = "W".encode("utf-16le") * 129
+        self.assertEqual(decode(wide), (0, 256, "utf-16le", "W" * 128, True))
+        self.assertEqual(decode(wide[:256] + b"\0\0"), (0, 256, "utf-16le", "W" * 128, False))
+        self.assertEqual(decode(b"ab\0", at=1), None)
+        self.assertEqual(decode(b"xab\0", at=1), (1, 2, "ascii", "ab", False))
+        self.assertEqual(decode("~ ".encode("utf-16le") + b"\0\0"), (0, 4, "utf-16le", "~ ", False))
+        self.assertEqual(decode(b"\x7f\x00a\x00\0\0"), None)
+        data = b"ab\0"
+        self.assertIsNone(worker.decode_string(data, [(0, 3, 0x1000, False), (0, 3, 0x1000, True)], 0x1000))  # two sections map it
+        self.assertIsNone(worker.decode_string(data, [(0, 3, 0x1000, False)], 0x2000))
+
+    def test_string_sources_are_sorted_unique_and_capped_at_eight(self):
+        data, layout = elf_refs()
+        greeting = layout["strings"][0]
+        refs = [{"to": greeting["address"], "from": 0x400000 + n} for n in (9, 3, 3, 7, 1, 8, 2, 6, 5, 4)]
+        found = worker.strings(data, worker.elf_map(data)[1], refs, DEFAULTS)
+        self.assertEqual(found[0]["value"]["from"], [0x400001, 0x400002, 0x400003, 0x400004, 0x400005, 0x400006, 0x400007, 0x400008])
+        self.assertEqual(found[0]["location"], {"offset": greeting["offset"], "length": greeting["length"]})
+        many = [{"to": layout["strings"][1]["address"], "from": 1}, {"to": greeting["address"], "from": 1}, {"to": layout["data"]["address"] + 0x40, "from": 1}]
+        self.assertEqual([o["value"]["address"] for o in worker.strings(data, worker.elf_map(data)[1], many, DEFAULTS)],
+                         [s["address"] for s in layout["strings"]])
+        self.assertEqual(len(worker.strings(data, worker.elf_map(data)[1], many, dict(DEFAULTS, max_strings=1))), 1)
+
+    def test_pseudocode_is_cut_to_fit_the_observation_limit(self):
+        """Decision m3c-pseudocode-fit: max_chars first, then the longest prefix whose value fits 4,096 bytes."""
+        data, layout = elf_code()
+        for max_chars in (2048, 1024):
+            for label, char in (("quote", "\""), ("backslash", "\\"), ("newline", "\n"), ("cjk", "\u4e00"), ("astral", "\U0001f600"),
+                                ("ascii", "a")):
+                text = char * 3000
+                q = query(data, layout, texts={f["entry"]: text for f in layout["functions"]})
+                values = [o["value"] for o in observe(data, q, max_chars=max_chars) if o["value"]["kind"] == "pseudocode"]
+                with self.subTest(max_chars=max_chars, label=label):
+                    self.assertEqual(len(values), 4)
+                    for value in values:
+                        size = len(canonical_json(value).encode())
+                        self.assertLessEqual(size, 4096)
+                        self.assertTrue(value["truncated"])
+                        self.assertLessEqual(len(value["text"]), max_chars)
+                        self.assertTrue(len(value["text"]) == max_chars or
+                                        len(canonical_json(dict(value, text=text[:len(value["text"]) + 1])).encode()) > 4096)
+        q = query(data, layout, texts={f["entry"]: "a" * 100 for f in layout["functions"]})
+        self.assertEqual({o["value"]["truncated"] for o in observe(data, q) if o["value"]["kind"] == "pseudocode"}, {False})
+        q = query(data, layout, texts={f["entry"]: "\U0001f600" * 2000 for f in layout["functions"]})  # within max_chars, over 4,096 bytes
+        values = [o["value"] for o in observe(data, q, max_chars=2048) if o["value"]["kind"] == "pseudocode"]
+        self.assertEqual({(v["truncated"], len(v["text"]) < 2000) for v in values}, {(True, True)})
+
+    def test_the_reply_at_every_maximum_is_never_refused_for_its_size(self):
+        """128 functions, 16 pseudocode texts, 256 calls, 8 listings of 64 rows, 128 references and 64 strings, with every
+        name and text at the size that costs most in JSON: the M3a kinds always fit, the M3c kinds are added only while the
+        reply does, none is cut, and the reply parses on the host."""
+        quote = "\"" * 128
+        text = bytearray(0x90 for _ in range(128 * 32))
+        strings = b"".join(b"\"" * 129 + b"\0" for _ in range(64))
+        data, places = code_elf(bytes(text), strings)
+        (text_offset, text_va), (strings_offset, strings_va) = places["text"], places["rodata"]
+
+        def hexed(offset, length):
+            return data[offset:offset + length].hex()
+
+        functions = []
+        for i in range(128):
+            offset, va = text_offset + 32 * i, text_va + 32 * i
+            calls = [{"address": va + 5 * c, "length": 5, "file_offset": offset + 5 * c, "bytes": hexed(offset + 5 * c, 5),
+                      "to": 2**63 + i, "to_file_offset": -1, "to_name": quote} for c in (0, 1)]
+            refs = [{"address": va + 10, "length": 5, "file_offset": offset + 10, "bytes": hexed(offset + 10, 5),
+                     "to": strings_va + 130 * (i % 64), "to_file_offset": strings_offset + 130 * (i % 64), "to_name": quote, "type": "DATA",
+                     "flow": False, "jump": False, "read": False, "write": False, "data": True, "inside": False}]
+            functions.append({"name": quote, "entry": va, "size": 2**64 - va - 1 - i, "file_offset": offset, "anchored": True,
+                              "bytes": hexed(offset, min(4096, len(text) - 32 * i)), "calls": calls, "refs": refs})
+        listings = [{"entry": text_va + 32 * i, "count": 65,
+                     "instructions": [{"address": text_va + 32 * i + r, "length": 1, "file_offset": text_offset + 32 * i + r,
+                                       "bytes": hexed(text_offset + 32 * i + r, 1), "text": "\"" * 64} for r in range(64)]}
+                    for i in range(8)]
+        q = {"format": "x", "options_off": {}, "functions": functions, "assembly": listings,
+             "blocks": [{"name": ".text", "start": text_va, "size": len(text), "execute": True, "initialized": True, "file_offset": text_offset},
+                        {"name": ".rodata", "start": strings_va, "size": len(strings), "execute": False, "initialized": True,
+                         "file_offset": strings_offset}],
+             "pseudocode": [{"entry": text_va + 32 * i, "text": "\U0001f600" * 2048} for i in range(128)]}
+        message = worker.reply(["ghidra.analyze", json.dumps(MAXIMA)], data, query_of=lambda *a: q)
+        self.assertEqual(message["status"], "ok")
+        raw = worker.encode(message)
+        self.assertLessEqual(len(raw), MAX_WORKER_REPLY_BYTES)
+        self.assertEqual(MAX_WORKER_REPLY_BYTES, worker.MAX_REPLY_BYTES)
+        parsed = parse_worker_reply(raw, input_sha256=sha256_hex(data), max_observations=600)
+        kinds = [o.value["kind"] for o in parsed]
+        self.assertEqual((kinds.count("function"), kinds.count("pseudocode"), kinds.count("call")), (128, 16, 256))
+        self.assertEqual(kinds, sorted(kinds, key=["function", "pseudocode", "call", "assembly", "ref", "string"].index))
+        self.assertGreater(kinds.count("assembly"), 0)
+        self.assertLess(kinds.count("ref") + kinds.count("string"), 128 + 64)  # the rest did not fit and was left out
+        fit = worker.Fit([])
+        for item in message["observations"]:
+            fit.add(item)
+        self.assertEqual(fit.size, len(raw))  # the running size is the encoded reply's
+        for item in message["observations"]:
+            self.assertLessEqual(len(canonical_json(item["value"]).encode()), 4096)
+
+
 class RequestAndCommandTests(unittest.TestCase):
     def test_requests_are_exact(self):
         self.assertEqual(worker.parse_request(["ghidra.analyze", "{}"]), ("ghidra.analyze", DEFAULTS))
-        self.assertEqual(worker.parse_request(["ghidra.analyze", json.dumps({"max_functions": 1, "decompile": 0, "max_chars": 64, "max_calls": 0})])[1],
-                         {"max_functions": 1, "decompile": 0, "max_chars": 64, "max_calls": 0})
-        self.assertEqual(worker.parse_request(["ghidra.analyze", json.dumps({"max_functions": 128, "decompile": 16, "max_chars": 2048, "max_calls": 256})])[1],
-                         {"max_functions": 128, "decompile": 16, "max_chars": 2048, "max_calls": 256})
+        for bounds in (MINIMA, MAXIMA):
+            self.assertEqual(worker.parse_request(["ghidra.analyze", json.dumps(bounds)])[1], bounds)
+        self.assertEqual(worker.parse_request(["ghidra.analyze", '{"max_calls": 0}'])[1], dict(DEFAULTS, max_calls=0))
         for argv in (["ghidra.analyze"], ["ghidra.analyze", "{}", "x"], ["yarax.matches", "{}"], ["ghidra.script", "{}"],
                      ["ghidra.analyze", '{"max_functions": 0}'], ["ghidra.analyze", '{"max_functions": 129}'],
                      ["ghidra.analyze", '{"decompile": 17}'], ["ghidra.analyze", '{"max_chars": 63}'], ["ghidra.analyze", '{"max_chars": 2049}'],
                      ["ghidra.analyze", '{"max_calls": -1}'], ["ghidra.analyze", '{"max_calls": 257}'], ["ghidra.analyze", '{"decompile": true}'],
                      ["ghidra.analyze", '{"decompile": 1.0}'], ["ghidra.analyze", '{"script": "Evil.java"}'], ["ghidra.analyze", '{"loader": "BinaryLoader"}'],
-                     ["ghidra.analyze", '{"decompile": 1, "decompile": 2}'], ["ghidra.analyze", "[]"], ["ghidra.analyze", "{"]):
+                     ["ghidra.analyze", '{"decompile": 1, "decompile": 2}'], ["ghidra.analyze", "[]"], ["ghidra.analyze", "{"],
+                     *(["ghidra.analyze", json.dumps({name: value})] for name in ("assembly", "max_instructions", "max_refs", "max_strings")
+                       for value in (MINIMA[name] - 1, MAXIMA[name] + 1, True, "1"))):
             with self.subTest(argv=argv), self.assertRaises(worker.InvalidRequest):
                 worker.parse_request(argv)
 
@@ -577,7 +920,9 @@ class RequestAndCommandTests(unittest.TestCase):
         self.assertEqual(worker.ghidra_argv("macho", "q", DEFAULTS, 1)[argv.index("-loader") + 1], "MachoLoader")
         self.assertEqual(argv[argv.index("-preScript") + 1], "ReverseAIOptions.java")
         post = argv.index("-postScript")
-        self.assertEqual(argv[post + 1:post + 7], ["ReverseAIQuery.java", "/tmp/reverseai-ghidra/query.json", "7", "3", "256", "40"])
+        self.assertEqual(argv[post + 1:post + 9], ["ReverseAIQuery.java", "/tmp/reverseai-ghidra/query.json", "7", "3", "256", "40", "4", "32"])
+        widened = worker.ghidra_argv("elf", "q", dict(DEFAULTS, assembly=8, max_instructions=64), 256)
+        self.assertEqual(widened[widened.index("-postScript") + 7:widened.index("-postScript") + 9], ["8", "64"])
         self.assertEqual(argv[argv.index("-scriptPath") + 1], str(worker.SCRIPTS))
         self.assertEqual(argv[argv.index("-max-cpu") + 1], "2")
         self.assertEqual(argv[argv.index("-analysisTimeoutPerFile") + 1], "120")
@@ -680,7 +1025,7 @@ class BuildInputTests(unittest.TestCase):
     def test_scripts_lock_and_dockerfile_are_pinned_consistently(self):
         lock = json.loads((SOURCE / "image.lock.json").read_text(encoding="utf-8"))
         self.assertEqual(set(lock), {"adapter_version", "base_digest", "ghidra_sha256", "image_id", "jdk_sha256", "platform"})
-        self.assertEqual((lock["adapter_version"], lock["platform"], worker.ADAPTER_VERSION), ("12.1.4-r4", "linux/arm64", "12.1.4-r4"))
+        self.assertEqual((lock["adapter_version"], lock["platform"], worker.ADAPTER_VERSION), ("12.1.4-r5", "linux/arm64", "12.1.4-r5"))
         self.assertEqual(lock["ghidra_sha256"], "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db")
         self.assertEqual(lock["jdk_sha256"], "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223")
         self.assertEqual(lock["base_digest"], json.loads((ROOT / "containers" / "lief" / "image.lock.json").read_text())["base_digest"])
@@ -697,7 +1042,15 @@ class BuildInputTests(unittest.TestCase):
         rule = re.compile(r'Pattern\.compile\("\(\?i\)\.\*\(pdb\|dwarf\|swift\)\.\*"\)')
         for name in ("ReverseAIOptions.java", "ReverseAIQuery.java"):
             self.assertRegex((SOURCE / "ghidra_scripts" / name).read_text(), rule)
-        self.assertIn("if (args.length != 5)", (SOURCE / "ghidra_scripts" / "ReverseAIQuery.java").read_text())
+        self.assertIn("if (args.length != 7)", (SOURCE / "ghidra_scripts" / "ReverseAIQuery.java").read_text())
+        # M3c: references leave calls (their own kind) and non-memory targets out; listings start at the entry and count
+        # the whole body, so the worker can tell a cut listing; the listed functions follow the pseudocode order.
+        for pin in ("if (refs == MAX_REFS_PER_FUNCTION || !target.isMemoryAddress() || type.isCall()) {",
+                    '.append(",\\"inside\\":").append(function.getBody().contains(target))',
+                    "if (listed == maxInstructions || instruction.getAddress().compareTo(entry) < 0) {",
+                    'out.append("],\\"count\\":").append(count).append("}");',
+                    "for (Function function : order.subList(0, Math.min(Math.max(assembly, 0), order.size()))) {"):
+            self.assertIn(pin, query_source)
         dockerfile = (SOURCE / "Dockerfile").read_text(encoding="utf-8")
         self.assertEqual(re.findall(r"^USER .*$", dockerfile, re.M | re.I), ["USER 65534:65534"])
         self.assertIn("g++=4:14.2.0-1 make=4.4.1-2", dockerfile)
