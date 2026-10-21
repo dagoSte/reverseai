@@ -59,6 +59,12 @@ def escape(value, maximum=255):
     return ''.join(parts)
 
 
+def _member_name(value):
+    # Ten extra characters admit a complete \UXXXXXXXX escape across the cutoff.
+    escaped = escape(value, maximum=255 + 10)
+    return escaped[:255], len(escaped) > 255
+
+
 @dataclass(frozen=True)
 class ZipMember:
     name: str
@@ -151,6 +157,8 @@ def members(data):
         except UnicodeError:
             name = raw_name.decode('utf-8', 'backslashreplace')
             flags.add('header_mismatch')
+        if _member_name(name)[1]:
+            flags.add('long_name')
         if _traversing(name):
             flags.add('traversing_name')
         if bits & (1 | 0x40 | 0x2000):
@@ -194,7 +202,7 @@ def members(data):
            'Bytes before the first ZIP local header')
     duplicate = {}
     for i, row in enumerate(rows):
-        duplicate.setdefault(escape(row.name), []).append(i)
+        duplicate.setdefault(_member_name(row.name)[0], []).append(i)
     bad = {i: set(row.flags) for i, row in enumerate(rows)}
     for indexes in duplicate.values():
         if len(indexes) > 1:
@@ -215,7 +223,7 @@ def members(data):
 
 
 def artifact(member, child):
-    return dict(member=escape(member.name), method=member.method, data_offset=member.data_offset,
+    return dict(member=_member_name(member.name)[0], method=member.method, data_offset=member.data_offset,
                 compressed_size=member.compressed_size, size=len(child), crc32=member.crc32, sha256=sha256_hex(child))
 
 
@@ -415,7 +423,7 @@ def inventory(data, args):
             except ApkError:
                 flags = ['crc']
         result.append(Observation(Location(member.central_offset, min(member.central_length, 4096)),
-            dict(kind='member', index=index, total=len(rows), name=escape(member.name), method=member.method,
+            dict(kind='member', index=index, total=len(rows), name=_member_name(member.name)[0], method=member.method,
                  compressed_size=member.compressed_size, size=member.size, crc32=member.crc32,
                  sha256=digest, flags=flags)))
     return result

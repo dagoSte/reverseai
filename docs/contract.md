@@ -609,8 +609,9 @@ and needs an owner-approved download. Decision `m4a-contract`.
   central directory entry (at most 4,096 bytes, in the input itself); `sha256` is
   the materialized child's hash, or null when the member cannot be materialized;
   `flags` a sorted list of refusal reasons (`crc`, `duplicate_name`, `encrypted`,
-  `header_mismatch`, `ratio`, `symlink`, `too_large`, `traversing_name`,
-  `unsupported_method`), empty when clean; `crc` covers every failed
+  `header_mismatch`, `long_name`, `ratio`, `symlink`, `too_large`, `traversing_name`,
+  `unsupported_method`), empty when clean; `long_name` marks an escaped name longer than 255
+  characters, listed as its first 255 escaped characters and never materialized; `crc` covers every failed
   materialization (CRC, inflate, size or trailing data); a flagged member is listed but never
   materialized; an empty name is listed only with `traversing_name`. The whole archive is refused (no observation) for ZIP64, multiple
   disks, an ambiguous end of central directory or bytes before the first local

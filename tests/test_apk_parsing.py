@@ -189,6 +189,33 @@ class ZipParsingTests(unittest.TestCase):
         invalid, _ = zip_bytes([(b'\xff', b'value')])
         self.assertIn('header_mismatch', apk.members(invalid)[0].flags)
 
+    def test_long_names_are_flagged_at_the_escaped_character_boundary(self):
+        # Decision m4b-start: disclose every cut member identity and never materialize it.
+        cases = [('a' * 255, 'a' * 255, False), ('a' * 256, 'a' * 255, True),
+                 ('a' * 251 + '\u00e9', 'a' * 251 + '\\xe9', False),
+                 ('a' * 252 + '\u00e9', 'a' * 252 + '\\xe', True),
+                 ('a' * 254 + '\u20ac', 'a' * 254 + '\\', True),
+                 ('a' * 254 + '\U0001f600', 'a' * 254 + '\\', True)]
+        for name, shown, long in cases:
+            with self.subTest(name=name):
+                data, _ = zip_bytes([(name, b'value')])
+                member, = apk.members(data)
+                self.assertEqual(member.name, name)
+                self.assertEqual(member.flags, ('long_name',) if long else ())
+                with patch.object(apk, '_materialize', wraps=apk._materialize) as inflate:
+                    row, = run('inventory', data)
+                self.assertEqual(row.value['name'], shown)
+                self.assertEqual(len(row.value['name']), 255)
+                self.assertEqual(row.value['flags'], ['long_name'] if long else [])
+                self.assertEqual(inflate.call_count, 0 if long else 1)
+                if long:
+                    self.assertIsNone(row.value['sha256'])
+                    with self.assertRaisesRegex(apk.ApkError, 'member is refused'):
+                        apk.materialize(data, member)
+                else:
+                    self.assertEqual(row.value['sha256'], sha256_hex(b'value'))
+                    self.assertEqual(apk.materialize(data, member)[0], b'value')
+
     def test_local_headers_descriptors_and_overlaps_are_checked(self):
         data, layout = zip_bytes([('x', b'value'), ('y', b'other')])
         cd = layout['rows'][0]['central']
@@ -218,6 +245,20 @@ class ZipParsingTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from('<3I', data, 4), (signature,) * 3)
         with self.assertRaises(apk.ApkError):
             apk._descriptor_end(data, 0, len(data), (signature,) * 3)
+
+    def test_prefixed_descriptor_requires_every_signature_byte(self):
+        data, layout = zip_bytes([('x', b'value')], descriptor=True)
+        at = layout['rows'][0]['end'] - 16
+        self.assertEqual(data[at:at + 4], b'PK\x07\x08')
+        self.assertEqual(apk.materialize(data, apk.members(data)[0])[0], b'value')
+        for byte in range(4):
+            with self.subTest(byte=byte):
+                bad = changed(data, at + byte, '<B', data[at + byte] ^ 1)
+                member, = apk.members(bad)
+                self.assertEqual(member.flags, ('header_mismatch',))
+                self.assertEqual(run('inventory', bad)[0].value['flags'], ['header_mismatch'])
+                with self.assertRaisesRegex(apk.ApkError, 'member is refused'):
+                    apk.materialize(bad, member)
 
     def test_exact_ratio_boundary_is_admitted_and_one_byte_over_is_flagged(self):
         for size, flags in ((1000, []), (1001, ['ratio'])):
@@ -484,6 +525,38 @@ class BinaryManifestTests(unittest.TestCase):
 
 
 class ApkOperationTests(unittest.TestCase):
+    def test_long_dex_names_are_reviewed_refusals_and_never_read_by_dex_operations(self):
+        from reverseai.tools import dex
+        child, _ = shared.classes2_dex()
+        for size in (255, 256):
+            name = 'classes' + 'x' * (size - 11) + '.dex'
+            data, _ = zip_bytes([(name, child)])
+            with self.subTest(size=size):
+                input_ref = InputRef(sha256_hex(data), len(data), 'synthetic.apk')
+                task = AnalysisTask(content_id('tk', {'long_name': size}), 'structural', input_ref,
+                                    (OperationRequest('apk.inventory'),), Budget())
+                result = Gateway((apk.TOOL,), Budget()).run(task, data)
+                self.assertEqual(result.status, 'ok', result)
+                evidence, = result.evidence
+                self.assertEqual(evidence.observation['flags'], ['long_name'] if size > 255 else [])
+                value = claims.RULES['android.members'][1]['apk.inventory']([evidence.observation])
+                self.assertIsNotNone(value)
+                finding = make_finding('structural', claims.statement('android.members'), 'android.members',
+                                       value, [evidence.id], 'observed')
+                final = AnalysisResult(task.id, 'structural', 'ok', result.evidence, (finding,))
+                self.assertEqual([v.status for v in review(data, input_ref, [final], {'apk': apk.TOOL})], ['supported'])
+                for operation, args in (('dex.classes', {}), ('dex.methods', {'class': shared.WORKER}),
+                                        ('dex.references', {'class': shared.WORKER, 'method': 'run'})):
+                    spec = dex.TOOL.operations[operation]
+                    with patch.object(apk, 'materialize', wraps=apk.materialize) as inflate:
+                        if size > 255:
+                            with self.assertRaises(dex.DexError):
+                                spec.handler(data, spec.validate_args(args))
+                            inflate.assert_not_called()
+                        else:
+                            self.assertTrue(spec.handler(data, spec.validate_args(args)))
+                            inflate.assert_called_once()
+
     def test_inventory_reuses_one_parse_and_preserves_rows_on_clean_and_hostile_pages(self):
         for builder in (shared.apk_basic, lambda: shared.apk_hostile('crc'),
                         lambda: shared.apk_hostile('descriptor_mismatch'), shared.apk_signing_block):
