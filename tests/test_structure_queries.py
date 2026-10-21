@@ -153,9 +153,14 @@ class StructureQueryTests(unittest.TestCase):
         dynamic = layout['shoff'] + 3 * 64
         changed[dynamic:dynamic + 64] = changed[symtab:symtab + 64]
         struct.pack_into('<I', changed, dynamic + 4, 11)
+        offset = len(changed)
+        changed += bytes(24) + struct.pack('<IBBHQQ', 1, 0x22, 0, 1, 0x9000, 1)
+        struct.pack_into('<QQ', changed, dynamic + 24, offset, 48)
         self.assertEqual([o.value['name'] for o in run('symbols', bytes(changed))], ['main', 'object', 'weak_import'])
         struct.pack_into('<I', changed, symtab + 4, 0)
-        self.assertEqual([o.value['name'] for o in run('symbols', bytes(changed))], ['main', 'object', 'weak_import'])
+        fallback = run('symbols', bytes(changed))
+        self.assertEqual([(o.value['name'], o.value['address'], o.value['binding']) for o in fallback],
+                         [('main', 0x9000, 'weak')])
         data, layout = macho_code(); changed = bytearray(data)
         changed[layout['linkedit'] + 4] = 0xE0
         self.assertEqual([o.value['name'] for o in run('symbols', bytes(changed))], ['add_numbers', 'compute', 'constant'])
