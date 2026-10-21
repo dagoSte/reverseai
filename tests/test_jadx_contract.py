@@ -53,6 +53,7 @@ class JavaClaimTests(unittest.TestCase):
         self.assertIn("android.java", claims.DERIVED_CLAIMS)
         self.assertEqual(judge({**ROW, "form": "error", "text": "", "start": 0, "total": 0}), "derived")
         self.assertEqual(judge({**ROW, "form": "fallback", "start": 10, "total": 62}), "derived")
+        self.assertEqual(judge({**ROW, "form": "omitted", "text": "", "start": 0, "total": 0}), "derived")
 
     def test_each_malformed_field_is_refused(self):
         bad = [("dex", ""), ("class", "Lé;"), ("prototype", ""), ("form", "smali"), ("start", -1),
@@ -60,6 +61,7 @@ class JavaClaimTests(unittest.TestCase):
         for field, value in bad:
             self.assertEqual(judge({**ROW, field: value}), "unsupported", (field, value))
         self.assertEqual(judge({**ROW, "form": "error"}), "unsupported")
+        self.assertEqual(judge({**ROW, "form": "omitted"}), "unsupported")  # decision m4b-omitted: no text
         self.assertEqual(judge({**ROW, "extra": 1}), "unsupported")
 
 

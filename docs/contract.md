@@ -725,8 +725,11 @@ Java is the decompiler's reading, kept **derived** like Ghidra's pseudocode.
   methods without code (abstract, native) have none.
   `{"kind": "java", "dex", "class", "name", "prototype", "form", "start", "total",
   "text"}`: identities as `dex.methods` rows; `form` `java` (decompiled),
-  `fallback` (JADX's fallback listing when it could not decompile) or `error`
-  (nothing produced: `text` "", `start` = `total` = 0); `total` the length in
+  `fallback` (JADX's fallback listing when it could not decompile), `omitted`
+  (JADX by design prints no text for this method: a default constructor that
+  only calls `super()`, a synthetic accessor, bridge or inlined lambda; decision
+  `m4b-omitted`) or `error` (nothing produced); `omitted` and `error` have
+  `text` "", `start` = `total` = 0; `total` the length in
   characters of the method's whole text; `text` its characters from `start`, at
   most `max_chars`, cut further to the longest prefix whose observation fits
   4,096 bytes. The text is printable ASCII, newline and tab only: the driver
@@ -734,13 +737,13 @@ Java is the decompiler's reading, kept **derived** like Ghidra's pseudocode.
   `total` count characters of that escaped text. The class declaration line JADX
   prints before a class's first method is not part of the method's text.
 - **Reply and anchors**: the worker answers each target, in order, with its
-  status (`ok`, `fallback`, `decompile_failed`, `class_not_found`,
+  status (`ok`, `fallback`, `omitted`, `decompile_failed`, `class_not_found`,
   `method_not_found`, `no_code`), JADX's `code_offset` and `insns_count` for the
   method, `total` and `text`; a whole-run failure (`memory`, `timeout`, `input`)
   is a fixed error and fails the operation. It names no location or artifact.
   The host builds each observation itself: identities escaped from its own
-  `dex.py` rows, `form` `java` for `ok`, `fallback` for `fallback`, `error`
-  otherwise; it requires JADX's `code_offset` and `insns_count` to equal the
+  `dex.py` rows, `form` `java` for `ok`, `fallback` for `fallback`, `omitted`
+  for `omitted`, `error` otherwise; it requires JADX's `code_offset` and `insns_count` to equal the
   verified `code_offset` and `code_units` of that method (for `ok` and
   `fallback`), and anchors the observation at the method's instructions (the
   `insns` of its `code_item`, at most their first 4,096 bytes) inside the
