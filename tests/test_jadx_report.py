@@ -162,6 +162,26 @@ class JavaQueryAnalystTests(unittest.TestCase):
 
 
 class JavaReportTests(unittest.TestCase):
+    def test_next_start_is_shown_when_exactly_one_character_remains(self):
+        for remaining in (0, 1, 2):
+            with self.subTest(remaining=remaining):
+                row = java_row(start=23, text="x;", total=25 + remaining)
+                markdown = report.to_markdown(java_analysis((row,)))
+                derived = markdown.split(DERIVED_HEADING, 1)[1].split("## Rejected or unreviewed claims", 1)[0]
+                self.assertIn(f"characters 23..24 of {25 + remaining}", derived)
+                if remaining:
+                    self.assertIn("Next start: 25", derived)
+                else:
+                    self.assertNotIn("Next start:", derived)
+
+    def test_java_header_keeps_every_hostile_identity_in_a_code_span(self):
+        row = java_row(dex="classes<img>.dex", **{"class": "Ldemo/[link](https://evil.invalid/);"},
+                       name="*method*", prototype="(Ldemo/`type`|<T>;)V")
+        markdown = report.to_markdown(java_analysis((row,)))
+        header, = [line for line in markdown.splitlines() if line.startswith("Method: ")]
+        self.assertEqual(header, "Method: `classes<img>.dex` · `Ldemo/[link](https://evil.invalid/);` · "
+                         "`*method*` `(Ldemo/'type'\\|<T>;)V`")
+
     def test_report_shows_full_java_pages_metadata_and_inclusive_character_bounds(self):
         rows = [java_row(), java_row(1, start=101, total=102, text=";")]
         for with_query in (True, False):
