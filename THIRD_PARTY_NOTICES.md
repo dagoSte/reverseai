@@ -56,3 +56,16 @@ under the GNU General Public License version 2 with the Classpath Exception. Deb
 `g++` 4:14.2.0-1 and `make` 4.4.1-2 are used only in the image's build stage (decision
 `owner-m3-apt-trixie`) and are not part of the image. This repository does not
 redistribute any of these files.
+
+## JADX and the Temurin JDK (JADX worker image only)
+
+The locally built image `reverseai-jadx` (`tools/build_jadx_image.py`, decision
+`owner-next-m4b`) contains JADX 1.5.6 by skylot and contributors (`jadx-1.5.6.zip`,
+SHA-256 `545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974`; its
+`lib/jadx-1.5.6-all.jar`, SHA-256
+`fe3e12c45acf75f92369685fd02d1d7a7323385dc725680a9b98a0dac0ea554b`), licensed under the
+Apache License 2.0, with the bundled dependencies and licenses that jar lists, and the
+same Eclipse Temurin JDK 21.0.12.1+1 as the Ghidra image (SHA-256
+`23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223`, GNU General Public
+License version 2 with the Classpath Exception). The image keeps JADX's LICENSE next to
+the jar. This repository does not redistribute any of these files.
