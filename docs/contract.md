@@ -600,9 +600,15 @@ and needs an owner-approved download. Decision `m4a-contract`.
   "name", "method", "compressed_size", "size", "crc32", "sha256", "flags"}` at the
   central directory entry (at most 4,096 bytes, in the input itself); `sha256` is
   the materialized child's hash, or null when the member cannot be materialized;
-  `flags` a sorted list of refusal reasons (`encrypted`, `unsupported_method`,
-  `duplicate_name`, `traversing_name`, `header_mismatch`, `too_large`,
-  `ratio`, `crc`), empty when clean. Claim `android.members` (observed) page rows
+  `flags` a sorted list of refusal reasons (`crc`, `duplicate_name`, `encrypted`,
+  `header_mismatch`, `ratio`, `symlink`, `too_large`, `traversing_name`,
+  `unsupported_method`), empty when clean; a flagged member is listed but never
+  materialized. The whole archive is refused (no observation) for ZIP64, multiple
+  disks, an ambiguous end of central directory or bytes before the first local
+  header other than none; an APK signing block between the last member and the
+  central directory is allowed. Manifest decoding is bounded too: XML depth 256,
+  at most 65,536 chunks, attributes and string entries in all, and 32 MiB of
+  decoded strings (decision `m4a-seams-z`). Claim `android.members` (observed) page rows
   `[name, method, compressed_size, size, crc32, sha256, flags]`.
 - `apk.manifest`: args `start` 0..65535 default 0, `limit` 1..256 default 256.
   The attributes of `AndroidManifest.xml` in document order, each
