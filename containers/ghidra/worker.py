@@ -602,9 +602,10 @@ def ref_type(item):
 
 
 def references(functions, anchors, args):
-    """Non-call references from emitted functions' instructions inside their span; unique, sorted by (instruction file
-    offset, to, type), at most max_refs."""
-    found = set()
+    """Non-call references from emitted functions' instructions inside their span; one row per contract key (instruction
+    file offset, to, type), the lowest when the query repeats a key with other details; sorted by that key, at most
+    max_refs."""
+    found = {}
     for function in functions:
         if not isinstance(function["refs"], list):
             raise InvalidQueryOutput()
@@ -613,17 +614,19 @@ def references(functions, anchors, args):
             mapped = _instruction(anchors, function, item) if kind else None
             to = _target(anchors, item) if mapped else None
             if to is not None:
-                found.add((mapped[1], to, kind, mapped[2], function["va"], printable_name(item.get("to_name", ""))))
+                row = (mapped[1], to, kind, mapped[2], function["va"], printable_name(item.get("to_name", "")))
+                found[row[:3]] = min(found.get(row[:3], row), row)
     return [{"location": {"offset": offset, "length": length},
              "value": {"kind": "ref", "from": start, "to": to, "type": kind, "to_name": name}}
-            for offset, to, kind, length, start, name in sorted(found)[:args["max_refs"]]]
+            for offset, to, kind, length, start, name in sorted(found.values())[:args["max_refs"]]]
 
 
 def decode_string(data, sections, address):
     """(file offset, encoded length, encoding, text, truncated) of the string at address under the contract rule, or
     None: ascii when 2..128 bytes in 0x20..0x7e start there, then a zero byte; else utf-16le with XX 00 units and a
-    00 00 terminator; a run that reaches 128 characters with the next one still matching is truncated instead. All of
-    it lies inside the one section whose file bytes map address."""
+    00 00 terminator; a run that reaches 128 characters with the next one still matching is truncated instead. The text
+    and its terminator (or that next unit) lie inside one section, and no other section maps any of those addresses or
+    file bytes: an ambiguous string is omitted, never refused (the host maps the whole span both ways)."""
     found = [s for s in sections if s[2] <= address < s[2] + (s[1] - s[0])]
     if len(found) != 1:
         return None
@@ -641,6 +644,11 @@ def decode_string(data, sections, address):
         count = min(count, MAX_STRING_CHARS)
         terminated = start + (count + 1) * step <= end and not any(data[start + count * step:start + (count + 1) * step])
         if count >= 2 and (truncated or terminated):
+            span = (count + 1) * step
+            virtual = [s for s in sections if s[2] < address + span and address < s[2] + (s[1] - s[0])]
+            backed = [s for s in sections if s[0] < start + span and start < s[1]]
+            if virtual != found or backed != found:
+                return None
             return start, count * step, encoding, data[start:start + count * step].decode(encoding), truncated
     return None
 

@@ -804,6 +804,48 @@ class M3cTests(unittest.TestCase):
         self.assertIsNone(worker.decode_string(data, [(0, 3, 0x1000, False), (0, 3, 0x1000, True)], 0x1000))  # two sections map it
         self.assertIsNone(worker.decode_string(data, [(0, 3, 0x1000, False)], 0x2000))
 
+    def test_a_string_needs_one_mapping_for_its_whole_span_both_ways(self):
+        """FIX-M3C-W (RD-M3C-CODEX-W M1): another section that maps any of the string's addresses or file bytes, terminator
+        or next unit included, makes the string ambiguous; it is omitted and the rest of the reply stays admissible."""
+        data, layout = elf_refs()
+        symtab = layout["shoff"] + 3 * 64  # .symtab's header becomes an allocated PROGBITS section
+
+        def aliased(address, offset, size):
+            changed = bytearray(data)
+            struct.pack_into("<IIQQQQ", changed, symtab, struct.unpack_from("<I", data, symtab)[0], 1, 0x2, address, offset, size)
+            return bytes(changed)
+
+        ascii, wide = layout["strings"]
+        cases = {"the data bytes mapped again elsewhere": (aliased(0x600000, layout["data"]["offset"], 80), []),
+                 "addresses inside the ascii text": (aliased(layout["data"]["address"] + 2, symtab - 64, 16), [wide["address"]]),
+                 "only the ascii terminator": (aliased(ascii["address"] + ascii["length"], symtab - 64, 1), [wide["address"]]),
+                 "only the wide terminator's bytes": (aliased(0x600000, wide["offset"] + wide["length"] + 1, 1), [ascii["address"]]),
+                 "next to the strings, no overlap": (aliased(ascii["address"] + ascii["length"] + 1, symtab - 64, 8),
+                                                    [ascii["address"], wide["address"]])}
+        for label, (sample, kept) in cases.items():
+            observations = observe(sample, refs_query(sample, layout))
+            with self.subTest(label):
+                self.assertEqual([o["value"]["address"] for o in observations if o["value"]["kind"] == "string"], kept)
+                self.assertEqual(len([o for o in observations if o["value"]["kind"] == "ref"]), 6)
+                ghidra_verify.verify(sample, [Observation(Location(**o["location"]), o["value"]) for o in observations], DEFAULTS)
+        sections = [(0, 8, 0x1000, False), (8, 16, 0x1003, False)]  # the second maps 0x1003.. as well
+        self.assertIsNone(worker.decode_string(b"abc\0" + bytes(12), sections, 0x1000))
+        self.assertEqual(worker.decode_string(b"ab\0" + bytes(13), sections, 0x1000), (0, 2, "ascii", "ab", False))
+
+    def test_references_are_unique_by_the_contract_key(self):
+        """FIX-M3C-W (RD-M3C-CODEX-W I1): a repeated (offset, to, type) with another name gives one row, the lowest."""
+        data, layout = elf_refs()
+        q = refs_query(data, layout)
+        describe = next(item for item in q["functions"] if item["name"] == "describe")
+        describe["refs"].insert(0, dict(describe["refs"][0], to_name="another printable name"))
+        observations = observe(data, q)
+        refs = [o["value"] for o in observations if o["value"]["kind"] == "ref"]
+        self.assertEqual(len(refs), 6)
+        self.assertEqual(refs[0]["to_name"], min("another printable name", "greeting"))
+        ghidra_verify.verify(data, [Observation(Location(**o["location"]), o["value"]) for o in observations], DEFAULTS)
+        describe["refs"].reverse()  # the same row whatever the query order
+        self.assertEqual([o["value"] for o in observe(data, q) if o["value"]["kind"] == "ref"], refs)
+
     def test_string_sources_are_sorted_unique_and_capped_at_eight(self):
         data, layout = elf_refs()
         greeting = layout["strings"][0]
