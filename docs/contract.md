@@ -631,7 +631,9 @@ and needs an owner-approved download. Decision `m4a-contract`.
   `name` and `superclass` descriptors (`superclass` null for none), `interfaces`
   a list (at most 64), `source_file` or null, `access` the flags as an int.
   Claim `android.classes` (observed) page rows `[dex, name, access, superclass]`.
-- `dex.methods`: args `member` literal 0..255 (required, one DEX member),
+- `dex.methods`: args `member` literal 0..255 default "" (as `dex.classes`: ""
+  selects every `classes*.dex` member, and a class defined in several members
+  lists each member's methods in member order; decision `m4a-seams-x4`),
   `class` literal 1..255 (exact descriptor), `start` 0..65535 default 0, `limit`
   1..256 default 128. The class's direct then virtual methods in `class_data`
   order: `{"kind": "method", "index", "total", "dex", "class", "name",
