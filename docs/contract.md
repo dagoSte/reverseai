@@ -621,11 +621,13 @@ and needs an owner-approved download. Decision `m4a-contract`.
   int or a bool. Claims (observed): `android.manifest` page rows `[element_index,
   element, attribute, type, value]`; `android.permissions` = sorted unique values
   of the cited `uses-permission` (and `uses-permission-sdk-23`) `android:name`
-  string attributes.
+  string attributes; more than 64 are split into several findings, each a subset,
+  which never contradict each other (decision `m4a-fix-round`).
 - `dex.classes`: args `member` literal 0..255 default "" (one DEX member by name;
   "" for every `classes*.dex` member in central directory order), `query` literal
-  0..128 default "" (substring of the class descriptor), `start` 0..1048575
-  default 0, `limit` 1..256 default 128. `{"kind": "class", "index", "total",
+  0..128 default "" (substring of the class descriptor), `class` literal 0..255
+  default "" (when set, exactly that descriptor and `query` must be ""; decision
+  `m4a-fix-round`), `start` 0..1048575 default 0, `limit` 1..256 default 128. `{"kind": "class", "index", "total",
   "dex", "name", "access", "superclass", "interfaces", "source_file"}` at the
   32-byte `class_def_item` inside the DEX child; `dex` is the member name,
   `name` and `superclass` descriptors (`superclass` null for none), `interfaces`
@@ -664,8 +666,7 @@ and needs an owner-approved download. Decision `m4a-contract`.
   it runs, and a permission declared is not evidence that it is used.
 - **Queries** (`reverseai/queries.py`), REA's Android names: `inspect_android_package`
   (`apk.inventory`, `apk.manifest`), `search_android_classes` (`dex.classes`),
-  `inspect_android_class` (`dex.classes` with the exact class as `query`,
-  `dex.methods`), `inspect_android_method` (`dex.methods`, `dex.references`
+  `inspect_android_class` (`dex.classes` with the exact `class`, `dex.methods`), `inspect_android_method` (`dex.methods`, `dex.references`
   `from`; decompiled Java comes with M4b), `trace_android_references`
   (`dex.references`; `direction` from the arguments).
 

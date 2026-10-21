@@ -189,6 +189,47 @@ class AndroidClaimTests(unittest.TestCase):
             [0, "manifest", "android:versionCode", "int", "7"]]}, [wrong_type]), "unsupported")
 
 
+class AndroidReviewerFixTests(unittest.TestCase):
+    """Decision m4a-fix-round: valid empty source files, malformed member flags refused without failing, permission subsets."""
+
+    def setUp(self):
+        self.dex, self.apk = ToolRef("dex", "0.1.0"), ToolRef("apk", "0.1.0")
+        self.tools = {"dex": ToolSpec(self.dex, {"dex.classes": OperationSpec("dex.classes", {}, lambda d, a: [])}),
+                      "apk": ToolSpec(self.apk, {name: OperationSpec(name, {}, lambda d, a: [])
+                                                 for name in ("apk.inventory", "apk.manifest")})}
+
+    def judge(self, findings, evidence):
+        result = AnalysisResult(content_id("tk", {"t": "fix"}), "structural", "ok", tuple(evidence), tuple(findings))
+        verdicts = {v.finding_id: v.status for v in review(DATA, INPUT, [result], self.tools)}
+        return [verdicts[f.id] for f in findings]
+
+    def test_an_empty_source_file_is_a_valid_dex_value(self):
+        row = make_evidence(DATA, self.dex, "dex.classes", observation(offset=0, length=4, kind="class", index=0, total=1,
+            dex="classes.dex", name="Lx;", access=1, superclass=None, interfaces=[], source_file=""))
+        finding = make_finding("structural", "Classes.", "android.classes",
+                               {"start": 0, "total": 1, "rows": [["classes.dex", "Lx;", 1, None]]}, [row.id], "observed")
+        self.assertEqual(self.judge([finding], [row]), ["supported"])
+
+    def test_malformed_member_flags_are_refused_not_raised(self):
+        for flags in ([[]], [{}], ["crc", 1], [None], "crc"):
+            row = make_evidence(DATA, self.apk, "apk.inventory", Observation(Location(0, 4), {
+                "kind": "member", "index": 0, "total": 1, "name": "x", "method": 8, "compressed_size": 1, "size": 1,
+                "crc32": 0, "sha256": None, "flags": flags}))
+            finding = make_finding("structural", "Members.", "android.members", {"start": 0, "total": 1, "rows": [
+                ["x", 8, 1, 1, 0, None, flags]]}, [row.id], "observed")
+            self.assertEqual(self.judge([finding], [row]), ["unsupported"], flags)
+
+    def test_permission_subsets_never_contradict(self):
+        def permission(offset, name, element_index):
+            return make_evidence(DATA, self.apk, "apk.manifest", Observation(Location(offset, 20), {
+                "kind": "manifest_attribute", "index": element_index, "total": 70, "element_index": element_index,
+                "element": "uses-permission", "attribute": "android:name", "type": "string", "value": name}, artifact()))
+        first, second = permission(0, "android.permission.A", 1), permission(20, "android.permission.B", 2)
+        a = make_finding("structural", "Permissions.", "android.permissions", ["android.permission.A"], [first.id], "observed")
+        b = make_finding("structural", "Permissions.", "android.permissions", ["android.permission.B"], [second.id], "observed")
+        self.assertEqual(self.judge([a, b], [first, second]), ["supported", "supported"])
+
+
 class SharedFindingTests(unittest.TestCase):
     def test_a_finding_in_two_tasks_is_judged_the_same_whatever_the_order(self):
         # Decision m3d-deferred (RR-M3D-CODEX-C R1): it joins every producing task's page family.

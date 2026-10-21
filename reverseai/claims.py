@@ -258,8 +258,8 @@ PAGES = {
                           and _uint(o["compressed_size"]) and _uint(o["size"]) and _uint(o["crc32"]) and o["crc32"] < 2**32
                           and (o["sha256"] is None or (isinstance(o["sha256"], str) and len(o["sha256"]) == 64
                                                        and all(c in "0123456789abcdef" for c in o["sha256"])))
-                          and isinstance(o["flags"], list) and o["flags"] == sorted(set(o["flags"]))
-                          and all(flag in MEMBER_FLAGS for flag in o["flags"]))),
+                          and isinstance(o["flags"], list) and all(isinstance(flag, str) for flag in o["flags"])
+                          and o["flags"] == sorted(set(o["flags"])) and all(flag in MEMBER_FLAGS for flag in o["flags"]))),
     "manifest_attribute": (("element_index", "element", "attribute", "type", "value"),
                            lambda o: (_index(o["element_index"]) and _text(o["element"], 128)
                                       and _text(o["attribute"], 128) and o["type"] in MANIFEST_TYPES
@@ -267,7 +267,9 @@ PAGES = {
     "class": (("dex", "name", "access", "superclass"),
               lambda o: (_text(o["dex"]) and _text(o["name"]) and _uint(o["access"]) and _maybe_text(o["superclass"])
                          and isinstance(o["interfaces"], list) and len(o["interfaces"]) <= 64
-                         and all(_text(i) for i in o["interfaces"]) and _maybe_text(o["source_file"]))),
+                         and all(_text(i) for i in o["interfaces"])
+                         and (o["source_file"] is None or (isinstance(o["source_file"], str) and len(o["source_file"]) <= 255
+                                                           and o["source_file"].isprintable())))),  # "" is a valid DEX value
     "method": (("dex", "class", "name", "prototype", "access", "code_offset", "code_units"),
                lambda o: (_text(o["dex"]) and _text(o["class"]) and _text(o["name"]) and _text(o["prototype"])
                           and _uint(o["access"]) and _maybe_uint(o["code_offset"]) and _maybe_uint(o["code_units"])
@@ -290,6 +292,8 @@ PAGE_CLAIMS = frozenset({"segments.list", "symbols.list", "strings.listed", "str
                          "android.classes", "android.methods", "android.references"})
 # Verified claims the reviewer checks against the cited bytes themselves: two of them never contradict each other.
 SELF_CHECKED_CLAIMS = frozenset({"bytes.read"})
+# Claims whose findings each name a subset of one set (M4a): several of them never contradict each other.
+SUBSET_CLAIMS = frozenset({"android.permissions"})
 
 
 def _page(kind):

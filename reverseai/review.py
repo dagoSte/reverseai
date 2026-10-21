@@ -112,7 +112,8 @@ def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tool
         # A finding produced by several tasks joins each task's list (decision m3d-deferred, RR-M3D-CODEX-C R1).
         return [(finding.claim_key, canonical_json(finding.value.get("to")), task) for task in sorted(tasks[finding_id])]
     for finding_id, finding in findings.items():
-        if problems[finding_id] or finding_id in derived or finding.claim_key in claims.SELF_CHECKED_CLAIMS:
+        if (problems[finding_id] or finding_id in derived or finding.claim_key in claims.SELF_CHECKED_CLAIMS
+                or finding.claim_key in claims.SUBSET_CLAIMS):
             continue
         if finding.claim_key in claims.PAGE_CLAIMS:
             for key in families_of(finding_id, finding):
@@ -130,7 +131,7 @@ def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tool
             verdicts.append(ReviewVerdict(finding_id, "unsupported", reasons))
         elif finding_id in derived:
             verdicts.append(ReviewVerdict(finding_id, "derived", ("cites a derived operation: the tool's reading, not verified against the bytes",)))
-        elif finding.claim_key in claims.SELF_CHECKED_CLAIMS:
+        elif finding.claim_key in claims.SELF_CHECKED_CLAIMS or finding.claim_key in claims.SUBSET_CLAIMS:
             verdicts.append(ReviewVerdict(finding_id, "supported"))
         elif finding.claim_key in claims.PAGE_CLAIMS:
             if any(key in clashing for key in families_of(finding_id, finding)):
