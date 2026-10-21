@@ -1,11 +1,14 @@
 // ReverseAI's fixed Ghidra query (reviewed code baked into the image; requests cannot choose scripts).
-// Arguments: <output JSON path> <max_functions> <decompile> <entry file offset or -1> <decompile seconds>.
+// Arguments: <output JSON path> <max_functions> <decompile> <entry file offset or -1> <decompile seconds> <assembly>
+// <max_instructions>.
 // Writes what Ghidra reports, as plain JSON: memory blocks, functions (address order, at most MAX_FUNCTIONS; size is
-// the span from the entry to the last body byte, decision m3a-function-span), the calls inside the first
-// max_functions file-backed executable functions, and pseudocode for the entry-point function and then the largest
-// of those. The Python worker checks what the bytes can confirm (each anchor's file offset, bytes and memory-block
-// mapping, one rebase delta, bounds and order) and drops or refuses the rest; names, sizes, call targets and
-// pseudocode remain Ghidra's interpretation, reported as derived and never as verified.
+// the span from the entry to the last body byte, decision m3a-function-span), the calls and the other references
+// (with their reference-type flags) from the instructions of the first max_functions file-backed executable
+// functions, pseudocode for the entry-point function and then the largest of those, and, in the same order, the
+// first instructions of `assembly` of them (M3c). The Python worker checks what the bytes can confirm (each anchor's
+// file offset, bytes and memory-block mapping, one rebase delta, bounds and order) and drops or refuses the rest;
+// names, sizes, call and reference targets, reference types, instruction texts and pseudocode remain Ghidra's
+// interpretation, reported as derived and never as verified.
 //@category ReverseAI
 
 import java.io.FileOutputStream;
@@ -28,12 +31,15 @@ import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.mem.MemoryBlockSourceInfo;
+import ghidra.program.model.symbol.RefType;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.Symbol;
 
 public class ReverseAIQuery extends GhidraScript {
 	private static final int MAX_FUNCTIONS = 4096;
 	private static final int MAX_CALLS_PER_FUNCTION = 1024;
+	private static final int MAX_REFS_PER_FUNCTION = 1024;
+	private static final int MAX_BODY_INSTRUCTIONS = 1000000;
 	private static final int MAX_LOCATION = 4096;
 	private static final int MAX_TEXT = 65536;
 	// The same rule as ReverseAIOptions: the worker refuses the run if any of these is still on.
@@ -44,13 +50,15 @@ public class ReverseAIQuery extends GhidraScript {
 	@Override
 	public void run() throws Exception {
 		String[] args = getScriptArgs();
-		if (args.length != 5) {
+		if (args.length != 7) {
 			throw new IllegalArgumentException("ReverseAIQuery arguments");
 		}
 		int maxFunctions = Integer.parseInt(args[1]);
 		int decompile = Integer.parseInt(args[2]);
 		long entryOffset = Long.parseLong(args[3]);
 		long deadline = System.currentTimeMillis() + 1000L * Integer.parseInt(args[4]);
+		int assembly = Integer.parseInt(args[5]);
+		int maxInstructions = Integer.parseInt(args[6]);
 		memory = currentProgram.getMemory();
 
 		StringBuilder out = new StringBuilder("{\"format\":").append(quote(currentProgram.getExecutableFormat()))
@@ -103,6 +111,10 @@ public class ReverseAIQuery extends GhidraScript {
 				selected.add(function);
 				appendCalls(out, function);
 			}
+			out.append("],\"refs\":[");
+			if (anchored) {
+				appendRefs(out, function);
+			}
 			out.append("]}");
 			first = false;
 		}
@@ -149,6 +161,13 @@ public class ReverseAIQuery extends GhidraScript {
 				decompiler.dispose();
 			}
 		}
+		out.append("],\"assembly\":[");
+		first = true;
+		for (Function function : order.subList(0, Math.min(Math.max(assembly, 0), order.size()))) {
+			out.append(first ? "" : ",");
+			appendInstructions(out, function, maxInstructions);
+			first = false;
+		}
 		out.append("]}");
 		try (Writer writer = new OutputStreamWriter(new FileOutputStream(args[0]), StandardCharsets.UTF_8)) {
 			writer.write(out.toString());
@@ -190,6 +209,63 @@ public class ReverseAIQuery extends GhidraScript {
 				.append(",\"to_name\":").append(quote(nameAt(target))).append("}");
 			first = false;
 		}
+	}
+
+	/** Every non-call memory reference from the function's instructions, with Ghidra's reference-type flags. */
+	private void appendRefs(StringBuilder out, Function function) throws Exception {
+		boolean first = true;
+		int refs = 0;
+		for (Instruction instruction : currentProgram.getListing().getInstructions(function.getBody(), true)) {
+			for (Reference reference : instruction.getReferencesFrom()) {
+				Address target = reference.getToAddress();
+				RefType type = reference.getReferenceType();
+				if (refs == MAX_REFS_PER_FUNCTION || !target.isMemoryAddress() || type.isCall()) {
+					continue;
+				}
+				refs++;
+				out.append(first ? "" : ",").append("{\"address\":").append(instruction.getAddress().getOffset())
+					.append(",\"length\":").append(instruction.getLength())
+					.append(",\"file_offset\":").append(fileOffset(instruction.getAddress()))
+					.append(",\"bytes\":").append(quote(toHex(instruction.getBytes())))
+					.append(",\"to\":").append(target.getOffset())
+					.append(",\"to_file_offset\":").append(fileOffset(target))
+					.append(",\"to_name\":").append(quote(nameAt(target)))
+					.append(",\"type\":").append(quote(type.getName()))
+					.append(",\"flow\":").append(type.isFlow())
+					.append(",\"jump\":").append(type.isJump())
+					.append(",\"read\":").append(type.isRead())
+					.append(",\"write\":").append(type.isWrite())
+					.append(",\"data\":").append(type.isData())
+					.append(",\"inside\":").append(function.getBody().contains(target)).append("}");
+				first = false;
+			}
+		}
+	}
+
+	/** The function's instructions from its entry in address order, at most maxInstructions, and how many it has. */
+	private void appendInstructions(StringBuilder out, Function function, int maxInstructions) throws Exception {
+		Address entry = function.getEntryPoint();
+		out.append("{\"entry\":").append(entry.getOffset()).append(",\"instructions\":[");
+		boolean first = true;
+		int listed = 0;
+		int count = 0;
+		for (Instruction instruction : currentProgram.getListing().getInstructions(function.getBody(), true)) {
+			if (count == MAX_BODY_INSTRUCTIONS) {
+				break;
+			}
+			count++;
+			if (listed == maxInstructions || instruction.getAddress().compareTo(entry) < 0) {
+				continue;
+			}
+			listed++;
+			out.append(first ? "" : ",").append("{\"address\":").append(instruction.getAddress().getOffset())
+				.append(",\"length\":").append(instruction.getLength())
+				.append(",\"file_offset\":").append(fileOffset(instruction.getAddress()))
+				.append(",\"bytes\":").append(quote(toHex(instruction.getBytes())))
+				.append(",\"text\":").append(quote(instruction.toString())).append("}");
+			first = false;
+		}
+		out.append("],\"count\":").append(count).append("}");
 	}
 
 	/** Entry to the last byte of the body: a body with gaps keeps the calls in its later ranges. */
