@@ -212,7 +212,30 @@ SYMBOL_TYPES = ("func", "object", "notype", "tls", "common", "ifunc", "other", "
 BINDINGS = ("local", "global", "weak", "other")
 XREF_TYPES = ("call", "jump", "read", "write", "read_write", "data")
 
-# M3d list pages: kind -> (row fields in claim order, shape of one row besides kind, index and total).
+MEMBER_FLAGS = ("crc", "duplicate_name", "encrypted", "header_mismatch", "ratio", "too_large", "traversing_name",
+                "unsupported_method")
+MANIFEST_TYPES = ("string", "int", "bool", "reference", "other")
+REF_KINDS = ("method", "field", "string", "type")
+
+
+def _text(value, maximum=255):
+    return isinstance(value, str) and 0 < len(value) <= maximum and value.isprintable()
+
+
+def _maybe_text(value, maximum=255):
+    return value is None or _text(value, maximum)
+
+
+def _manifest_value(o):
+    kind, value = o["type"], o["value"]
+    if kind == "int":
+        return type(value) is int and -2**31 <= value < 2**32
+    if kind == "bool":
+        return _bool(value)
+    return isinstance(value, str) and len(value) <= 256 and value.isprintable()
+
+
+# List pages (M3d, M4a): kind -> (row fields in claim order, shape of one row besides kind, index and total).
 PAGES = {
     "segment": (("name", "offset", "filesz", "address", "memsz", "readable", "writable", "executable"),
                 lambda o: (_symbol(o["name"]) and all(_uint(o[key]) for key in ("offset", "filesz", "address", "memsz"))
@@ -227,13 +250,40 @@ PAGES = {
                      lambda o: _symbol(o["name"]) and _uint(o["entry"]) and _uint(o["size"]) and o["size"] > 0),
     "xref": (("at", "from", "type"),
              lambda o: _uint(o["at"]) and _maybe_uint(o["from"]) and o["type"] in XREF_TYPES and _uint(o["to"])),
+    # contract/3, M4a: Android package pages
+    "member": (("name", "method", "compressed_size", "size", "crc32", "sha256", "flags"),
+               lambda o: (_text(o["name"]) and type(o["method"]) is int and 0 <= o["method"] < 2**16
+                          and _uint(o["compressed_size"]) and _uint(o["size"]) and _uint(o["crc32"]) and o["crc32"] < 2**32
+                          and (o["sha256"] is None or (isinstance(o["sha256"], str) and len(o["sha256"]) == 64
+                                                       and all(c in "0123456789abcdef" for c in o["sha256"])))
+                          and isinstance(o["flags"], list) and o["flags"] == sorted(set(o["flags"]))
+                          and all(flag in MEMBER_FLAGS for flag in o["flags"]))),
+    "manifest_attribute": (("element_index", "element", "attribute", "type", "value"),
+                           lambda o: (_index(o["element_index"]) and _text(o["element"], 128)
+                                      and _text(o["attribute"], 128) and o["type"] in MANIFEST_TYPES
+                                      and _manifest_value(o))),
+    "class": (("dex", "name", "access", "superclass"),
+              lambda o: (_text(o["dex"]) and _text(o["name"]) and _uint(o["access"]) and _maybe_text(o["superclass"])
+                         and isinstance(o["interfaces"], list) and len(o["interfaces"]) <= 64
+                         and all(_text(i) for i in o["interfaces"]) and _maybe_text(o["source_file"]))),
+    "method": (("dex", "class", "name", "prototype", "access", "code_offset", "code_units"),
+               lambda o: (_text(o["dex"]) and _text(o["class"]) and _text(o["name"]) and _text(o["prototype"])
+                          and _uint(o["access"]) and _maybe_uint(o["code_offset"]) and _maybe_uint(o["code_units"])
+                          and (o["code_offset"] is None) == (o["code_units"] is None))),
+    "dex_ref": (("dex", "from_class", "from_method", "from_prototype", "at", "ref_kind", "target"),
+                lambda o: (_text(o["dex"]) and _text(o["from_class"]) and _text(o["from_method"])
+                           and _text(o["from_prototype"]) and _uint(o["at"]) and o["ref_kind"] in REF_KINDS
+                           and isinstance(o["target"], str) and len(o["target"]) <= 512 and o["target"].isprintable())),
 }
+# Fields a page row carries besides its claimed columns, index and total.
+PAGE_EXTRA = {"xref": {"to"}, "class": {"interfaces", "source_file"}}
 
 
 # Page claims (contract M3d): their findings are pages of one list, so the reviewer compares them row by row,
 # within the task (one query with its arguments) that produced them.
 PAGE_CLAIMS = frozenset({"segments.list", "symbols.list", "strings.listed", "strings.matches",
-                         "code.function_list", "code.xrefs"})
+                         "code.function_list", "code.xrefs", "android.members", "android.manifest",
+                         "android.classes", "android.methods", "android.references"})
 # Verified claims the reviewer checks against the cited bytes themselves: two of them never contradict each other.
 SELF_CHECKED_CLAIMS = frozenset({"bytes.read"})
 
@@ -241,7 +291,7 @@ SELF_CHECKED_CLAIMS = frozenset({"bytes.read"})
 def _page(kind):
     """{"start", "total", "rows"}: indexes contiguous from start, one total, rows in index order (contract M3d)."""
     fields, shape = PAGES[kind]
-    expected = {"kind", "index", "total", *fields} | ({"to"} if kind == "xref" else set())
+    expected = {"kind", "index", "total", *fields} | PAGE_EXTRA.get(kind, set())
 
     def derive(observations):
         rows = _kind(kind)(observations)
@@ -265,6 +315,18 @@ def _single(kind, keys):
         found = _shaped(kind)(observations)
         return {key: found[0][key] for key in keys} if found and len(found) == 1 else None
     return derive
+
+
+def _permissions(observations):
+    """Sorted unique permission names from cited uses-permission android:name string attributes."""
+    rows = _kind("manifest_attribute")(observations)
+    if not rows or not all(set(o) == {"kind", "index", "total", *PAGES["manifest_attribute"][0]}
+                           and PAGES["manifest_attribute"][1](o) for o in rows):
+        return None
+    if not all(o["element"] in ("uses-permission", "uses-permission-sdk-23") and o["attribute"] == "android:name"
+               and o["type"] == "string" and o["value"] for o in rows):
+        return None
+    return sorted({o["value"] for o in rows})
 
 
 def _callers(observations):
@@ -329,6 +391,13 @@ RULES = {
         "instructions", ("entry", "start", "total", "rows", "truncated"))}),
     "code.callers": ("inferred", {"ghidra.function": _callers}),
     "code.xrefs": ("inferred", {"ghidra.xrefs": _page("xref")}),
+    # contract/3, M4a: Android packages, verified on the host (declarations in the bytes, not behaviour)
+    "android.members": ("observed", {"apk.inventory": _page("member")}),
+    "android.manifest": ("observed", {"apk.manifest": _page("manifest_attribute")}),
+    "android.permissions": ("observed", {"apk.manifest": _permissions}),
+    "android.classes": ("observed", {"dex.classes": _page("class")}),
+    "android.methods": ("observed", {"dex.methods": _page("method")}),
+    "android.references": ("observed", {"dex.references": _page("dex_ref")}),
     **{f"capability.{name}": ("inferred", {"strings.indicators": _category(name)}) for name in CATEGORIES},
 }
 
@@ -366,6 +435,12 @@ STATEMENTS = {
     "code.instructions": "Instructions the analysis tool disassembled for one function (one page)",
     "code.callers": "Calls to one function the analysis tool identified",
     "code.xrefs": "References to one address the analysis tool identified (one page)",
+    "android.members": "Members the package's ZIP central directory declares (one page)",
+    "android.manifest": "Attributes of the binary Android manifest (one page)",
+    "android.permissions": "Permissions the Android manifest declares (not evidence of use)",
+    "android.classes": "Classes the DEX files declare (one page)",
+    "android.methods": "Methods one DEX class declares (one page)",
+    "android.references": "References in DEX code (declarations, not evidence of execution; one page)",
     **{f"capability.{name}": f"String hints of {name.replace('_', ' ')} capability (names only, not behaviour)" for name in CATEGORIES},
 }
 
