@@ -536,7 +536,13 @@ is never cut. Anchors follow the M3a rules (a function's first bytes, at most
   the worker's anchor checks. Instructions are indexed from the entry in address
   order (a body chunk before the entry is not listed). A run that would count more
   than 65,536 callers, xrefs or functions fails with a fixed error instead of
-  reporting a total cut short.
+  reporting a total cut short. `callers_total` and `callees_total` count call
+  instructions (each once), as the `caller` and `call` rows do. `ghidra.xrefs` rows
+  are ordered by `at`, then `type` (ASCII order); one instruction may give several
+  rows of different types, never two of the same type. An `instructions` page is
+  `truncated` exactly when it holds fewer than `limit` rows and
+  `start + len(rows) < total`; no `instructions` observation when `start` is at or
+  past `total`.
 - **Host check** (`ghidra_verify`): per mode, exact field sets and types, anchors
   as above (an instruction's `at` must be the virtual address its offset maps to;
   `to` the target entry or `address`), indexes contiguous from `start`, one
