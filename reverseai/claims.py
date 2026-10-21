@@ -91,32 +91,82 @@ def _uint(value):
     return type(value) is int and 0 <= value < 2**64
 
 
-def _assembly(observations):
-    listings = _kind("assembly")(observations)
-    if not listings or len(listings) != 1:
-        return None
-    return {key: listings[0].get(key) for key in ("entry", "instructions", "truncated")}
+def _ascii(value, minimum, maximum):
+    return isinstance(value, str) and minimum <= len(value) <= maximum and all(" " <= char <= "~" for char in value)
 
 
+def _symbol(value):
+    return isinstance(value, str) and len(value) <= 128 and all(char.isprintable() for char in value)
+
+
+def _rows(rows):
+    """1..64 [delta, length, text] instruction rows in address order, non-overlapping (contract M3c)."""
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 64:
+        return False
+    end = 0
+    for row in rows:
+        if not (isinstance(row, list) and len(row) == 3 and _uint(row[0]) and row[0] >= end
+                and type(row[1]) is int and 1 <= row[1] <= 16 and _ascii(row[2], 1, 64)):
+            return False
+        end = row[0] + row[1]
+    return True
+
+
+def _sources(value):
+    return (isinstance(value, list) and 1 <= len(value) <= 8 and all(_uint(entry) for entry in value)
+            and all(a < b for a, b in zip(value, value[1:])))
+
+
+# The reviewer's own checks of the M3c shapes: a malformed reading yields nothing, even when a finding repeats it.
+SHAPES = {
+    "assembly": lambda o: (type(o.get("index")) is int and 0 <= o["index"] < 128 and _uint(o.get("entry"))
+                           and _rows(o.get("instructions")) and type(o.get("truncated")) is bool),
+    "ref": lambda o: (_uint(o.get("from")) and _uint(o.get("to")) and o.get("type") in REFERENCE_TYPES
+                      and _symbol(o.get("to_name"))),
+    "string": lambda o: (_uint(o.get("address")) and o.get("encoding") in ("ascii", "utf-16le")
+                         and _ascii(o.get("text"), 2, 128) and type(o.get("truncated")) is bool
+                         and (not o["truncated"] or len(o["text"]) == 128) and _sources(o.get("from"))),
+}
+FIELDS = {
+    "assembly": {"kind", "index", "entry", "instructions", "truncated"},
+    "ref": {"kind", "from", "to", "type", "to_name"},
+    "string": {"kind", "address", "encoding", "text", "truncated", "from"},
+}
 REFERENCE_TYPES = ("read", "write", "read_write", "data", "jump")
 
 
+def _shaped(name):
+    """Observations of one M3c kind, each with exactly its contract fields and shape, or None."""
+    def select(observations):
+        chosen = _kind(name)(observations)
+        if not chosen or not all(set(o) == FIELDS[name] and SHAPES[name](o) for o in chosen):
+            return None
+        return chosen
+    return select
+
+
+def _assembly(observations):
+    listings = _shaped("assembly")(observations)
+    if not listings or len(listings) != 1:
+        return None
+    return {key: listings[0][key] for key in ("entry", "instructions", "truncated")}
+
+
 def _references(observations):
-    refs = _kind("ref")(observations)
-    if not refs or not all(_uint(o.get("from")) and _uint(o.get("to")) and o.get("type") in REFERENCE_TYPES
-                           and isinstance(o.get("to_name"), str) for o in refs):
+    refs = _shaped("ref")(observations)
+    if not refs:
         return None
     return [list(row) for row in sorted({(o["from"], o["type"], o["to"], o["to_name"]) for o in refs})]
 
 
 def _strings(observations):
     """One entry per string address, in address order; two readings of the same address yield nothing."""
-    strings = _kind("string")(observations)
-    if not strings or not all(_uint(o.get("address")) for o in strings):
+    strings = _shaped("string")(observations)
+    if not strings:
         return None
     by_address = {}
     for o in strings:
-        entry = {key: o.get(key) for key in ("address", "encoding", "text", "truncated", "from")}
+        entry = {key: o[key] for key in ("address", "encoding", "text", "truncated", "from")}
         if by_address.setdefault(o["address"], entry) != entry:
             return None
     return [by_address[address] for address in sorted(by_address)]

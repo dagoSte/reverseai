@@ -142,6 +142,59 @@ class DerivedTests(unittest.TestCase):
             finding = make_finding("code", "Code.", key, [], [item.id], "inferred")
             self.assertEqual(verdicts([finding], [item])[finding.id].status, "unsupported")
 
+    def test_a_finding_that_repeats_a_malformed_reading_is_still_refused(self):
+        # RD-M3C-CODEX-C R1: the rule checks each M3c shape itself; echoing a malformed projection is not enough.
+        rows = [[0, 1, "PUSH RBP"]]
+        good = {"assembly": dict(index=0, entry=0x1000, instructions=rows, truncated=False),
+                "ref": {"from": 0x1000, "to": 0x2000, "type": "read", "to_name": "counter"},
+                "string": dict(address=0x2000, encoding="ascii", text="hello", truncated=False, **{"from": [0x1000]})}
+        changes = {
+            "assembly": [{"entry": None}, {"instructions": []}, {"instructions": None}, {"truncated": None},
+                         {"truncated": 0}, {"entry": True}, {"index": 128}, {"instructions": [[0, 17, "X"]]},
+                         {"instructions": [[0, 2, "A"], [1, 1, "B"]]}, {"instructions": [[0, 1, ""]]},
+                         {"instructions": [[0, 1, "A\nB"]]}, {"instructions": [[0, 1, "x" * 65]]},
+                         {"instructions": [[0, 1, "A"]] * 65}, {"extra": 1}],
+            "ref": [{"to_name": "x" * 129}, {"to_name": "a\nb"}, {"to": True}, {"from": False}, {"type": "call"},
+                    {"to_name": None}],
+            "string": [{"encoding": None}, {"encoding": "utf-8"}, {"text": "h"}, {"text": "x" * 129},
+                       {"text": "café"}, {"truncated": None}, {"truncated": True}, {"from": []}, {"from": [2, 1]},
+                       {"from": [1, 1]}, {"from": [True]}, {"from": list(range(9))}, {"address": True}],
+        }
+        for kind, variants in changes.items():
+            key, fields = {"assembly": ("code.assembly", ("entry", "instructions", "truncated")),
+                           "ref": ("code.references", ("from", "type", "to", "to_name")),
+                           "string": ("code.strings", ("address", "encoding", "text", "truncated", "from"))}[kind]
+            control = observed(0, kind=kind, **good[kind])
+            projection = {name: control.observation[name] for name in fields}
+            value = projection if kind == "assembly" else [list(projection.values()) if kind == "ref" else projection]
+            finding = make_finding("code", "Code.", key, value, [control.id], "inferred")
+            self.assertEqual(verdicts([finding], [control], tool(derived=False))[finding.id].status, "derived", kind)
+            for change in variants:
+                item = observed(0, kind=kind, **{**good[kind], **change})
+                projection = {name: item.observation.get(name) for name in fields}
+                value = projection if kind == "assembly" else [list(projection.values()) if kind == "ref" else projection]
+                finding = make_finding("code", "Code.", key, value, [item.id], "inferred")
+                self.assertEqual(verdicts([finding], [item])[finding.id].status, "unsupported", (kind, change))
+
+    def test_single_listing_and_single_reading_guards_are_pinned(self):
+        # RD-M3C-CODEX-C I1: equal listings at two locations, and both orders of a conflicting string reading.
+        rows = [[0, 1, "RET"]]
+        one = observed(0, kind="assembly", index=0, entry=0x1000, instructions=rows, truncated=False)
+        two = observed(64, kind="assembly", index=0, entry=0x1000, instructions=rows, truncated=False)
+        value = {"entry": 0x1000, "instructions": rows, "truncated": False}
+        both = make_finding("code", "Code.", "code.assembly", value, [one.id, two.id], "inferred")
+        self.assertEqual(verdicts([both], [one, two])[both.id].status, "unsupported")
+
+        def string(offset, text):
+            return observed(offset, kind="string", address=0x2000, encoding="ascii", text=text, truncated=False,
+                            **{"from": [0x1000]})
+        first, second = string(0, "hello"), string(16, "world")
+        for text in ("hello", "world"):
+            claimed = [{"address": 0x2000, "encoding": "ascii", "text": text, "truncated": False, "from": [0x1000]}]
+            for order in ([first, second], [second, first]):
+                finding = make_finding("code", "Code.", "code.strings", claimed, [e.id for e in order], "inferred")
+                self.assertEqual(verdicts([finding], order)[finding.id].status, "unsupported", (text, order[0].id))
+
     def test_derived_must_be_a_bool(self):
         with self.assertRaises(ContractError):
             OperationSpec("ghidra.analyze", {}, lambda data, args: [], derived="yes")
