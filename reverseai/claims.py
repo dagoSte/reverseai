@@ -266,7 +266,8 @@ PAGES = {
                                       and _manifest_value(o))),
     "class": (("dex", "name", "access", "superclass"),
               lambda o: (_text(o["dex"]) and _text(o["name"]) and _uint(o["access"]) and _maybe_text(o["superclass"])
-                         and isinstance(o["interfaces"], list) and len(o["interfaces"]) <= 64
+                         and isinstance(o["interfaces"], list) and _uint(o["interfaces_total"])
+                         and len(o["interfaces"]) <= o["interfaces_total"] <= 64
                          and all(_text(i) for i in o["interfaces"])
                          and (o["source_file"] is None or (isinstance(o["source_file"], str) and len(o["source_file"]) <= 255
                                                            and o["source_file"].isprintable())))),  # "" is a valid DEX value
@@ -282,7 +283,7 @@ PAGES = {
                            and (not o["target_truncated"] or (o["ref_kind"] == "string" and len(o["target"]) == 256)))),
 }
 # Fields a page row carries besides its claimed columns, index and total.
-PAGE_EXTRA = {"xref": {"to"}, "class": {"interfaces", "source_file"}}
+PAGE_EXTRA = {"xref": {"to"}, "class": {"interfaces", "interfaces_total", "source_file"}}
 
 
 # Page claims (contract M3d): their findings are pages of one list, so the reviewer compares them row by row,

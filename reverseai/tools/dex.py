@@ -15,10 +15,12 @@ import struct
 import zlib
 
 from reverseai.contract import (
-    ArgSpec, ContractError, Location, Observation, OperationSpec, ToolRef, ToolSpec,
+    ArgSpec, ContractError, Location, MAX_OBSERVATION_BYTES, Observation, OperationSpec, ToolRef, ToolSpec,
+    canonical_json,
 )
 
 MAX_CHILD_BYTES = 32 * 1024 * 1024
+MAX_CHILDREN_BYTES = 128 * 1024 * 1024
 MAX_ENTRIES = 65536
 MAX_STRING_IDS = 1048576
 MAX_STRING_BYTES = 65536
@@ -634,13 +636,13 @@ def _prototype_parts(prototype):
     yield prototype["return_type"]
 
 
+def _matches(parts, text):
+    displayed, truncated = _render(parts, 255)
+    return not truncated and displayed == text
+
+
 def _prototype_matches(prototype, text):
-    position = 0
-    for part in _prototype_parts(prototype):
-        if not text.startswith(part, position):
-            return False
-        position += len(part)
-    return position == len(text)
+    return _matches(_prototype_parts(prototype), text)
 
 
 def _dex_files(data, selected):
@@ -649,12 +651,12 @@ def _dex_files(data, selected):
     total = 0
     string_budget = [0]
     for member in apk.members(data):
-        if ((selected and member.name != selected)
+        if ((selected and not _matches((member.name,), selected))
                 or (not selected and re.fullmatch(r"classes[^/]*\.dex", member.name) is None)):
             continue
         _check(not member.flags)
         total += member.size
-        _check(total <= 128 * 1024 * 1024)
+        _check(total <= MAX_CHILDREN_BYTES)
         child, _ = apk.materialize(data, member)
         yield member.name, child, parse(child, _string_budget=string_budget), apk.artifact(member, child)
 
@@ -666,23 +668,35 @@ def _collect(rows, args):
             page.append((location, {**value, "index": total}, artifact))
         total += 1
     try:
-        return [Observation(Location(row["offset"], row["length"]), {**value, "total": total}, artifact)
-                for row, value, artifact in page]
+        result = []
+        for row, value, artifact in page:
+            value = {**value, "total": total}
+            if value["kind"] == "class":
+                # Index and total are included: retain the longest declared prefix that fits.
+                while value["interfaces"] and len(canonical_json(value).encode()) > MAX_OBSERVATION_BYTES:
+                    value["interfaces"].pop()
+            result.append(Observation(Location(row["offset"], row["length"]), value, artifact))
+        return result
     except ContractError:
         raise DexError("Invalid DEX structure") from None
 
 
 def _class_rows(data, args):
+    _check(not (args["class"] and args["query"]))
     for name, _, parsed, artifact in _dex_files(data, args["member"]):
         for row in parsed["classes"]:
-            if args["query"] not in row["class_descriptor"]:
+            if args["class"] and not _matches((row["class_descriptor"],), args["class"]):
+                continue
+            displayed = _identity((row["class_descriptor"],))
+            if args["query"] not in displayed:
                 continue
             _check(len(row["interface_type_indices"]) <= 64)
             yield row, dict(kind="class", dex=_identity((name,), 255),
-                            name=_identity((row["class_descriptor"],)), access=row["access_flags"],
+                            name=displayed, access=row["access_flags"],
                             superclass=None if row["superclass"] is None else _identity((row["superclass"],)),
                             interfaces=[_identity((parsed["types"][i]["descriptor"],))
                                         for i in row["interface_type_indices"]],
+                            interfaces_total=len(row["interface_type_indices"]),
                             source_file=None if row["source_file"] is None else _identity((row["source_file"],))), artifact
 
 
@@ -698,7 +712,7 @@ def _methods(data, args):
     def rows():
         for name, _, parsed, artifact in _dex_files(data, args["member"]):
             for declaration, method in _defined_methods(parsed):
-                if method["class_descriptor"] != args["class"]:
+                if not _matches((method["class_descriptor"],), args["class"]):
                     continue
                 code = declaration.get("code")
                 value = {"kind": "method", "dex": _identity((name,), 255),
@@ -711,7 +725,7 @@ def _methods(data, args):
 
 
 def _selected_method(method, args):
-    return (method["class_descriptor"] == args["class"] and method["name"] == args["method"]
+    return (_matches((method["class_descriptor"],), args["class"]) and _matches((method["name"],), args["method"])
             and (not args["prototype"] or _prototype_matches(method["prototype"], args["prototype"])))
 
 
@@ -772,6 +786,7 @@ def _reference_rows(data, args):
 TOOL = ToolSpec(ToolRef("dex", "0.1.0"), {
     "dex.classes": OperationSpec("dex.classes", {
         "member": ArgSpec("literal", 0, 255, default=""), "query": ArgSpec("literal", 0, 128, default=""),
+        "class": ArgSpec("literal", 0, 255, default=""),
         "start": ArgSpec("int", 0, 1048575, default=0), "limit": ArgSpec("int", 1, 256, default=128),
     }, lambda data, args: _collect(_class_rows(data, args), args), max_observations=256),
     "dex.methods": OperationSpec("dex.methods", {

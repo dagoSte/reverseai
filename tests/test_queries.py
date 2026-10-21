@@ -35,6 +35,7 @@ ANDROID_SCHEMAS = {
     "apk.inventory": {"start": _int(0, 65535, 0), "limit": _int(1, 256, 128)},
     "apk.manifest": {"start": _int(0, 65535, 0), "limit": _int(1, 256, 256)},
     "dex.classes": {"member": ArgSpec("literal", 0, 255, default=""), "query": ArgSpec("literal", 0, 128, default=""),
+                    "class": ArgSpec("literal", 0, 255, default=""),
                     "start": _int(0, 1048575, 0), "limit": _int(1, 256, 128)},
     "dex.methods": {"member": ArgSpec("literal", 0, 255, default=""), "class": ArgSpec("literal", 1, 255),
                     "start": _int(0, 65535, 0), "limit": _int(1, 256, 128)},
@@ -74,8 +75,10 @@ def android_standins(layout):
     def classes(data, args):
         return page([(Location(c["offset"], 32), {
             "kind": "class", "dex": name, "name": c["name"], "access": c["access"], "superclass": c["superclass"],
-            "interfaces": c["interfaces"], "source_file": c["source_file"]}, members[name]["artifact"])
-            for name in selected(args) for c in layout["dex"][name]["classes"] if args["query"] in c["name"]], args)
+            "interfaces": c["interfaces"], "interfaces_total": len(c["interfaces"]),
+            "source_file": c["source_file"]}, members[name]["artifact"])
+            for name in selected(args) for c in layout["dex"][name]["classes"]
+            if (not args["class"] or args["class"] == c["name"]) and args["query"] in c["name"]], args)
 
     def methods(data, args):
         return page([(Location(m["offset"], 8), {
@@ -342,7 +345,7 @@ class AndroidQueryTests(unittest.TestCase):
                          [("apk.inventory", {"start": 0, "limit": 2}), ("apk.manifest", {"start": 3, "limit": 256})])
         spec, args = queries.resolve("inspect_android_class", {"member": "classes.dex", "class": fixtures_apk.MAIN})
         self.assertEqual([(r.operation, dict(r.args)) for r in spec.requests(args)],
-                         [("dex.classes", {"member": "classes.dex", "query": fixtures_apk.MAIN}),
+                         [("dex.classes", {"member": "classes.dex", "class": fixtures_apk.MAIN}),
                           ("dex.methods", {"member": "classes.dex", "class": fixtures_apk.MAIN, "start": 0, "limit": 128})])
         spec, args = queries.resolve("inspect_android_method", {"member": "classes.dex", "class": "La;", "method": "m",
                                                                 "prototype": "(I)I", "limit": 5})
@@ -364,7 +367,7 @@ class AndroidQueryTests(unittest.TestCase):
                 self.assertEqual({source for taken, _ in spec.routes.values() for source in taken.values()}, set(spec.args))
         self.assertEqual(queries.resolve("inspect_android_class", {"class": "La;"})[1]["member"], "")
         for name, raw in (("inspect_android_class", {}), ("inspect_android_class", {"member": "x" * 256, "class": "La;"}),
-                          ("inspect_android_class", {"member": "classes.dex", "class": "L" + "a" * 127 + ";"}),
+                          ("inspect_android_class", {"member": "classes.dex", "class": "L" + "a" * 254 + ";"}),
                           ("inspect_android_method", {"member": "classes.dex", "class": "La;", "method": "m",
                                                       "direction": "to"}),
                           ("trace_android_references", {"class": "La;", "method": "m", "direction": "both"}),
@@ -435,7 +438,7 @@ class AndroidQueryTests(unittest.TestCase):
         self.assertGreater(artifact["size"] - 32, len(data))
         item = make_evidence(data, query.REFS["dex"], "dex.classes", Observation(Location(artifact["size"] - 32, 32), {
             "kind": "class", "index": 0, "total": 1, "dex": "classes.dex", "name": "La;", "access": 1,
-            "superclass": None, "interfaces": [], "source_file": None}, artifact))
+            "superclass": None, "interfaces": [], "interfaces_total": 0, "source_file": None}, artifact))
         task = AnalysisTask(content_id("tk", {"q": "child"}), "structural", ref, (OperationRequest("dex.classes"),))
         finding, = query.conclude(task, [item])
         self.assertEqual(finding.value, {"start": 0, "total": 1, "rows": [["classes.dex", "La;", 1, None]]})
