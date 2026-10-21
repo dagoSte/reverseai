@@ -445,7 +445,7 @@ class AndroidQueryTests(unittest.TestCase):
                            item.excerpt_sha256, item.observation, artifact)
         self.assertEqual(query.conclude(task, [outside]), ())
 
-    def test_permissions_are_one_finding_of_the_first_64_uses_permission_names(self):
+    def test_permissions_are_concluded_in_chunks_of_64_in_document_order(self):  # decision m4a-fix-round-2 (F3)
         artifact = self.layout["members"][0]["artifact"]
         rows = [("uses-permission", "android:name", "string", f"p.{i:02}") for i in range(70)]
         rows[3] = ("uses-permission", "android:name", "reference", "@0x7f0a0001")
@@ -460,14 +460,16 @@ class AndroidQueryTests(unittest.TestCase):
                             (OperationRequest("apk.manifest"),))
         findings = query.conclude(task, items)
         self.assertEqual([(f.claim_key, len(f.evidence_ids)) for f in findings],
-                         [("android.manifest", 64), ("android.manifest", 6), ("android.permissions", 64)])
-        permissions = findings[-1]
-        self.assertEqual(set(permissions.evidence_ids), {item.id for item in items
-                                                         if item.observation["element"] != "permission"
-                                                         and item.observation["type"] == "string"
-                                                         and item.observation["attribute"] == "android:name"
-                                                         and item.observation["index"] < 67})
-        self.assertEqual(permissions.value, sorted({f"p.{i:02}" for i in range(67) if i not in (3, 4, 6)}))
+                         [("android.manifest", 64), ("android.manifest", 6), ("android.permissions", 64),
+                          ("android.permissions", 3)])
+        names = [item for item in items if item.observation["element"] != "permission"
+                 and item.observation["type"] == "string" and item.observation["attribute"] == "android:name"]
+        self.assertEqual([set(f.evidence_ids) for f in findings[2:]], [{item.id for item in names[:64]},
+                                                                       {item.id for item in names[64:]}])
+        self.assertEqual([f.value for f in findings[2:]], [sorted(item.observation["value"] for item in names[:64]),
+                                                           sorted(item.observation["value"] for item in names[64:])])
+        self.assertEqual(sorted(findings[2].value + findings[3].value),
+                         sorted({f"p.{i:02}" for i in range(70) if i not in (3, 4, 6)}))
 
     def test_the_real_tools_give_the_fixture_answers_row_for_row(self):
         # Seam check: the apk and dex tools in pipeline.TOOLS and the stand-ins built from the fixture layout agree on
@@ -520,3 +522,23 @@ class AndroidQueryTests(unittest.TestCase):
                     other = pipeline.query_bytes(data, ref, "search_android_classes", {"member": "classes.dex"})
                     self.assertEqual({v.status for v in other.verdicts}, {"supported"})
 
+
+class PermissionChunkTests(unittest.TestCase):
+    def test_more_than_64_permissions_through_the_real_apk_tool_and_reviewer(self):
+        # FIX-M4A-F (RD-M4A-CODEX-F F3): no permission is omitted; every chunk is supported (claims.SUBSET_CLAIMS).
+        names = [f"org.reverseai.permission.P{i:03d}" for i in range(70)]
+        tag, line, end, attributes, children = fixtures_apk.MANIFEST
+        permissions = tuple(("uses-permission", 3, 3, ((True, "name", name),), ()) for name in names)
+        permissions += (("uses-permission-sdk-23", 3, 3, ((True, "name", "android.permission.INTERNET"),), ()),)
+        manifest = (tag, line, end, attributes, (children[0],) + permissions + children[3:])
+        data, _ = fixtures_apk.zip_archive([fixtures_apk.member("AndroidManifest.xml",
+                                                                fixtures_apk.manifest_axml(manifest=manifest)[0])])
+        ref = InputRef(sha256_hex(data), len(data), "permissions.apk")
+        analysis = pipeline.query_bytes(data, ref, "inspect_android_package", {})
+        self.assertEqual({v.status for v in analysis.verdicts}, {"supported"})
+        chunks = [f for f in analysis.results[0].findings if f.claim_key == "android.permissions"]
+        self.assertEqual([len(f.evidence_ids) for f in chunks], [64, 7])
+        self.assertEqual(sorted(name for f in chunks for name in f.value), sorted(names + ["android.permission.INTERNET"]))
+        cited = {e.id: e for e in analysis.results[0].evidence}
+        last_of_first = max(cited[i].observation["index"] for i in chunks[0].evidence_ids)
+        self.assertTrue(all(cited[i].observation["index"] > last_of_first for i in chunks[1].evidence_ids))

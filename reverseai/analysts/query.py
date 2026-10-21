@@ -91,16 +91,17 @@ def conclude(task, evidence):
                 if names and all(isinstance(name, str) for name in names):
                     emit(key, sorted(set(names)), selected)
         if operation == "apk.manifest":
-            # One finding: the permissions of the page's first 64 uses-permission names, in document order.
+            # Every uses-permission name of the page, in document order, in findings of at most 64 citations:
+            # each names a subset of the declared permissions (claims.SUBSET_CLAIMS), so none is omitted.
             selected = sorted((item for item in items if item.observation.get("kind") == "manifest_attribute"
                                and item.observation.get("element") in PERMISSION_ELEMENTS
                                and item.observation.get("attribute") == "android:name"
                                and item.observation.get("type") == "string"
                                and isinstance(item.observation.get("value"), str) and item.observation["value"]
                                and type(item.observation.get("index")) is int),
-                              key=lambda item: item.observation["index"])[:MAX_EVIDENCE_PER_FINDING]
-            if selected:
-                emit("android.permissions", sorted({item.observation["value"] for item in selected}), selected)
+                              key=lambda item: item.observation["index"])
+            for chunk in _chunks(selected):
+                emit("android.permissions", sorted({item.observation["value"] for item in chunk}), chunk)
         if operation == "ghidra.function":
             for kind, key, fields in (("call", "code.calls", ("from", "to_name")),
                                        ("ref", "code.references", ("from", "type", "to", "to_name"))):
