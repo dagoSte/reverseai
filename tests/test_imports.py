@@ -42,6 +42,19 @@ class ImportTests(unittest.TestCase):
                 self.assertEqual(run("structure.imports", ordinal_data)[1], Observation(
                     Location(ordinal_layout["thunks"][0], 8 if plus else 4), {"kind": "symbols", "library": "lib.dll", "names": ["#42", "#43"]}))
 
+    def test_macho_reexport_lazy_and_upward_dylibs_use_the_bounded_name_layout(self):
+        for width in (32, 64):
+            data, layout = macho(width=width, libraries=(b"/usr/lib/libother.dylib",))
+            position = layout["dylib_names"][0] - 24
+            expected = run("structure.imports", data)
+            self.assertEqual(expected[0].value, {"kind": "library", "name": "/usr/lib/libother.dylib"})
+            for command in (0xC, 0x80000018, 0x8000001f, 0x20, 0x80000023):
+                changed = patched(data, position, "<I", command)
+                with self.subTest(width=width, command=command):
+                    self.assertEqual(run("structure.imports", changed), expected)
+                    self.assertEqual(run("structure.imports", patched(changed, position + 8, "<I", 23)), [])
+                    self.assertEqual(run("structure.imports", patched(changed, position + 8, "<I", 2**32 - 1)), [])
+
     def test_macho_load_and_weak_dylibs_and_only_undefined_external_symbols(self):
         for width in (32, 64):
             data, layout = macho(width=width, libraries=(b"/usr/lib/a.dylib", b"/usr/lib/b.dylib"), symbols=(b"_alpha", b"_beta"))

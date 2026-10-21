@@ -26,8 +26,7 @@ MAX_ELF_MAPPING_WORK = 65536
 ELF_MAGIC = b"\x7fELF"
 ZIP_MAGICS = (b"PK\x03\x04", b"PK\x05\x06")
 MACHO_MAGICS = (b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xce\xfa\xed\xfe", b"\xcf\xfa\xed\xfe")
-FAT_MAGICS = {b"\xca\xfe\xba\xbe": (">", 20), b"\xca\xfe\xba\xbf": (">", 32),
-              b"\xbe\xba\xfe\xca": ("<", 20), b"\xbf\xba\xfe\xca": ("<", 32)}
+FAT_MAGICS = {b"\xca\xfe\xba\xbe": (">", 20), b"\xca\xfe\xba\xbf": (">", 32)}
 MACHO_MACHINES = {7: "x86", 0x1000007: "x86_64", 12: "arm", 0x100000C: "aarch64",
                   18: "powerpc", 0x1000012: "powerpc64"}
 
@@ -605,7 +604,7 @@ def _macho_import_records(data):
         return
     symbols = []
     for command, position, size in _macho_commands(data, h):
-        if command in (0xC, 0x80000018):
+        if command in (0xC, 0x80000018, 0x8000001f, 0x20, 0x80000023):
             if size < 24:
                 break
             start = struct.unpack_from("<I", data, position + 8)[0]

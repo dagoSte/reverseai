@@ -7,10 +7,11 @@ from unittest.mock import patch
 
 from reverseai.contract import ContractError, Location, Observation
 from reverseai.tools import ghidra_verify, structure
-from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code
+from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code, elf_refs, pe_refs, macho_refs
 from tests.fixtures_structure import elf, pe, macho
 
-ARGS = {"max_functions": 64, "decompile": 8, "max_chars": 1024, "max_calls": 128}
+ARGS = {"max_functions": 64, "decompile": 8, "max_chars": 1024, "max_calls": 128,
+        "assembly": 4, "max_instructions": 32, "max_refs": 64, "max_strings": 32}
 
 
 def records(layout):
@@ -31,6 +32,23 @@ def records(layout):
 
 def observations(items):
     return tuple(Observation(Location(**item["location"]), item["value"]) for item in items)
+
+
+def reference_records(layout):
+    items = records(layout)
+    ranked = sorted(enumerate(layout["functions"]), key=lambda item: (
+        item[1]["entry"] != layout["entry"], -item[1]["size"], item[1]["entry"]))[:4]
+    for index, function in ranked:
+        items.append({"location": {"offset": function["offset"], "length": function["size"]}, "value": {
+            "kind": "assembly", "index": index, "entry": function["entry"],
+            "instructions": [[*row, "derived instruction"] for row in function["instructions"]], "truncated": False}})
+    for ref in layout["refs"]:
+        items.append({"location": {"offset": ref["offset"], "length": ref["length"]}, "value": {
+            "kind": "ref", **{key: ref[key] for key in ("from", "to", "type")}, "to_name": ref["to_name"] or ""}})
+    for string in layout["strings"]:
+        items.append({"location": {"offset": string["offset"], "length": string["length"]}, "value": {
+            "kind": "string", **{key: string[key] for key in ("address", "encoding", "text", "truncated", "from")}}})
+    return items
 
 
 class MachOAnchorTests(unittest.TestCase):
@@ -156,6 +174,225 @@ class MachOAnchorTests(unittest.TestCase):
         for size in (4, 28, 103, 175, 255):
             with self.subTest(size=size):
                 self.assertFalse(self.accepts([], data=self.data[:size]))
+
+
+def m3c_records():
+    data, layout = elf(entry=0x1000, sections=((b".text", 1, 6, 256), (b".rodata", 1, 2, 512), (b".bss", 8, 3, 16)))
+    data = bytearray(data)
+    for index, address in enumerate((0x1000, 0x3000, 0x5000), 1):
+        struct.pack_into("<Q", data, layout["shoff"] + index * 64 + 16, address)
+    text, rodata = layout["offsets"][:2]
+    for offset, value in ((0, b"hello\0"), (32, "wide".encode("utf-16le") + b"\0\0"), (64, b"A" * 129)):
+        data[rodata + offset:rodata + offset + len(value)] = value
+    functions = [{"location": {"offset": text + 32 * index, "length": size},
+                  "value": {"kind": "function", "index": index, "entry": 0x1000 + 32 * index,
+                            "name": f"f{index}", "size": size}} for index, size in enumerate((16, 32, 24))]
+    assembly = [{"location": dict(item["location"]), "value": {
+        "kind": "assembly", "index": item["value"]["index"], "entry": item["value"]["entry"],
+        "instructions": [[0, 1, "PUSH RBP"], [4, 5, "LEA RAX,[data]"]], "truncated": False}} for item in functions]
+    refs = [{"location": {"offset": text + delta, "length": 5}, "value": {
+        "kind": "ref", "from": origin, "to": target, "type": kind, "to_name": ""}}
+        for delta, origin, target, kind in ((2, 0x1000, 0x3000, "read"), (7, 0x1000, 0x3020, "data"),
+                                          (34, 0x1020, 0x3000, "write"), (66, 0x1040, 0x3040, "read_write"))]
+    strings = [{"location": {"offset": rodata + delta, "length": len(text.encode(encoding))}, "value": {
+        "kind": "string", "address": 0x3000 + delta, "encoding": encoding, "text": text,
+        "truncated": truncated, "from": origins}}
+        for delta, encoding, text, truncated, origins in ((0, "ascii", "hello", False, [0x1000, 0x1020]),
+            (32, "utf-16le", "wide", False, [0x1000]), (64, "ascii", "A" * 128, True, [0x1040]))]
+    return bytes(data), layout, functions + assembly + refs + strings
+
+
+class M3cAnchorTests(unittest.TestCase):
+    def setUp(self):
+        self.data, self.layout, self.items = m3c_records()
+
+    def check(self, items=None, *, data=None, args=None):
+        return ghidra_verify.verify(self.data if data is None else data,
+            observations(self.items if items is None else items), ARGS if args is None else args)
+
+    def refuse(self, items=None, **kwargs):
+        with self.assertRaisesRegex(ContractError, "^" + ghidra_verify.REFUSED + "$"):
+            self.check(items, **kwargs)
+
+    def test_all_kinds_admit_data_strings_without_relaxing_code_permissions(self):
+        self.check()
+        self.check(self.items[:3])
+        for index in (0, 3, 6):
+            items = copy.deepcopy(self.items)
+            items[index]["location"] = dict(items[-3]["location"])
+            self.refuse(items)
+
+    def test_shared_elf_pe_macho_reference_fixtures_map_code_and_data(self):
+        for generator in (elf_refs, pe_refs, macho_refs):
+            data, layout = generator()
+            items = reference_records(layout)
+            with self.subTest(format=layout["format"]):
+                self.check(items, data=data)
+                items[-1]["value"]["text"] += "!"
+                self.refuse(items, data=data)
+
+    def test_ascii_and_utf16_rule_minimum_terminator_priority_and_truncation(self):
+        for encoding in ("ascii", "utf-16le"):
+            for count in (1, 2, 127, 128, 129):
+                for terminated in (False, True):
+                    raw = ("Z" * count).encode(encoding) + (bytes(1 if encoding == "ascii" else 2) if terminated else b"\x01")
+                    expected = count >= 2 and (terminated or count >= 129)
+                    with self.subTest(encoding=encoding, count=count, terminated=terminated):
+                        # End the section before any bytes beyond this test's payload.
+                        if expected:
+                            got = ghidra_verify._string_bytes(raw, 0, len(raw))
+                            self.assertEqual(got, (encoding, "Z" * min(count, 128), count >= 129))
+                        else:
+                            with self.assertRaises(ContractError): ghidra_verify._string_bytes(raw, 0, len(raw))
+        self.assertEqual(ghidra_verify._string_bytes(b"AB\0C\0\0", 0, 6), ("ascii", "AB", False))
+        for raw in (b"A\0", b"\x1fB\0", b"AB\x7f\0", b"A\0B\x01\0\0", b"A\0B\0\0"):
+            with self.subTest(raw=raw), self.assertRaises(ContractError):
+                ghidra_verify._string_bytes(raw, 0, len(raw))
+
+    def test_string_origins_are_the_lowest_eight_distinct_emitted_ref_origins(self):
+        text = self.layout["offsets"][0]
+        functions, refs = [], []
+        for index in range(10):
+            entry = 0x1000 + index * 16
+            functions.append({"location": {"offset": text + index * 16, "length": 8}, "value": {
+                "kind": "function", "index": index, "name": "f", "entry": entry, "size": 8}})
+            refs.append({"location": {"offset": text + index * 16, "length": 1}, "value": {
+                "kind": "ref", "from": entry, "to": 0x3000, "type": "data", "to_name": ""}})
+        string = copy.deepcopy(self.items[10]); string["value"]["from"] = [0x1000 + index * 16 for index in range(8)]
+        self.check(functions + refs + [string])
+        string["value"]["from"][-1] += 16
+        self.refuse(functions + refs + [string])
+
+    def test_each_new_kind_requires_exact_fields_and_global_emission_order(self):
+        for index in (3, 6, 10):
+            for field in (*self.items[index]["value"], "extra"):
+                items = copy.deepcopy(self.items)
+                if field == "extra":
+                    items[index]["value"][field] = 0
+                else:
+                    del items[index]["value"][field]
+                with self.subTest(index=index, field=field):
+                    self.refuse(items)
+        for left, right in ((0, 3), (3, 6), (6, 10)):
+            items = copy.deepcopy(self.items)
+            items[left], items[right] = items[right], items[left]
+            self.refuse(items)
+
+    def test_kind_block_order_is_independent_of_each_kinds_internal_order(self):
+        self.check()
+        self.refuse(self.items[:3] + self.items[6:10] + self.items[3:6] + self.items[10:])
+        self.refuse(self.items[:10] + self.items[12:] + self.items[10:12])
+
+    def test_ref_instruction_span_is_checked_without_a_sorting_or_string_failure(self):
+        ref = copy.deepcopy(self.items[6])
+        self.check(self.items[:3] + [ref])
+        ref["location"] = {"offset": self.layout["offsets"][0] + 15, "length": 2}
+        self.refuse(self.items[:3] + [ref])
+
+    def test_assembly_requires_emitted_function_anchor_rank_and_unique_index(self):
+        for key, value in (("index", True), ("index", -1), ("index", 3), ("entry", 0x1001), ("truncated", 1)):
+            items = copy.deepcopy(self.items); items[3]["value"][key] = value
+            self.refuse(items)
+        for pair in ((4, 3), (3, 3)):
+            self.refuse(self.items[:3] + [self.items[i] for i in pair])
+        self.check(self.items[:3] + [self.items[4]])  # A failed/over-budget listing may be omitted.
+        items = copy.deepcopy(self.items); items[3]["location"]["length"] -= 1
+        self.refuse(items)
+        self.refuse(self.items[3:])
+
+    def test_instruction_types_order_lengths_ascii_and_anchor_bounds(self):
+        bad_rows = ([], [[0, 1]], [[True, 1, "x"]], [[-1, 1, "x"]], [[0, True, "x"]],
+                    [[0, 0, "x"]], [[0, 17, "x"]], [[0, 1, ""]], [[0, 1, "x" * 65]],
+                    [[0, 1, "é"]], [[0, 1, "x\n"]], [[0, 1, "\x7f"]], [[0, 1, "x\u202e"]],
+                    [[0, 4, "x"], [3, 1, "y"]], [[4, 1, "x"], [0, 1, "y"]], [[15, 2, "x"]])
+        for rows in bad_rows:
+            items = copy.deepcopy(self.items); items[3]["value"]["instructions"] = rows
+            with self.subTest(rows=rows): self.refuse(items)
+        items = copy.deepcopy(self.items); items[3]["value"]["instructions"] = [[0, 16, "x" * 64]]
+        self.check(items)
+
+    def test_reference_types_instruction_span_order_uniqueness_and_emitted_origin(self):
+        for key, value in (("from", True), ("from", 0x9999), ("to", -1),
+                           ("type", "call"), ("type", []), ("to_name", "x\x1b"), ("to_name", "x" * 129)):
+            items = copy.deepcopy(self.items); items[6]["value"][key] = value
+            self.refuse(items)
+        for delta, length in ((0, 17), (15, 2), (32, 1)):
+            items = copy.deepcopy(self.items); items[6]["location"] = {"offset": self.layout["offsets"][0] + delta, "length": length}
+            self.refuse(items)
+        for refs in ([self.items[7], self.items[6]], [self.items[6], self.items[6]]):
+            self.refuse(self.items[:3] + refs)
+        for kind in ("read", "write", "read_write", "data", "jump"):
+            ref = copy.deepcopy(self.items[6]); ref["value"].update(type=kind, to=2**64-1)
+            self.check(self.items[:3] + [ref])
+
+    def test_reference_order_ties_use_target_then_type_and_ignore_target_name(self):
+        refs = []
+        for target, kind in ((0x3000, "data"), (0x3000, "read"), (0x3001, "data")):
+            row = copy.deepcopy(self.items[6]); row["value"].update(to=target, type=kind)
+            refs.append(row)
+        self.check(self.items[:3] + refs)
+        for pair in ((0, 1), (1, 2)):
+            changed = copy.deepcopy(refs)
+            left, right = pair; changed[left], changed[right] = changed[right], changed[left]
+            self.refuse(self.items[:3] + changed)
+        duplicate = copy.deepcopy(refs[0]); duplicate["value"]["to_name"] = "another name"
+        self.refuse(self.items[:3] + [refs[0], duplicate])
+
+    def test_pe_string_terminator_cannot_use_raw_padding_beyond_virtual_extent(self):
+        data, layout = pe_refs()
+        self.check(reference_records(layout), data=data)
+        changed = bytearray(data)
+        pe_offset = struct.unpack_from("<I", changed, 0x3c)[0]
+        optional_size = struct.unpack_from("<H", changed, pe_offset + 20)[0]
+        data_header = pe_offset + 24 + optional_size + 40
+        struct.pack_into("<I", changed, data_header + 8, layout["strings"][0]["length"])
+        self.refuse(reference_records(layout), data=bytes(changed))
+
+    def test_string_value_anchor_and_origin_list_are_rederived(self):
+        for key, value in (("address", True), ("address", 0x3001), ("encoding", "utf-8"),
+                           ("encoding", "utf-16le"), ("text", "HELLO"), ("truncated", True),
+                           ("truncated", 0), ("from", []), ("from", [0x1020, 0x1000]),
+                           ("from", [0x1000]), ("from", [0x1000, 0x1000]), ("from", [True]),
+                           ("from", [0x1000, 0x1020, 0x1040])):
+            items = copy.deepcopy(self.items); items[10]["value"][key] = value
+            with self.subTest(key=key, value=value): self.refuse(items)
+        for key in ("offset", "length"):
+            items = copy.deepcopy(self.items); items[10]["location"][key] += 1
+            self.refuse(items)
+        self.refuse(self.items[:6] + self.items[10:])
+        self.refuse(self.items[:10] + [self.items[11], self.items[10]])
+        self.refuse(self.items + [self.items[-1]])
+
+    def test_string_terminator_and_129th_unit_must_be_inside_the_same_file_section(self):
+        rodata = self.layout["offsets"][1]
+        for offset, replacement in ((5, b"!"), (40, b"x\0"), (64 + 128, b"\0")):
+            data = bytearray(self.data); data[rodata + offset:rodata + offset + len(replacement)] = replacement
+            self.refuse(data=bytes(data))
+        for size in (5, 6, 64 + 128, 64 + 129):
+            data = bytearray(self.data)
+            struct.pack_into("<Q", data, self.layout["shoff"] + 2 * 64 + 32, size)
+            if size == 6:
+                self.check(self.items[:10] + self.items[10:11], data=bytes(data))
+            elif size == 64 + 129:
+                self.check(data=bytes(data))
+            else:
+                self.refuse(data=bytes(data))
+
+    def test_string_mapping_refuses_nonallocated_nobits_and_ambiguous_file_or_virtual_ranges(self):
+        for field, fmt, value in ((8, "<Q", 0), (4, "<I", 8)):
+            data = bytearray(self.data); struct.pack_into(fmt, data, self.layout["shoff"] + 2 * 64 + field, value)
+            self.refuse(data=bytes(data))
+        for address, offset in ((0x3000, self.layout["offsets"][2]), (0x6000, self.layout["offsets"][1])):
+            data = bytearray(self.data); at = self.layout["shoff"] + 3 * 64
+            struct.pack_into("<I", data, at + 4, 1)
+            struct.pack_into("<Q", data, at + 16, address)
+            struct.pack_into("<Q", data, at + 24, offset)
+            self.refuse(data=bytes(data))
+
+    def test_individual_new_caps_are_enforced_and_zero_disables_the_kind(self):
+        for key, value in (("assembly", 2), ("max_instructions", 1), ("max_refs", 3), ("max_strings", 2)):
+            self.refuse(args=dict(ARGS, **{key: value}))
+        self.check(self.items[:3], args=dict(ARGS, assembly=0, max_refs=0, max_strings=0))
 
 
 class AnchorTests(unittest.TestCase):

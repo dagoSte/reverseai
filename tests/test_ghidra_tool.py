@@ -19,7 +19,7 @@ from reverseai.tools import ghidra_tool, ghidra_verify
 from tests.fixtures_code import elf_code, pe_code
 from tests.fixtures_structure import elf
 from tests.test_contained import ghidra_lock
-from tests.test_ghidra_verify import ARGS, observations, records
+from tests.test_ghidra_verify import ARGS, observations, records, m3c_records
 
 
 def reply(data, items, **changes):
@@ -48,10 +48,10 @@ class ToolTests(unittest.TestCase):
         self.operation = self.tool.operations["ghidra.analyze"]
 
     def test_metadata_defaults_derived_declaration_and_snapshot_binding(self):
-        self.assertEqual((self.tool.ref.name, self.tool.ref.version), ("ghidra", "12.1.4-r4"))
+        self.assertEqual((self.tool.ref.name, self.tool.ref.version), ("ghidra", "12.1.4-r5"))
         self.assertTrue(self.tool.contained)
         self.assertTrue(self.operation.derived)
-        self.assertEqual(self.operation.max_observations, 400)
+        self.assertEqual(self.operation.max_observations, 600)
         self.assertEqual(set(self.tool.operations), {"ghidra.analyze"})
         self.assertEqual(self.tool.runtime, {"image": ghidra_lock()["image_id"], "platform": "linux/arm64"})
         self.assertEqual(self.operation.handler(self.data, {}), observations(self.items))
@@ -63,7 +63,8 @@ class ToolTests(unittest.TestCase):
 
     def test_invalid_analyst_arguments_fail_before_the_executor(self):
         for key, low, high in (("max_functions", 1, 128), ("decompile", 0, 16),
-                               ("max_chars", 64, 2048), ("max_calls", 0, 256)):
+                               ("max_chars", 64, 2048), ("max_calls", 0, 256), ("assembly", 0, 8),
+                               ("max_instructions", 1, 64), ("max_refs", 0, 128), ("max_strings", 0, 64)):
             for value in (True, low - 1, high + 1, str(low)):
                 with self.subTest(key=key, value=value), self.assertRaises(ContractError):
                     self.operation.handler(self.data, {key: value})
@@ -107,6 +108,19 @@ class ToolTests(unittest.TestCase):
             self.operation.handler(self.data, {})
         self.assertIs(caught.exception, failure)
 
+    def test_a_forged_final_string_refuses_all_code_evidence_atomically(self):
+        data, _, items = m3c_records()
+        executor = FakeExecutor(reply(data, items))
+        tool = ghidra_tool.make_tool(executor)
+        task = AnalysisTask(content_id("tk", {"input": sha256_hex(data)}), "code",
+                            InputRef(sha256_hex(data), len(data), "inert"), (OperationRequest("ghidra.analyze"),))
+        self.assertEqual(Gateway((tool,), Budget()).run(task, data).status, "ok")
+        items[-1]["value"]["text"] = "forged"
+        executor.response = reply(data, items)
+        result = Gateway((tool,), Budget()).run(task, data)
+        self.assertEqual(result.status, "error")
+        self.assertEqual(result.evidence, ())
+
     def test_the_exact_maximum_of_400_observations_is_admitted_and_the_next_is_refused(self):
         data, layout = elf(entry=0x1000, sections=((b".text", 1, 6, 8192),))
         data = bytearray(data)
@@ -140,7 +154,7 @@ class ToolTests(unittest.TestCase):
         importlib.reload(ghidra_tool)
         with patch.object(ghidra_tool, "DockerExecutor", return_value=self.executor) as factory:
             tool = ghidra_tool.make_tool()
-            factory.assert_called_once_with(ghidra_tool.DEFAULT_LOCK, adapter_version="12.1.4-r4")
+            factory.assert_called_once_with(ghidra_tool.DEFAULT_LOCK, adapter_version="12.1.4-r5")
             self.assertTrue(tool.operations["ghidra.analyze"].derived)
 
     def test_availability_requires_exact_lock_and_local_image_without_host_native_imports(self):
@@ -150,7 +164,7 @@ class ToolTests(unittest.TestCase):
             return image
         self.assertTrue(ghidra_tool.available(ghidra_lock(), inspect=inspect))
         self.assertEqual(inspected, [ghidra_lock()["image_id"]])
-        for version in ("12.1.4-r1", "12.1.4-r2", "12.1.4-r3"):
+        for version in ("12.1.4-r1", "12.1.4-r2", "12.1.4-r3", "12.1.4-r4"):
             with self.subTest(version=version):
                 self.assertFalse(ghidra_tool.available(dict(ghidra_lock(), adapter_version=version), inspect=inspect))
         self.assertFalse(ghidra_tool.available(dict(ghidra_lock(), ghidra_sha256="0" * 64), inspect=inspect))
@@ -162,3 +176,43 @@ class ToolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             self.assertFalse(ghidra_tool.available(Path(folder) / "missing", inspect=inspect))
         self.assertEqual(len(inspected), 1)
+
+    def test_all_600_observations_can_be_admitted_and_601_is_refused(self):
+        data, layout = elf(entry=0x1000, sections=((b".text", 1, 6, 8192), (b".data", 1, 3, 512)))
+        data = bytearray(data)
+        for index, address in ((1, 0x1000), (2, 0x4000)):
+            struct.pack_into("<Q", data, layout["shoff"] + index * 64 + 16, address)
+        text, raw = layout["offsets"]
+        functions, pseudocode, calls, assembly, refs, strings = [], [], [], [], [], []
+        for index in range(128):
+            entry, offset = 0x1000 + index * 32, text + index * 32
+            location = {"offset": offset, "length": 16}
+            functions.append({"location": location, "value": {
+                "kind": "function", "index": index, "entry": entry, "name": f"f{index}", "size": 16}})
+            if index < 16:
+                pseudocode.append({"location": location, "value": {
+                    "kind": "pseudocode", "index": index, "entry": entry, "text": "return;", "truncated": False}})
+            if index < 8:
+                assembly.append({"location": location, "value": {
+                    "kind": "assembly", "index": index, "entry": entry,
+                    "instructions": [[0, 1, "RET"]], "truncated": False}})
+            for delta in (0, 5):
+                calls.append({"location": {"offset": offset + delta, "length": 5}, "value": {
+                    "kind": "call", "from": entry, "to": 0, "to_name": ""}})
+            refs.append({"location": {"offset": offset + 10, "length": 1}, "value": {
+                "kind": "ref", "from": entry, "to": 0x4000 + (index % 64) * 8, "type": "data", "to_name": ""}})
+        for index in range(64):
+            value = f"s{index:02}"
+            data[raw + index * 8:raw + index * 8 + 4] = value.encode() + b"\0"
+            strings.append({"location": {"offset": raw + index * 8, "length": 3}, "value": {
+                "kind": "string", "address": 0x4000 + index * 8, "encoding": "ascii", "text": value,
+                "truncated": False, "from": [0x1000 + index * 32, 0x1000 + (index + 64) * 32]}})
+        data = bytes(data)
+        items = functions + pseudocode + calls + assembly + refs + strings
+        executor = FakeExecutor(reply(data, items))
+        handler = ghidra_tool.make_tool(executor).operations["ghidra.analyze"].handler
+        args = dict(ARGS, max_functions=128, decompile=16, max_calls=256, assembly=8, max_refs=128, max_strings=64)
+        self.assertEqual(len(handler(data, args)), 600)
+        executor.response = reply(data, items + strings[:1])
+        with self.assertRaises(ContractError):
+            handler(data, args)

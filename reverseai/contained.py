@@ -23,7 +23,7 @@ WALL_SECONDS = 45
 GHIDRA_WALL_SECONDS = 240
 PLATFORM = "linux/arm64"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
-GHIDRA_VERSION = "12.1.4-r4"
+GHIDRA_VERSION = "12.1.4-r5"
 GHIDRA_PINS = MappingProxyType({
     "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
     "ghidra_sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",
@@ -99,9 +99,12 @@ def _validated_args(operation, args):
         count = args.get("max_matches", 32)
         if args.get("ruleset", "m2_fixture_v1") == "m2_fixture_v1" and type(count) is int and 1 <= count <= 64:
             return {"ruleset": "m2_fixture_v1", "max_matches": count}
-    if operation == "ghidra.analyze" and not set(args) - {"max_functions", "decompile", "max_chars", "max_calls"}:
+    if operation == "ghidra.analyze" and not set(args) - {"max_functions", "decompile", "max_chars", "max_calls",
+                                                       "assembly", "max_instructions", "max_refs", "max_strings"}:
         bounds = {"max_functions": (1, 128, 64), "decompile": (0, 16, 8),
-                  "max_chars": (64, 2048, 1024), "max_calls": (0, 256, 128)}
+                  "max_chars": (64, 2048, 1024), "max_calls": (0, 256, 128),
+                  "assembly": (0, 8, 4), "max_instructions": (1, 64, 32),
+                  "max_refs": (0, 128, 64), "max_strings": (0, 64, 32)}
         checked = {key: args.get(key, default) for key, (_, _, default) in bounds.items()}
         if all(type(checked[key]) is int and low <= checked[key] <= high for key, (low, high, _) in bounds.items()):
             return checked

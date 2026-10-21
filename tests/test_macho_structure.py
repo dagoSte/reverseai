@@ -43,7 +43,7 @@ class MachoStructureTests(unittest.TestCase):
                 self.assertEqual(run(operation, thin), [])
             self.assertEqual(structure.macho_sections(thin), [])
             self.assertIsNone(structure.macho_entry(thin))
-            for order in ("<", ">"):
+            for order in (">",):
                 fat = macho_fat(width=width, order=order, machines=(7, 0x1000007, 0x100000C, 999) * 3)
                 self.assertEqual(run("structure.identify", fat)[0].value, {
                     "format": "macho-universal", "magic": fat[:4].hex(),
@@ -51,6 +51,11 @@ class MachoStructureTests(unittest.TestCase):
                 for operation in ("structure.headers", "structure.sections", "structure.imports"):
                     self.assertEqual(run(operation, fat), [])
                 self.assertEqual(run("structure.identify", fat[:7])[0].value["format"], "unknown")
+
+    def test_little_endian_fat_magics_are_not_universal(self):
+        for width in (32, 64):
+            data = macho_fat(width=width, order="<")
+            self.assertEqual(run("structure.identify", data)[0].value["format"], "unknown")
 
     def test_names_escape_controls_backslashes_and_non_ascii(self):
         data, _ = macho(sections=((b"a\x1b\xff\\", b"S\x00ignored", 0, 0, 1),))
