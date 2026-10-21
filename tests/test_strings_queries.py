@@ -1,6 +1,7 @@
 """M3d string pages: exact byte citations, full-run literal search and real reviewer checks."""
 
 import unittest
+import tracemalloc
 
 from reverseai import claims
 from reverseai.contract import (AnalysisResult, InputRef, Location, content_id, make_evidence, make_finding, sha256_hex)
@@ -122,6 +123,40 @@ class StringsQueryTests(unittest.TestCase):
         self.assertEqual(page[0].location.offset,13)
         supported(self,data,'search',page,expected)
         self.assertEqual(run('search',data,query='hit',start=3),[])
+
+    def test_dense_pages_count_all_runs_with_bounded_allocation(self):
+        # 64 MiB measurements are in CARRY-M4B-S; keep the routine check small.
+        count = 70000
+        data = b'abcd\0' * count
+        for operation in ('list', 'search'):
+            args = dict(start=count - 1, limit=1)
+            args.update(dict(min_length=4) if operation == 'list' else dict(query='abcd'))
+            with self.subTest(operation=operation):
+                tracemalloc.start()
+                try:
+                    rows = run(operation, data, **args)
+                    _, peak = tracemalloc.get_traced_memory()
+                finally:
+                    tracemalloc.stop()
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0].value['index'], count - 1)
+                self.assertEqual(rows[0].value['total'], count)
+                self.assertEqual(rows[0].value['text'], 'abcd')
+                self.assertEqual(rows[0].location, Location((count - 1) * 5, 4))
+                self.assertLess(peak, 1024 * 1024)
+
+    def test_huge_run_pages_keep_preview_and_excerpt_bounded(self):
+        for codec in ('ascii', 'utf-16le'):
+            data = ('A' * (256 * 1024) + 'needle').encode(codec)
+            for operation in ('list', 'search'):
+                args = {} if operation == 'list' else dict(query='needle')
+                with self.subTest(codec=codec, operation=operation):
+                    rows = run(operation, data, limit=1, **args)
+                    self.assertEqual(len(rows), 1)
+                    self.assertEqual(rows[0].value['total'], 1)
+                    self.assertEqual(rows[0].value['text'], 'A' * 256)
+                    self.assertTrue(rows[0].value['truncated'])
+                    self.assertEqual(rows[0].location, Location(0, 4096))
 
     def test_argument_ranges_unknown_keys_and_search_requirement(self):
         for operation,args in [('list',{'min_length':3}),('list',{'min_length':65}),('list',{'limit':257}),

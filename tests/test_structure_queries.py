@@ -6,8 +6,10 @@ import random
 from unittest.mock import patch
 
 from reverseai import claims
-from reverseai.contract import (AnalysisResult, InputRef, Location, content_id, make_evidence, make_finding, sha256_hex)
+from reverseai.contract import (AnalysisResult, AnalysisTask, Budget, InputRef, Location, OperationRequest, content_id, make_evidence, make_finding, sha256_hex)
 from reverseai.review import review
+from reverseai.gateway import Gateway
+from reverseai.report import Analysis, to_markdown
 from reverseai.tools import structure
 from tests.fixtures_code import elf_code, pe_code, macho_code, elf_refs, macho_refs
 from tests.fixtures_structure import elf, elf_symbols, pe, pe_exports, macho
@@ -88,6 +90,56 @@ class StructureQueryTests(unittest.TestCase):
             supported(self, data, 'segments', 'segments.list', page,
                       dict(start=1, total=len(expected), rows=[[page[0].value[k] for k in fields]]))
         self.assertEqual(run('segments', b'unknown'), [])
+
+    @staticmethod
+    def mixed_width_segments(width, *, wrong=True):
+        base, _ = macho(width=width, sections=(), entry=None)
+        commands = []
+        for index in range(3):
+            current = 96 - width if wrong and index == 1 else width
+            if current == 64:
+                command = struct.pack('<II16s4Q4I', 0x19, 72, f'S{index}'.encode(), 0, 0, 0, 0, 0, 0, 0, 0)
+            else:
+                command = struct.pack('<II16s8I', 1, 56, f'S{index}'.encode(), 0, 0, 0, 0, 0, 0, 0, 0)
+            commands.append(command)
+        header = bytearray(base[:32 if width == 64 else 28])
+        struct.pack_into('<II', header, 16, len(commands), sum(map(len, commands)))
+        return bytes(header) + b''.join(commands)
+
+    def test_macho_wrong_width_segment_never_returns_a_complete_prefix(self):
+        # Decision m4b-carry-s changes only this formerly silent prefix.
+        for width in (32, 64):
+            honest = self.mixed_width_segments(width, wrong=False)
+            self.assertEqual([o.value['name'] for o in run('segments', honest)], ['S0', 'S1', 'S2'])
+            hostile = self.mixed_width_segments(width)
+            for start in (0, 1, 2):
+                with self.subTest(width=width, start=start):
+                    with self.assertRaises(structure.StructureError) as error:
+                        run('segments', hostile, start=start, limit=1)
+                    self.assertEqual(type(error.exception).__name__, 'MachoSegmentWidthMismatch')
+
+    def test_macho_width_error_reaches_gateway_and_report_without_evidence(self):
+        for width in (32, 64):
+            with self.subTest(width=width):
+                data = self.mixed_width_segments(width)
+                ref = InputRef(sha256_hex(data), len(data), 'synthetic')
+                task = AnalysisTask(content_id('tk', {'width': width}), 'structural', ref,
+                                    (OperationRequest('structure.segments'),), Budget())
+                result = Gateway([structure.TOOL], Budget()).run(task, data)
+                self.assertEqual(result.status, 'error')
+                self.assertEqual(result.evidence, ())
+                self.assertEqual(result.errors, ('structure.segments: MachoSegmentWidthMismatch',))
+                report = to_markdown(Analysis(ref, (structure.REF,), (result,), ()))
+                self.assertIn('structure.segments: MachoSegmentWidthMismatch', report)
+
+    def test_macho_short_segment_still_keeps_its_valid_prefix(self):
+        for width in (32, 64):
+            data = bytearray(self.mixed_width_segments(width, wrong=False))
+            header, stride = (32, 72) if width == 64 else (28, 56)
+            struct.pack_into('<I', data, header + stride + 4, 8)
+            rows = run('segments', bytes(data))
+            self.assertEqual([o.value['name'] for o in rows], ['S0'])
+            self.assertEqual(rows[0].value['total'], 1)
 
     def test_entries_cite_the_declaring_field_on_every_format(self):
         for builder, field in ((elf_code, 24), (pe_code, 104), (macho_code, 440)):
