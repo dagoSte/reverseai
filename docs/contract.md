@@ -388,7 +388,10 @@ query names, so M7 can compare them one by one. Decision `m3d-contract`.
   `start+n < total` the report says so and gives the next `start`. A row missing
   from a page is never evidence that it does not exist. List claims have the
   value `{"start", "total", "rows"}`: indexes contiguous from `start`, one `total`,
-  rows in index order; an empty page makes no finding.
+  rows in index order; an empty page makes no finding. A long page is split into
+  findings of at most 64 citations, each a contiguous page; the reviewer compares
+  verified pages of one list row by row, so they contradict only by a different
+  `total` or a different row at the same index (decision `m3d-seams-paging`).
 
 | Query | Operations (fixed arguments) | Accepted `--arg` keys |
 | --- | --- | --- |

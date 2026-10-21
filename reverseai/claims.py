@@ -230,6 +230,11 @@ PAGES = {
 }
 
 
+# Page claims (contract M3d): their findings are pages of one list, so the reviewer compares them row by row.
+PAGE_CLAIMS = frozenset({"segments.list", "symbols.list", "strings.listed", "strings.matches",
+                         "code.function_list", "code.xrefs"})
+
+
 def _page(kind):
     """{"start", "total", "rows"}: indexes contiguous from start, one total, rows in index order (contract M3d)."""
     fields, shape = PAGES[kind]
