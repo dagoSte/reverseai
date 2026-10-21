@@ -693,17 +693,26 @@ Java is the decompiler's reading, kept **derived** like Ghidra's pseudocode.
   `python:3.12-slim` base with JADX 1.5.6 (`jadx-1.5.6.zip`, `545ea2be...8974`,
   the one approved download) and the JDK bytes already approved for Ghidra
   (Temurin 21.0.12.1+1, `23e37e02...e223`); a fixed driver is compiled at build
-  time against the bundled `jadx-core`. Lock keys: the M2a keys plus
-  `jadx_sha256`, `jdk_sha256`. Adapter `1.5.6-r1`.
+  time against the bundled `jadx-1.5.6-all.jar` (`fe3e12c4...554b`, its Apache-2.0
+  LICENSE kept with it). Lock keys: `adapter_version` `1.5.6-r1`, `platform`,
+  `base_digest`, `jadx_zip_sha256`, `jadx_jar_sha256`, `jdk_sha256`,
+  `driver_sha256`, `worker_sha256`, `image_id`.
 - **Resource profile** (fixed in `reverseai/contained.py`, proven by the native
-  verifier): as Ghidra's (`--memory 2g --memory-swap 2g --pids-limit 256 --cpus 2
-  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=512m`, wall 240 s) with a fixed JVM
-  heap and thread count; M4B-W measures and proposes the final values.
-- **Analysis**: one JADX load of the frozen input per run, bundled DEX input
-  only, no resource decoding, no deobfuscation, no export outside `/tmp`, no
-  plugins or options chosen by a request. The driver identifies methods by their
-  raw DEX identity escaped exactly as `dex.*` rows show it; JADX's display
-  renames appear only inside the Java text.
+  verifier): `--memory 2g --memory-swap 2g --pids-limit 256 --cpus 2
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=512m`, wall 120 s, JVM heap 1,536 MiB,
+  one JADX thread (decision `m4b-w-plan`; measured: about 4 s and a 207 MB heap
+  peak for a 21.7 MB DEX of 60,001 methods).
+- **Analysis**: the host resolves the escaped selectors with `dex.py` first.
+  The worker request carries the artifact of every clean `classes*.dex` member
+  (central directory order, at most 16 and 128 MiB, for type resolution), the
+  selected methods as targets (member, and class, name and prototype as hex of
+  their raw decoded text, so no escaping or injection question reaches Java),
+  `start` and `max_chars`. The worker re-materializes each member from the
+  read-only snapshot into `/tmp` and refuses unless size, CRC-32 and SHA-256 equal
+  the artifact; JADX reads only those DEX files, never the ZIP, with only its DEX
+  input plugin, no resource decoding, no deobfuscation or renames, comments at
+  WARN (no paths), no export outside `/tmp`, no option chosen by a request. JADX's
+  display names appear only inside the Java text.
 - **Argument kind `identity`**: 0..255 printable ASCII characters, the escaped
   form rows show. Unlike `literal`, a contained tool may declare it; its worker
   compares it as text only, never as a path, option or program.
@@ -720,14 +729,22 @@ Java is the decompiler's reading, kept **derived** like Ghidra's pseudocode.
   (nothing produced: `text` "", `start` = `total` = 0); `total` the length in
   characters of the method's whole text; `text` its characters from `start`, at
   most `max_chars`, cut further to the longest prefix whose observation fits
-  4,096 bytes; only printable ASCII, newline and tab (the driver writes any other
-  character as a Java `\uXXXX` escape).
-- **Anchors**: the worker's observations carry no location, offset or artifact.
-  The host anchors each one itself: it decodes the named DEX member with `dex.py`
-  (same limits, same escaped selectors), requires the identity to name exactly one
-  method with code, and anchors the observation at that method's instructions
-  (the `insns` of its `code_item`) inside the member's child artifact. Anything
-  else fails the operation.
+  4,096 bytes. The text is printable ASCII, newline and tab only: the driver
+  writes every other UTF-16 unit as a Java `\uXXXX` escape, and `start` and
+  `total` count characters of that escaped text. The class declaration line JADX
+  prints before a class's first method is not part of the method's text.
+- **Reply and anchors**: the worker answers each target, in order, with its
+  status (`ok`, `fallback`, `decompile_failed`, `class_not_found`,
+  `method_not_found`, `no_code`), JADX's `code_offset` and `insns_count` for the
+  method, `total` and `text`; a whole-run failure (`memory`, `timeout`, `input`)
+  is a fixed error and fails the operation. It names no location or artifact.
+  The host builds each observation itself: identities escaped from its own
+  `dex.py` rows, `form` `java` for `ok`, `fallback` for `fallback`, `error`
+  otherwise; it requires JADX's `code_offset` and `insns_count` to equal the
+  verified `code_offset` and `code_units` of that method (for `ok` and
+  `fallback`), and anchors the observation at the method's instructions (the
+  `insns` of its `code_item`) inside the member's child artifact. A reply for
+  other methods, in another order, or with other counts fails the operation.
 - **Claim** `android.java` (inferred, derived): the observation's fields but
   `kind`, one finding per method page. It never contradicts and is never
   contradicted.
