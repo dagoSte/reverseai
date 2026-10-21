@@ -23,7 +23,7 @@ from reverseai.contract import (
 )
 from tests import verify_m2_runtime as verifier
 from tests.fixtures_structure import elf, pe
-from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code
+from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code, elf_refs, pe_refs, macho_refs
 
 
 IMAGE_ID = "sha256:" + "a" * 64
@@ -2643,7 +2643,8 @@ class YaraxKnownAnswerRegressionTests(unittest.TestCase):
                              max_matches=cap, ruleset=ruleset)
 
 
-GHIDRA_BUILDERS = {"elf_code": elf_code, "pe_code": pe_code, "elf_data_only": elf_data_only, "macho_code": macho_code}
+GHIDRA_BUILDERS = {"elf_code": elf_code, "pe_code": pe_code, "elf_data_only": elf_data_only, "macho_code": macho_code,
+                   "elf_refs": elf_refs, "pe_refs": pe_refs, "macho_refs": macho_refs}
 
 
 def ghidra_worker_records(layout, *, pseudocode=None, names=None, sizes=None):
@@ -2684,7 +2685,24 @@ def ghidra_worker_records(layout, *, pseudocode=None, names=None, sizes=None):
                    "to_name": name_at_entry[row["to"]]}}
         for row in layout["calls"]
     ]
-    return records + (calls + texts if default_pseudocode else texts + calls)
+    if "refs" not in layout:
+        return records + (calls + texts if default_pseudocode else texts + calls)
+    result = records + texts + calls
+    selection = sorted(records, key=lambda item: (item["value"]["entry"] != layout["entry"],
+                                                  -item["value"]["size"], item["value"]["entry"]))[:4]
+    for function in selection:
+        value = function["value"]
+        rows = layout["functions"][value["index"]]["instructions"]
+        result.append({"location": dict(function["location"]), "value": {
+            "kind": "assembly", "index": value["index"], "entry": value["entry"],
+            "instructions": [[*row, "canned instruction"] for row in rows], "truncated": False}})
+    for row in layout["refs"]:
+        result.append({"location": {"offset": row["offset"], "length": row["length"]}, "value": {
+            "kind": "ref", **{key: row[key] for key in ("from", "to", "type")}, "to_name": row["to_name"] or ""}})
+    for row in layout["strings"]:
+        result.append({"location": {"offset": row["offset"], "length": row["length"]}, "value": {
+            "kind": "string", **{key: row[key] for key in ("address", "encoding", "text", "truncated", "from")}}})
+    return result
 
 
 def ghidra_observations(records):
@@ -3000,8 +3018,52 @@ class GhidraKnownAnswerTests(unittest.TestCase):
                 parse_worker_reply(raw, input_sha256=sha256_hex(data), max_observations=400)
 
 
+class GhidraM3cKnownAnswerTests(unittest.TestCase):
+    def setUp(self):
+        self.data, self.layout = elf_refs()
+        self.rows = ghidra_worker_records(self.layout, pseudocode=(0,))
+
+    def test_new_fixtures_have_assembly_exact_refs_and_both_encoded_strings(self):
+        for builder in (elf_refs, pe_refs, macho_refs):
+            data, layout = builder()
+            rows = ghidra_worker_records(layout, pseudocode=(0,))
+            with self.subTest(format=layout["format"]):
+                self.assertEqual(sum(row["value"]["kind"] == "assembly" for row in rows), 4)
+                self.assertEqual(sum(row["value"]["kind"] == "ref" for row in rows), 6)
+                self.assertEqual([row["value"]["encoding"] for row in rows if row["value"]["kind"] == "string"],
+                                 ["ascii", "utf-16le"])
+                self.assertIsNone(verifier.compare_ghidra_observations(data, ghidra_observations(rows)))
+
+    def test_omitted_duplicate_reordered_or_moved_new_observations_fail_the_oracle(self):
+        for kind in ("assembly", "ref", "string"):
+            indices = [index for index, row in enumerate(self.rows) if row["value"]["kind"] == kind]
+            index = indices[0]
+            for mode in ("omitted", "last_omitted", "duplicate", "reordered", "moved"):
+                rows = copy.deepcopy(self.rows)
+                if mode == "omitted": del rows[index]
+                elif mode == "last_omitted": del rows[indices[-1]]
+                elif mode == "duplicate": rows.insert(index, copy.deepcopy(rows[index]))
+                elif mode == "reordered": rows[index], rows[indices[1]] = rows[indices[1]], rows[index]
+                else: rows[index]["location"]["offset"] += 1
+                with self.subTest(kind=kind, mode=mode), self.assertRaises(verifier.VerificationError):
+                    verifier.compare_ghidra_observations(self.data, ghidra_observations(rows))
+
+    def test_new_known_answers_refuse_lies_at_otherwise_valid_locations(self):
+        for kind, field, bad in (("assembly", "instructions", [[0, 2, "x"]]),
+                                ("assembly", "truncated", True), ("ref", "from", 0),
+                                ("ref", "to", 0), ("ref", "type", "execute"),
+                                ("string", "text", "forged"), ("string", "encoding", "ascii"),
+                                ("string", "truncated", True), ("string", "from", [0])):
+            rows = copy.deepcopy(self.rows)
+            index = next(index for index, row in enumerate(rows) if row["value"]["kind"] == kind
+                         and (field != "encoding" or row["value"].get("encoding") == "utf-16le"))
+            rows[index]["value"][field] = bad
+            with self.subTest(kind=kind, field=field), self.assertRaises(verifier.VerificationError):
+                verifier.compare_ghidra_observations(self.data, ghidra_observations(rows))
+
+
 def ghidra_lock_fixture():
-    return {"adapter_version": "12.1.4-r4", "platform": "linux/arm64", "image_id": IMAGE_ID,
+    return {"adapter_version": "12.1.4-r5", "platform": "linux/arm64", "image_id": IMAGE_ID,
             "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
             "ghidra_sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",
             "jdk_sha256": "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223"}
@@ -3011,7 +3073,7 @@ def ghidra_receipt_fixture():
     receipt = receipt_fixture()
     receipt.update(tool="ghidra", lock=ghidra_lock_fixture(),
                    checks=[{"id": name, "status": "passed"} for name in verifier.GHIDRA_REQUIRED_CHECKS],
-                   cleanup=receipt["cleanup"][:14])
+                   cleanup=receipt["cleanup"][:17])
     return receipt
 
 
@@ -3060,8 +3122,8 @@ class GhidraFakeBoundary(FakeBoundary):
 
 
 class GhidraProfileAndReceiptTests(unittest.TestCase):
-    def test_older_lock_and_receipt_cannot_impersonate_r4(self):
-        for version in ("12.1.4-r1", "12.1.4-r2", "12.1.4-r3"):
+    def test_older_lock_and_receipt_cannot_impersonate_r5(self):
+        for version in ("12.1.4-r1", "12.1.4-r2", "12.1.4-r3", "12.1.4-r4"):
             lock = ghidra_lock_fixture()
             lock["adapter_version"] = version
             with self.subTest(version=version), self.assertRaises(verifier.VerificationError):
@@ -3080,14 +3142,14 @@ class GhidraProfileAndReceiptTests(unittest.TestCase):
             verifier.NativeVerifier(boundary, ghidra_lock_fixture(), {"checks": [], "cleanup": []}, tool="ghidra")
         self.assertEqual(boundary.calls, [])
 
-    def test_reviewed_lock_and_complete_receipt_have_six_keys_seventeen_checks_fourteen_runs(self):
+    def test_reviewed_lock_and_complete_receipt_have_six_keys_twenty_checks_seventeen_runs(self):
         lock = ghidra_lock_fixture()
         verifier.verify_ghidra_lock(lock)
         receipt = ghidra_receipt_fixture()
         self.assertEqual(len(lock), 6)
-        self.assertEqual(len(receipt["checks"]), 17)
-        self.assertEqual(len(receipt["cleanup"]), 14)
-        self.assertEqual(verifier.GHIDRA_FIXTURE_NAMES, ("elf_code", "pe_code", "elf_data_only", "macho_code"))
+        self.assertEqual(len(receipt["checks"]), 20)
+        self.assertEqual(len(receipt["cleanup"]), 17)
+        self.assertEqual(verifier.GHIDRA_FIXTURE_NAMES, ("elf_code", "pe_code", "elf_data_only", "macho_code", "elf_refs", "pe_refs", "macho_refs"))
         self.assertIn("macho_code.analyze", {row["id"] for row in receipt["checks"]})
         self.assertTrue(verifier.receipt_passes(receipt))
 
@@ -3107,18 +3169,14 @@ class GhidraProfileAndReceiptTests(unittest.TestCase):
             with self.subTest(extra=key), self.assertRaises(verifier.VerificationError):
                 verifier.verify_ghidra_lock(lock)
 
-    def test_cross_profile_provenance_refuses_substitution_and_identical_cleanup_is_shared(self):
+    def test_cross_profile_provenance_refuses_substitution_including_different_cleanup_counts(self):
         for tool in ("lief", "yarax"):
             foreign = receipt_fixture() if tool == "lief" else YaraxReceiptTests().receipt()
             for key in ("tool", "lock", "checks", "cleanup"):
                 receipt = ghidra_receipt_fixture()
                 receipt[key] = foreign[key]
                 with self.subTest(source=tool, field=key):
-                    if tool == "yarax" and key == "cleanup":
-                        self.assertEqual(foreign[key], ghidra_receipt_fixture()[key])
-                        self.assertTrue(verifier.receipt_passes(receipt))
-                    else:
-                        self.assertFalse(verifier.receipt_passes(receipt))
+                    self.assertFalse(verifier.receipt_passes(receipt))
             foreign["lock"] = ghidra_lock_fixture()
             self.assertFalse(verifier.receipt_passes(foreign))
         for key in ("ruleset_sha256", "wheel_sha256"):
@@ -3310,7 +3368,7 @@ class GhidraNativeProfileTests(unittest.TestCase):
         self.assertIsNone(self.receipt["cleanup"][0]["container_id"])
         self.assertFalse(self.receipt["cleanup"][0]["verified"])
 
-    def test_profile_plan_uses_three_fixtures_one_operation_and_exactly_thirteen_inspections(self):
+    def test_profile_plan_uses_seven_fixtures_one_operation_and_seventeen_native_runs(self):
         def control(name, data):
             self.native.inspected += 1
             self.assertEqual(data, elf_code()[0])
@@ -3328,7 +3386,7 @@ class GhidraNativeProfileTests(unittest.TestCase):
             [mock.call(data, "ghidra.analyze") for data in verifier.ghidra_fixtures().values()])
         self.assertEqual({row["id"] for row in self.receipt["checks"]}, set(verifier.GHIDRA_REQUIRED_CHECKS))
         self.assertTrue(all(row["status"] == "passed" for row in self.receipt["checks"]))
-        self.assertEqual(self.native.native_runs, 14)
+        self.assertEqual(self.native.native_runs, 17)
 
     def test_controls_pass_only_fixed_ghidra_request_and_validate_ghidra_evidence(self):
         for name in verifier.CONTROL_NAMES:
@@ -3336,9 +3394,10 @@ class GhidraNativeProfileTests(unittest.TestCase):
             with mock.patch.object(self.native, "invoke", return_value=json.dumps(value).encode()) as invoke:
                 self.assertEqual(self.native.control(name, elf_code()[0]), value)
             invoke.assert_called_once_with(elf_code()[0], "ghidra.analyze",
-                {"max_functions": 64, "decompile": 8, "max_chars": 1024, "max_calls": 128}, probe=name)
+                {"max_functions": 64, "decompile": 8, "max_chars": 1024, "max_calls": 128,
+                 "assembly": 4, "max_instructions": 32, "max_refs": 64, "max_strings": 32}, probe=name)
 
-    def test_known_answer_runs_all_four_exact_fixtures_and_refuses_forgery(self):
+    def test_known_answer_runs_all_seven_exact_fixtures_and_refuses_forgery(self):
         for builder in GHIDRA_BUILDERS.values():
             data, layout = builder()
             rows = ghidra_worker_records(layout, pseudocode=(0,) if layout["functions"] else ())
@@ -3392,7 +3451,7 @@ class GhidraNativeProfileTests(unittest.TestCase):
             staging = Path(folder) / "snapshot"
             def factory(lock, *, runner, adapter_version):
                 self.assertEqual(lock, ghidra_lock_fixture())
-                self.assertEqual(adapter_version, "12.1.4-r4")
+                self.assertEqual(adapter_version, "12.1.4-r5")
                 def run(operation, args, data, digest):
                     staging.mkdir()
                     (staging / "input").write_bytes(data)
@@ -3457,11 +3516,11 @@ class GhidraMainTests(unittest.TestCase):
         self.assertEqual(run.receipt["lock_sha256"], sha256_hex(run.raw))
         self.assertEqual(run.receipt["executor_sha256"], sha256_hex(b"inert frozen source"))
         self.assertEqual(run.receipt["verifier_sha256"], sha256_hex(b"inert frozen source"))
-        run.boundary.load_lock.assert_called_once_with(run.lock, adapter_version="12.1.4-r4")
+        run.boundary.load_lock.assert_called_once_with(run.lock, adapter_version="12.1.4-r5")
         run.factory.assert_called_once()
         self.assertEqual(run.factory.call_args.kwargs, {"tool": "ghidra"})
-        self.assertEqual(len(run.receipt["checks"]), 17)
-        self.assertEqual(len(run.receipt["cleanup"]), 14)
+        self.assertEqual(len(run.receipt["checks"]), 20)
+        self.assertEqual(len(run.receipt["cleanup"]), 17)
         self.assertNotIn("ruleset_sha256", run.receipt)
 
     def test_cli_rejects_foreign_locks_and_profile_drift_before_native_creation(self):

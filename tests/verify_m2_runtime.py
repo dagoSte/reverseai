@@ -27,7 +27,7 @@ if __package__ in (None, ""):
 from reverseai.contract import MAX_WORKER_REPLY_BYTES, Observation, parse_worker_reply, sha256_hex
 from reverseai.tools import structure, ghidra_verify
 from tests.fixtures_structure import elf, pe
-from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code
+from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code, elf_refs, pe_refs, macho_refs
 
 
 PLATFORM = "linux/arm64"
@@ -52,11 +52,11 @@ YARAX_FIXTURE_NAMES = ("upx_markers", "utf16_markers", "clean", "repeated_marker
 YARAX_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                          *(f"{name}.matches" for name in YARAX_FIXTURE_NAMES))
 YARAX_NATIVE_RUNS = len(CONTROL_NAMES) + len(YARAX_FIXTURE_NAMES)
-GHIDRA_ADAPTER_VERSION = "12.1.4-r4"
+GHIDRA_ADAPTER_VERSION = "12.1.4-r5"
 GHIDRA_BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
 GHIDRA_SHA256 = "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db"
 GHIDRA_JDK_SHA256 = "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223"
-GHIDRA_FIXTURE_NAMES = ("elf_code", "pe_code", "elf_data_only", "macho_code")
+GHIDRA_FIXTURE_NAMES = ("elf_code", "pe_code", "elf_data_only", "macho_code", "elf_refs", "pe_refs", "macho_refs")
 GHIDRA_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                           *(f"{name}.analyze" for name in GHIDRA_FIXTURE_NAMES))
 GHIDRA_NATIVE_RUNS = len(CONTROL_NAMES) + len(GHIDRA_FIXTURE_NAMES)
@@ -258,22 +258,28 @@ def verify_ghidra_lock(lock):
 
 
 def ghidra_fixtures():
-    return dict(zip(GHIDRA_FIXTURE_NAMES, (elf_code()[0], pe_code()[0], elf_data_only()[0], macho_code()[0])))
+    return dict(zip(GHIDRA_FIXTURE_NAMES, (elf_code()[0], pe_code()[0], elf_data_only()[0], macho_code()[0],
+                                         elf_refs()[0], pe_refs()[0], macho_refs()[0])))
 
 
 def ghidra_args():
-    return {"max_functions": 64, "decompile": 8, "max_chars": 1024, "max_calls": 128}
+    return {"max_functions": 64, "decompile": 8, "max_chars": 1024, "max_calls": 128,
+            "assembly": 4, "max_instructions": 32, "max_refs": 64, "max_strings": 32}
 
 
 def compare_ghidra_observations(data, observations):
     """Check fixture entries/calls/symbols and require working decompilation."""
     need(type(data) is bytes and isinstance(observations, (list, tuple)), "KnownAnswerShape")
-    layout = next((layout for sample, layout in (elf_code(), pe_code(), elf_data_only(), macho_code()) if sample == data), None)
+    layout = next((layout for sample, layout in (elf_code(), pe_code(), elf_data_only(), macho_code(),
+                                                elf_refs(), pe_refs(), macho_refs()) if sample == data), None)
     need(layout is not None, "KnownAnswerFixture")
-    groups = {"function": [], "pseudocode": [], "call": []}
+    groups = {"function": [], "pseudocode": [], "call": [], "assembly": [], "ref": [], "string": []}
     schemas = {"function": {"kind", "index", "name", "entry", "size"},
                "pseudocode": {"kind", "index", "entry", "text", "truncated"},
-               "call": {"kind", "from", "to", "to_name"}}
+               "call": {"kind", "from", "to", "to_name"},
+               "assembly": {"kind", "index", "entry", "instructions", "truncated"},
+               "ref": {"kind", "from", "to", "type", "to_name"},
+               "string": {"kind", "address", "encoding", "text", "truncated", "from"}}
     for item in observations:
         need(isinstance(item, Observation) and item.location.within(len(data)), "KnownAnswerLocation")
         value = item.value
@@ -319,6 +325,52 @@ def compare_ghidra_observations(data, observations):
              item.location == function.location and type(value["text"]) is str and len(value["text"]) <= 1024 and
              type(value["truncated"]) is bool, "KnownAnswerPseudocode")
         seen.add(index)
+    selection = sorted(functions, key=lambda item: (item.value["entry"] != layout["entry"],
+                                                   -item.value["size"], item.value["entry"]))[:4]
+    assembly = groups["assembly"]
+    if "refs" in layout:
+        need(len(assembly) == len(selection), "KnownAnswerAssemblyMissing")
+    for item, function in zip(assembly, selection):
+        value = item.value
+        need(type(value["index"]) is int and value["index"] == function.value["index"] and
+             type(value["entry"]) is int and value["entry"] == function.value["entry"] and
+             item.location == function.location and type(value["truncated"]) is bool,
+             "KnownAnswerAssemblyAnchor")
+        rows = value["instructions"]
+        need(type(rows) is list and 1 <= len(rows) <= 32, "KnownAnswerInstructions")
+        end = 0
+        for row in rows:
+            need(type(row) is list and len(row) == 3, "KnownAnswerInstruction")
+            delta, length, text = row
+            need(type(delta) is int and type(length) is int and end <= delta and 1 <= length <= 16
+                 and delta + length <= item.location.length and type(text) is str and 1 <= len(text) <= 64
+                 and all(0x20 <= ord(c) <= 0x7e for c in text), "KnownAnswerInstruction")
+            end = delta + length
+        expected = layout["functions"][function.value["index"]].get("instructions")
+        if expected is not None:
+            listed = [row for row in expected if sum(row) <= item.location.length][:32]
+            need([row[:2] for row in rows] == listed and value["truncated"] == (len(listed) < len(expected)),
+                 "KnownAnswerInstructions")
+    need(len(assembly) <= len(selection), "KnownAnswerAssemblyCount")
+    refs = groups["ref"]
+    need(len(refs) == len(layout.get("refs", [])), "KnownAnswerRefCount")
+    for item, expected in zip(refs, layout.get("refs", [])):
+        value = item.value
+        need(type(value["from"]) is int and type(value["to"]) is int and
+             (value["from"], value["to"]) == (expected["from"], expected["to"]) and
+             (item.location.offset, item.location.length) == (expected["offset"], expected["length"]) and
+             value["type"] in ("read", "write", "read_write", "data", "jump") and
+             type(value["to_name"]) is str and len(value["to_name"]) <= 128 and
+             all(c.isprintable() for c in value["to_name"]), "KnownAnswerRef")
+    strings = groups["string"]
+    need(len(strings) == len(layout.get("strings", [])), "KnownAnswerStringCount")
+    for item, expected in zip(strings, layout.get("strings", [])):
+        value = item.value
+        need(type(value["address"]) is int and type(value["truncated"]) is bool and
+             type(value["from"]) is list and all(type(entry) is int for entry in value["from"]) and
+             value == {"kind": "string", **{key: expected[key] for key in ("address", "encoding", "text", "truncated", "from")}}
+             and (item.location.offset, item.location.length) == (expected["offset"], expected["length"]),
+             "KnownAnswerString")
 
 
 def yarax_fixtures():
@@ -731,7 +783,7 @@ class NativeVerifier:
         if self.tool == "ghidra":
             need(operation == "ghidra.analyze", "KnownAnswerShape")
             raw = self.invoke(data, operation, ghidra_args())
-            observations = parse_worker_reply(raw, input_sha256=sha256_hex(data), max_observations=400)
+            observations = parse_worker_reply(raw, input_sha256=sha256_hex(data), max_observations=600)
             ghidra_verify.verify(data, observations, ghidra_args())
             compare_ghidra_observations(data, observations)
             return {"input_sha256": sha256_hex(data), "input_bytes": len(data), "observations": len(observations)}

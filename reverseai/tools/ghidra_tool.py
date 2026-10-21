@@ -6,7 +6,7 @@ from reverseai.contained import ContainedError, DockerExecutor, inspect_image, l
 from reverseai.contract import ArgSpec, ContractError, OperationSpec, ToolRef, ToolSpec, WorkerError, parse_worker_reply, sha256_hex
 from reverseai.tools import ghidra_verify
 
-REF = ToolRef("ghidra", "12.1.4-r4")
+REF = ToolRef("ghidra", "12.1.4-r5")
 DEFAULT_LOCK = Path(__file__).resolve().parents[2] / "containers/ghidra/image.lock.json"
 
 
@@ -20,7 +20,7 @@ def make_tool(executor=None):
         digest = sha256_hex(data)
         raw = executor.run("ghidra.analyze", checked, data, digest)
         try:
-            observations = parse_worker_reply(raw, input_sha256=digest, max_observations=400)
+            observations = parse_worker_reply(raw, input_sha256=digest, max_observations=600)
         except WorkerError:
             raise
         except (ContractError, UnicodeError):
@@ -33,7 +33,11 @@ def make_tool(executor=None):
         "decompile": ArgSpec("int", 0, 16, default=8),
         "max_chars": ArgSpec("int", 64, 2048, default=1024),
         "max_calls": ArgSpec("int", 0, 256, default=128),
-    }, invoke, max_observations=400, derived=True)
+        "assembly": ArgSpec("int", 0, 8, default=4),
+        "max_instructions": ArgSpec("int", 1, 64, default=32),
+        "max_refs": ArgSpec("int", 0, 128, default=64),
+        "max_strings": ArgSpec("int", 0, 64, default=32),
+    }, invoke, max_observations=600, derived=True)
     return ToolSpec(REF, {operation.name: operation}, contained=True,
                     runtime={"image": lock["image_id"], "platform": lock["platform"]})
 

@@ -1,4 +1,4 @@
-"""Re-derive derived Ghidra observations' executable byte anchors, not code semantics."""
+"""Re-derive Ghidra byte anchors and referenced strings, not code semantics."""
 
 from collections import namedtuple
 import struct
@@ -16,6 +16,9 @@ _FIELDS = {
     "function": {"kind", "index", "name", "entry", "size"},
     "pseudocode": {"kind", "index", "entry", "text", "truncated"},
     "call": {"kind", "from", "to", "to_name"},
+    "assembly": {"kind", "index", "entry", "instructions", "truncated"},
+    "ref": {"kind", "from", "to", "type", "to_name"},
+    "string": {"kind", "address", "encoding", "text", "truncated", "from"},
 }
 
 
@@ -108,6 +111,34 @@ def _function_anchor(sections, entry, size):
     return Location(offset, length)
 
 
+def _file_map(sections, start, length, *, virtual):
+    """String mapping admits only file-backed bytes, independent of execute permission."""
+    matches = [section for section in sections if section.size > 0
+               and start < (section.va if virtual else section.offset) + section.size
+               and start + length > (section.va if virtual else section.offset)]
+    _check(len(matches) == 1)
+    section = matches[0]
+    delta = start - (section.va if virtual else section.offset)
+    _check(0 <= delta and delta + length <= section.size)
+    return (section.offset if virtual else section.va) + delta, section
+
+
+def _string_bytes(data, offset, end):
+    for encoding, width in (("ascii", 1), ("utf-16le", 2)):
+        chars = []
+        while len(chars) < 128 and offset + (len(chars) + 1) * width <= end:
+            unit = data[offset + len(chars) * width:offset + (len(chars) + 1) * width]
+            if not 0x20 <= unit[0] <= 0x7e or (width == 2 and unit[1] != 0):
+                break
+            chars.append(chr(unit[0]))
+        following = data[offset + len(chars) * width:min(end, offset + (len(chars) + 1) * width)]
+        truncated = (len(chars) == 128 and len(following) == width
+                     and 0x20 <= following[0] <= 0x7e and (width == 1 or following[1] == 0))
+        if len(chars) >= 2 and (truncated or following == bytes(width)):
+            return encoding, "".join(chars), truncated
+    raise ContractError(REFUSED)
+
+
 def verify(data, observations, args):
     """Validate the whole reply before admitting any derived observation."""
     try:
@@ -117,46 +148,93 @@ def verify(data, observations, args):
 
 
 def _verify(data, observations, args):
-    _check(isinstance(data, bytes) and isinstance(observations, (list, tuple)) and len(observations) <= 400)
+    args = {"assembly": 4, "max_instructions": 32, "max_refs": 64, "max_strings": 32, **args}
+    _check(isinstance(data, bytes) and isinstance(observations, (list, tuple)) and len(observations) <= 600)
     sections, binary_entry = _sections(data)
-    functions, pseudocode, calls = [], [], []
+    groups = {kind: [] for kind in _FIELDS}
+    order = {kind: index for index, kind in enumerate(_FIELDS)}
+    previous_kind = 0
     for item in observations:
         _check(isinstance(item, Observation) and item.location.within(len(data)))
         value = item.value
         kind = value.get("kind")
-        _check(kind in _FIELDS and set(value) == _FIELDS[kind])
+        _check(isinstance(kind, str) and kind in _FIELDS and set(value) == _FIELDS[kind])
+        _check(order[kind] >= previous_kind)
+        previous_kind = order[kind]
+        functions = groups["function"]
         if kind == "function":
             _check(type(value["index"]) is int and value["index"] == len(functions) and _name(value["name"]))
             _check(_uint(value["entry"]) and _uint(value["size"], 1) and value["entry"] + value["size"] <= 2**64)
             _check(not functions or value["entry"] > functions[-1].value["entry"])
             _check(item.location == _function_anchor(sections, value["entry"], value["size"]))
-            functions.append(item)
-        elif kind == "pseudocode":
-            _check(type(value["index"]) is int and _uint(value["entry"]) and isinstance(value["text"], str))
-            _check(len(value["text"]) <= args["max_chars"] and type(value["truncated"]) is bool)
-            pseudocode.append(item)
-        else:
+        elif kind in ("pseudocode", "assembly"):
+            _check(type(value["index"]) is int and _uint(value["entry"]) and type(value["truncated"]) is bool)
+            if kind == "pseudocode":
+                _check(isinstance(value["text"], str) and len(value["text"]) <= args["max_chars"])
+            else:
+                _check(isinstance(value["instructions"], list) and 1 <= len(value["instructions"]) <= args["max_instructions"])
+                end = 0
+                for row in value["instructions"]:
+                    _check(isinstance(row, list) and len(row) == 3)
+                    delta, length, text = row
+                    _check(_uint(delta) and type(length) is int and 1 <= length <= 16
+                           and end <= delta and delta + length <= item.location.length)
+                    _check(isinstance(text, str) and 1 <= len(text) <= 64 and all(0x20 <= ord(c) <= 0x7e for c in text))
+                    end = delta + length
+        elif kind in ("call", "ref"):
             _check(_uint(value["from"]) and _uint(value["to"]) and _name(value["to_name"]))
             _check(1 <= item.location.length <= 16)
-            calls.append(item)
-    _check(len(functions) <= args["max_functions"] and len(pseudocode) <= args["decompile"]
-           and len(calls) <= args["max_calls"])
+            if kind == "ref":
+                _check(value["type"] in ("read", "write", "read_write", "data", "jump"))
+        else:
+            _check(_uint(value["address"]) and type(value["truncated"]) is bool)
+            _check(isinstance(value["from"], list) and 1 <= len(value["from"]) <= 8
+                   and all(_uint(entry) for entry in value["from"]))
+        groups[kind].append(item)
+    for kind, limit in (("function", "max_functions"), ("pseudocode", "decompile"), ("call", "max_calls"),
+                        ("assembly", "assembly"), ("ref", "max_refs"), ("string", "max_strings")):
+        _check(len(groups[kind]) <= args[limit])
+    functions = groups["function"]
     by_entry = {item.value["entry"]: item for item in functions}
     selection = sorted(functions, key=lambda item: (item.value["entry"] != binary_entry,
                                                    -item.value["size"], item.value["entry"]))
     ranks = {item.value["index"]: index for index, item in enumerate(selection)}
-    previous = -1
-    for item in pseudocode:
-        value = item.value
-        _check(0 <= value["index"] < len(functions))
-        function = functions[value["index"]]
-        _check(value["entry"] == function.value["entry"] and item.location == function.location)
-        _check(ranks[value["index"]] > previous)
-        previous = ranks[value["index"]]
-    for item in calls:
+    for kind in ("pseudocode", "assembly"):
+        previous = -1
+        for item in groups[kind]:
+            value = item.value
+            _check(0 <= value["index"] < len(functions))
+            function = functions[value["index"]]
+            _check(value["entry"] == function.value["entry"] and item.location == function.location)
+            _check(ranks[value["index"]] > previous)
+            previous = ranks[value["index"]]
+    for item in groups["call"] + groups["ref"]:
         value = item.value
         _check(value["from"] in by_entry)
         function = by_entry[value["from"]].value
         va, _ = _map(sections, item.location.offset, item.location.length, virtual=False)
         _map(sections, va, item.location.length, virtual=True)
         _check(value["from"] <= va and va + item.location.length <= value["from"] + function["size"])
+    previous = None
+    origins = {}
+    for item in groups["ref"]:
+        value = item.value
+        key = (item.location.offset, value["to"], value["type"])
+        _check(previous is None or key > previous)
+        previous = key
+        origins.setdefault(value["to"], set()).add(value["from"])
+    previous = -1
+    for item in groups["string"]:
+        value = item.value
+        address = value["address"]
+        _check(address > previous and address in origins)
+        previous = address
+        _check(value["from"] == sorted(origins[address])[:8])
+        offset, section = _file_map(sections, address, 1, virtual=True)
+        encoding, text, truncated = _string_bytes(data, offset, section.offset + section.size)
+        _check((value["encoding"], value["text"], value["truncated"]) == (encoding, text, truncated))
+        length = len(text.encode(encoding))
+        _check(item.location == Location(offset, length))
+        checked_length = length + (1 if encoding == "ascii" else 2)
+        _file_map(sections, address, checked_length, virtual=True)
+        _file_map(sections, offset, checked_length, virtual=False)
