@@ -23,7 +23,7 @@ def lock():
 
 
 def ghidra_lock():
-    return {"image_id": "sha256:" + "a" * 64, "platform": "linux/arm64", "adapter_version": "12.1.4-r5",
+    return {"image_id": "sha256:" + "a" * 64, "platform": "linux/arm64", "adapter_version": "12.1.4-r6",
             "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
             "ghidra_sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",
             "jdk_sha256": "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223"}
@@ -306,9 +306,9 @@ class LockAndArgvTests(unittest.TestCase):
 
 class GhidraBoundaryTests(unittest.TestCase):
     def test_lock_has_exact_pinned_ghidra_keys_and_no_wheel(self):
-        kwargs = {"adapter_version": "12.1.4-r5"}
+        kwargs = {"adapter_version": "12.1.4-r6"}
         self.assertEqual(load_lock(ghidra_lock(), **kwargs), ghidra_lock())
-        for version in ("12.1.4-r1", "12.1.4-r2", "12.1.4-r3", "12.1.4-r4"):
+        for version in ("12.1.4-r1", "12.1.4-r2", "12.1.4-r3", "12.1.4-r4", "12.1.4-r5"):
             with self.subTest(version=version), self.assertRaises(ContainedError):
                 load_lock(dict(ghidra_lock(), adapter_version=version), **kwargs)
         for field in ghidra_lock():
@@ -380,7 +380,7 @@ class GhidraBoundaryTests(unittest.TestCase):
                     if fail:
                         raise ContainedTimeout("WorkerTimeout")
                     return b"reply"
-                executor = DockerExecutor(ghidra_lock(), runner=runner, adapter_version="12.1.4-r5",
+                executor = DockerExecutor(ghidra_lock(), runner=runner, adapter_version="12.1.4-r6",
                                           inspect=lambda image: image, staging_root=folder)
                 with self.subTest(fail=fail):
                     if fail:
@@ -400,10 +400,107 @@ class GhidraBoundaryTests(unittest.TestCase):
 
     def test_default_ghidra_executor_selects_the_closed_profile_on_the_same_runner(self):
         with tempfile.TemporaryDirectory() as folder, patch("reverseai.contained.run_bounded", return_value=b"reply") as runner:
-            executor = DockerExecutor(ghidra_lock(), adapter_version="12.1.4-r5", inspect=lambda image: image, staging_root=folder)
+            executor = DockerExecutor(ghidra_lock(), adapter_version="12.1.4-r6", inspect=lambda image: image, staging_root=folder)
             executor.run("ghidra.analyze", {}, b"inert", sha256_hex(b"inert"))
             self.assertEqual(runner.call_args.kwargs,
                              {"profile": "ghidra", "timeout": 240, "max_output": MAX_WORKER_REPLY_BYTES})
+
+
+class GhidraQueryBoundaryTests(unittest.TestCase):
+    DEFAULTS = {
+        "ghidra.functions": {"query": "", "start": 0, "limit": 64},
+        "ghidra.function": {"select": "entry", "entry": 0, "name": "", "parts": "all", "start": 0,
+                            "limit": 64, "max_chars": 1024, "max_calls": 64, "max_refs": 64},
+        "ghidra.xrefs": {"address": 0, "start": 0, "limit": 64},
+    }
+
+    def argv(self, operation, args):
+        return build_argv(ghidra_lock()["image_id"], "reverseai-abc", "/private/staging", operation, args)
+
+    def test_query_defaults_keep_the_same_argv_and_fixed_resource_profile(self):
+        control = self.argv("ghidra.analyze", {})
+        for operation, expected in self.DEFAULTS.items():
+            with self.subTest(operation=operation):
+                args = {"address": 0} if operation == "ghidra.xrefs" else {}
+                try:
+                    argv = self.argv(operation, args)
+                except ContainedError as failure:
+                    self.fail(f"Declared query operation refused: {failure}")
+                self.assertEqual(argv[:-2], control[:-2])
+                self.assertEqual(argv[-2], operation)
+                self.assertEqual(json.loads(argv[-1]), expected)
+                self.assertEqual(resource_profile(operation), resource_profile("ghidra.analyze"))
+                self.assertEqual(resource_profile(operation)["wall_seconds"], 240)
+        for operation in ("ghidra.other", "ghidra", "ghidra.functions --privileged"):
+            with self.subTest(operation=operation), self.assertRaises(ContainedError):
+                self.argv(operation, {})
+
+    def test_query_boundary_rejects_unknown_keys_invalid_bounds_and_non_str_search(self):
+        ranges = {
+            "ghidra.functions": {"start": (0, 65535), "limit": (1, 128)},
+            "ghidra.function": {"entry": (0, 2 ** 64 - 1), "start": (0, 65535), "limit": (1, 256),
+                                "max_chars": (64, 2048), "max_calls": (0, 256), "max_refs": (0, 128)},
+            "ghidra.xrefs": {"address": (0, 2 ** 64 - 1), "start": (0, 65535), "limit": (1, 256)},
+        }
+        for operation, bounds in ranges.items():
+            defaults = self.DEFAULTS[operation]
+            for key, (low, high) in bounds.items():
+                for number in (low, high):
+                    with self.subTest(operation=operation, key=key, accepted=number):
+                        try:
+                            argv = self.argv(operation, dict(defaults, **{key: number}))
+                        except ContainedError as failure:
+                            self.fail(f"Declared query bound refused: {failure}")
+                        self.assertEqual(json.loads(argv[-1])[key], number)
+                for value in (low - 1, high + 1, True, str(low), float(low), None):
+                    with self.subTest(operation=operation, key=key, value=value), self.assertRaises(ContainedError):
+                        self.argv(operation, dict(defaults, **{key: value}))
+            for key in ("profile", "timeout", "script", "loader", "path", "entrypoint", "max_functions"):
+                with self.subTest(operation=operation, key=key), self.assertRaises(ContainedError):
+                    self.argv(operation, dict(defaults, **{key: "untrusted"}))
+        for operation, key in (("ghidra.functions", "query"), ("ghidra.function", "name")):
+            for text in ("", "name with spaces", "name`$()", "a" * 256):
+                with self.subTest(operation=operation, accepted=text):
+                    self.assertEqual(json.loads(self.argv(operation, {key: text})[-1])[key], text)
+            for text in ("/tmp/name", "with\\backslash", "-flag", "bad\x00name", "a" * 257, 0, None):
+                with self.subTest(operation=operation, rejected=text), self.assertRaises(ContainedError):
+                    self.argv(operation, {key: text})
+        for key, values in (("select", ("offset", "--entrypoint", None)), ("parts", ("other", "--privileged", None))):
+            for value in values:
+                with self.subTest(key=key, value=value), self.assertRaises(ContainedError):
+                    self.argv("ghidra.function", {key: value})
+        with self.assertRaises(ContainedError):
+            self.argv("ghidra.xrefs", {})
+
+    def test_query_executor_identity_fixed_runner_limits_and_cleanup(self):
+        data = b"inert query snapshot"
+        for operation, args in self.DEFAULTS.items():
+            calls = []
+            with tempfile.TemporaryDirectory() as folder:
+                def runner(argv, **kwargs):
+                    calls.append((argv, kwargs))
+                    mount = argv[argv.index("--mount") + 1]
+                    staged = Path(mount.split("source=")[1].split(",target=")[0])
+                    self.assertEqual((staged / "input").read_bytes(), data)
+                    return b"reply"
+                executor = DockerExecutor(ghidra_lock(), runner=runner, adapter_version="12.1.4-r6",
+                                          inspect=lambda image: image, staging_root=folder)
+                self.assertEqual(executor.run(operation, args, data, sha256_hex(data)), b"reply")
+                self.assertEqual(calls[0][1], {"timeout": 240, "max_output": MAX_WORKER_REPLY_BYTES})
+                self.assertEqual(calls[0][0][-2], operation)
+                self.assertEqual(list(Path(folder).iterdir()), [])
+            with self.subTest(operation=operation), self.assertRaises(ContainedError):
+                DockerExecutor(lock(), inspect=lambda image: image).run(operation, args, data, sha256_hex(data))
+
+    def test_each_default_query_executor_selects_the_closed_ghidra_runner(self):
+        for operation, args in self.DEFAULTS.items():
+            with self.subTest(operation=operation), tempfile.TemporaryDirectory() as folder, \
+                    patch("reverseai.contained.run_bounded", return_value=b"reply") as runner:
+                executor = DockerExecutor(ghidra_lock(), adapter_version="12.1.4-r6",
+                                          inspect=lambda image: image, staging_root=folder)
+                executor.run(operation, args, b"inert", sha256_hex(b"inert"))
+                self.assertEqual(runner.call_args.kwargs,
+                                 {"profile": "ghidra", "timeout": 240, "max_output": MAX_WORKER_REPLY_BYTES})
 
 
 class ProcessRunnerTests(unittest.TestCase):

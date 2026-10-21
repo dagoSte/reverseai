@@ -18,6 +18,7 @@ class Analysis:
     results: tuple  # tuple[AnalysisResult, ...]
     verdicts: tuple  # tuple[ReviewVerdict, ...]
     runtimes: tuple = ()  # ((tool name, {"image": ..., "platform": ...}), ...) for contained tools
+    query: object = None  # {"name": str, "args": dict} for targeted queries only
 
 
 def to_dict(analysis):
@@ -54,6 +55,7 @@ def to_dict(analysis):
                   for t in analysis.tools],
         "results": results,
         "summary": summary,
+        **({"query": analysis.query} if analysis.query is not None else {}),
     }
 
 
@@ -76,7 +78,7 @@ def _address(value):
 
 def _code_value(key, value):
     """Markdown-only address formatting; leave JSON values and byte offsets intact."""
-    if key in ("code.assembly", "code.pseudocode") and isinstance(value, dict):
+    if key in ("code.assembly", "code.pseudocode", "code.instructions", "code.function_info") and isinstance(value, dict):
         return {k: _address(v) if k == "entry" else v for k, v in value.items()}
     if key in ("code.calls", "code.references") and isinstance(value, list):
         width = 2 if key == "code.calls" else 4
@@ -86,7 +88,71 @@ def _code_value(key, value):
         return [{k: _address(v) if k == "address" else [_address(a) for a in v]
                  if k == "from" and isinstance(v, list) else v for k, v in entry.items()}
                 if isinstance(entry, dict) else entry for entry in value]
+    if key in ("code.function_list", "code.xrefs", "code.callers") and isinstance(value, dict):
+        positions = (1,) if key == "code.function_list" else (0, 1)
+        return {k: _address(v) if k == "to" else [
+            [_address(cell) if i in positions else cell for i, cell in enumerate(row)] for row in v]
+                if k == "rows" else v for k, v in value.items()}
+    if key in ("load.entry", "bytes.read") and isinstance(value, dict):
+        return {k: _address(v) if k == "address" else v for k, v in value.items()}
+    if key in ("segments.list", "symbols.list") and isinstance(value, dict):
+        position = 3 if key == "segments.list" else 1
+        return {k: [[_address(cell) if i == position else cell for i, cell in enumerate(row)] for row in v]
+                if k == "rows" else v for k, v in value.items()}
     return value
+
+
+def _query_details(rows):
+    columns = {
+        "segments.list": ("Name", "File offset", "File size", "Address", "Memory size", "Readable", "Writable", "Executable"),
+        "symbols.list": ("Name", "Address", "Type", "Binding", "Defined"),
+        "strings.listed": ("File offset", "Encoding", "Text", "Truncated"),
+        "strings.matches": ("File offset", "Encoding", "Text", "Truncated"),
+        "code.function_list": ("Name", "Entry", "Size"),
+        "code.xrefs": ("At", "From function", "Type"),
+    }
+    lines = []
+    for _, finding in rows:
+        key, raw = finding["claim_key"], finding["value"]
+        if key == "bytes.read":
+            lines += ["", "### Bytes read from the input", "", "| File offset | Address | Bytes (hex) |", "|---|---|---|",
+                      f"| {_cell(raw['offset'])} | {_cell(_address(raw['address']))} | {_cell(raw['hex'], limit=8192)} |"]
+            continue
+        if key == "code.function_info":
+            lines += ["", "### Function (derived)", "", "| Field | Value |", "|---|---|"]
+            lines += [f"| {field} | {_cell(value, limit=512)} |" for field, value in _code_value(key, raw).items()]
+            continue
+        if key == "code.pseudocode":
+            lines += ["", "### Pseudocode (derived)", "", f"Entry: {_cell(_address(raw['entry']))}",
+                      f"Truncated: {_cell(raw['truncated'])}", ""]
+            for line in raw["text"].splitlines():
+                lines += [_cell(line, limit=4096), ""]
+            continue
+        if key in ("code.callers", "code.calls"):
+            value = _code_value(key, raw)
+            values = value.get("rows", []) if key == "code.callers" else value
+            lines += ["", f"### {claims.statement(key)}", "", "| At | From function |" if key == "code.callers"
+                      else "| From function | Callee |", "|---|---|"]
+            lines += ["| " + " | ".join(_cell(cell) for cell in row) + " |" for row in values]
+            continue
+        if key not in columns and key != "code.instructions":
+            continue
+        if not isinstance(raw, dict) or not all(field in raw for field in ("start", "total", "rows")) or not raw["rows"]:
+            continue
+        value = _code_value(key, raw)
+        start, end, total = raw["start"], raw["start"] + len(raw["rows"]) - 1, raw["total"]
+        lines += ["", f"### {claims.statement(key)}", "", f"rows {start}..{end} of {total}"]
+        if end + 1 < total:
+            lines += [f"Next start: {end + 1}"]
+        if key == "code.instructions":
+            lines += [f"Truncated: {_cell(raw['truncated'])}", "", "| Index | Address | Length | Instruction |", "|---|---|---|---|"]
+            for index, (delta, length, text) in enumerate(raw["rows"], start):
+                lines.append(f"| {index} | {_cell(_address(raw['entry'] + delta))} | {_cell(length)} | {_cell(text)} |")
+        else:
+            lines += ["", "| Index | " + " | ".join(columns[key]) + " |", "|---|" + "---|" * len(columns[key])]
+            for index, row in enumerate(value["rows"], start):
+                lines.append(f"| {index} | " + " | ".join(_cell(cell, limit=512) for cell in row) + " |")
+    return lines
 
 
 def _code_details(rows):
@@ -143,6 +209,11 @@ def to_markdown(analysis):
         "## Supported findings",
         "",
     ]
+    if analysis.query is not None:
+        args = analysis.query["args"]
+        displayed = {k: _address(v) if k in ("entry", "address") or (k == "at" and args.get("mode") == "address")
+                     else v for k, v in args.items()}
+        lines[2:2] = [f"- Query: {_cell(analysis.query['name'])}; arguments: {_cell(displayed, limit=4096)}"]
     supported = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] == "supported"]
     derived = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] == "derived"]
     rejected = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] not in ("supported", "derived")]
@@ -164,6 +235,8 @@ def to_markdown(analysis):
         # contract/2: the tool's reading, anchored in the input but not verified against it
         lines += ["", "## Derived by analysis tools (not verified against the bytes)", ""] + table(derived)
         lines += _code_details(derived)
+    if analysis.query is not None:
+        lines += _query_details(supported + derived)
     lines += ["", "## Rejected or unreviewed claims", ""]
     if rejected:
         lines += ["| Analyst | Claim (analyst wording, unchecked) | Verdict | Reasons |", "|---|---|---|---|"]
