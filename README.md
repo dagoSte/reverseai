@@ -6,9 +6,14 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M3d released: targeted queries.** Deterministic
-analysts read file structure (ELF, PE and Mach-O), imports and string indicators in-process, and three pinned
-open-source tools, LIEF, YARA-X and Ghidra, run in locked containers. Every value
+**Status: M4a released: Android packages verified on the host.** Deterministic
+analysts read file structure (ELF, PE and Mach-O), imports and string indicators in-process,
+alongside APK members, binary manifest attributes, DEX classes, methods and code references.
+The gateway and reviewer independently re-derive bytes inside stored or compressed
+package members from the original package (contract/3). These Android results describe
+declarations in the bytes, not evidence of behaviour. Decompiled Java through JADX is
+planned for M4b and needs an approved download.
+Three pinned open-source tools, LIEF, YARA-X and Ghidra, run in locked containers. Every value
 LIEF and YARA-X report is re-derived by the host from the input bytes before it can
 become evidence, and a reviewer re-checks each claim against those bytes. Ghidra's
 functions, pseudocode, calls, assembly and references from code are its own reading.
@@ -21,7 +26,7 @@ Model-driven agents are not part of the current releases.
 ## How it works
 
 <p align="center">
-  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway serves whole-file analysis or one targeted query at a time, running allowlisted operations in host parsers and in a locked container per run (LIEF, YARA-X, Ghidra); the host re-derives every LIEF and YARA-X value and every Ghidra anchor, and re-reads referenced string contents; evidence binds hash, tool, operation and byte range; analysts make claims, including Ghidra assembly, references from code and referenced strings as derived readings; a reviewer re-checks bytes and rules; the report sorts findings into supported, derived, unsupported and contradicted.">
+  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway serves whole-file analysis or a targeted query through host parsers for native files, APK and DEX, or a locked container per run (LIEF, YARA-X, Ghidra); the host re-derives every LIEF and YARA-X value and every Ghidra anchor, and re-reads referenced strings; evidence binds hash, tool, operation and byte range, with member provenance for bytes inside a package; a reviewer independently rebuilds package members and re-checks cited bytes and claim rules; Ghidra interpretations stay derived; reports separate supported, derived, unsupported and contradicted findings.">
 </p>
 
 What this buys, and how each point is checked:
@@ -46,7 +51,8 @@ What this buys, and how each point is checked:
 | M3b | Mach-O host decoder, verified imports for ELF, PE and Mach-O, Ghidra on Mach-O | released |
 | M3c | Ghidra assembly, references from code and referenced strings as derived evidence | released |
 | M3d | Targeted queries by name, address or text with paging; REA's 16 native query names | released |
-| M4 | JADX for Android packages | planned |
+| M4a | APK members, binary manifest and DEX classes, methods and code references verified on the host, including compressed-member evidence (contract/3) | released |
+| M4b | Decompiled Java through JADX; needs an approved download | planned |
 | M5 | JavaScript application analysis | planned |
 | M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
 | M7 | Measured comparison with REA Safe Agent on a known-answer corpus | planned |
@@ -82,6 +88,11 @@ Pages show `rows a..b of N` and the next `start`; a missing row is never evidenc
 | `procedure_callers` | Call sites targeting the selected function | Derived (Ghidra) |
 | `analyze_function` | Function info, pseudocode, assembly, calls and references | Derived (Ghidra) |
 | `xrefs` | References to the selected address | Derived (Ghidra) |
+| `inspect_android_package` | APK members and binary manifest declarations | Verified (host) |
+| `search_android_classes` | DEX classes whose descriptors contain the search text | Verified (host) |
+| `inspect_android_class` | Class metadata and declared methods | Verified (host) |
+| `inspect_android_method` | Method metadata and code references; decompiled Java comes with M4b | Verified (host) |
+| `trace_android_references` | References from or to a method, selected by class, name and optional prototype | Verified (host) |
 
 ## Try it
 
@@ -90,6 +101,7 @@ Python 3.12 or later, no Python dependencies:
 ```sh
 python3 -m reverseai analyze path/to/approved-file --out new-report-dir
 python3 -m reverseai query path/to/approved-file --query list_segments --arg limit=16 --out new-query-dir
+python3 -m reverseai query path/to/approved.apk --query search_android_classes --arg query=Main --out new-android-report
 python3 -B -m unittest discover -s tests -t . -v
 ```
 

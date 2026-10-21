@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 680" width="1280" height="680" role="img" aria-labelledby="title desc">
   <title id="title">How ReverseAI works</title>
-  <desc id="desc">An approved file is frozen and hashed. The gateway serves a whole-file analyze run or one targeted query at a time, running only allowlisted operations within budgets: in-process parsers on the host, and pinned tools (LIEF, YARA-X, Ghidra) in a locked container per run. The host re-derives every LIEF and YARA-X value and every Ghidra anchor from the input bytes, and re-reads referenced string contents. The code analyst also yields assembly, references from code and referenced strings: Ghidra interpretations and reference relationships stay derived. Evidence records bind input hash, tool, operation and byte range. A reviewer re-checks bytes and claim rules, and the report sorts findings into supported, derived, unsupported and contradicted.</desc>
+  <desc id="desc">An approved file is frozen and hashed. The gateway serves whole-file analysis or a targeted query through allowlisted operations within budgets: host parsers for native structure, imports, strings, APK and DEX, and pinned LIEF, YARA-X and Ghidra in a locked container per run. The host re-derives every LIEF and YARA-X value and every Ghidra anchor and re-reads referenced string contents; Ghidra interpretations stay derived. Evidence binds the input hash, tool, operation and byte range, with member provenance for bytes inside a package. The reviewer independently rebuilds stored or compressed members from the package bytes and checks cited ranges and claim rules. Reports separate supported, derived, unsupported and contradicted findings. Android declarations are not evidence of behaviour.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0b1220"/>
@@ -64,7 +64,7 @@
   <g>
     <rect class="box" x="700" y="96" width="320" height="56" rx="12"/>
     <text x="860" y="120" class="h" text-anchor="middle" style="font-size:15px">In-process parsers</text>
-    <text x="860" y="139" class="s" text-anchor="middle">structure, imports, strings (host code, stdlib)</text>
+    <text x="860" y="139" class="s" text-anchor="middle">structure · imports · strings · APK · DEX</text>
   </g>
   <g>
     <rect x="700" y="170" width="320" height="170" rx="16" fill="#0e1a30" stroke="#f59e0b" stroke-width="2" stroke-dasharray="7 5"/>
@@ -110,7 +110,8 @@
     <text x="52" y="468" class="k">input SHA-256 · tool and version</text>
     <text x="52" y="488" class="k">operation · exact byte range</text>
     <text x="52" y="508" class="k">hash of the bytes at that range</text>
-    <text x="52" y="538" class="s" style="font-size:11.5px">made only by the gateway, content-bound ID</text>
+    <text x="52" y="526" class="k">package member provenance, if any</text>
+    <text x="52" y="548" class="s" style="font-size:11.5px">gateway-created · content-bound ID</text>
   </g>
   <g>
     <rect class="box" x="330" y="412" width="220" height="150" rx="14"/>
@@ -128,9 +129,9 @@
     <text x="635" y="439" class="h">Reviewer</text>
     <circle cx="805" cy="452" r="15" fill="none" stroke="#7dd3fc" stroke-width="3"/>
     <path d="M816 463 l12 12" stroke="#7dd3fc" stroke-width="4" stroke-linecap="round"/>
-    <text x="612" y="474" class="k">re-reads every cited byte range</text>
-    <text x="612" y="494" class="k">claim rule must give exactly</text>
-    <text x="612" y="514" class="k">the claimed value</text>
+    <text x="612" y="474" class="k">re-reads input or member bytes</text>
+    <text x="612" y="494" class="k">members rebuilt from package bytes</text>
+    <text x="612" y="514" class="k">claim rule must match the value</text>
     <text x="612" y="542" class="s" style="font-size:11.5px">analyst output is untrusted</text>
   </g>
   <g>
