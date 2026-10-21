@@ -864,6 +864,15 @@ class TargetedAnchorTests(unittest.TestCase):
         changed["location"]["length"] -= 1
         self.refuse([target, changed], args=args)
 
+    def test_function_parts_require_global_order_even_when_each_part_is_valid(self):
+        target = self.target()
+        pseudo = {"location": dict(target["location"]), "value": {"kind": "pseudocode", "index": 0,
+                  "entry": target["value"]["entry"], "text": "return a + b;", "truncated": False}}
+        page = self.instruction_page(target)
+        args = {"entry": target["value"]["entry"], "parts": "all", "limit": 2}
+        self.check([target, pseudo, page], args=args)
+        self.refuse([target, page, pseudo], args=args)
+
     def test_instruction_page_checks_virtual_start_exact_span_and_function_extent(self):
         target = self.target()
         page = self.instruction_page(target)
