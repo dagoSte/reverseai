@@ -15,15 +15,19 @@ from reverseai.review import review
 
 DATA = bytes(range(256)) * 32
 INPUT = InputRef(sha256_hex(DATA), len(DATA), "inline.bin")
-REF = ToolRef("ghidra", "12.1.4-r4")
+REF = ToolRef("ghidra", "12.1.4-r5")
 
 
 def tool(*, ref=REF, derived=True, operation="ghidra.analyze"):
     args = {"max_functions": ArgSpec("int", 1, 128, default=64),
             "decompile": ArgSpec("int", 0, 16, default=8),
             "max_chars": ArgSpec("int", 64, 2048, default=1024),
-            "max_calls": ArgSpec("int", 0, 256, default=128)}
-    spec = OperationSpec(operation, args, lambda data, args: (), max_observations=400, derived=derived)
+            "max_calls": ArgSpec("int", 0, 256, default=128),
+            "assembly": ArgSpec("int", 0, 8, default=4),
+            "max_instructions": ArgSpec("int", 1, 64, default=32),
+            "max_refs": ArgSpec("int", 0, 128, default=64),
+            "max_strings": ArgSpec("int", 0, 64, default=32)}
+    spec = OperationSpec(operation, args, lambda data, args: (), max_observations=600, derived=derived)
     return ToolSpec(ref, {operation: spec})
 
 
@@ -44,6 +48,22 @@ def call(offset=4, *, source=0x1000, target=0x1020, name="helper"):
     return observed(offset, length=5, **{"kind": "call", "from": source, "to": target, "to_name": name})
 
 
+def assembly(index=0, *, instructions=None, truncated=False):
+    return observed(index * 32, kind="assembly", index=index, entry=0x1000 + index * 32,
+                    instructions=[[0, 5, "CALL helper"], [5, 1, "RET"]] if instructions is None else instructions,
+                    truncated=truncated)
+
+
+def reference(offset=4, *, source=0x1000, target=0x2000, type="read", name="message"):
+    return observed(offset, length=5, **{"kind": "ref", "from": source, "to": target, "type": type, "to_name": name})
+
+
+def string(address=0x2000, *, text="message", encoding="ascii", sources=None, truncated=False, offset=128):
+    return observed(offset, length=len(text) * (2 if encoding == "utf-16le" else 1),
+                    **{"kind": "string", "address": address, "encoding": encoding, "text": text,
+                       "truncated": truncated, "from": [0x1000] if sources is None else sources})
+
+
 class CodeAnalystTests(unittest.TestCase):
     def setUp(self):
         self.tool = tool()
@@ -57,7 +77,7 @@ class CodeAnalystTests(unittest.TestCase):
     def test_plan_is_optional_and_requires_the_exact_derived_operation(self):
         self.assertIsNone(code.plan(INPUT))
         for other in (tool(ref=ToolRef("ghidra", "12.1.4-r1")), tool(ref=ToolRef("ghidra", "12.1.4-r2")),
-                      tool(ref=ToolRef("ghidra", "12.1.4-r3")),
+                      tool(ref=ToolRef("ghidra", "12.1.4-r3")), tool(ref=ToolRef("ghidra", "12.1.4-r4")),
                       tool(derived=False), tool(operation="ghidra.other")):
             with self.subTest(tool=other.ref, operations=tuple(other.operations)):
                 self.assertIsNone(code.plan(INPUT, tools=(other,)))
@@ -68,7 +88,8 @@ class CodeAnalystTests(unittest.TestCase):
         self.assertEqual(self.task.id, content_id("tk", {"input": INPUT.sha256, "role": "code"}))
         self.assertEqual(self.task.operations, (OperationRequest("ghidra.analyze"),))
         self.assertEqual(self.tool.operations["ghidra.analyze"].validate_args(self.task.operations[0].args),
-                         {"decompile": 8, "max_calls": 128, "max_chars": 1024, "max_functions": 64})
+                         {"decompile": 8, "max_calls": 128, "max_chars": 1024, "max_functions": 64,
+                          "assembly": 4, "max_instructions": 32, "max_refs": 64, "max_strings": 32})
         self.assertEqual(self.task, code.plan(INPUT, tools=(self.tool, self.tool)))
         self.assertEqual(self.task.id, code.plan(replace(INPUT, name="alias"), tools=(self.tool,)).id)
         self.assertNotEqual(self.task.id, code.plan(replace(INPUT, sha256="f" * 64), tools=(self.tool,)).id)
@@ -212,6 +233,101 @@ class CodeAnalystTests(unittest.TestCase):
         for index, finding in enumerate(grouped["code.calls"]):
             self.assertEqual(set(finding.evidence_ids), {e.id for e in ordered_calls[index * 64:(index + 1) * 64]})
         self.assertEqual({v.status for v in self.verdicts(evidence, findings)}, {"derived"})
+
+    def test_m3c_exact_values_order_citations_and_real_derived_verdicts(self):
+        evidence = (assembly(1, truncated=True), reference(target=0x3000, type="write"),
+                    string(0x3000, text="later"), assembly(), reference(), string())
+        findings = code.conclude(self.task, evidence)
+        listings = [f for f in findings if f.claim_key == "code.assembly"]
+        self.assertEqual([f.value for f in listings], [
+            {"entry": 0x1000, "instructions": [[0, 5, "CALL helper"], [5, 1, "RET"]], "truncated": False},
+            {"entry": 0x1020, "instructions": [[0, 5, "CALL helper"], [5, 1, "RET"]], "truncated": True}])
+        self.assertEqual([f.evidence_ids for f in listings], [(evidence[3].id,), (evidence[0].id,)])
+        refs = next(f for f in findings if f.claim_key == "code.references")
+        self.assertEqual(refs.value, [[0x1000, "read", 0x2000, "message"], [0x1000, "write", 0x3000, "message"]])
+        self.assertEqual(set(refs.evidence_ids), {evidence[1].id, evidence[4].id})
+        strings = next(f for f in findings if f.claim_key == "code.strings")
+        self.assertEqual(strings.value, [{k: e.observation[k] for k in ("address", "encoding", "text", "truncated", "from")}
+                                         for e in (evidence[5], evidence[2])])
+        self.assertEqual(set(strings.evidence_ids), {evidence[2].id, evidence[5].id})
+        self.assertEqual({v.status for v in self.verdicts(evidence, findings)}, {"derived"})
+        self.assertTrue(all(f.confidence == "inferred" for f in findings))
+        self.assertEqual(findings, code.conclude(self.task, tuple(reversed(evidence)) + evidence))
+
+    def test_m3c_shape_and_bounds_refuse_malformed_values(self):
+        examples = [assembly(), reference(), string()]
+        malformed = []
+        for item in examples:
+            value = item.observation
+            for field in value:
+                malformed.append({k: v for k, v in value.items() if k != field})
+            malformed.append(dict(value, extra="unexpected"))
+        listing, ref, text = [item.observation for item in examples]
+        malformed += [dict(listing, **changes) for changes in (
+            {"index": True}, {"index": 128}, {"entry": -1}, {"instructions": {}}, {"instructions": []},
+            {"instructions": [[0, 0, "RET"]]}, {"instructions": [[True, 1, "RET"]]},
+            {"instructions": [[0, True, "RET"]]}, {"instructions": [[0, 17, "RET"]]},
+            {"instructions": [[15, 2, "RET"]]}, {"instructions": [[0, 2, "MOV"], [1, 1, "RET"]]},
+            {"instructions": [[0, 1, ""]]}, {"instructions": [[0, 1, "x" * 65]]},
+            {"instructions": [[0, 1, "line\nRET"]]}, {"instructions": [[0, 1, "é"]]},
+            {"instructions": [[0, 1, "RET", "extra"]]}, {"instructions": [[0, 1, "RET"]] * 65},
+            {"truncated": 1})]
+        malformed += [dict(ref, **changes) for changes in (
+            {"from": True}, {"to": -1}, {"type": "call"}, {"type": []},
+            {"to_name": "x" * 129}, {"to_name": "bad\x00name"})]
+        malformed += [dict(text, **changes) for changes in (
+            {"address": True}, {"encoding": "utf-8"}, {"text": "x"}, {"text": "x" * 129},
+            {"text": "a\nb"}, {"text": "éé"}, {"from": []}, {"from": [True]},
+            {"from": [0x1000] * 2}, {"from": [0x1020, 0x1000]}, {"from": list(range(9))},
+            {"truncated": 1}, {"truncated": True})]
+        for value in malformed:
+            with self.subTest(value=value):
+                length = 16
+                if value.get("kind") == "string" and isinstance(value.get("text"), str):
+                    length = max(1, len(value["text"]) * (2 if value.get("encoding") == "utf-16le" else 1))
+                self.assertEqual(code.conclude(self.task, (observed(length=length, **value),)), ())
+        self.assertEqual(code.conclude(self.task, (observed(length=17, **ref),)), ())
+        self.assertEqual(code.conclude(self.task, (observed(length=1, **text),)), ())
+
+    def test_m3c_boundary_values_are_admitted(self):
+        items = (assembly(instructions=[[0, 16, "x" * 64]]), reference(type="read_write", name=""), reference(type="data"),
+                 reference(type="jump"), string(text="xy", encoding="utf-16le"),
+                 string(0x3000, text="x" * 128, truncated=True, sources=list(range(8))))
+        self.assertTrue(all(code._valid(item) for item in items))
+        self.assertEqual({v.status for v in self.verdicts(items)}, {"derived"})
+
+    def test_m3c_all_six_hundred_observations_have_bounded_citations(self):
+        evidence = (*[function(i) for i in range(128)], *[pseudocode(i) for i in range(16)],
+                    *[call(4096 + 5 * i, name=f"target{i}") for i in range(256)],
+                    *[assembly(i) for i in range(8)],
+                    *[reference(4096 + 5 * i, target=0x2000 + i) for i in range(128)],
+                    *[string(0x2000 + i, text=f"string{i}") for i in range(64)])
+        findings = code.conclude(self.task, tuple(reversed(evidence)))
+        self.assertEqual(findings, code.conclude(self.task, evidence))
+        ids = [identifier for finding in findings for identifier in finding.evidence_ids]
+        self.assertEqual(len(ids), 600)
+        self.assertEqual(set(ids), {item.id for item in evidence})
+        self.assertTrue(all(len(f.evidence_ids) <= 64 for f in findings))
+        refs = [f for f in findings if f.claim_key == "code.references"]
+        self.assertEqual([len(f.evidence_ids) for f in refs], [64, 64])
+        strings = [f for f in findings if f.claim_key == "code.strings"]
+        self.assertEqual([entry["address"] for f in strings for entry in f.value], list(range(0x2000, 0x2040)))
+        self.assertEqual({v.status for v in self.verdicts(evidence, findings)}, {"derived"})
+
+    def test_m3c_never_cites_foreign_or_mutated_records(self):
+        for original in (assembly(), reference(), string()):
+            for changes in ({"data": DATA + b"!"}, {"ref": ToolRef("ghidra", "12.1.4-r4")},
+                            {"operation": "ghidra.other"}):
+                foreign = observed(length=original.location.length, **changes, **original.observation)
+                self.assertEqual(code.conclude(self.task, (foreign,)), ())
+            mutated = copy.deepcopy(original)
+            mutated.observation["truncated" if original.observation["kind"] != "ref" else "to_name"] = "changed"
+            self.assertEqual(code.conclude(self.task, (mutated,)), ())
+
+    def test_conflicting_strings_at_one_address_do_not_create_a_claim(self):
+        items = (string(), string(text="different"))
+        self.assertEqual(code.conclude(self.task, items), ())
+        self.assertEqual(code.conclude(self.task, tuple(reversed(items))), ())
 
 
 if __name__ == "__main__":

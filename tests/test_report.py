@@ -24,6 +24,27 @@ def analysis(verdict_status="supported"):
     return Analysis(ref, (TOOL,), (result,), verdicts)
 
 
+def code_analysis(*, status="derived", instruction="MOV rax, [message]", name="message", text="hello"):
+    tool = ToolRef("ghidra", "12.1.4-r5")
+    values = (
+        (Location(8, 16), {"kind": "assembly", "index": 0, "entry": 0x1000,
+                          "instructions": [[2, 3, instruction]], "truncated": True}, "code.assembly",
+         {"entry": 0x1000, "instructions": [[2, 3, instruction]], "truncated": True}),
+        (Location(10, 3), {"kind": "ref", "from": 0x1000, "to": 0x2000, "type": "read", "to_name": name},
+         "code.references", [[0x1000, "read", 0x2000, name]]),
+        (Location(64, len(text)), {"kind": "string", "address": 0x2000, "encoding": "ascii", "text": text,
+                                 "truncated": False, "from": [0x1000]}, "code.strings",
+         [{"address": 0x2000, "encoding": "ascii", "text": text, "truncated": False, "from": [0x1000]}]),
+    )
+    evidence = tuple(make_evidence(DATA, tool, "ghidra.analyze", Observation(location, value))
+                     for location, value, _, _ in values)
+    findings = tuple(make_finding("code", "Tool interpretation.", key, value, [item.id], "inferred")
+                     for item, (_, _, key, value) in zip(evidence, values))
+    result = AnalysisResult("tk-0123456789abcdef", "code", "ok", evidence, findings)
+    return Analysis(InputRef(sha256_hex(DATA), len(DATA), "inline"), (tool,), (result,),
+                    tuple(ReviewVerdict(f.id, status, ("Tool reading; not verified.",)) for f in findings))
+
+
 class ReportTests(unittest.TestCase):
     def test_json_is_deterministic_and_complete(self):
         first, second = report.to_json(analysis()), report.to_json(analysis())
@@ -67,6 +88,54 @@ class ReportTests(unittest.TestCase):
     def test_no_supported_findings(self):
         text = report.to_markdown(analysis("unsupported"))
         self.assertIn("No finding was supported by the evidence.", text)
+
+    def test_m3c_markdown_has_full_readable_derived_details_and_exact_json_values(self):
+        original = code_analysis()
+        text = report.to_markdown(original)
+        supported, derived = text.split("## Derived by analysis tools (not verified against the bytes)")
+        self.assertNotIn("MOV rax", supported)
+        for marker in ("### Assembly (derived)", "### References (derived)", "### Referenced strings (derived)",
+                       "| File offset | Length | Instruction |", "| `10` | `3` | `MOV rax, [message]` |",
+                       "`message`", "`hello`", "`ascii`", "`4096`", "`8192`"):
+            self.assertIn(marker, derived)
+        self.assertIn("Truncated: `true`", derived)
+        parsed = json.loads(report.to_json(original))
+        self.assertEqual([f["value"] for f in parsed["results"][0]["findings"]],
+                         [f.value for f in original.results[0].findings])
+
+    def test_m3c_detail_cells_keep_hostile_text_inert(self):
+        text = report.to_markdown(code_analysis(instruction="`<img src=x>|\nRET", name="[x](https://evil.invalid)",
+                                               text="![p](x)`|"))
+        import re
+        count = 0
+        for line in text.splitlines():
+            if not line.startswith("|"):
+                continue
+            for cell in re.split(r"(?<!\\)\|", line)[1:-1]:
+                cell = cell.strip()
+                if any(marker in cell for marker in ("<img", "](", "RET")):
+                    count += 1
+                    self.assertTrue(cell.startswith("`") and cell.endswith("`") and "`" not in cell[1:-1], cell)
+        self.assertGreaterEqual(count, 3)
+
+    def test_rejected_or_unreviewed_code_never_gets_derived_detail_tables(self):
+        for status in ("unsupported", "unreviewed"):
+            original = code_analysis(status="unsupported")
+            if status == "unreviewed":
+                original = Analysis(original.input, original.tools, original.results, ())
+            text = report.to_markdown(original)
+            self.assertNotIn("### Assembly", text)
+            self.assertNotIn("### References", text)
+            self.assertNotIn("### Referenced strings", text)
+
+    def test_assembly_offsets_resolve_only_its_own_result_evidence(self):
+        original = code_analysis()
+        result, = original.results
+        isolated = AnalysisResult(result.task_id, result.role, result.status, (), result.findings)
+        foreign = AnalysisResult("tk-fedcba9876543210", "code", "ok", result.evidence, ())
+        changed = Analysis(original.input, original.tools, (isolated, foreign), original.verdicts)
+        text = report.to_markdown(changed)
+        self.assertNotIn("| `10` | `3` |", text)
 
 
 if __name__ == "__main__":
