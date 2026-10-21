@@ -112,7 +112,7 @@ def _eocd(data):
            and data[max(0, at - 20):at - 16] != b'PK\x06\x07', 'ZIP64 is unsupported')
     _check(disk == cd_disk == 0 and disk_count == count, 'Multi-disk ZIP is unsupported')
     _check(count <= MAX_MEMBERS, 'Too many ZIP members')
-    _check(offset + size == at, 'Inconsistent ZIP directory extent')
+    _check(offset <= at <= offset + size, 'Inconsistent ZIP directory extent')
     return count, offset, at
 
 
@@ -127,7 +127,7 @@ def members(data):
             break  # only the fully parsed central-directory prefix is usable
         row = _unpack('<4s6H3I5H2I', data, at, end)
         _, made, version, bits, method, _, _, crc, packed, size, n, x, c, disk, _, external, local = row
-        _check(version < 45 and NONE not in (packed, size, local), 'ZIP64 is unsupported')
+        _check(NONE not in (packed, size, local), 'ZIP64 is unsupported')
         _check(disk == 0, 'Multi-disk ZIP is unsupported')
         length = 46 + n + x + c
         if at + length > end:
@@ -158,7 +158,7 @@ def members(data):
         try:
             fields = _unpack('<4s5H3I2H', data, local, directory)
             sig, lv, lb, lm, _, _, lc, lp, ls, ln, lx = fields
-            _check(lv < 45 and NONE not in (lp, ls), 'ZIP64 is unsupported')
+            _check(NONE not in (lp, ls), 'ZIP64 is unsupported')
             _extras(data, local + 30 + ln, lx, directory)
             data_offset = local + 30 + ln + lx
             _need(data, local + 30, ln + lx, directory)

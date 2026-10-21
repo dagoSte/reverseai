@@ -18,6 +18,7 @@ from reverseai.contract import (
 from reverseai.gateway import Gateway
 from reverseai.review import review
 from reverseai.tools import apk
+from tests import fixtures_apk as shared
 
 NONE = 0xffffffff
 
@@ -211,8 +212,10 @@ class ZipParsingTests(unittest.TestCase):
     def test_whole_archive_refusals_zip64_multidisk_sfx_ambiguity_and_limits(self):
         data, layout = zip_bytes([('x', b'value')])
         cd, end = layout['cd'], layout['end']
-        bad = [changed(data, end + 10, '<H', 0xffff), changed(data, cd + 6, '<H', 45),
-               changed(data, 4, '<H', 45), changed(data, cd + 24, '<I', NONE),
+        # Decision m4a-seams-z3: version-needed alone never establishes ZIP64.
+        classic = changed(changed(data, cd + 6, '<H', 46), 4, '<H', 46)
+        self.assertEqual(apk.materialize(classic, apk.members(classic)[0])[0], b'value')
+        bad = [changed(data, end + 10, '<H', 0xffff), changed(data, cd + 24, '<I', NONE),
                changed(data, end + 4, '<H', 1), changed(data, cd + 34, '<H', 1),
                changed(data, end + 8, '<H', 0), changed(data, end + 16, '<I', cd + 1)]
         prefixed = b'prefix' + data
@@ -454,6 +457,47 @@ class BinaryManifestTests(unittest.TestCase):
 
 
 class ApkOperationTests(unittest.TestCase):
+    def test_shared_fixture_members_and_manifest_match_declared_layouts(self):
+        for builder in (shared.apk_basic, lambda: shared.apk_basic(True), shared.apk_signing_block):
+            data, layout = builder()
+            members = apk.members(data)
+            self.assertEqual(len(members), len(layout['members']))
+            for member, expected in zip(members, layout['members']):
+                self.assertEqual(member.flags, ())
+                self.assertEqual((member.name, member.zip_flags, member.method, member.crc32, member.size,
+                                  member.compressed_size, member.data_offset, member.central_offset, member.central_length),
+                                 tuple(expected[k] for k in ('name', 'flags', 'method', 'crc32', 'size', 'compressed_size',
+                                                            'data_offset', 'central_offset', 'central_length')))
+                child, digest = apk.materialize(data, member)
+                self.assertEqual(digest, expected['sha256'])
+                self.assertEqual(apk.artifact(member, child), expected['artifact'])
+                self.assertEqual(materialize(data, expected['artifact']), child)
+            expected_attrs = layout['manifest']['attributes']
+            attrs = run('manifest', data)
+            self.assertEqual([(o.location.offset, o.location.length) for o in attrs],
+                             [(a['offset'], a['length']) for a in expected_attrs])
+            self.assertEqual([o.value for o in attrs], [dict(kind='manifest_attribute', total=len(expected_attrs),
+                             **{k: a[k] for k in ('index', 'element_index', 'element', 'attribute', 'type', 'value')})
+                             for a in expected_attrs])
+
+    def test_shared_hostile_archive_expectations(self):
+        for kind, (expected_flags, refused) in shared.HOSTILE_KINDS.items():
+            with self.subTest(kind=kind):
+                data, layout = shared.apk_hostile(kind)
+                if refused:
+                    with self.assertRaises(apk.ApkError):
+                        apk.members(data)
+                    continue
+                rows = run('inventory', data)
+                anomaly = layout['anomaly']
+                if kind == 'truncated_central':
+                    self.assertEqual(len(rows), anomaly['complete_entries'])
+                for index in anomaly.get('members', [anomaly['member']]):
+                    if index is not None:
+                        self.assertEqual(rows[index].value['flags'], expected_flags)
+                        self.assertEqual(rows[index].value['sha256'], None if expected_flags else
+                                         layout['members'][index]['sha256'])
+
     def test_operation_bounds_registration_and_paging(self):
         self.assertEqual(set(apk.TOOL.operations), {'apk.inventory', 'apk.manifest'})
         for name, spec in apk.TOOL.operations.items():
