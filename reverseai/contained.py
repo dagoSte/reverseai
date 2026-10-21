@@ -16,14 +16,15 @@ import time
 from types import MappingProxyType
 import uuid
 
-from reverseai.contract import MAX_WORKER_REPLY_BYTES, canonical_json, sha256_hex
+from reverseai.contract import ArgSpec, ContractError, MAX_WORKER_REPLY_BYTES, canonical_json, sha256_hex
 
 STAGING_ROOT = Path("/Users/Shared/rea-safe-staging-501")
 WALL_SECONDS = 45
 GHIDRA_WALL_SECONDS = 240
 PLATFORM = "linux/arm64"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
-GHIDRA_VERSION = "12.1.4-r5"
+GHIDRA_VERSION = "12.1.4-r6"
+GHIDRA_OPERATIONS = frozenset(("ghidra.analyze", "ghidra.functions", "ghidra.function", "ghidra.xrefs"))
 GHIDRA_PINS = MappingProxyType({
     "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
     "ghidra_sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",
@@ -37,7 +38,7 @@ _GHIDRA_PROFILE = MappingProxyType({"pids": 256, "memory": "2g", "cpus": 2,
 
 def resource_profile(operation):
     """Only the validated operation selects resources; requests cannot override them."""
-    if operation == "ghidra.analyze":
+    if operation in GHIDRA_OPERATIONS:
         return _GHIDRA_PROFILE
     if operation in ("lief.headers", "lief.sections", "yarax.matches"):
         return _LEGACY_PROFILE
@@ -85,6 +86,31 @@ def load_lock(lock, *, adapter_version="1.0.0-r2", extra_keys=()):
         raise ContainedError("InvalidImageLock") from None
 
 
+_GHIDRA_QUERY_ARGS = {
+    "ghidra.functions": {
+        "query": ArgSpec("str", default=""),
+        "start": ArgSpec("int", 0, 65535, default=0),
+        "limit": ArgSpec("int", 1, 128, default=64),
+    },
+    "ghidra.function": {
+        "select": ArgSpec("enum", choices=("entry", "name"), default="entry"),
+        "entry": ArgSpec("int", 0, 2 ** 64 - 1, default=0),
+        "name": ArgSpec("str", default=""),
+        "parts": ArgSpec("enum", choices=("info", "pseudocode", "assembly", "callees", "callers", "all"), default="all"),
+        "start": ArgSpec("int", 0, 65535, default=0),
+        "limit": ArgSpec("int", 1, 256, default=64),
+        "max_chars": ArgSpec("int", 64, 2048, default=1024),
+        "max_calls": ArgSpec("int", 0, 256, default=64),
+        "max_refs": ArgSpec("int", 0, 128, default=64),
+    },
+    "ghidra.xrefs": {
+        "address": ArgSpec("int", 0, 2 ** 64 - 1),
+        "start": ArgSpec("int", 0, 65535, default=0),
+        "limit": ArgSpec("int", 1, 256, default=64),
+    },
+}
+
+
 def _validated_args(operation, args):
     # Validate here as well as at the gateway: this is the last boundary before argv.
     if not isinstance(args, Mapping):
@@ -108,6 +134,12 @@ def _validated_args(operation, args):
         checked = {key: args.get(key, default) for key, (_, _, default) in bounds.items()}
         if all(type(checked[key]) is int and low <= checked[key] <= high for key, (low, high, _) in bounds.items()):
             return checked
+    specs = _GHIDRA_QUERY_ARGS.get(operation)
+    if specs is not None and not set(args) - set(specs):
+        try:
+            return {key: spec.check(args.get(key, spec.default)) for key, spec in specs.items()}
+        except ContractError:
+            pass
     raise ContainedError("InvalidWorkerArguments")
 
 
@@ -208,7 +240,7 @@ class DockerExecutor:
 
     def run(self, operation, args, data, input_sha256):
         args = _validated_args(operation, args)
-        if (operation == "ghidra.analyze") != (self.lock["adapter_version"] == GHIDRA_VERSION):
+        if (operation in GHIDRA_OPERATIONS) != (self.lock["adapter_version"] == GHIDRA_VERSION):
             raise ContainedError("InvalidWorkerArguments")
         if not isinstance(data, bytes) or sha256_hex(data) != input_sha256:
             raise ContainedError("SnapshotMismatch")

@@ -1,5 +1,7 @@
 """Re-derive Ghidra byte anchors and referenced strings, not code semantics."""
 
+from array import array
+from bisect import bisect_left, bisect_right
 from collections import namedtuple
 import struct
 
@@ -91,13 +93,47 @@ def _sections(data):
     return sections, base + header["entry"]
 
 
+class _Intervals:
+    """Count overlaps in O(log n), including aliases away from the query's start."""
+
+    def __init__(self, sections, *, virtual, backed=False):
+        self.sections = sections
+        bounds = ((section.va if virtual else section.offset,
+                   section.size if backed or not virtual else section.span, index)
+                  for index, section in enumerate(sections))
+        self.starts, self.start_ids = self._prefix(sorted((start, index) for start, length, index in bounds if length))
+        bounds = ((section.va if virtual else section.offset,
+                   section.size if backed or not virtual else section.span, index)
+                  for index, section in enumerate(sections))
+        self.ends, self.end_ids = self._prefix(sorted((start + length, index) for start, length, index in bounds if length))
+
+    @staticmethod
+    def _prefix(rows):
+        points, ids = [], array("Q", [0])
+        for point, index in rows:
+            points.append(point)
+            ids.append(ids[-1] ^ index)
+        return points, ids
+
+    def single(self, start, length):
+        _check(length > 0)
+        began = bisect_left(self.starts, start + length)
+        ended = bisect_right(self.ends, start)
+        _check(began - ended == 1)
+        # Ended intervals are a subset of started ones; their IDs cancel in the XOR.
+        return self.sections[self.start_ids[began] ^ self.end_ids[ended]]
+
+
+class _SectionIndex:
+    def __init__(self, sections):
+        self.virtual = _Intervals(sections, virtual=True)
+        self.file = _Intervals(sections, virtual=False)
+        self.backed_virtual = (self.virtual if all(section.span == section.size for section in sections)
+                               else _Intervals(sections, virtual=True, backed=True))
+
+
 def _map(sections, start, length, *, virtual):
-    matches = [section for section in sections
-               if start < (section.va + section.span if virtual else section.offset + section.size)
-               and start + length > (section.va if virtual else section.offset)
-               and (section.span if virtual else section.size) > 0]
-    _check(len(matches) == 1)
-    section = matches[0]
+    section = (sections.virtual if virtual else sections.file).single(start, length)
     delta = start - (section.va if virtual else section.offset)
     _check(section.executable and 0 <= delta and delta + length <= section.size)
     return (section.offset if virtual else section.va) + delta, section
@@ -113,11 +149,7 @@ def _function_anchor(sections, entry, size):
 
 def _file_map(sections, start, length, *, virtual):
     """String mapping admits only file-backed bytes, independent of execute permission."""
-    matches = [section for section in sections if section.size > 0
-               and start < (section.va if virtual else section.offset) + section.size
-               and start + length > (section.va if virtual else section.offset)]
-    _check(len(matches) == 1)
-    section = matches[0]
+    section = (sections.backed_virtual if virtual else sections.file).single(start, length)
     delta = start - (section.va if virtual else section.offset)
     _check(0 <= delta and delta + length <= section.size)
     return (section.offset if virtual else section.va) + delta, section
@@ -139,18 +171,22 @@ def _string_bytes(data, offset, end):
     raise ContractError(REFUSED)
 
 
-def verify(data, observations, args):
+def verify(data, observations, args, operation="ghidra.analyze"):
     """Validate the whole reply before admitting any derived observation."""
     try:
-        _verify(data, observations, args)
-    except (ContractError, struct.error, TypeError, KeyError, ValueError):
+        if operation == "ghidra.analyze":
+            _verify(data, observations, args)
+        else:
+            _verify_query(data, observations, args, operation)
+    except (ContractError, struct.error, TypeError, KeyError, ValueError, IndexError):
         raise ContractError(REFUSED) from None
 
 
 def _verify(data, observations, args):
     args = {"assembly": 4, "max_instructions": 32, "max_refs": 64, "max_strings": 32, **args}
     _check(isinstance(data, bytes) and isinstance(observations, (list, tuple)) and len(observations) <= 600)
-    sections, binary_entry = _sections(data)
+    decoded, binary_entry = _sections(data)
+    sections = _SectionIndex(decoded)
     groups = {kind: [] for kind in _FIELDS}
     order = {kind: index for index, kind in enumerate(_FIELDS)}
     previous_kind = 0
@@ -238,3 +274,182 @@ def _verify(data, observations, args):
         checked_length = length + (1 if encoding == "ascii" else 2)
         _file_map(sections, address, checked_length, virtual=True)
         _file_map(sections, offset, checked_length, virtual=False)
+
+
+_QUERY_FIELDS = {
+    "function_row": {"kind", "index", "total", "name", "entry", "size"},
+    "target": {"kind", "name", "entry", "size", "matches", "callers_total", "callees_total"},
+    "instructions": {"kind", "entry", "start", "total", "rows", "truncated"},
+    "caller": {"kind", "at", "from", "to"},
+    "xref": {"kind", "index", "total", "at", "from", "to", "type"},
+    **{kind: _FIELDS[kind] for kind in ("pseudocode", "call", "ref")},
+}
+_REFERENCE_TYPES = ("read", "write", "read_write", "data", "jump")
+
+
+def _index(value, minimum=0):
+    return type(value) is int and minimum <= value < 2**32
+
+
+def _instruction_anchor(sections, item):
+    _check(1 <= item.location.length <= 16)
+    address, _ = _map(sections, item.location.offset, item.location.length, virtual=False)
+    offset, _ = _map(sections, address, item.location.length, virtual=True)
+    _check(offset == item.location.offset)
+    return address
+
+
+def _instruction_rows(rows, maximum, size):
+    _check(isinstance(rows, list) and 1 <= len(rows) <= maximum)
+    end = 0
+    for row in rows:
+        _check(isinstance(row, list) and len(row) == 3)
+        delta, length, text = row
+        _check(_uint(delta) and type(length) is int and 1 <= length <= 16
+               and end <= delta and delta + length <= size)
+        _check(isinstance(text, str) and 1 <= len(text) <= 64 and all(" " <= c <= "~" for c in text))
+        end = delta + length
+
+
+def _page_rows(items, args):
+    total = None
+    for index, item in enumerate(items, args["start"]):
+        value = item.value
+        _check(type(value["index"]) is int and value["index"] == index)
+        _check(_index(value["total"]) and index < value["total"] <= 65536)
+        _check(total is None or total == value["total"])
+        total = value["total"]
+
+
+def _verify_query(data, observations, args, operation):
+    _check(operation in ("ghidra.functions", "ghidra.function", "ghidra.xrefs"))
+    _check(isinstance(data, bytes) and isinstance(observations, (list, tuple))
+           and len(observations) <= (643 if operation == "ghidra.function" else 256))
+    _check(isinstance(args, dict))
+    defaults = {
+        "ghidra.functions": {"query": "", "start": 0, "limit": 64},
+        "ghidra.function": {"select": "entry", "entry": 0, "name": "", "parts": "all", "start": 0,
+                             "limit": 64, "max_chars": 1024, "max_calls": 64, "max_refs": 64},
+        "ghidra.xrefs": {"start": 0, "limit": 64},
+    }[operation]
+    _check(set(args) <= set(defaults) | ({"address"} if operation == "ghidra.xrefs" else set()))
+    args = {**defaults, **args}
+    _check(type(args["start"]) is int and 0 <= args["start"] <= 65535)
+    maximum = 128 if operation == "ghidra.functions" else 256
+    _check(type(args["limit"]) is int and 1 <= args["limit"] <= maximum)
+    decoded, _ = _sections(data)
+    sections = _SectionIndex(decoded)
+    allowed = ({"function_row"} if operation == "ghidra.functions" else {"xref"}
+               if operation == "ghidra.xrefs" else {"target", "pseudocode", "instructions", "call", "caller", "ref"})
+    for item in observations:
+        _check(isinstance(item, Observation) and item.location.within(len(data)))
+        value = item.value
+        kind = value.get("kind")
+        _check(isinstance(kind, str) and kind in allowed and set(value) == _QUERY_FIELDS[kind])
+    if operation == "ghidra.function":
+        _verify_function(sections, observations, args)
+        return
+    _check(len(observations) <= args["limit"])
+    _page_rows(observations, args)
+    previous = -1
+    if operation == "ghidra.functions":
+        _check(isinstance(args["query"], str))
+        for item in observations:
+            value = item.value
+            _check(_name(value["name"]) and args["query"] in value["name"])
+            _check(_uint(value["entry"]) and value["entry"] > previous and _uint(value["size"], 1)
+                   and value["entry"] + value["size"] <= 2**64)
+            previous = value["entry"]
+            _check(item.location == _function_anchor(sections, value["entry"], value["size"]))
+    else:
+        _check(_uint(args["address"]))
+        previous = None
+        for item in observations:
+            value = item.value
+            address = _instruction_anchor(sections, item)
+            _check(_uint(value["at"]) and value["at"] == address)
+            _check(_uint(value["to"]) and value["to"] == args["address"])
+            _check(value["type"] in ("call", *_REFERENCE_TYPES))
+            _check(value["from"] is None or _uint(value["from"]))
+            key = (value["at"], value["type"])
+            _check(previous is None or key > previous)
+            previous = key
+
+
+
+def _verify_function(sections, observations, args):
+    _check(args["select"] in ("entry", "name") and _uint(args["entry"]) and isinstance(args["name"], str))
+    parts = args["parts"]
+    _check(parts in ("info", "pseudocode", "assembly", "callees", "callers", "all"))
+    for key, minimum, maximum in (("max_chars", 64, 2048), ("max_calls", 0, 256), ("max_refs", 0, 128)):
+        _check(type(args[key]) is int and minimum <= args[key] <= maximum)
+    if not observations:
+        return
+    target_item = observations[0]
+    target = target_item.value
+    _check(target["kind"] == "target" and _name(target["name"]))
+    _check(_uint(target["entry"]) and _uint(target["size"], 1)
+           and target["entry"] + target["size"] <= 2**64)
+    _check(_index(target["matches"], 1) and target["matches"] <= 65536
+           and _index(target["callers_total"]) and target["callers_total"] <= 65536
+           and _index(target["callees_total"]))
+    _check((target["entry"] == args["entry"] and target["matches"] == 1) if args["select"] == "entry"
+           else target["name"] == args["name"])
+    _check(target_item.location == _function_anchor(sections, target["entry"], target["size"]))
+    kinds = ("target", "pseudocode", "instructions", "call", "caller", "ref")
+    limits = {"target": 1, "pseudocode": 1, "instructions": 1, "call": args["max_calls"],
+              "caller": args["max_calls"], "ref": args["max_refs"]}
+    selected = {"info": (), "pseudocode": ("pseudocode",), "assembly": ("instructions",),
+                "callees": ("call",), "callers": ("caller",), "all": kinds[1:]}[parts]
+    previous_kind = 0
+    counts = dict.fromkeys(kinds, 0)
+    previous_caller = -1
+    previous_ref = None
+    call_sites = set()
+    for item in observations:
+        value = item.value
+        kind = value["kind"]
+        rank = kinds.index(kind)
+        _check(rank >= previous_kind and (kind == "target" or kind in selected))
+        previous_kind = rank
+        counts[kind] += 1
+        _check(counts[kind] <= limits[kind])
+        if kind == "target":
+            continue
+        if kind == "pseudocode":
+            _check(type(value["index"]) is int and value["index"] == 0 and _uint(value["entry"])
+                   and value["entry"] == target["entry"] and item.location == target_item.location)
+            _check(isinstance(value["text"], str) and len(value["text"]) <= args["max_chars"]
+                   and type(value["truncated"]) is bool)
+        elif kind == "instructions":
+            _check(_uint(value["entry"]) and value["entry"] == target["entry"])
+            _check(type(value["start"]) is int and value["start"] == args["start"] and _index(value["total"]))
+            rows = value["rows"]
+            _instruction_rows(rows, args["limit"], target["size"])
+            _check(value["start"] + len(rows) <= value["total"] and type(value["truncated"]) is bool)
+            _check(value["truncated"] == (len(rows) < args["limit"] and value["start"] + len(rows) < value["total"]))
+            address = target["entry"] + rows[0][0]
+            length = rows[-1][0] + rows[-1][1] - rows[0][0]
+            offset, _ = _map(sections, address, length, virtual=True)
+            reverse, _ = _map(sections, offset, length, virtual=False)
+            _check(reverse == address and item.location == Location(offset, length))
+        elif kind == "caller":
+            address = _instruction_anchor(sections, item)
+            _check(_uint(value["at"]) and value["at"] == address and address > previous_caller)
+            _check(_uint(value["to"]) and value["to"] == target["entry"])
+            _check(value["from"] is None or _uint(value["from"]))
+            previous_caller = address
+        else:
+            _check(_uint(value["from"]) and value["from"] == target["entry"]
+                   and _uint(value["to"]) and _name(value["to_name"]))
+            address = _instruction_anchor(sections, item)
+            _check(target["entry"] <= address and address + item.location.length <= target["entry"] + target["size"])
+            if kind == "call":
+                _check(address not in call_sites)
+                call_sites.add(address)
+            if kind == "ref":
+                _check(value["type"] in _REFERENCE_TYPES)
+                key = (item.location.offset, value["to"], value["type"])
+                _check(previous_ref is None or key > previous_ref)
+                previous_ref = key
+    _check(counts["caller"] <= target["callers_total"] and counts["call"] <= target["callees_total"])

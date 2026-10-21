@@ -184,6 +184,39 @@ class ReportTests(unittest.TestCase):
         text = report.to_markdown(changed)
         self.assertNotIn("| `10` | `3` |", text)
 
+    def test_query_instruction_page_is_complete_paged_hex_and_inert_without_json_mutation(self):
+        original = code_analysis()
+        result, = original.results
+        value = {"entry": 0x1000, "start": 64, "total": 100,
+                 "rows": [[16, 1, "RET`|<img src=x>"], [17, 2, "CALL [4096]"]], "truncated": True}
+        finding = make_finding("code", "Tool reading.", "code.instructions", value, [result.evidence[0].id], "inferred")
+        current = Analysis(original.input, original.tools,
+                           (AnalysisResult(result.task_id, "code", "ok", result.evidence, (finding,)),),
+                           (ReviewVerdict(finding.id, "derived", ("Tool reading.",)),), (),
+                           {"name": "procedure_assembly", "args": {"entry": 0x1000, "start": 64}})
+        before = report.to_json(current)
+        text = report.to_markdown(current)
+        for marker in ('"entry":"0x1000"', "rows 64..65 of 100", "Next start: 66", "Truncated: `true`",
+                       "| 64 | `0x1010` | `1` | `RET'\\|<img src=x>` |", "| 65 | `0x1011` | `2` | `CALL [4096]` |"):
+            self.assertIn(marker, text)
+        self.assertEqual(report.to_json(current), before)
+        parsed = json.loads(before)
+        self.assertEqual(parsed["query"]["args"]["entry"], 4096)
+        self.assertEqual(parsed["results"][0]["findings"][0]["value"], value)
+
+    def test_complete_query_page_has_no_next_start_and_addresses_are_hex(self):
+        original = code_analysis()
+        result, = original.results
+        value = {"start": 9, "total": 10, "rows": [["<img src=x>|`", 0x2000, "func", "global", True]]}
+        finding = make_finding("structural", "Reading.", "symbols.list", value, [result.evidence[0].id])
+        current = Analysis(original.input, original.tools,
+                           (AnalysisResult(result.task_id, "structural", "ok", result.evidence, (finding,)),),
+                           (ReviewVerdict(finding.id, "supported", ()),), (), {"name": "list_names", "args": {"query": "x"}})
+        text = report.to_markdown(current)
+        self.assertIn("rows 9..9 of 10", text)
+        self.assertNotIn("Next start:", text)
+        self.assertIn("| 9 | `<img src=x>\\|'` | `0x2000` | `func` | `global` | `true` |", text)
+
 
 if __name__ == "__main__":
     unittest.main()
