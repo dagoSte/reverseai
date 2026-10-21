@@ -3092,7 +3092,8 @@ def ghidra_receipt_fixture():
     receipt = receipt_fixture()
     receipt.update(tool="ghidra", lock=ghidra_lock_fixture(),
                    checks=[{"id": name, "status": "passed"} for name in verifier.GHIDRA_REQUIRED_CHECKS],
-                   cleanup=receipt["cleanup"][:17])
+                   cleanup=[dict(container_id=f"{index + 1:064x}", verified=True, staging_removed=True)
+                            for index in range(29)])
     return receipt
 
 
@@ -3141,7 +3142,7 @@ class GhidraFakeBoundary(FakeBoundary):
 
 
 class GhidraProfileAndReceiptTests(unittest.TestCase):
-    def test_older_lock_and_receipt_cannot_impersonate_r5(self):
+    def test_older_lock_and_receipt_cannot_impersonate_r6(self):
         for version in ("12.1.4-r1", "12.1.4-r2", "12.1.4-r3", "12.1.4-r4", "12.1.4-r5"):
             lock = ghidra_lock_fixture()
             lock["adapter_version"] = version
@@ -3161,13 +3162,13 @@ class GhidraProfileAndReceiptTests(unittest.TestCase):
             verifier.NativeVerifier(boundary, ghidra_lock_fixture(), {"checks": [], "cleanup": []}, tool="ghidra")
         self.assertEqual(boundary.calls, [])
 
-    def test_reviewed_lock_and_complete_receipt_have_six_keys_twenty_checks_seventeen_runs(self):
+    def test_reviewed_lock_and_complete_receipt_have_six_keys_32_checks_29_runs(self):
         lock = ghidra_lock_fixture()
         verifier.verify_ghidra_lock(lock)
         receipt = ghidra_receipt_fixture()
         self.assertEqual(len(lock), 6)
-        self.assertEqual(len(receipt["checks"]), 20)
-        self.assertEqual(len(receipt["cleanup"]), 17)
+        self.assertEqual(len(receipt["checks"]), 32)
+        self.assertEqual(len(receipt["cleanup"]), 29)
         self.assertEqual(verifier.GHIDRA_FIXTURE_NAMES, ("elf_code", "pe_code", "elf_data_only", "macho_code", "elf_refs", "pe_refs", "macho_refs"))
         self.assertIn("macho_code.analyze", {row["id"] for row in receipt["checks"]})
         self.assertTrue(verifier.receipt_passes(receipt))
@@ -3420,12 +3421,12 @@ class GhidraNativeProfileTests(unittest.TestCase):
         self.assertIsNone(self.receipt["cleanup"][0]["container_id"])
         self.assertFalse(self.receipt["cleanup"][0]["verified"])
 
-    def test_profile_plan_uses_seven_fixtures_one_operation_and_seventeen_native_runs(self):
+    def test_profile_plan_retains_seven_analyzes_and_adds_twelve_queries(self):
         def control(name, data):
             self.native.inspected += 1
             self.assertEqual(data, elf_code()[0])
             return ghidra_probe_fixture(name)
-        def known(data, operation):
+        def known(data, operation, args=None):
             self.native.inspected += 1
             return {}
         with mock.patch.object(self.native, "local_daemon", return_value={}), \
@@ -3435,10 +3436,12 @@ class GhidraNativeProfileTests(unittest.TestCase):
             self.native.run()
         self.assertEqual(controls.call_count, 10)
         self.assertEqual(known_answers.call_args_list,
-            [mock.call(data, "ghidra.analyze") for data in verifier.ghidra_fixtures().values()])
+            [mock.call(data, "ghidra.analyze") for data in verifier.ghidra_fixtures().values()] +
+            [mock.call(verifier.ghidra_fixtures()[name], operation, args) for name in verifier.GHIDRA_QUERY_FIXTURES
+             for operation, args in verifier.ghidra_query_requests(verifier.ghidra_fixtures()[name]).values()])
         self.assertEqual({row["id"] for row in self.receipt["checks"]}, set(verifier.GHIDRA_REQUIRED_CHECKS))
         self.assertTrue(all(row["status"] == "passed" for row in self.receipt["checks"]))
-        self.assertEqual(self.native.native_runs, 17)
+        self.assertEqual(self.native.native_runs, 29)
 
     def test_controls_pass_only_fixed_ghidra_request_and_validate_ghidra_evidence(self):
         for name in verifier.CONTROL_NAMES:
@@ -3522,6 +3525,110 @@ class GhidraNativeProfileTests(unittest.TestCase):
         self.assertIsNone(self.native.active)
 
 
+class GhidraQueryKnownAnswerTests(unittest.TestCase):
+    def setUp(self):
+        self.data, layout = elf_refs()
+        self.operation, self.args = verifier.ghidra_query_requests(self.data)['functions_page']
+        # Synthetic query readings exercise comparison/transport only; these are not native Ghidra pins.
+        self.records = [{'location': {'offset': f['offset'], 'length': f['size']}, 'value': {
+            'kind': 'function_row', 'index': index, 'total': 5, 'name': f'synthetic-{index}',
+            'entry': f['entry'], 'size': f['size']}} for index, f in enumerate(layout['functions'][1:3], 1)]
+        self.expected = {sha256_hex(self.data): {'functions_page': self.records}}
+        self.native = verifier.NativeVerifier(GhidraFakeBoundary(), ghidra_lock_fixture(),
+                                              {'checks': [], 'cleanup': []}, tool='ghidra')
+
+    def test_measured_oracle_is_required_and_compares_exact_ordered_rows_and_anchors(self):
+        rows = ghidra_observations(self.records)
+        with mock.patch.dict(verifier.GHIDRA_QUERY_EXPECTED, {}, clear=True), self.assertRaises(verifier.VerificationError):
+            verifier.compare_ghidra_query(self.data, self.operation, self.args, rows)
+        with mock.patch.dict(verifier.GHIDRA_QUERY_EXPECTED, self.expected, clear=True):
+            verifier.compare_ghidra_query(self.data, self.operation, self.args, rows)
+            variants = [self.records[:1], self.records[::-1], self.records + self.records[:1]]
+            for group, field, value in [('location','offset',0),('location','length',1),('value','name','forged'),
+                                        ('value','index',True),('value','total',6),('value','entry',0)]:
+                changed = copy.deepcopy(self.records); changed[0][group][field] = value; variants.append(changed)
+            for changed in variants:
+                with self.subTest(rows=changed), self.assertRaises(verifier.VerificationError):
+                    verifier.compare_ghidra_query(self.data, self.operation, self.args, ghidra_observations(changed))
+            for args in ({**self.args, 'start':0}, {**self.args, 'limit':3}):
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.compare_ghidra_query(self.data, self.operation, args, rows)
+
+    def test_known_answer_uses_real_host_admission_and_binds_operation_args_and_input(self):
+        raw = ghidra_worker_reply(self.data, self.records)
+        original = verifier.ghidra_verify.verify
+        with mock.patch.dict(verifier.GHIDRA_QUERY_EXPECTED, self.expected, clear=True), \
+                mock.patch.object(self.native, 'invoke', return_value=raw) as invoke, \
+                mock.patch.object(verifier.ghidra_verify, 'verify', wraps=original) as admission:
+            value = self.native.known_answer(self.data, self.operation, self.args)
+        self.assertEqual(value, {'input_sha256':sha256_hex(self.data), 'input_bytes':len(self.data),
+                                 'observations':2, 'operation':self.operation, 'args':self.args})
+        invoke.assert_called_once_with(self.data, self.operation, self.args)
+        admission.assert_called_once_with(self.data, ghidra_observations(self.records), self.args, operation=self.operation)
+
+    def test_each_mode_routes_through_admission_and_the_independent_comparator(self):
+        for operation, args in verifier.ghidra_query_requests(self.data).values():
+            with mock.patch.object(self.native, 'invoke', return_value=ghidra_worker_reply(self.data, [])), \
+                    mock.patch.object(verifier.ghidra_verify, 'verify') as admission, \
+                    mock.patch.object(verifier, 'compare_ghidra_query') as compare:
+                result = self.native.known_answer(self.data, operation, args)
+            admission.assert_called_once_with(self.data, (), args, operation=operation)
+            compare.assert_called_once_with(self.data, operation, args, ())
+            self.assertEqual(result['operation'], operation)
+            self.assertEqual(result['args'], args)
+
+    def test_forged_protocol_hash_or_host_anchor_never_passes_the_native_oracle(self):
+        for changes in ({'protocol':'unknown'}, {'snapshot_sha256':'f'*64}):
+            with mock.patch.object(self.native, 'invoke', return_value=ghidra_worker_reply(self.data,self.records,**changes)), \
+                    self.assertRaises(ContractError):
+                self.native.known_answer(self.data, self.operation, self.args)
+        bad = copy.deepcopy(self.records); bad[0]['location']['offset'] += 1
+        with mock.patch.object(self.native, 'invoke', return_value=ghidra_worker_reply(self.data,bad)), \
+                self.assertRaises(ContractError):
+            self.native.known_answer(self.data, self.operation, self.args)
+        with mock.patch.object(self.native, 'invoke') as invoke, self.assertRaises(verifier.VerificationError):
+            self.native.known_answer(self.data, self.operation, {**self.args,'query':'unapproved'})
+        invoke.assert_not_called()
+
+    def test_all_twelve_measured_replies_pass_host_admission_and_the_complete_oracle(self):
+        seen = 0
+        for builder in (elf_refs, pe_refs, macho_refs):
+            data, _ = builder()
+            expected = verifier.GHIDRA_QUERY_EXPECTED[sha256_hex(data)]
+            self.assertEqual(set(expected), set(verifier.GHIDRA_QUERY_CASES))
+            for case, (operation, args) in verifier.ghidra_query_requests(data).items():
+                records = copy.deepcopy(expected[case])
+                with self.subTest(format=builder.__name__, case=case), \
+                        mock.patch.object(self.native, 'invoke', return_value=ghidra_worker_reply(data, records)):
+                    result = self.native.known_answer(data, operation, args)
+                self.assertEqual(result, {'input_sha256':sha256_hex(data), 'input_bytes':len(data),
+                    'observations':len(records), 'operation':operation, 'args':args})
+                seen += 1
+        self.assertEqual(seen, 12)
+
+    def test_semantic_forgery_admitted_as_derived_still_fails_the_known_answer(self):
+        for builder in (elf_refs, pe_refs, macho_refs):
+            data, _ = builder()
+            for case, (operation, args) in verifier.ghidra_query_requests(data).items():
+                records = copy.deepcopy(verifier.GHIDRA_QUERY_EXPECTED[sha256_hex(data)][case])
+                if case == 'function_add':
+                    text = records[1]['value']['text']
+                    changed = text.replace(' + ', ' - ', 1)
+                    self.assertNotEqual(changed, text)
+                    records[1]['value']['text'] = changed
+                elif case == 'xrefs_counter':
+                    records[0]['value']['type'] = 'data'
+                else:
+                    records[0]['value']['name'] = 'plausible_forged_name'
+                rows = ghidra_observations(records)
+                # Types, byte anchors and relationships remain admissible as tool interpretations.
+                verifier.ghidra_verify.verify(data, rows, args, operation=operation)
+                with self.subTest(format=builder.__name__, case=case), \
+                        mock.patch.object(self.native, 'invoke', return_value=ghidra_worker_reply(data, records)), \
+                        self.assertRaises(verifier.VerificationError):
+                    self.native.known_answer(data, operation, args)
+
+
 class GhidraMainTests(unittest.TestCase):
     def run_cli(self, *, lock=None, change=None, native_error=None, profile_bad=False):
         lock = ghidra_lock_fixture() if lock is None else lock
@@ -3571,8 +3678,8 @@ class GhidraMainTests(unittest.TestCase):
         run.boundary.load_lock.assert_called_once_with(run.lock, adapter_version="12.1.4-r6")
         run.factory.assert_called_once()
         self.assertEqual(run.factory.call_args.kwargs, {"tool": "ghidra"})
-        self.assertEqual(len(run.receipt["checks"]), 20)
-        self.assertEqual(len(run.receipt["cleanup"]), 17)
+        self.assertEqual(len(run.receipt["checks"]), 32)
+        self.assertEqual(len(run.receipt["cleanup"]), 29)
         self.assertNotIn("ruleset_sha256", run.receipt)
 
     def test_cli_rejects_foreign_locks_and_profile_drift_before_native_creation(self):
