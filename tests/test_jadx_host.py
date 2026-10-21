@@ -141,11 +141,12 @@ class HostTests(unittest.TestCase):
         for start in (len(TEXT), len(TEXT) + 1, 1048575):
             rows, _ = self.invoke({"start": start})
             self.assertTrue(all((o.value["start"], o.value["total"], o.value["text"]) == (len(TEXT), len(TEXT), "") for o in rows))
-        for status in ("decompile_failed", "class_not_found", "method_not_found", "no_code"):
+        for status in ("decompile_failed", "class_not_found", "method_not_found", "no_code", "omitted"):
             def change(rows):
                 return [{**r, "status": status, "code_offset": None, "insns_count": None, "total": 0, "text": ""} for r in rows]
             rows, _ = self.invoke({"start": 7}, change=change)
-            self.assertTrue(all((o.value["form"], o.value["start"], o.value["total"], o.value["text"]) == ("error", 0, 0, "") for o in rows))
+            form = "omitted" if status == "omitted" else "error"
+            self.assertTrue(all((o.value["form"], o.value["start"], o.value["total"], o.value["text"]) == (form, 0, 0, "") for o in rows))
             with self.assertRaises(ContractError):
                 self.invoke(change=lambda r: [{**r[0], "status": status}, r[1]])
 

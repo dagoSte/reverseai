@@ -97,7 +97,7 @@ def anchor(rows, args, anchors):
         _check(isinstance(row, dict) and set(row) == _FIELDS)
         _check(type(row["target"]) is int and row["target"] == index)
         status, total, text = row["status"], row["total"], row["text"]
-        _check(isinstance(status, str) and status in {"ok", "fallback", *_ERRORS})
+        _check(isinstance(status, str) and status in {"ok", "fallback", "omitted", *_ERRORS})
         _check(type(total) is int and 0 <= total < 2**32 and isinstance(text, str)
                and len(text) <= args["max_chars"]
                and all(" " <= char <= "~" or char in "\n\t" for char in text))
@@ -109,7 +109,7 @@ def anchor(rows, args, anchors):
             form = "java" if status == "ok" else "fallback"
         else:
             _check(row["code_offset"] is None and row["insns_count"] is None and total == 0 and text == "")
-            start, form = 0, "error"
+            start, form = 0, "omitted" if status == "omitted" else "error"
         value = {"kind": "java", **expected.identity, "form": form, "start": start, "total": total, "text": text}
         _check(len(canonical_json(value).encode()) <= MAX_OBSERVATION_BYTES)
         result.append(Observation(expected.location, value, dict(expected.artifact)))

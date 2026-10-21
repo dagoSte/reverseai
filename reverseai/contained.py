@@ -129,7 +129,7 @@ _GHIDRA_QUERY_ARGS = {
 }
 
 
-def _jadx_request(args):
+def validate_jadx_request(args):
     """Only host-resolved artifacts and raw hex identities cross the worker boundary."""
     try:
         if set(args) != {"members", "targets", "start", "max_chars"}:
@@ -173,7 +173,7 @@ def _validated_args(operation, args):
     if not isinstance(args, Mapping):
         raise ContainedError("InvalidWorkerArguments")
     if operation == "jadx.method":
-        return _jadx_request(args)
+        return validate_jadx_request(args)
     if operation == "lief.headers" and not args:
         return {}
     if operation == "lief.sections" and not set(args) - {"max_sections"}:
