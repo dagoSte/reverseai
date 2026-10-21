@@ -80,6 +80,21 @@ class ClaimRuleTests(unittest.TestCase):
         lief = evidence(ToolRef("lief", "1.0.0-r2"), "lief.headers", 0, kind="library", name="libc.so.6")
         self.assertNotEqual(claims.check(finding("imports.libraries", ["libc.so.6"], [lief]), [lief]), ())
 
+    def test_import_claims_keep_the_host_tools_name_bounds(self):
+        # Decision m3b-deferred-to-m3c (R3-P): at most 32 names per group, each 1..128 printable characters.
+        names = [f"f{index}" for index in range(32)]
+        full = evidence(STRUCTURE, "structure.imports", 0, kind="symbols", library=None, names=names)
+        self.assertEqual(claims.check(finding("imports.symbols", sorted(names), [full]), [full]), ())
+        over = evidence(STRUCTURE, "structure.imports", 0, kind="symbols", library=None, names=names + ["f32"])
+        self.assertNotEqual(claims.check(finding("imports.symbols", sorted(names + ["f32"]), [over]), [over]), ())
+        self.assertEqual(claims.check(finding("imports.symbols", ["x" * 128], [ok := evidence(
+            STRUCTURE, "structure.imports", 0, kind="symbols", library=None, names=["x" * 128])]), [ok]), ())
+        for bad in ("x" * 129, "bad\nname", "tab\tname", "nul\x00", "del\x7f", ""):
+            for kind, value in (("symbols", {"library": None, "names": [bad]}), ("library", {"name": bad})):
+                odd = evidence(STRUCTURE, "structure.imports", 0, kind=kind, **value)
+                key = "imports.symbols" if kind == "symbols" else "imports.libraries"
+                self.assertNotEqual(claims.check(finding(key, [bad], [odd]), [odd]), (), (kind, bad))
+
     def test_signature_claims_name_exactly_the_matched_reviewed_rules(self):
         yarax = ToolRef("yarax", "1.21.0-r2")
         upx = evidence(yarax, "yarax.matches", 0, ruleset="m2_fixture_v1", rule="upx_packed", pattern="$a")

@@ -290,6 +290,74 @@ verified evidence (not derived), as in M1.
   Ghidra anchors through `macho_sections` (an anchor must lie inside an executable
   section's file bytes). Adapter `12.1.4-r4` (decision `m3b-fix-round`).
 
+## Assembly, references and referenced strings (M3c)
+
+The same single `ghidra.analyze` run (one container, same resource profile and
+wall limit) reports three more derived kinds. Adapter `12.1.4-r5`. Decision
+`m3c-contract`.
+
+- **New args** (all ints, defaults when absent): `assembly` 0..8 default 4,
+  `max_instructions` 1..64 default 32, `max_refs` 0..128 default 64,
+  `max_strings` 0..64 default 32. At most 600 observations (the sum of every
+  kind's maximum). The reply limit stays 262,144 bytes: the M3a kinds are
+  emitted as before, then `assembly`, `ref` and `string` observations in that
+  order, each added only while the encoded reply stays within the limit; an
+  observation is never cut, and a reply at every maximum is never refused for
+  its size.
+- `{"kind": "assembly", "index", "entry", "instructions", "truncated"}` at the
+  same anchor as function `index` (equal location and entry), for `assembly`
+  functions chosen in the pseudocode order (entry-point function first, then the
+  largest, ties by lower entry); observations in that order. `instructions` is a
+  list of at most `max_instructions` `[delta, length, text]` rows in address
+  order from the entry: `delta` the instruction's offset from the entry,
+  `length` 1..16, rows non-overlapping (`delta + length` at most the next
+  `delta`) and inside the anchor (`delta + length` at most the location
+  length); `text` 1..64 printable ASCII characters, the instruction as Ghidra
+  prints it. Only instructions wholly inside the anchor are listed; the worker
+  confirms each one's bytes against the snapshot. `truncated` is true when the
+  function has instructions that were not listed (cut by `max_instructions`, by
+  the anchor's end or by the 4,096-byte observation limit).
+- `{"kind": "ref", "from", "to", "type", "to_name"}` at the referencing
+  instruction's bytes (1..16 bytes inside an executable section and inside the
+  span of the function whose entry is `from`, as for `call`). `type` is one of
+  `read`, `write`, `read_write`, `data` (any other data reference, such as an
+  address taken) and `jump` (a jump to an address outside the function's body);
+  calls stay `call`, and flow inside the function's body is not reported. `to`
+  is a virtual address that may lie outside the file (zero-fill, external,
+  unresolved); `to_name` at most 128 printable characters, empty when Ghidra has
+  no symbol there. Rows are unique, sorted by (instruction file offset, `to`,
+  `type`), at most `max_refs`.
+- `{"kind": "string", "address", "encoding", "text", "truncated", "from"}` at
+  the string's own bytes, for distinct `to` addresses of the reply's `ref`
+  observations whose target bytes hold a string under this fixed rule, which the
+  host re-derives from the snapshot: `ascii` when 2..128 bytes in 0x20..0x7e
+  start at the target, else `utf-16le` when 2..128 code units `XX 00` with `XX`
+  in 0x20..0x7e do; `truncated` is true only when the run reaches 128 characters
+  and the next character still matches, otherwise a terminator (one zero byte,
+  or two for `utf-16le`) must follow. The location is exactly the encoded `text`
+  (terminator excluded); it and its terminator lie inside one section's file
+  bytes (executable or not: ELF `SHF_ALLOC` sections that are not `SHT_NOBITS`,
+  PE raw data within the mapped extent, Mach-O sections that are not zero-fill),
+  and that section maps the location to `address`. `from` is the sorted unique
+  `from` values of the reply's `ref` observations whose `to` is `address`, the
+  lowest 8 when there are more, never empty. Sorted by `address`, unique, at
+  most `max_strings`.
+- **Host check** (`reverseai/tools/ghidra_verify.py`): the rules above, every
+  string re-derived from the bytes (text, encoding, terminator or truncation,
+  section, address) and every `from` list recomputed from the reply's `ref`
+  rows; any violation refuses the whole reply, as in M3a. Instruction texts,
+  reference types, targets and names remain Ghidra's reading.
+- **Claims** (all `inferred`, all derived, in `DERIVED_CLAIMS`):
+  `code.assembly` = `{"entry", "instructions", "truncated"}` for one function
+  (one finding per disassembled function); `code.references` = sorted unique
+  `[from, type, to, to_name]` rows; `code.strings` = the cited string
+  observations as `{"address", "encoding", "text", "truncated", "from"}`, one per
+  address, in address order. A string's bytes are re-read by the host, yet the
+  finding stays derived: that code references the string is Ghidra's reading.
+- **Imports claim bounds** (decision `m3b-deferred-to-m3c`, R3-P): the
+  `imports.*` rules refuse a symbols group of more than 32 names and any name that
+  is empty, longer than 128 characters or not printable.
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under

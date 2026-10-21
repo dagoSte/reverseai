@@ -87,6 +87,48 @@ def _calls(observations):
     return [list(pair) for pair in sorted({(o["from"], o["to_name"]) for o in calls})] if calls else None
 
 
+def _uint(value):
+    return type(value) is int and 0 <= value < 2**64
+
+
+def _assembly(observations):
+    listings = _kind("assembly")(observations)
+    if not listings or len(listings) != 1:
+        return None
+    return {key: listings[0].get(key) for key in ("entry", "instructions", "truncated")}
+
+
+REFERENCE_TYPES = ("read", "write", "read_write", "data", "jump")
+
+
+def _references(observations):
+    refs = _kind("ref")(observations)
+    if not refs or not all(_uint(o.get("from")) and _uint(o.get("to")) and o.get("type") in REFERENCE_TYPES
+                           and isinstance(o.get("to_name"), str) for o in refs):
+        return None
+    return [list(row) for row in sorted({(o["from"], o["type"], o["to"], o["to_name"]) for o in refs})]
+
+
+def _strings(observations):
+    """One entry per string address, in address order; two readings of the same address yield nothing."""
+    strings = _kind("string")(observations)
+    if not strings or not all(_uint(o.get("address")) for o in strings):
+        return None
+    by_address = {}
+    for o in strings:
+        entry = {key: o.get(key) for key in ("address", "encoding", "text", "truncated", "from")}
+        if by_address.setdefault(o["address"], entry) != entry:
+            return None
+    return [by_address[address] for address in sorted(by_address)]
+
+
+MAX_IMPORT_NAMES = 32  # decision m3b-deferred-to-m3c (R3-P): the host tool's own bounds, now also the reviewer's
+
+
+def _import_name(name):
+    return isinstance(name, str) and 0 < len(name) <= 128 and all(char.isprintable() for char in name)
+
+
 def _import_names(kind):
     """Sorted unique names from cited import observations of one kind (library names or symbol groups)."""
     def derive(observations):
@@ -94,11 +136,11 @@ def _import_names(kind):
             return None
         if kind == "library":
             names = [o.get("name") for o in observations]
-        elif all(isinstance(o.get("names"), list) and o["names"] for o in observations):
+        elif all(isinstance(o.get("names"), list) and 0 < len(o["names"]) <= MAX_IMPORT_NAMES for o in observations):
             names = [n for o in observations for n in o["names"]]
         else:
-            return None  # a symbols group must carry a non-empty list of names
-        return sorted(set(names)) if all(isinstance(n, str) and n for n in names) else None
+            return None  # a symbols group must carry 1..32 names
+        return sorted(set(names)) if all(_import_name(n) for n in names) else None
     return derive
 
 
@@ -118,6 +160,9 @@ RULES = {
     "code.functions": ("inferred", {"ghidra.analyze": _function_names}),
     "code.pseudocode": ("inferred", {"ghidra.analyze": _pseudocode}),
     "code.calls": ("inferred", {"ghidra.analyze": _calls}),
+    "code.assembly": ("inferred", {"ghidra.analyze": _assembly}),
+    "code.references": ("inferred", {"ghidra.analyze": _references}),
+    "code.strings": ("inferred", {"ghidra.analyze": _strings}),
     **{f"capability.{name}": ("inferred", {"strings.indicators": _category(name)}) for name in CATEGORIES},
 }
 
@@ -140,6 +185,9 @@ STATEMENTS = {
     "code.functions": "Functions the analysis tool identified, in address order",
     "code.pseudocode": "Pseudocode the analysis tool decompiled for one function",
     "code.calls": "Calls between functions the analysis tool identified",
+    "code.assembly": "Instructions the analysis tool disassembled for one function",
+    "code.references": "References from code to other addresses the analysis tool identified",
+    "code.strings": "Strings the analysis tool found referenced from code",
     **{f"capability.{name}": f"String hints of {name.replace('_', ' ')} capability (names only, not behaviour)" for name in CATEGORIES},
 }
 
