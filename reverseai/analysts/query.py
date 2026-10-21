@@ -4,7 +4,9 @@ from reverseai.analysts import structural
 from reverseai.contract import MAX_EVIDENCE_PER_FINDING, ToolRef, evidence_intact, make_finding
 
 REFS = {"structure": ToolRef("structure", "0.1.0"), "strings": ToolRef("strings", "0.1.0"),
-        "ghidra": ToolRef("ghidra", "12.1.4-r6"), "apk": ToolRef("apk", "0.1.0"), "dex": ToolRef("dex", "0.1.0")}
+        "ghidra": ToolRef("ghidra", "12.1.4-r6"), "apk": ToolRef("apk", "0.1.0"), "dex": ToolRef("dex", "0.1.0"),
+        "jadx": ToolRef("jadx", "1.5.6-r1")}
+JAVA_FIELDS = ("dex", "class", "name", "prototype", "form", "start", "total", "text")
 PAGES = {
     "structure.segments": ("segment", "segments.list", ("name", "offset", "filesz", "address", "memsz", "readable", "writable", "executable")),
     "structure.symbols": ("symbol", "symbols.list", ("name", "address", "type", "binding", "defined")),
@@ -49,13 +51,17 @@ def conclude(task, evidence):
 
     def emit(key, value, items):
         findings.append(make_finding(task.role, "Query result.", key, value, [item.id for item in items],
-                                     "inferred" if key.startswith("code.") else "observed"))
+                                     "inferred" if key.startswith("code.") or key == "android.java" else "observed"))
 
     # The overview reuses the existing structural conclusions; imports are additional query results.
     if "structure.identify" in allowed:
         findings.extend(structural.conclude(task, tuple(own.values())))
     for operation in sorted(allowed):
         items = [item for item in own.values() if item.operation == operation]
+        if operation == "jadx.method":
+            for item in items:
+                if item.observation.get("kind") == "java" and set(JAVA_FIELDS) <= set(item.observation):
+                    emit("android.java", {field: item.observation[field] for field in JAVA_FIELDS}, [item])
         if operation in PAGES:
             kind, key, fields = PAGES[operation]
             rows = [item for item in items if item.observation.get("kind") == kind]

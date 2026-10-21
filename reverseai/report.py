@@ -1,11 +1,12 @@
 """Deterministic JSON and Markdown reports without timestamps or host paths.
 
 Reports carry bounded text taken from the sample (strings, URLs, section names)
-and from analysts. It stays untrusted: Markdown shows it only inside code spans,
-where HTML, links, images and autolinks do not render.
+and from analysts. It stays untrusted: Markdown shows it inside code spans or
+fenced blocks, where HTML, links, images and autolinks do not render.
 """
 
 from dataclasses import dataclass
+import re
 
 from reverseai import __version__, claims
 from reverseai.contract import CONTRACT_VERSION, VERDICT_STATUS, InputRef, canonical_json
@@ -232,6 +233,37 @@ def _code_details(rows):
     return lines
 
 
+def _java_details(rows, tools):
+    lines = []
+    runtimes = {tool["name"]: tool.get("runtime", {}) for tool in tools}
+    for result, finding in rows:
+        if finding["claim_key"] != "android.java":
+            continue
+        value = finding["value"]
+        own = {item["id"]: item for item in result["evidence"]}
+        cited = [own[i] for i in finding["evidence_ids"] if i in own]
+        tool = cited[0]["tool"] if cited else {"name": "jadx", "version": "not recorded"}
+        image = runtimes.get(tool["name"], {}).get("image", "not recorded")
+        start, stop, total = value["start"], value["start"] + len(value["text"]), value["total"]
+        lines += ["", "### Java (derived)", "",
+                  f"Method: {_cell(value['dex'], 255)} · {_cell(value['class'], 255)} · "
+                  f"{_cell(value['name'], 255)} {_cell(value['prototype'], 255)}",
+                  f"Tool: {_cell(tool['name'] + ' ' + tool['version'])}; Image: {_cell(image, 128)}",
+                  f"Form: {_cell(value['form'])}"]
+        if value["text"]:
+            lines += [f"characters {start}..{stop - 1} of {total}"]
+            if stop < total:
+                lines += [f"Next start: {stop}"]
+        else:
+            lines += [f"no text (form {value['form']})"]
+        # Controls stay visible as escapes; a fence longer than any run cannot be closed by the text.
+        text = "".join(char if " " <= char <= "~" or char in "\n\t" else ascii(char)[1:-1]
+                       for char in value["text"])
+        fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", text)), default=0))
+        lines += ["", fence + "java", text, fence]
+    return lines
+
+
 def to_markdown(analysis):
     report = to_dict(analysis)
     evidence = {e["id"]: e for r in report["results"] for e in r["evidence"]}
@@ -253,6 +285,8 @@ def to_markdown(analysis):
         displayed = {k: _address(v) if k in ("entry", "address") or (k == "at" and args.get("mode") == "address")
                      else v for k, v in args.items()}
         lines[2:2] = [f"- Query: {_cell(analysis.query['name'])}; arguments: {_cell(displayed, limit=4096)}"]
+        if analysis.query["name"] == "inspect_android_method" and not any(t["name"] == "jadx" for t in report["tools"]):
+            lines[3:3] = ["- Decompiled Java requires --with-jadx and the locally built pinned JADX image."]
     supported = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] == "supported"]
     derived = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] == "derived"]
     rejected = [(r, f) for r in report["results"] for f in r["findings"] if f["verdict"] not in ("supported", "derived")]
@@ -280,6 +314,7 @@ def to_markdown(analysis):
         # contract/2: the tool's reading, anchored in the input but not verified against it
         lines += ["", "## Derived by analysis tools (not verified against the bytes)", ""] + table(derived)
         lines += _code_details(derived)
+        lines += _java_details(derived, report["tools"])
     if analysis.query is not None:
         lines += _query_details(supported + derived)
     lines += ["", "## Rejected or unreviewed claims", ""]
