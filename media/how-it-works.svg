@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 680" width="1280" height="680" role="img" aria-labelledby="title desc">
   <title id="title">How ReverseAI works</title>
-  <desc id="desc">An approved file is frozen and hashed. The gateway serves whole-file analysis or a targeted query through allowlisted operations within budgets: host parsers for native structure, imports, strings, APK and DEX, and pinned LIEF, YARA-X and Ghidra in a locked container per run. The host re-derives every LIEF and YARA-X value and every Ghidra anchor and re-reads referenced string contents; Ghidra interpretations stay derived. Evidence binds the input hash, tool, operation and byte range, with member provenance for bytes inside a package. The reviewer independently rebuilds stored or compressed members from the package bytes and checks cited ranges and claim rules. Reports separate supported, derived, unsupported and contradicted findings. Android declarations are not evidence of behaviour.</desc>
+  <desc id="desc">An approved file is frozen and hashed. The gateway serves whole-file analysis or a targeted query through allowlisted operations within budgets: host parsers for native structure, imports, strings, APK and DEX, and pinned LIEF, YARA-X, Ghidra and JADX in a locked container per run. The host re-derives every LIEF and YARA-X value and every Ghidra anchor and re-reads referenced string contents; JADX's Java is bound to a method the host DEX decoder verifies, whose code offset and instruction count JADX must report exactly. Ghidra and JADX interpretations stay derived. Evidence binds the input hash, tool, operation and byte range, with member provenance for bytes inside a package. The reviewer independently rebuilds stored or compressed members from the package bytes and checks cited ranges and claim rules. Reports separate supported, derived, unsupported and contradicted findings. Android declarations are not evidence of behaviour.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0b1220"/>
@@ -70,9 +70,10 @@
     <rect x="700" y="170" width="320" height="170" rx="16" fill="#0e1a30" stroke="#f59e0b" stroke-width="2" stroke-dasharray="7 5"/>
     <circle cx="722" cy="192" r="12" fill="#f59e0b"/><text x="722" y="196" class="n" text-anchor="middle">4</text>
     <text x="745" y="197" class="h" style="font-size:15px">Locked container, one per run</text>
-    <rect x="720" y="212" width="86" height="28" rx="14" fill="#86efac"/><text x="763" y="231" class="chip" text-anchor="middle">LIEF</text>
-    <rect x="816" y="212" width="94" height="28" rx="14" fill="#86efac"/><text x="863" y="231" class="chip" text-anchor="middle">YARA-X</text>
-    <rect x="920" y="212" width="84" height="28" rx="14" fill="#86efac"/><text x="962" y="231" class="chip" text-anchor="middle">Ghidra</text>
+    <rect x="720" y="212" width="60" height="28" rx="14" fill="#86efac"/><text x="750" y="231" class="chip" text-anchor="middle">LIEF</text>
+    <rect x="787" y="212" width="76" height="28" rx="14" fill="#86efac"/><text x="825" y="231" class="chip" text-anchor="middle">YARA-X</text>
+    <rect x="870" y="212" width="68" height="28" rx="14" fill="#86efac"/><text x="904" y="231" class="chip" text-anchor="middle">Ghidra</text>
+    <rect x="945" y="212" width="58" height="28" rx="14" fill="#86efac"/><text x="974" y="231" class="chip" text-anchor="middle">JADX</text>
     <text x="720" y="264" class="k">no network · read-only root · non-root user</text>
     <text x="720" y="284" class="k">capabilities dropped · CPU, memory, time limits</text>
     <text x="720" y="304" class="k">one read-only snapshot mount · image pinned by ID</text>
@@ -82,11 +83,12 @@
   <g>
     <rect x="1060" y="170" width="190" height="170" rx="16" fill="url(#shield)" stroke="#22c55e" stroke-width="1.8"/>
     <circle cx="1082" cy="192" r="12" fill="#22c55e"/><text x="1082" y="196" class="n" text-anchor="middle">5</text>
-    <path d="M1155 200 l22 9 v17 c0 15 -10 25 -22 30 c-12 -5 -22 -15 -22 -30 v-17 z" fill="#22c55e" opacity="0.9"/>
-    <path d="M1145 228 l7 7 l13 -14" stroke="#0b1220" stroke-width="3.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
-    <text x="1155" y="282" class="h" text-anchor="middle" style="font-size:15px">Host re-derivation</text>
-    <text x="1155" y="302" class="s" text-anchor="middle" style="fill:#bbf7d0">LIEF, YARA-X: every value</text>
-    <text x="1155" y="319" class="s" text-anchor="middle" style="fill:#bbf7d0">Ghidra: every anchor</text>
+    <path d="M1155 194 l22 9 v17 c0 15 -10 25 -22 30 c-12 -5 -22 -15 -22 -30 v-17 z" fill="#22c55e" opacity="0.9"/>
+    <path d="M1145 222 l7 7 l13 -14" stroke="#0b1220" stroke-width="3.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="1155" y="272" class="h" text-anchor="middle" style="font-size:15px">Host re-derivation</text>
+    <text x="1155" y="290" class="s" text-anchor="middle" style="fill:#bbf7d0">LIEF, YARA-X: every value</text>
+    <text x="1155" y="305" class="s" text-anchor="middle" style="fill:#bbf7d0">Ghidra: every anchor</text>
+    <text x="1155" y="320" class="s" text-anchor="middle" style="fill:#bbf7d0">JADX: via host DEX decoder</text>
     <text x="1155" y="334" class="s" text-anchor="middle" style="fill:#bbf7d0;font-size:11px">string bytes re-read too</text>
   </g>
 
