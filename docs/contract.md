@@ -276,8 +276,10 @@ verified evidence (not derived), as in M1.
 - **Imports**: new operation `structure.imports`, arg `max_imports` int 1..256
   default 128, at most 256 observations, for ELF (`DT_NEEDED` libraries and
   undefined dynamic symbols), PE (import directory: DLL names and imported names or
-  ordinals as `#<n>`) and thin Mach-O (`LC_LOAD_DYLIB`/`LC_LOAD_WEAK_DYLIB` paths
-  and undefined symbols from `LC_SYMTAB`). Observations:
+  ordinals as `#<n>`) and thin Mach-O (`LC_LOAD_DYLIB`/`LC_LOAD_WEAK_DYLIB` paths,
+  and since M3c `LC_REEXPORT_DYLIB`, `LC_LAZY_LOAD_DYLIB` and `LC_LOAD_UPWARD_DYLIB`
+  through the same dylib command layout, and undefined symbols from `LC_SYMTAB`).
+  Little-endian fat magics are not universal (M3c). Observations:
   `{"kind": "library", "name"}` at the bytes of that name, and
   `{"kind": "symbols", "library": <name or null>, "names": [at most 32]}` at the
   bytes of the first name in the group. Names are at most 128 printable
@@ -307,7 +309,9 @@ wall limit) reports three more derived kinds. Adapter `12.1.4-r5`. Decision
 - `{"kind": "assembly", "index", "entry", "instructions", "truncated"}` at the
   same anchor as function `index` (equal location and entry), for `assembly`
   functions chosen in the pseudocode order (entry-point function first, then the
-  largest, ties by lower entry); observations in that order. `instructions` is a
+  largest, ties by lower entry): a subset of that selection in that order, each
+  function at most once (a listing that fails or does not fit the reply is
+  omitted, as pseudocode may be). `instructions` is a non-empty
   list of at most `max_instructions` `[delta, length, text]` rows in address
   order from the entry: `delta` the instruction's offset from the entry,
   `length` 1..16, rows non-overlapping (`delta + length` at most the next
@@ -332,9 +336,10 @@ wall limit) reports three more derived kinds. Adapter `12.1.4-r5`. Decision
   observations whose target bytes hold a string under this fixed rule, which the
   host re-derives from the snapshot: `ascii` when 2..128 bytes in 0x20..0x7e
   start at the target, else `utf-16le` when 2..128 code units `XX 00` with `XX`
-  in 0x20..0x7e do; `truncated` is true only when the run reaches 128 characters
-  and the next character still matches, otherwise a terminator (one zero byte,
-  or two for `utf-16le`) must follow. The location is exactly the encoded `text`
+  in 0x20..0x7e do; `ascii` wins whenever its whole rule holds. `truncated` is
+  true only when the run reaches 128 characters and the next character still
+  matches inside the same section's file bytes (no terminator is then needed);
+  otherwise a terminator (one zero byte, or two for `utf-16le`) must follow there. The location is exactly the encoded `text`
   (terminator excluded); it and its terminator lie inside one section's file
   bytes (executable or not: ELF `SHF_ALLOC` sections that are not `SHT_NOBITS`,
   PE raw data within the mapped extent, Mach-O sections that are not zero-fill),
