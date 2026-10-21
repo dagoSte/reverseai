@@ -252,7 +252,9 @@ PAGES = {
              lambda o: _uint(o["at"]) and _maybe_uint(o["from"]) and o["type"] in XREF_TYPES and _uint(o["to"])),
     # contract/3, M4a: Android package pages
     "member": (("name", "method", "compressed_size", "size", "crc32", "sha256", "flags"),
-               lambda o: (_text(o["name"]) and type(o["method"]) is int and 0 <= o["method"] < 2**16
+               lambda o: ((_text(o["name"]) or (o["name"] == "" and isinstance(o["flags"], list)
+                                                 and "traversing_name" in o["flags"]))
+                          and type(o["method"]) is int and 0 <= o["method"] < 2**16
                           and _uint(o["compressed_size"]) and _uint(o["size"]) and _uint(o["crc32"]) and o["crc32"] < 2**32
                           and (o["sha256"] is None or (isinstance(o["sha256"], str) and len(o["sha256"]) == 64
                                                        and all(c in "0123456789abcdef" for c in o["sha256"])))
