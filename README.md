@@ -153,7 +153,7 @@ Known limits, by design:
   memory and process limits. Containment is proven on Docker Desktop linux/arm64
   only; other platforms need their own proof.
 - Reports contain bounded text taken from the sample. They are written with
-  private permissions, and Markdown shows that text only inside code spans.
+  private permissions, and Markdown shows that text only inside code spans or fenced code blocks.
 
 ## Security foundation
 

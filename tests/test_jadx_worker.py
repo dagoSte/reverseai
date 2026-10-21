@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -275,8 +276,9 @@ class UnpackTests(unittest.TestCase):
 
 
 class FakeDocker:
-    def __init__(self, image_id="sha256:" + "a" * 64, base_present=True):
+    def __init__(self, image_id="sha256:" + "a" * 64, base_present=True, on_build=None):
         self.calls, self.context, self.image_id, self.base_present = [], None, image_id, base_present
+        self.on_build, self.built = on_build, {}
 
     def __call__(self, *args, capture=False):
         self.calls.append(args)
@@ -285,6 +287,9 @@ class FakeDocker:
         if args[0] == "build":
             context = Path(args[-1])
             self.context = sorted(str(path.relative_to(context)) for path in context.rglob("*"))
+            self.built = {name: build.file_sha256(context / name) for name in ("worker.py", "driver/ReverseAIJadx.java")}
+            if self.on_build:
+                self.on_build()
             Path(args[args.index("--iidfile") + 1]).write_text(self.image_id)
         return "sha256:" + "b" * 64 if capture else None
 
@@ -334,6 +339,50 @@ class BuildToolTests(unittest.TestCase):
             self.main(FakeDocker(base_present=False))
         with self.assertRaises(SystemExit):
             self.main(FakeDocker(image_id="no id"))
+        self.assertFalse(self.lock.exists())
+
+    def private_source(self):
+        source = self.downloads / "jadx-source"
+        shutil.copytree(build.SOURCE, source)
+        patcher = patch.object(build, "SOURCE", source)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return source
+
+    def test_the_lock_names_the_built_context_and_an_edit_during_the_build_writes_no_lock(self):
+        # RD-M4B-CODEX-W M1: the hashes are of the bytes Docker builds; a source changed meanwhile refuses the lock.
+        source = self.private_source()
+        docker = FakeDocker()
+        self.assertEqual(self.main(docker), 0)
+        lock = json.loads(self.lock.read_text())
+        self.assertEqual((lock["worker_sha256"], lock["driver_sha256"]),
+                         (docker.built["worker.py"], docker.built["driver/ReverseAIJadx.java"]))
+        self.lock.unlink()
+        for name in ("worker.py", "driver/ReverseAIJadx.java"):
+            original = (source / name).read_bytes()
+
+            def edit(name=name):
+                with open(source / name, "ab") as stream:
+                    stream.write(b"\n# edited during the build\n" if name.endswith(".py") else b"\n// edited during the build\n")
+            with self.subTest(edited=name), self.assertRaisesRegex(SystemExit, "changed during the build"):
+                self.main(FakeDocker(on_build=edit))
+            self.assertFalse(self.lock.exists())
+            (source / name).write_bytes(original)
+
+    def test_the_copied_dockerfile_is_checked_again_before_the_build(self):
+        self.private_source()
+        real_copy = shutil.copy2
+
+        def copy(source, target, *args, **kwargs):
+            result = real_copy(source, target, *args, **kwargs)
+            if Path(target).name == "Dockerfile":
+                with open(target, "a") as stream:
+                    stream.write("ADD x /x\n")
+            return result
+        docker = FakeDocker()
+        with patch.object(build.shutil, "copy2", copy), self.assertRaisesRegex(SystemExit, "ADD"):
+            self.main(docker)
+        self.assertNotIn("build", [call[0] for call in docker.calls])
         self.assertFalse(self.lock.exists())
 
     def test_the_pinned_inputs_are_the_approved_ones(self):
