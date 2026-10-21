@@ -1,5 +1,6 @@
 """Targeted command uses inert in-process stand-ins until the host lane is integrated."""
 import contextlib
+from dataclasses import replace
 import io
 import json
 import os
@@ -9,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from reverseai import cli, intake, pipeline
-from reverseai.contract import ArgSpec, Location, Observation, OperationSpec, ToolRef, ToolSpec
+from reverseai.contract import ArgSpec, ContractError, Location, Observation, OperationSpec, ToolRef, ToolSpec
 
 
 def byte_tool():
@@ -51,6 +52,22 @@ class QueryCliTests(unittest.TestCase):
                 self.assertNotIn(folder, (out / name).read_text())
                 self.assertEqual((out / name).stat().st_mode & 0o777, 0o600)
             self.assertEqual(out.stat().st_mode & 0o777, 0o700)
+
+    def test_failed_query_operation_exits_one_without_writing_reports(self):
+        def fail(data, args):
+            raise ContractError("synthetic operation failure")
+
+        tool = byte_tool()
+        spec = replace(tool.operations["structure.read_bytes"], handler=fail)
+        tool = replace(tool, operations={spec.name: spec})
+        with tempfile.TemporaryDirectory() as folder, patch.object(pipeline, "TOOLS", (tool,)):
+            sample, out = Path(folder, "sample"), Path(folder, "report")
+            sample.write_bytes(b"inert input")
+            code, stdout, stderr = self.invoke("query", str(sample), "--query", "read_bytes", "--out", str(out))
+            self.assertEqual(code, 1)
+            self.assertEqual(stdout, "")
+            self.assertEqual(stderr, "reverseai: analysis failed: ValueError\n")
+            self.assertEqual(list(out.iterdir()), [])
 
     def test_invalid_query_arguments_are_refused_before_snapshot_or_output(self):
         for name, args in (("read_bytes", ["length=2001"]), ("read_bytes", ["path=/secret"]),

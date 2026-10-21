@@ -135,6 +135,51 @@ class QueryTests(unittest.TestCase):
         for current, evidence in ((task, [altered]), (foreign, [item]), (undeclared, [item])):
             self.assertEqual(query.conclude(current, evidence), ())
 
+    def test_query_analyst_refuses_a_gapped_page_of_intact_evidence(self):
+        task = AnalysisTask(content_id("tk", {"q": "page-gap"}), "code", REF,
+                            (OperationRequest("ghidra.functions", {"start": 7, "limit": 2}),))
+
+        def evidence(indexes):
+            return [make_evidence(DATA, query.REFS["ghidra"], "ghidra.functions", Observation(Location(i, 1), {
+                "kind": "function_row", "index": index, "total": 20, "name": f"f{i}",
+                "entry": 0x1000 + i, "size": 1})) for i, index in enumerate(indexes)]
+
+        valid = query.conclude(task, evidence((7, 8)))
+        self.assertEqual(len(valid), 1)
+        self.assertEqual((valid[0].claim_key, valid[0].value["start"], len(valid[0].value["rows"])),
+                         ("code.function_list", 7, 2))
+        self.assertEqual(query.conclude(task, evidence((7, 9))), ())
+
+    def test_query_analyst_refuses_xrefs_with_mixed_targets(self):
+        task = AnalysisTask(content_id("tk", {"q": "xref-target"}), "code", REF,
+                            (OperationRequest("ghidra.xrefs", {"address": 0x2000}),))
+
+        def evidence(targets):
+            return [make_evidence(DATA, query.REFS["ghidra"], "ghidra.xrefs", Observation(Location(i * 5, 5), {
+                "kind": "xref", "index": i, "total": 2, "at": 0x1000 + i * 5,
+                "from": None, "to": target, "type": "read"})) for i, target in enumerate(targets)]
+
+        valid = query.conclude(task, evidence((0x2000, 0x2000)))
+        self.assertEqual(len(valid), 1)
+        self.assertEqual((valid[0].claim_key, valid[0].value["to"], len(valid[0].value["rows"])),
+                         ("code.xrefs", 0x2000, 2))
+        self.assertEqual(query.conclude(task, evidence((0x2000, 0x3000))), ())
+
+    def test_query_analyst_refuses_callers_with_mixed_targets(self):
+        task = AnalysisTask(content_id("tk", {"q": "caller-target"}), "code", REF,
+                            (OperationRequest("ghidra.function", {"entry": 0x2000, "parts": "callers"}),))
+
+        def evidence(targets):
+            return [make_evidence(DATA, query.REFS["ghidra"], "ghidra.function", Observation(Location(i * 5, 5), {
+                "kind": "caller", "at": 0x1000 + i * 5, "from": None, "to": target}))
+                for i, target in enumerate(targets)]
+
+        valid = query.conclude(task, evidence((0x2000, 0x2000)))
+        self.assertEqual(len(valid), 1)
+        self.assertEqual((valid[0].claim_key, valid[0].value),
+                         ("code.callers", {"to": 0x2000, "rows": [[0x1000, None], [0x1005, None]]}))
+        self.assertEqual(query.conclude(task, evidence((0x2000, 0x3000))), ())
+
     def test_xref_pages_preserve_target_and_nullable_sources(self):
         rows = [Observation(Location(i*5, 5), {"kind": "xref", "index": i, "total": 2, "at": 0x1000+i*5,
                                               "from": None if i == 0 else 0x1000, "to": 0x2000, "type": "read"}) for i in range(2)]
