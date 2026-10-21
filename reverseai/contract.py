@@ -218,26 +218,35 @@ def evidence_from_dict(raw) -> Evidence:
 
 @dataclass(frozen=True)
 class ArgSpec:
-    """Bounded argument: an int range, a short string or a closed set. Never a path or a flag."""
+    """Bounded argument: an int range, a short string or a closed set. Never a path or a flag.
 
-    kind: str  # "int" | "str" | "enum"
+    "literal" (M3d) is search text for in-process tools only: minimum..maximum printable characters, and it may
+    contain "/" or start with "-"; a contained tool may not declare one (ToolSpec refuses it).
+    """
+
+    kind: str  # "int" | "str" | "enum" | "literal"
     minimum: int = 0
     maximum: int = 0
     choices: tuple = ()
     default: object = None
 
     def __post_init__(self):
-        require(self.kind in ("int", "str", "enum"), "Invalid argument kind")
+        require(self.kind in ("int", "str", "enum", "literal"), "Invalid argument kind")
         if self.kind == "enum":
             require(self.choices and all(isinstance(c, str) for c in self.choices), "Enum needs string choices")
         if self.kind == "int":
             require(self.minimum <= self.maximum, "Invalid int range")
+        if self.kind == "literal":
+            require(0 <= self.minimum <= self.maximum <= MAX_STRING_ARG_CHARS, "Invalid literal length range")
 
     def check(self, value):
         if self.kind == "int":
             require(type(value) is int and self.minimum <= value <= self.maximum, "Integer argument out of range")
         elif self.kind == "enum":
             require(value in self.choices, "Argument not in allowed choices")
+        elif self.kind == "literal":
+            require(isinstance(value, str) and self.minimum <= len(value) <= self.maximum and value.isprintable(),
+                    "Literal argument is not allowed")
         else:
             require(isinstance(value, str) and len(value) <= MAX_STRING_ARG_CHARS and "\x00" not in value
                     and "/" not in value and "\\" not in value and not value.startswith("-"),
@@ -287,6 +296,8 @@ class ToolSpec:
         for name, op in self.operations.items():
             require(name == op.name and name.split(".", 1)[0] == self.ref.name, "Operation must be keyed by name and belong to its tool")
         require(type(self.contained) is bool, "ToolSpec contained must be a bool")
+        require(not self.contained or all(arg.kind != "literal" for op in self.operations.values() for arg in op.args.values()),
+                "Contained tools cannot take literal arguments")
         require(isinstance(self.runtime, Mapping) and len(self.runtime) <= 8 and all(
             isinstance(k, str) and _NAME.match(k) and isinstance(v, str) and 0 < len(v) <= 128 and v.isprintable()
             for k, v in self.runtime.items()), "Invalid ToolSpec runtime")

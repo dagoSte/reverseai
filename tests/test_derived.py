@@ -42,9 +42,11 @@ class DerivedTests(unittest.TestCase):
 
     def test_code_claims_stay_derived_even_under_a_misregistered_spec(self):
         # Decision m3a-derived-claims-by-key: the claim key, not only the spec flag, makes a finding derived.
-        # Decision m3c-contract adds assembly, references and referenced strings.
+        # Decision m3c-contract adds assembly, references and referenced strings; m3d-contract the targeted queries.
         self.assertEqual(claims.DERIVED_CLAIMS, {"code.functions", "code.pseudocode", "code.calls",
-                                                 "code.assembly", "code.references", "code.strings"})
+                                                 "code.assembly", "code.references", "code.strings",
+                                                 "code.function_list", "code.function_info", "code.instructions",
+                                                 "code.callers", "code.xrefs"})
         finding = make_finding("code", "Functions.", "code.functions", ["entry", "helper"], [e.id for e in FUNCTIONS], "inferred")
         self.assertEqual(verdicts([finding], FUNCTIONS, tool(derived=False))[finding.id].status, "derived")
 

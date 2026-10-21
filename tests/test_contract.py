@@ -74,6 +74,24 @@ class OperationTests(unittest.TestCase):
             with self.assertRaises(ContractError):
                 ArgSpec("str").check(bad)
 
+    def test_literal_search_text_is_bounded_printable_and_never_contained(self):
+        # Decision m3d-contract: search text may hold "/" or start with "-", but only in-process tools take it.
+        literal = ArgSpec("literal", 1, 128)
+        for good in ("http://example.test/a", "-flag", "a b", "x" * 128, "café"):
+            self.assertEqual(literal.check(good), good)
+        for bad in ("", "x" * 129, "a\nb", "nul\x00", 7, None, b"bytes"):
+            with self.assertRaises(ContractError):
+                literal.check(bad)
+        self.assertEqual(ArgSpec("literal", 0, 128).check(""), "")
+        for low, high in ((-1, 4), (5, 4), (0, 257)):
+            with self.assertRaises(ContractError):
+                ArgSpec("literal", low, high)
+        search = OperationSpec("strings.search", {"query": literal}, lambda data, args: [])
+        ToolSpec(ToolRef("strings", "0.1.0"), {"strings.search": search})
+        contained = OperationSpec("ghidra.functions", {"query": ArgSpec("literal", 0, 128, default="")}, lambda d, a: [])
+        with self.assertRaises(ContractError):
+            ToolSpec(ToolRef("ghidra", "12.1.4-r6"), {"ghidra.functions": contained}, contained=True)
+
     def test_tool_spec_requires_owned_operations(self):
         ToolSpec(ToolRef("strings", "0.1.0"), {"strings.extract": self.spec})
         with self.assertRaises(ContractError):

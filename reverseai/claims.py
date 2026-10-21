@@ -6,7 +6,7 @@ observations yield exactly the finding's value; a claim_key with no rule is neve
 supported. Rules are trusted reviewer code, independent of the analysts.
 """
 
-from reverseai.contract import canonical_json
+from reverseai.contract import canonical_json, sha256_hex
 
 
 def _one(values):
@@ -73,17 +73,17 @@ def _kind(name):
 
 
 def _function_names(observations):
-    functions = _kind("function")(observations)
+    functions = _shaped("function")(observations)
     return [o["name"] for o in sorted(functions, key=lambda o: o["index"])] if functions else None
 
 
 def _pseudocode(observations):
-    texts = _kind("pseudocode")(observations)
+    texts = _shaped("pseudocode")(observations)
     return {key: texts[0][key] for key in ("entry", "text", "truncated")} if texts and len(texts) == 1 else None
 
 
 def _calls(observations):
-    calls = _kind("call")(observations)
+    calls = _shaped("call")(observations)
     return [list(pair) for pair in sorted({(o["from"], o["to_name"]) for o in calls})] if calls else None
 
 
@@ -99,9 +99,9 @@ def _symbol(value):
     return isinstance(value, str) and len(value) <= 128 and all(char.isprintable() for char in value)
 
 
-def _rows(rows):
-    """1..64 [delta, length, text] instruction rows in address order, non-overlapping (contract M3c)."""
-    if not isinstance(rows, list) or not 1 <= len(rows) <= 64:
+def _rows(rows, maximum=64):
+    """1..maximum [delta, length, text] instruction rows in address order, non-overlapping (contracts M3c, M3d)."""
+    if not isinstance(rows, list) or not 1 <= len(rows) <= maximum:
         return False
     end = 0
     for row in rows:
@@ -117,8 +117,36 @@ def _sources(value):
             and all(a < b for a, b in zip(value, value[1:])))
 
 
-# The reviewer's own checks of the M3c shapes: a malformed reading yields nothing, even when a finding repeats it.
+def _bool(value):
+    return type(value) is bool
+
+
+def _maybe_uint(value):
+    return value is None or _uint(value)
+
+
+def _index(value):
+    return type(value) is int and 0 <= value < 2**32
+
+
+# The reviewer's own checks of each code and query shape: a malformed reading yields nothing, even when a finding
+# repeats it (M3c R1; M3a kinds and M3d rows since decision m3d-contract).
 SHAPES = {
+    "function": lambda o: (_index(o.get("index")) and _symbol(o.get("name")) and _uint(o.get("entry"))
+                           and _uint(o.get("size")) and o["size"] > 0),
+    "pseudocode": lambda o: (_index(o.get("index")) and _uint(o.get("entry")) and isinstance(o.get("text"), str)
+                             and len(o["text"]) <= 2048 and _bool(o.get("truncated"))),
+    "call": lambda o: _uint(o.get("from")) and _uint(o.get("to")) and _symbol(o.get("to_name")),
+    "target": lambda o: (_symbol(o.get("name")) and _uint(o.get("entry")) and _uint(o.get("size")) and o["size"] > 0
+                         and all(_index(o.get(key)) for key in ("matches", "callers_total", "callees_total"))),
+    "instructions": lambda o: (_uint(o.get("entry")) and _index(o.get("start")) and _index(o.get("total"))
+                               and _rows(o.get("rows"), 256)
+                               and o["start"] + len(o["rows"]) <= o["total"] and _bool(o.get("truncated"))),
+    "caller": lambda o: _uint(o.get("at")) and _maybe_uint(o.get("from")) and _uint(o.get("to")),
+    "entry": lambda o: _uint(o.get("address")) and _maybe_uint(o.get("offset")),
+    "bytes": lambda o: (_uint(o.get("offset")) and _maybe_uint(o.get("address")) and isinstance(o.get("hex"), str)
+                        and 2 <= len(o["hex"]) <= 8192 and len(o["hex"]) % 2 == 0
+                        and all(char in "0123456789abcdef" for char in o["hex"])),
     "assembly": lambda o: (type(o.get("index")) is int and 0 <= o["index"] < 128 and _uint(o.get("entry"))
                            and _rows(o.get("instructions")) and type(o.get("truncated")) is bool),
     "ref": lambda o: (_uint(o.get("from")) and _uint(o.get("to")) and o.get("type") in REFERENCE_TYPES
@@ -128,6 +156,14 @@ SHAPES = {
                          and (not o["truncated"] or len(o["text"]) == 128) and _sources(o.get("from"))),
 }
 FIELDS = {
+    "function": {"kind", "index", "name", "entry", "size"},
+    "pseudocode": {"kind", "index", "entry", "text", "truncated"},
+    "call": {"kind", "from", "to", "to_name"},
+    "target": {"kind", "name", "entry", "size", "matches", "callers_total", "callees_total"},
+    "instructions": {"kind", "entry", "start", "total", "rows", "truncated"},
+    "caller": {"kind", "at", "from", "to"},
+    "entry": {"kind", "address", "offset"},
+    "bytes": {"kind", "offset", "address", "hex"},
     "assembly": {"kind", "index", "entry", "instructions", "truncated"},
     "ref": {"kind", "from", "to", "type", "to_name"},
     "string": {"kind", "address", "encoding", "text", "truncated", "from"},
@@ -172,6 +208,64 @@ def _strings(observations):
     return [by_address[address] for address in sorted(by_address)]
 
 
+SYMBOL_TYPES = ("func", "object", "notype", "tls", "common", "ifunc", "other", "symbol", "export")
+BINDINGS = ("local", "global", "weak", "other")
+XREF_TYPES = ("call", "jump", "read", "write", "read_write", "data")
+
+# M3d list pages: kind -> (row fields in claim order, shape of one row besides kind, index and total).
+PAGES = {
+    "segment": (("name", "offset", "filesz", "address", "memsz", "readable", "writable", "executable"),
+                lambda o: (_symbol(o["name"]) and all(_uint(o[key]) for key in ("offset", "filesz", "address", "memsz"))
+                           and all(_bool(o[key]) for key in ("readable", "writable", "executable")))),
+    "symbol": (("name", "address", "type", "binding", "defined"),
+               lambda o: (_import_name(o["name"]) and _uint(o["address"]) and o["type"] in SYMBOL_TYPES
+                          and o["binding"] in BINDINGS and _bool(o["defined"]))),
+    "string": (("offset", "encoding", "text", "truncated"),
+               lambda o: (_uint(o["offset"]) and o["encoding"] in ("ascii", "utf-16le") and isinstance(o["text"], str)
+                          and 0 < len(o["text"]) <= 256 and o["text"].isprintable() and _bool(o["truncated"]))),
+    "function_row": (("name", "entry", "size"),
+                     lambda o: _symbol(o["name"]) and _uint(o["entry"]) and _uint(o["size"]) and o["size"] > 0),
+    "xref": (("at", "from", "type"),
+             lambda o: _uint(o["at"]) and _maybe_uint(o["from"]) and o["type"] in XREF_TYPES and _uint(o["to"])),
+}
+
+
+def _page(kind):
+    """{"start", "total", "rows"}: indexes contiguous from start, one total, rows in index order (contract M3d)."""
+    fields, shape = PAGES[kind]
+    expected = {"kind", "index", "total", *fields} | ({"to"} if kind == "xref" else set())
+
+    def derive(observations):
+        rows = _kind(kind)(observations)
+        if not rows or not all(set(o) == expected and _index(o["index"]) and _index(o["total"]) and shape(o) for o in rows):
+            return None
+        rows = sorted(rows, key=lambda o: o["index"])
+        start, total = rows[0]["index"], rows[0]["total"]
+        if start + len(rows) > total or any(o["total"] != total or o["index"] != start + i for i, o in enumerate(rows)):
+            return None
+        page = {"start": start, "total": total, "rows": [[o[key] for key in fields] for o in rows]}
+        if kind == "xref":
+            targets = {o["to"] for o in rows}
+            return {"to": targets.pop(), **page} if len(targets) == 1 else None
+        return page
+    return derive
+
+
+def _single(kind, keys):
+    """One observation of kind, projected to keys."""
+    def derive(observations):
+        found = _shaped(kind)(observations)
+        return {key: found[0][key] for key in keys} if found and len(found) == 1 else None
+    return derive
+
+
+def _callers(observations):
+    calls = _shaped("caller")(observations)
+    if not calls or len({o["to"] for o in calls}) != 1 or len({o["at"] for o in calls}) != len(calls):
+        return None
+    return {"to": calls[0]["to"], "rows": [[o["at"], o["from"]] for o in sorted(calls, key=lambda o: o["at"])]}
+
+
 MAX_IMPORT_NAMES = 32  # decision m3b-deferred-to-m3c (R3-P): the host tool's own bounds, now also the reviewer's
 
 
@@ -208,17 +302,32 @@ RULES = {
     "imports.symbols": ("observed", {"structure.imports": _import_names("symbols")}),
     # contract/2 derived claims: the tool's reading, always inferred, reviewed as "derived"
     "code.functions": ("inferred", {"ghidra.analyze": _function_names}),
-    "code.pseudocode": ("inferred", {"ghidra.analyze": _pseudocode}),
-    "code.calls": ("inferred", {"ghidra.analyze": _calls}),
+    "code.pseudocode": ("inferred", {"ghidra.analyze": _pseudocode, "ghidra.function": _pseudocode}),
+    "code.calls": ("inferred", {"ghidra.analyze": _calls, "ghidra.function": _calls}),
     "code.assembly": ("inferred", {"ghidra.analyze": _assembly}),
-    "code.references": ("inferred", {"ghidra.analyze": _references}),
+    "code.references": ("inferred", {"ghidra.analyze": _references, "ghidra.function": _references}),
     "code.strings": ("inferred", {"ghidra.analyze": _strings}),
+    # M3d targeted queries: verified host pages and readings, then derived Ghidra ones
+    "segments.list": ("observed", {"structure.segments": _page("segment")}),
+    "load.entry": ("observed", {"structure.entry": _single("entry", ("address", "offset"))}),
+    "symbols.list": ("observed", {"structure.symbols": _page("symbol")}),
+    "bytes.read": ("observed", {"structure.read_bytes": _single("bytes", ("offset", "address", "hex"))}),
+    "strings.listed": ("observed", {"strings.list": _page("string")}),
+    "strings.matches": ("observed", {"strings.search": _page("string")}),
+    "code.function_list": ("inferred", {"ghidra.functions": _page("function_row")}),
+    "code.function_info": ("inferred", {"ghidra.function": _single(
+        "target", ("name", "entry", "size", "matches", "callers_total", "callees_total"))}),
+    "code.instructions": ("inferred", {"ghidra.function": _single(
+        "instructions", ("entry", "start", "total", "rows", "truncated"))}),
+    "code.callers": ("inferred", {"ghidra.function": _callers}),
+    "code.xrefs": ("inferred", {"ghidra.xrefs": _page("xref")}),
     **{f"capability.{name}": ("inferred", {"strings.indicators": _category(name)}) for name in CATEGORIES},
 }
 
 
 # contract/2: claims that are always a tool's reading; the reviewer reports them as derived whatever a ToolSpec says.
-DERIVED_CLAIMS = frozenset(key for key, (_, derivations) in RULES.items() if set(derivations) <= {"ghidra.analyze"})
+DERIVED_CLAIMS = frozenset(key for key, (_, derivations) in RULES.items()
+                           if all(operation.startswith("ghidra.") for operation in derivations))
 
 
 # claim_key -> the fixed statement a supported finding makes; the value column says what it found.
@@ -238,7 +347,65 @@ STATEMENTS = {
     "code.assembly": "Instructions the analysis tool disassembled for one function",
     "code.references": "References from code to other addresses the analysis tool identified",
     "code.strings": "Strings the analysis tool found referenced from code",
+    "segments.list": "Segments the file declares (one page)",
+    "load.entry": "Entry point the file declares",
+    "symbols.list": "Symbols the file declares (one page)",
+    "bytes.read": "Bytes read from the input",
+    "strings.listed": "Printable strings in the input (one page)",
+    "strings.matches": "Printable strings in the input that contain the searched text (one page)",
+    "code.function_list": "Functions the analysis tool identified (one page)",
+    "code.function_info": "One function as the analysis tool identified it",
+    "code.instructions": "Instructions the analysis tool disassembled for one function (one page)",
+    "code.callers": "Calls to one function the analysis tool identified",
+    "code.xrefs": "References to one address the analysis tool identified (one page)",
     **{f"capability.{name}": f"String hints of {name.replace('_', ' ')} capability (names only, not behaviour)" for name in CATEGORIES},
+}
+
+
+def _bytes_match(cited):
+    """bytes.read: the hex is exactly the cited bytes (their length and the excerpt hash)."""
+    for item in cited:
+        raw = bytes.fromhex(item.observation["hex"])
+        if len(raw) != item.location.length or sha256_hex(raw) != item.excerpt_sha256:
+            return False
+    return True
+
+
+def _texts_match(cited):
+    """strings.listed and strings.matches: an untruncated row's text, encoded, is exactly the cited bytes."""
+    for item in cited:
+        row = item.observation
+        if not row["truncated"]:
+            raw = row["text"].encode("ascii" if row["encoding"] == "ascii" else "utf-16-le")
+            if len(raw) != item.location.length or sha256_hex(raw) != item.excerpt_sha256:
+                return False
+    return True
+
+
+def _rows_inside(cited):
+    """code.assembly: rows end inside the cited anchor, which starts at the entry (decision m3c-deferred)."""
+    return all(max(delta + length for delta, length, _ in item.observation["instructions"]) <= item.location.length
+               for item in cited)
+
+
+def _page_span(cited):
+    """code.instructions: the cited bytes run from the first listed instruction to the end of the last."""
+    for item in cited:
+        if item.observation.get("kind") != "instructions":
+            continue
+        rows = item.observation["rows"]
+        if item.location.length != rows[-1][0] + rows[-1][1] - rows[0][0]:
+            return False
+    return True
+
+
+# claim_key -> check(cited evidence) run after the value check: what the reviewer confirms against the cited bytes.
+BYTE_CHECKS = {
+    "bytes.read": _bytes_match,
+    "strings.listed": _texts_match,
+    "strings.matches": _texts_match,
+    "code.assembly": _rows_inside,
+    "code.instructions": _page_span,
 }
 
 
@@ -267,4 +434,6 @@ def check(finding, cited):
         expected = derivations[operation](observations)
         if expected is None or canonical_json(expected) != claimed:
             return ("cited evidence does not yield the claimed value",)
+    if finding.claim_key in BYTE_CHECKS and not BYTE_CHECKS[finding.claim_key](cited):
+        return ("cited bytes do not match the claimed value",)
     return ()

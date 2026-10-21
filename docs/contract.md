@@ -367,6 +367,176 @@ wall limit) reports three more derived kinds. Adapter `12.1.4-r5`. Decision
   `imports.*` rules refuse a symbols group of more than 32 names and any name that
   is empty, longer than 128 characters or not printable.
 
+## Targeted queries (M3d)
+
+M3d answers one question at a time, by name, address or text, with paging, next
+to the whole-file `analyze` run. The query names are REA Safe Agent's 16 native
+query names, so M7 can compare them one by one. Decision `m3d-contract`.
+
+- **Command**: `python3 -m reverseai query FILE --query NAME [--arg KEY=VALUE ...]
+  --out DIR [--with-ghidra]`. NAME is one of the closed table below
+  (`reverseai/queries.py`); each `--arg` key must be one the query accepts and its
+  value is checked by the operation's `ArgSpec` (integers in decimal or `0x` hex);
+  anything else is refused before the input is read. A query runs its fixed
+  operations through the same intake, gateway, budgets and reviewer as `analyze`
+  and writes the same report files; the report adds `"query": {"name", "args"}`
+  (JSON) and a line naming the query and its arguments (Markdown). A Ghidra query
+  without `--with-ghidra`, or without the Ghidra image, exits 1 cleanly.
+- **Paging**: list operations take `start` (0-based) and `limit`. Every row
+  carries `index` (its place in the operation's full, deterministic order) and
+  `total` (rows in that order). A page holds rows `start..start+n-1`; when
+  `start+n < total` the report says so and gives the next `start`. A row missing
+  from a page is never evidence that it does not exist. List claims have the
+  value `{"start", "total", "rows"}`: indexes contiguous from `start`, one `total`,
+  rows in index order; an empty page makes no finding.
+
+| Query | Operations (fixed arguments) | Accepted `--arg` keys |
+| --- | --- | --- |
+| `binary_overview` | `structure.identify`, `.headers`, `.sections`, `.imports`, `.entry` | none |
+| `list_segments` | `structure.segments` | `start`, `limit` |
+| `inspect_native_load_image` | `structure.segments`, `structure.entry` | `start`, `limit` |
+| `list_names` | `structure.symbols` | `query`, `start`, `limit` |
+| `read_bytes` | `structure.read_bytes` | `mode`, `at`, `length` |
+| `list_strings` | `strings.list` | `encoding`, `min_length`, `start`, `limit` |
+| `search_strings` | `strings.search` | `query`, `encoding`, `start`, `limit` |
+| `list_procedures` | `ghidra.functions` (`query` "") | `start`, `limit` |
+| `search_procedures` | `ghidra.functions` | `query`, `start`, `limit` |
+| `procedure_info` | `ghidra.function` (`parts` info) | `select`, `entry`, `name` |
+| `procedure_pseudo_code` | `ghidra.function` (`parts` pseudocode) | `select`, `entry`, `name`, `max_chars` |
+| `procedure_assembly` | `ghidra.function` (`parts` assembly) | `select`, `entry`, `name`, `start`, `limit` |
+| `procedure_callees` | `ghidra.function` (`parts` callees) | `select`, `entry`, `name`, `max_calls` |
+| `procedure_callers` | `ghidra.function` (`parts` callers) | `select`, `entry`, `name`, `max_calls` |
+| `analyze_function` | `ghidra.function` (`parts` all) | every `ghidra.function` key except `parts` |
+| `xrefs` | `ghidra.xrefs` | `address`, `start`, `limit` |
+
+### Host operations (verified, in-process, stdlib)
+
+Search text is the `ArgSpec` kind `literal`: a bounded number of printable
+characters that may contain `/` or start with `-`. Only in-process tools may
+declare it (a contained `ToolSpec` refuses one), so Ghidra's `query` and `name`
+keep the `str` rule (no `/`, `\`, leading `-`, at most 256 characters).
+
+Rows are re-derived by the host from the bytes, as in M1; names are escaped and
+cut as section and import names are (at most 128 printable characters).
+`structure.file_sections(data)` is a public helper: the file-backed sections of
+ELF (`SHF_ALLOC`, not `SHT_NOBITS`), PE (raw data within `min(SizeOfRawData,
+VirtualSize)`, `SizeOfRawData` when `VirtualSize` is 0) and thin Mach-O (not
+zero-fill) as `{"name", "address", "offset", "size", "executable"}` rows.
+
+- `structure.segments`: args `start` 0..65535 default 0, `limit` 1..256 default
+  64. One row per ELF program header, PE section header or Mach-O
+  `LC_SEGMENT`/`LC_SEGMENT_64`, in file order: `{"kind": "segment", "index",
+  "total", "name", "offset", "filesz", "address", "memsz", "readable", "writable",
+  "executable"}` at the declaring header (32/56, 40 or 56/72 bytes). ELF `name` is
+  the program header type (`LOAD`, `DYNAMIC`, `INTERP`, `NOTE`, `PHDR`, `TLS`,
+  `GNU_STACK`, `GNU_RELRO`, `GNU_EH_FRAME`, else `0x` hex) and the permissions
+  are `PF_R/W/X`; PE `address` is `ImageBase + VirtualAddress`, `memsz`
+  `VirtualSize`, `offset`/`filesz` the raw data, permissions from
+  `IMAGE_SCN_MEM_*`; Mach-O uses `segname`, `fileoff`, `filesize`, `vmaddr`,
+  `vmsize`, `initprot`. Claim `segments.list` (observed) rows
+  `[name, offset, filesz, address, memsz, readable, writable, executable]`.
+- `structure.entry`: no args, at most 1 observation: `{"kind": "entry",
+  "address", "offset"}` at the field that declares it (ELF `e_entry`, PE
+  `AddressOfEntryPoint`, Mach-O `LC_MAIN` `entryoff` or the `LC_UNIXTHREAD` pc);
+  `address` virtual (PE `ImageBase` + RVA; Mach-O `__TEXT` `vmaddr` + `entryoff`),
+  `offset` the file offset it maps to through `file_sections`, else null. No
+  observation when the file declares none (ELF `e_entry` 0). Claim `load.entry`
+  (observed) = `{"address", "offset"}`.
+- `structure.symbols`: args `query` literal 0..128 default "" (case-sensitive
+  substring of the name; "" lists all), `start` 0..1048575 default 0, `limit` 1..256 default
+  128. Rows in table order: ELF `.symtab`, or `.dynsym` when there is no
+  `.symtab`, without index 0, `STT_SECTION` and `STT_FILE`; Mach-O `LC_SYMTAB`
+  without stab entries; PE export names. Empty names are skipped. `{"kind":
+  "symbol", "index", "total", "name", "address", "type", "binding", "defined"}` at
+  the name's bytes; `type` ELF `func`, `object`, `notype`, `tls`, `common`,
+  `ifunc` or `other`, Mach-O `symbol`, PE `export`; `binding` `local`, `global`,
+  `weak` or `other` (Mach-O external is `global`, PE `global`); `defined` bool.
+  Claim `symbols.list` (observed) rows `[name, address, type, binding, defined]`.
+- `structure.read_bytes`: args `mode` enum `offset`|`address` default `offset`,
+  `at` int 0..2^64-1 default 0, `length` 1..4096 default 256; at most 1
+  observation. `offset`: bytes `[at, min(at + length, size))`, none when `at` is at
+  or past the end. `address`: `at` must map into exactly one `file_sections` row;
+  the range is cut at that row's file end; none otherwise. `{"kind": "bytes",
+  "offset", "address", "hex"}` at exactly those bytes; `address` is the virtual
+  address when the offset lies in exactly one file-backed section, else null;
+  `hex` lowercase. Claim `bytes.read` (observed) = `{"offset", "address", "hex"}`;
+  the reviewer also checks that `hex` decodes to bytes whose SHA-256 is the cited
+  evidence's excerpt hash.
+- `strings.list`: args `encoding` enum `any`|`ascii`|`utf16le` default `any`,
+  `min_length` 4..64 default 6, `start` 0..1048575 default 0, `limit` 1..256
+  default 128. The printable runs of `strings.extract` (ASCII, UTF-16LE), merged
+  in offset order (ASCII first on ties): `{"kind": "string", "index", "total",
+  "offset", "encoding", "text", "truncated"}` at the run's bytes (at most 4,096),
+  `text` at most 256 characters, `truncated` when longer. Claim `strings.listed`
+  (observed) rows `[offset, encoding, text, truncated]`; for an untruncated row
+  the reviewer checks that the encoded text is exactly the cited bytes.
+- `strings.search`: args `query` literal 1..128, `encoding` and `start` as
+  `strings.list`, `limit` 1..256 default 64. The `strings.list` runs (minimum
+  length 4) whose full text contains `query` (case-sensitive), same rows and
+  order, `total` counting matches. Claim `strings.matches` (observed), same rows
+  and checks as `strings.listed`.
+
+### Ghidra operations (derived, contained)
+
+Same image, resource profile and wall limit as M3a; adapter `12.1.4-r6`. The
+query script takes a fixed mode argument; requests still cannot choose scripts
+or options. Each operation is one container run (one import and analysis).
+Rows are added only while the encoded reply fits 262,144 bytes; an observation
+is never cut. Anchors follow the M3a rules (a function's first bytes, at most
+4,096, inside an executable section; an instruction's 1..16 bytes).
+
+- `ghidra.functions`: args `query` str default "", `start` 0..65535 default 0,
+  `limit` 1..128 default 64; at most 128 observations. File-backed, executable,
+  non-external functions in address order whose name contains `query`:
+  `{"kind": "function_row", "index", "total", "name", "entry", "size"}` at the
+  function's anchor. Claim `code.function_list` (derived) rows
+  `[name, entry, size]`.
+- `ghidra.function`: args `select` enum `entry`|`name` default `entry`, `entry`
+  int 0..2^64-1 default 0, `name` str default "", `parts` enum
+  `info`|`pseudocode`|`assembly`|`callees`|`callers`|`all` default `all`, `start`
+  0..65535 default 0, `limit` 1..256 default 64, `max_chars` 64..2048 default
+  1024, `max_calls` 0..256 default 64, `max_refs` 0..128 default 64; at most 600
+  observations. The target is the function whose entry is `entry`, or the
+  lowest-entry function named exactly `name`; no observation when there is none.
+  - always `{"kind": "target", "name", "entry", "size", "matches", "callers_total",
+    "callees_total"}` at the function's anchor (`matches`: functions with that name,
+    1 for `select` entry); claim `code.function_info` (derived) = the value
+    without `kind`;
+  - `pseudocode` or `all`: one M3a `pseudocode` observation (index 0), claim
+    `code.pseudocode`;
+  - `assembly` or `all`: `{"kind": "instructions", "entry", "start", "total",
+    "rows", "truncated"}` at the bytes from the first listed instruction to the
+    end of the last (at most 4,096); `rows` at most `limit` M3c rows `[delta,
+    length, text]`, `delta` from `entry`, inside the function's span; `total` the
+    function's instruction count; `truncated` when the anchor or observation limit
+    stopped the page before `limit`; claim `code.instructions` = the value without
+    `kind`, and the reviewer checks the cited location starts at the first row and
+    ends at the last row's end;
+  - `callees` or `all`: M3a `call` rows from the target (`from` = target entry),
+    at most `max_calls`, claim `code.calls`;
+  - `callers` or `all`: `{"kind": "caller", "at", "from", "to"}` at each call
+    instruction in file-backed executable code whose target is the target's entry,
+    in address order, at most `max_calls`; `at` the instruction's virtual address,
+    `from` the containing function's entry or null, `to` the target entry; claim
+    `code.callers` = `{"to", "rows": [[at, from], ...]}` in `at` order;
+  - `all` only: M3c `ref` rows from the target, at most `max_refs`, claim
+    `code.references`.
+- `ghidra.xrefs`: args `address` int 0..2^64-1 (required), `start` 0..65535
+  default 0, `limit` 1..256 default 64; at most 256 observations. Every reference
+  to `address` from an instruction in file-backed executable code, in instruction
+  address order: `{"kind": "xref", "index", "total", "at", "from", "to", "type"}`
+  at the instruction's bytes; `type` `call` (tail calls included), `jump`, `read`,
+  `write`, `read_write` or `data`; `from` the containing function's entry or null;
+  `to` equals `address`. Claim `code.xrefs` (derived) =
+  `{"to", "start", "total", "rows": [[at, from, type], ...]}`.
+- **Host check** (`ghidra_verify`): per mode, exact field sets and types, anchors
+  as above (an instruction's `at` must be the virtual address its offset maps to;
+  `to` the target entry or `address`), indexes contiguous from `start`, one
+  `total`, counts within `limit`/`max_*`; any violation refuses the whole reply.
+  `analyze` keeps `ghidra.analyze` unchanged.
+- All `code.*` claims stay in `DERIVED_CLAIMS` (every claim whose operations are
+  all `ghidra.*`).
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under
