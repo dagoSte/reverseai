@@ -646,15 +646,18 @@ and needs an owner-approved download. Decision `m4a-contract`.
   references the method's code makes, in code order; `to`: every instruction in
   the selected DEX members that references the method, in member and code order.
   `{"kind": "dex_ref", "index", "total", "dex", "from_class", "from_method",
-  "from_prototype", "at", "ref_kind", "target"}` at the instruction's code units
-  inside the DEX child; `at` the instruction's offset inside the child; `ref_kind`
-  `method`, `field`, `string` or `type`; `target` `Lcls;->name(params)ret`,
-  `Lcls;->name:Type`, the string (escaped, at most 256 characters) or a type
-  descriptor. Only references decoded from complete, valid instructions count;
+  "from_prototype", "at", "ref_kind", "target", "target_truncated"}` at the
+  instruction's code units inside the DEX child; `at` the instruction's offset
+  inside the child; `ref_kind` `method`, `field`, `string` or `type`; `target`
+  `Lcls;->name(params)ret`, `Lcls;->name:Type`, the string or a type descriptor.
+  Only a string literal is cut (escaped, at 256 characters, `target_truncated`
+  true); an identity (descriptor, name, prototype, member) longer than 255
+  escaped characters, or a composed target longer than 512, fails the operation
+  with a fixed error rather than an ambiguous cut (decision `m4a-seams-x`). Only references decoded from complete, valid instructions count;
   a method whose code cannot be decoded gives no rows and the run fails with a
   fixed error rather than a total cut short. Claim `android.references`
   (observed) page rows `[dex, from_class, from_method, from_prototype, at,
-  ref_kind, target]`.
+  ref_kind, target, target_truncated]`.
 - These are declarations in the bytes: a reference in code is not evidence that
   it runs, and a permission declared is not evidence that it is used.
 - **Queries** (`reverseai/queries.py`), REA's Android names: `inspect_android_package`
