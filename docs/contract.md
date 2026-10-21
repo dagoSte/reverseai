@@ -328,7 +328,9 @@ wall limit) reports three more derived kinds. Adapter `12.1.4-r5`. Decision
   span of the function whose entry is `from`, as for `call`). `type` is one of
   `read`, `write`, `read_write`, `data` (any other data reference, such as an
   address taken) and `jump` (a jump to an address outside the function's body);
-  calls stay `call`, and flow inside the function's body is not reported. `to`
+  calls stay `call`, including a jump Ghidra reads as a tail call (flow type
+  call-terminator, decision `m3c-tail-call`), and flow inside the function's
+  body is not reported. `to`
   is a virtual address that may lie outside the file (zero-fill, external,
   unresolved); `to_name` at most 128 printable characters, empty when Ghidra has
   no symbol there. Rows are unique, sorted by (instruction file offset, `to`,
