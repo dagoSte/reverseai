@@ -16,7 +16,7 @@ import time
 from types import MappingProxyType
 import uuid
 
-from reverseai.contract import ArgSpec, ContractError, MAX_WORKER_REPLY_BYTES, canonical_json, sha256_hex
+from reverseai.contract import ArgSpec, ContractError, MAX_WORKER_REPLY_BYTES, canonical_json, check_artifact, sha256_hex
 
 STAGING_ROOT = Path("/Users/Shared/rea-safe-staging-501")
 WALL_SECONDS = 45
@@ -25,21 +25,33 @@ PLATFORM = "linux/arm64"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 GHIDRA_VERSION = "12.1.4-r6"
 GHIDRA_OPERATIONS = frozenset(("ghidra.analyze", "ghidra.functions", "ghidra.function", "ghidra.xrefs"))
+JADX_VERSION = "1.5.6-r1"
+JADX_WALL_SECONDS = 120
 GHIDRA_PINS = MappingProxyType({
     "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
     "ghidra_sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",
     "jdk_sha256": "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223",
 })
+JADX_PINS = MappingProxyType({
+    "base_digest": GHIDRA_PINS["base_digest"],
+    "jadx_zip_sha256": "545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974",
+    "jadx_jar_sha256": "fe3e12c45acf75f92369685fd02d1d7a7323385dc725680a9b98a0dac0ea554b",
+    "jdk_sha256": GHIDRA_PINS["jdk_sha256"],
+})
 _LEGACY_PROFILE = MappingProxyType({"pids": 64, "memory": "512m", "cpus": 1,
     "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=64m", "wall_seconds": WALL_SECONDS})
 _GHIDRA_PROFILE = MappingProxyType({"pids": 256, "memory": "2g", "cpus": 2,
     "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=512m", "wall_seconds": GHIDRA_WALL_SECONDS})
+_JADX_PROFILE = MappingProxyType({"pids": 256, "memory": "2g", "cpus": 2,
+    "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=512m", "wall_seconds": JADX_WALL_SECONDS})
 
 
 def resource_profile(operation):
     """Only the validated operation selects resources; requests cannot override them."""
     if operation in GHIDRA_OPERATIONS:
         return _GHIDRA_PROFILE
+    if operation == "jadx.method":
+        return _JADX_PROFILE
     if operation in ("lief.headers", "lief.sections", "yarax.matches"):
         return _LEGACY_PROFILE
     raise ContainedError("InvalidWorkerArguments")
@@ -70,7 +82,13 @@ def load_lock(lock, *, adapter_version="1.0.0-r2", extra_keys=()):
             raise ValueError
         if not _DIGEST.fullmatch(value.get("base_digest", "")):
             raise ValueError
-        if adapter_version == GHIDRA_VERSION:
+        if adapter_version == JADX_VERSION:
+            keys = ("image_id", "platform", "adapter_version", *JADX_PINS, "driver_sha256", "worker_sha256")
+            if (extra_keys or set(value) != set(keys) or any(value[key] != pin for key, pin in JADX_PINS.items())
+                    or any(not isinstance(value[key], str) or not re.fullmatch(r"[0-9a-f]{64}", value[key])
+                           for key in ("driver_sha256", "worker_sha256"))):
+                raise ValueError
+        elif adapter_version == GHIDRA_VERSION:
             keys = ("image_id", "platform", "adapter_version", *GHIDRA_PINS)
             if extra_keys or set(value) != set(keys) or any(value[key] != pin for key, pin in GHIDRA_PINS.items()):
                 raise ValueError
@@ -111,10 +129,51 @@ _GHIDRA_QUERY_ARGS = {
 }
 
 
+def _jadx_request(args):
+    """Only host-resolved artifacts and raw hex identities cross the worker boundary."""
+    try:
+        if set(args) != {"members", "targets", "start", "max_chars"}:
+            raise ValueError
+        start = ArgSpec("int", 0, 1048575).check(args["start"])
+        maximum = ArgSpec("int", 64, 2048).check(args["max_chars"])
+        members, targets = args["members"], args["targets"]
+        if not (isinstance(members, list) and 1 <= len(members) <= 16
+                and isinstance(targets, list) and 1 <= len(targets) <= 16):
+            raise ValueError
+        for member in members:
+            check_artifact(member)
+            if not re.fullmatch(r"classes[^/]*\.dex", member["member"]):
+                raise ValueError
+        if (len({member["member"] for member in members}) != len(members)
+                or sum(member["size"] for member in members) > 128 * 1024 * 1024):
+            raise ValueError
+        seen, previous = set(), -1
+        for target in targets:
+            if (not isinstance(target, dict) or set(target) != {"member", "class", "method", "prototype"}
+                    or type(target["member"]) is not int or not 0 <= target["member"] < len(members)
+                    or target["member"] < previous
+                    or any(not isinstance(target[key], str) or not re.fullmatch(r"(?:[0-9a-f]{2}){1,255}", target[key])
+                           for key in ("class", "method", "prototype"))):
+                raise ValueError
+            identity = tuple(target[key] for key in ("member", "class", "method", "prototype"))
+            for key in ("class", "method", "prototype"):
+                bytes.fromhex(target[key]).decode("utf-8")
+            if identity in seen:
+                raise ValueError
+            seen.add(identity)
+            previous = target["member"]
+        return {"members": [dict(member) for member in members], "targets": [dict(target) for target in targets],
+                "start": start, "max_chars": maximum}
+    except (ContractError, ValueError, TypeError, KeyError):
+        raise ContainedError("InvalidWorkerArguments") from None
+
+
 def _validated_args(operation, args):
     # Validate here as well as at the gateway: this is the last boundary before argv.
     if not isinstance(args, Mapping):
         raise ContainedError("InvalidWorkerArguments")
+    if operation == "jadx.method":
+        return _jadx_request(args)
     if operation == "lief.headers" and not args:
         return {}
     if operation == "lief.sections" and not set(args) - {"max_sections"}:
@@ -166,9 +225,9 @@ def build_argv(image_id, name, staging_folder, operation, args):
 def run_bounded(argv, *, timeout=WALL_SECONDS, max_output=MAX_WORKER_REPLY_BYTES, profile="default"):
     """Drain at most cap+1 bytes; communicate()/capture_output would be unbounded."""
     # Trusted controllers select a fixed profile; calls may only tighten its limits.
-    if profile not in ("default", "ghidra"):
+    if profile not in ("default", "ghidra", "jadx"):
         raise ContainedError("InvalidWorkerArguments")
-    timeout = min(timeout, GHIDRA_WALL_SECONDS if profile == "ghidra" else WALL_SECONDS)
+    timeout = min(timeout, {"default": WALL_SECONDS, "ghidra": GHIDRA_WALL_SECONDS, "jadx": JADX_WALL_SECONDS}[profile])
     max_output = min(max_output, MAX_WORKER_REPLY_BYTES)
     process = None
     try:
@@ -227,8 +286,9 @@ class DockerExecutor:
     def __init__(self, lock, runner=None, *, adapter_version="1.0.0-r2", extra_keys=(),
                  inspect=inspect_image, staging_root=STAGING_ROOT):
         self.lock = MappingProxyType(load_lock(lock, adapter_version=adapter_version, extra_keys=extra_keys))
-        self.runner = runner if runner is not None else (
-            partial(run_bounded, profile="ghidra") if adapter_version == GHIDRA_VERSION else run_bounded)
+        profile = {GHIDRA_VERSION: "ghidra", JADX_VERSION: "jadx"}.get(adapter_version, "default")
+        self.runner = runner if runner is not None else (run_bounded if profile == "default" else
+                                                        partial(run_bounded, profile=profile))
         self.inspect = inspect
         self.staging_root = Path(staging_root)
 
@@ -240,7 +300,8 @@ class DockerExecutor:
 
     def run(self, operation, args, data, input_sha256):
         args = _validated_args(operation, args)
-        if (operation in GHIDRA_OPERATIONS) != (self.lock["adapter_version"] == GHIDRA_VERSION):
+        if ((operation in GHIDRA_OPERATIONS) != (self.lock["adapter_version"] == GHIDRA_VERSION)
+                or (operation == "jadx.method") != (self.lock["adapter_version"] == JADX_VERSION)):
             raise ContainedError("InvalidWorkerArguments")
         if not isinstance(data, bytes) or sha256_hex(data) != input_sha256:
             raise ContainedError("SnapshotMismatch")
