@@ -140,7 +140,7 @@ public class ReverseAIQuery extends GhidraScript {
 				.append(",\"calls\":[");
 			if (anchored) {
 				selected.add(function);
-				appendCalls(out, function);
+				appendCalls(out, function, MAX_CALLS_PER_FUNCTION);  // analyze: at most 1,024 rows, unchanged
 			}
 			out.append("],\"refs\":[");
 			if (anchored) {
@@ -333,8 +333,8 @@ public class ReverseAIQuery extends GhidraScript {
 			.append(",\"bytes\":").append(quote(hex(entry, memory.getBlock(entry), size)));
 		if (edges) {
 			out.append(",\"calls\":[");
-			appendCalls(out, function);
-			out.append("],\"refs\":[");
+			boolean more = appendCalls(out, function, MAX_ROWS);  // the query modes count every call (decision m3d-fix-round)
+			out.append("],\"calls_overflow\":").append(more).append(",\"refs\":[");
 			appendRefs(out, function);
 			out.append("]");
 		}
@@ -385,18 +385,21 @@ public class ReverseAIQuery extends GhidraScript {
 		out.append("],\"overflow\":false}");
 	}
 
-	/** Instructions start..start+limit-1 of the function, counted from its entry in address order, and the count. */
+	/** Instructions start..start+limit-1 of the function, counted from its entry in address order, and the count of
+	 * all of them; "overflow" when there are more than MAX_BODY_INSTRUCTIONS (the worker then fails the run). */
 	private void appendPage(StringBuilder out, Function function, int start, int limit) throws Exception {
 		Address entry = function.getEntryPoint();
 		out.append("{\"start\":").append(start).append(",\"rows\":[");
 		boolean first = true;
+		boolean overflow = false;
 		int index = 0;
 		for (Instruction instruction : currentProgram.getListing().getInstructions(function.getBody(), true)) {
-			if (index == MAX_BODY_INSTRUCTIONS) {
-				break;
-			}
 			if (instruction.getAddress().compareTo(entry) < 0) {
 				continue;
+			}
+			if (index == MAX_BODY_INSTRUCTIONS) {
+				overflow = true;
+				break;
 			}
 			if (index >= start && index - start < limit) {
 				out.append(first ? "" : ",").append("{\"index\":").append(index)
@@ -409,7 +412,7 @@ public class ReverseAIQuery extends GhidraScript {
 			}
 			index++;
 		}
-		out.append("],\"total\":").append(index).append("}");
+		out.append("],\"total\":").append(index).append(",\"overflow\":").append(overflow).append("}");
 	}
 
 	/** Decompiled C for one function within the deadline (at most 15 s), cut at MAX_TEXT; null when it fails. */
@@ -438,11 +441,12 @@ public class ReverseAIQuery extends GhidraScript {
 		return new String(bytes, StandardCharsets.UTF_8);
 	}
 
-	private void appendCalls(StringBuilder out, Function function) throws Exception {
+	/** One row per call instruction of the function with a memory target, at most cap rows; true when there are more. */
+	private boolean appendCalls(StringBuilder out, Function function, int cap) throws Exception {
 		boolean first = true;
 		int calls = 0;
 		for (Instruction instruction : currentProgram.getListing().getInstructions(function.getBody(), true)) {
-			if (calls == MAX_CALLS_PER_FUNCTION || !instruction.getFlowType().isCall()) {
+			if (!instruction.getFlowType().isCall()) {
 				continue;
 			}
 			Address target = null;
@@ -463,6 +467,9 @@ public class ReverseAIQuery extends GhidraScript {
 			if (target == null) {
 				continue;
 			}
+			if (calls == cap) {
+				return true;
+			}
 			calls++;
 			out.append(first ? "" : ",").append("{\"address\":").append(instruction.getAddress().getOffset())
 				.append(",\"length\":").append(instruction.getLength())
@@ -473,6 +480,7 @@ public class ReverseAIQuery extends GhidraScript {
 				.append(",\"to_name\":").append(quote(nameAt(target))).append("}");
 			first = false;
 		}
+		return false;
 	}
 
 	/** Every non-call memory reference from the function's instructions, with Ghidra's reference-type flags. */

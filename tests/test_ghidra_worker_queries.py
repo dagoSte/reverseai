@@ -3,6 +3,8 @@ ghidra.function and ghidra.xrefs from canned query output built from the refs fi
 
 import copy
 import json
+from pathlib import Path
+import struct
 import unittest
 from unittest.mock import patch
 
@@ -75,10 +77,10 @@ def function_query(data, layout, name, *, start=0, limit=64, delta=0, parts="all
     rows = [{"index": i, "address": target["entry"] + d + delta, "length": n, "file_offset": target["offset"] + d,
              "bytes": data[target["offset"] + d:target["offset"] + d + n].hex(), "text": f"INSN_{d:x}"}
             for i, (d, n) in enumerate(target["instructions"])]
-    q.update(matches=matches, target=dict(item, index=0),
+    q.update(matches=matches, target=dict(item, index=0, calls_overflow=False),
              callers={"rows": [r for r in reference_rows(data, layout, target["entry"], delta) if r["call"]], "overflow": False},
              pseudocode=text if parts in ("pseudocode", "all") else None,
-             instructions={"start": start, "rows": rows[start:start + limit], "total": len(rows)}
+             instructions={"start": start, "rows": rows[start:start + limit], "total": len(rows), "overflow": False}
              if parts in ("assembly", "all") else None)
     return q
 
@@ -326,15 +328,102 @@ class LongFunctionTests(unittest.TestCase):
         q = {"format": "x", "options_off": {}, "mode": "function", "matches": 1,
              "blocks": [{"name": ".text", "start": va, "size": 6000, "execute": True, "initialized": True, "file_offset": offset}],
              "target": {"index": 0, "name": "long", "entry": va, "size": 6000, "file_offset": offset, "anchored": True,
-                        "bytes": data[offset:offset + 4096].hex(), "calls": [], "refs": []},
+                        "bytes": data[offset:offset + 4096].hex(), "calls": [], "calls_overflow": False, "refs": []},
              "callers": {"rows": [], "overflow": False}, "pseudocode": None,
-             "instructions": {"start": 0, "total": 3, "rows": [
+             "instructions": {"start": 0, "total": 3, "overflow": False, "rows": [
                  {"index": i, "address": va + d, "length": 1, "file_offset": offset + d, "bytes": "90", "text": "NOP"}
                  for i, d in enumerate((0, 4095, 4096))]}}
         got = next(o for o in worker.run("ghidra.function", dict(FUNCTION, entry=va, parts="assembly"), data, query_of=lambda *a: q)
                    if o["value"]["kind"] == "instructions")
         self.assertEqual((got["location"], got["value"]["rows"], got["value"]["truncated"]),
                          ({"offset": offset, "length": 4096}, [[0, 1, "NOP"], [4095, 1, "NOP"]], True))
+
+
+
+class CountLimitTests(unittest.TestCase):
+    """FIX-M3D-W (RD-M3D-CODEX-W R1, R2, I1; decision m3d-fix-round): totals are complete counts; past MAX_ROWS rows or
+    MAX_FUNCTION_INSTRUCTIONS instructions, or on the query's overflow marker, the run fails with TooManyRows."""
+
+    def test_the_contract_ceilings(self):
+        self.assertEqual((worker.MAX_ROWS, worker.MAX_FUNCTION_INSTRUCTIONS), (65536, 1_000_000))
+        source = (Path(worker.__file__).parent / "ghidra_scripts" / "ReverseAIQuery.java").read_text()
+        for pin in ("private static final int MAX_ROWS = 65536;", "private static final int MAX_BODY_INSTRUCTIONS = 1000000;",
+                    "private static final int MAX_CALLS_PER_FUNCTION = 1024;",
+                    "appendCalls(out, function, MAX_CALLS_PER_FUNCTION);  // analyze: at most 1,024 rows, unchanged",
+                    "boolean more = appendCalls(out, function, MAX_ROWS);",
+                    'out.append("],\\"calls_overflow\\":").append(more)',
+                    "\t\t\tif (calls == cap) {\n\t\t\t\treturn true;\n\t\t\t}\n\t\t\tcalls++;",
+                    "\t\t\tif (index == MAX_BODY_INSTRUCTIONS) {\n\t\t\t\toverflow = true;\n\t\t\t\tbreak;",
+                    'out.append("],\\"total\\":").append(index).append(",\\"overflow\\":").append(overflow)',
+                    "\t\t\tif (rows == MAX_ROWS) {\n\t\t\t\tout.append(\"],\\\"overflow\\\":true}\");",
+                    "\t\t\tif (total == MAX_ROWS) {\n\t\t\t\tout.append(\"],\\\"overflow\\\":true,\\\"total\\\":\").append(total);"):
+            with self.subTest(pin=pin):
+                self.assertIn(pin, source)
+
+    def test_a_callee_total_counts_every_call_past_analyzes_1024(self):
+        from tests.test_ghidra_worker_logic import code_elf
+        calls = 1025
+        text = bytearray()
+        for i in range(calls):
+            text += b"\xe8" + struct.pack("<i", 5 * calls - 5 * (i + 1))  # call the ret after the last call
+        text += b"\xc3"
+        data, places = code_elf(bytes(text), b"")
+        offset, va = places["text"]
+        rows = [{"address": va + 5 * i, "length": 5, "file_offset": offset + 5 * i, "bytes": data[offset + 5 * i:offset + 5 * i + 5].hex(),
+                 "to": va + 5 * calls, "to_file_offset": offset + 5 * calls, "to_name": "g"} for i in range(calls)]
+        q = {"format": "x", "options_off": {}, "mode": "function", "matches": 1,
+             "blocks": [{"name": ".text", "start": va, "size": len(text), "execute": True, "initialized": True, "file_offset": offset}],
+             "target": {"index": 0, "name": "f", "entry": va, "size": len(text), "file_offset": offset, "anchored": True,
+                        "bytes": data[offset:offset + 4096].hex(), "calls": rows, "calls_overflow": False, "refs": []},
+             "callers": {"rows": [], "overflow": False}, "pseudocode": None, "instructions": None}
+        got = values(data, "ghidra.function", q, entry=va, parts="callees")
+        self.assertEqual((got[0]["callees_total"], len(got) - 1), (1025, 64))
+        with patch.object(worker, "MAX_ROWS", 1025):
+            self.assertEqual(values(data, "ghidra.function", q, entry=va, parts="info")[0]["callees_total"], 1025)
+        with patch.object(worker, "MAX_ROWS", 1024), self.assertRaises(worker.TooManyRows):
+            values(data, "ghidra.function", q, entry=va, parts="info")  # the limit plus one, even without the marker
+        for change, error in (({"calls_overflow": True}, worker.TooManyRows), ({"calls_overflow": None}, worker.InvalidQueryOutput)):
+            with self.subTest(change=change), self.assertRaises(error):
+                values(data, "ghidra.function", dict(q, target=dict(q["target"], **change)), entry=va, parts="info")
+
+    def test_rows_past_the_ceiling_fail_the_run_in_every_mode(self):
+        data, layout = elf_refs()
+        constant, counter = by_name(layout, "constant"), layout["data"]["address"] + 0x40
+        with patch.object(worker, "MAX_ROWS", 2):
+            self.assertEqual(len(values(data, "ghidra.function", function_query(data, layout, "constant"), entry=constant["entry"],
+                                        parts="callers")), 3)
+            self.assertEqual(len(values(data, "ghidra.xrefs", xrefs_query(data, layout, counter), address=counter)), 2)
+            self.assertEqual(len(values(data, "ghidra.functions", functions_query(data, layout, query="o"), query="o")), 2)
+        with patch.object(worker, "MAX_ROWS", 1):
+            for operation, q, args in (("ghidra.function", function_query(data, layout, "constant"), {"entry": constant["entry"]}),
+                                       ("ghidra.xrefs", xrefs_query(data, layout, counter), {"address": counter}),
+                                       ("ghidra.functions", functions_query(data, layout, query="o"), {"query": "o"})):
+                with self.subTest(operation=operation), self.assertRaises(worker.TooManyRows):
+                    values(data, operation, q, **args)
+        q = xrefs_query(data, layout, counter)
+        message = worker.reply(["ghidra.xrefs", json.dumps({"address": counter})], data,
+                               query_of=lambda *a: dict(q, xrefs={"rows": q["xrefs"]["rows"], "overflow": True}))
+        self.assertEqual(message, {"protocol": "reverseai.worker/1", "status": "error", "snapshot_sha256": sha256_hex(data),
+                                   "error": "TooManyRows"})
+
+    def test_an_instruction_total_past_the_ceiling_fails_the_run(self):
+        data, layout = elf_refs()
+        compute = by_name(layout, "compute")
+
+        def page(**change):
+            q = function_query(data, layout, "compute", parts="assembly")
+            q["instructions"].update(change)
+            return values(data, "ghidra.function", q, entry=compute["entry"], parts="assembly")
+
+        self.assertEqual(page()[1]["total"], 9)
+        with patch.object(worker, "MAX_FUNCTION_INSTRUCTIONS", 9):
+            self.assertEqual(page()[1]["total"], 9)
+        with patch.object(worker, "MAX_FUNCTION_INSTRUCTIONS", 8), self.assertRaises(worker.TooManyRows):
+            page()  # a total past the ceiling is never published
+        for change, error in (({"overflow": True}, worker.TooManyRows), ({"overflow": "no"}, worker.InvalidQueryOutput),
+                              ({"total": 1_000_001}, worker.TooManyRows)):
+            with self.subTest(change=change), self.assertRaises(error):
+                page(**change)
 
 
 class XrefsTests(unittest.TestCase):
