@@ -145,7 +145,7 @@ SHAPES = {
     "caller": lambda o: _uint(o.get("at")) and _maybe_uint(o.get("from")) and _uint(o.get("to")),
     "entry": lambda o: _uint(o.get("address")) and _maybe_uint(o.get("offset")),
     "bytes": lambda o: (_uint(o.get("offset")) and _maybe_uint(o.get("address")) and isinstance(o.get("hex"), str)
-                        and 2 <= len(o["hex"]) <= 8192 and len(o["hex"]) % 2 == 0
+                        and 2 <= len(o["hex"]) <= 4000 and len(o["hex"]) % 2 == 0
                         and all(char in "0123456789abcdef" for char in o["hex"])),
     "assembly": lambda o: (type(o.get("index")) is int and 0 <= o["index"] < 128 and _uint(o.get("entry"))
                            and _rows(o.get("instructions")) and type(o.get("truncated")) is bool),
