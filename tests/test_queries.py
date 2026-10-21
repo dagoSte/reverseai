@@ -360,7 +360,7 @@ class AndroidQueryTests(unittest.TestCase):
             "inspect_android_package": ["attribute_limit", "attribute_start", "member_limit", "member_start"],
             "search_android_classes": ["limit", "member", "query", "start"],
             "inspect_android_class": ["class", "limit", "member", "start"],
-            "inspect_android_method": ["class", "limit", "member", "method", "prototype", "start"],
+            "inspect_android_method": ["class", "java_start", "limit", "max_chars", "member", "method", "prototype", "start"],
             "trace_android_references": ["class", "direction", "limit", "member", "method", "prototype", "start"]})
         for spec in queries.TABLE.values():  # a routed query uses every argument it accepts
             if spec.routes:

@@ -66,6 +66,8 @@ def main(argv=None):
     query.add_argument("--arg", action="append", default=[], metavar="KEY=VALUE")
     query.add_argument("--out", type=Path, required=True, help="New or empty directory for report.json and report.md")
     query.add_argument("--with-ghidra", action="store_true", help="Enable the pinned contained Ghidra query worker")
+    query.add_argument("--with-jadx", action="store_true",
+                       help="Include derived Java for Android method queries using the pinned contained JADX worker")
     args = parser.parse_args(argv)
 
     if args.command == "query":
@@ -85,16 +87,17 @@ def main(argv=None):
     tools = pipeline.TOOLS
     for wanted, module, label in ((getattr(args, "with_lief", False), "lief_tool", "LIEF"),
                                   (getattr(args, "with_yarax", False), "yarax_tool", "YARA-X"),
-                                  (args.with_ghidra, "ghidra_tool", "Ghidra")):
+                                  (args.with_ghidra, "ghidra_tool", "Ghidra"),
+                                  (getattr(args, "with_jadx", False), "jadx_tool", "JADX")):
         if not wanted:
             continue
         from importlib import import_module
         from reverseai.contained import ContainedError
-        contained = import_module(f"reverseai.tools.{module}")
         try:
+            contained = import_module(f"reverseai.tools.{module}")
             # The lock can change between the check and the build of the tool.
             worker = contained.make_tool() if contained.available() else None
-        except ContainedError:
+        except (ContainedError, ImportError):
             worker = None
         if worker is None:
             parser.exit(1, f"reverseai: the {label} worker is unavailable (image lock, image or Docker missing)\n")
