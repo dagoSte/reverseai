@@ -148,6 +148,8 @@ def _package(data, args):
 
     def rows():
         for name, child, artifact, _ in _sources(data, members):
+            if members is None and not child.removeprefix(b'\xef\xbb\xbf').lstrip(b' \t\r\n').startswith(b'{'):
+                continue
             for node, path in _declarations(child):
                 text, truncated = _cut(node.value)
                 yield Location(node.start, min(node.end - node.start, MAX_EXCERPT_BYTES)), dict(
