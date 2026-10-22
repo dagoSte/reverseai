@@ -548,7 +548,7 @@ class ApkOperationTests(unittest.TestCase):
                 for operation, args in (('dex.classes', {}), ('dex.methods', {'class': shared.WORKER}),
                                         ('dex.references', {'class': shared.WORKER, 'method': 'run'})):
                     spec = dex.TOOL.operations[operation]
-                    with patch.object(apk, 'materialize', wraps=apk.materialize) as inflate:
+                    with patch.object(apk, '_materialize', wraps=apk._materialize) as inflate:
                         if size > 255:
                             with self.assertRaises(dex.DexError):
                                 spec.handler(data, spec.validate_args(args))
