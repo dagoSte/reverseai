@@ -431,6 +431,13 @@ class RunTests(unittest.TestCase):
         self.assertEqual(calls, [(0, len(data))])
         tampered = data[:-5] + bytes([data[-5] ^ 1]) + data[-4:]  # trailer CRC-32
         self.assertEqual(worker.reply(request(files), tampered, driver=driver)["error"], "input")
+        # One byte past the inflated stream: the slice is empty, so its CRC-32 and hash match; only the range refuses.
+        past = [{"artifact": {**artifacts[0][1], "inner_offset": len(zlib.decompress(data, 31)), "size": 1,
+                              "crc32": zlib.crc32(b""), "sha256": hashlib.sha256(b"").hexdigest()}, "dialect": "js"}]
+        worker.parse_request(request(past))
+        seen.clear()
+        message = worker.reply(request(past), data, driver=driver)
+        self.assertEqual((message.get("error"), seen), ("input", {}), message)
 
     def test_the_driver_command_is_fixed(self):
         self.assertEqual(worker.driver_argv(), [
