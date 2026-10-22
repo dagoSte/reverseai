@@ -805,10 +805,15 @@ evaluates the sample.
   its child artifact for an archive); `sha256` the file's hash (equal to the
   artifact's), `lines` the count of line feeds plus one when the last byte is
   not a line feed (0 for an empty file), `max_line` the longest line in bytes (a
-  minified or packed file shows here). An empty archive member is anchored at its
+  minified or packed file shows here). A JavaScript-named member that the ZIP
+  parser flags is listed too, with `flags` (sorted reviewed flag names, `[]` for
+  clean rows), `sha256`, `lines` and `max_line` null and `size` the declared size,
+  anchored at its central directory entry and never read (decision
+  `m5a-fix-round`); for a clean row `size` 0 means `lines` and `max_line` 0, else
+  1 <= `lines` <= `size` and `max_line` <= `size`. An empty archive member is anchored at its
   central directory entry in the input instead (no artifact); an empty
   single-file input has no rows (decision `m5a-seams-p`). Claim `javascript.files` (observed) page
-  rows `[file, size, sha256, lines, max_line]`.
+  rows `[file, size, sha256, lines, max_line, flags]`.
 - `js.package`: args `file` literal 0..255 default "" ("" for the `package.json`
   with the fewest path segments, the first in central directory order on a tie;
   for a single-file input, the input when its first byte that is not JSON
@@ -843,7 +848,10 @@ evaluates the sample.
   "truncated"}` anchored at the matched bytes (at most 4,096); `hint` the pattern
   name, `text` the matched text escaped, cut at 256 with `truncated`. Claim
   `javascript.hints` (observed) page rows `[file, category, hint, text,
-  truncated]`: lexical occurrences, not evidence that the code runs.
+  truncated]`: lexical occurrences, not evidence that the code runs. Known
+  limits: a call split by a comment or by more than 64 bytes of whitespace, an
+  indirect call or a non-literal `fs` receiver is missed; `process_call` matches
+  bare process calls and calls on `child_process`, `childProcess` or `cp` only.
   `jshints.scan(data)` yields `(offset, length, category, hint)` for one file's
   bytes, in offset order, overlapping matches of different patterns allowed.
 - **Query** `analyze_javascript_application` (REA's name): args `detail` enum
