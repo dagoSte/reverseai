@@ -61,7 +61,8 @@ def prepare(data, args):
                     dict(artifact), declaration["code_off"], code["insns_size"]))
     except (ContractError, UnicodeError):
         raise ContractError(REFUSED) from None
-    _check(selected)
+    if not selected:
+        raise ContractError("JADX member is not a classes*.dex member of the input")
     return {"members": members, "targets": targets, "start": args["start"], "max_chars": args["max_chars"]}, tuple(anchors)
 
 
@@ -109,7 +110,7 @@ def anchor(rows, args, anchors):
             _check(total > 0 and type(row["code_offset"]) is int and row["code_offset"] == expected.code_offset
                    and type(row["insns_count"]) is int and row["insns_count"] == expected.insns_count)
             start = min(args["start"], total)
-            _check(start + len(text) <= total)
+            _check(len(text) == min(args["max_chars"], total - start))
             form = "java" if status == "ok" else "fallback"
         else:
             _check(row["code_offset"] is None and row["insns_count"] is None and total == 0 and text == "")
