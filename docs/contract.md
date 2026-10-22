@@ -951,6 +951,34 @@ parser's reading and stays **derived**; the bytes at each anchor are verified.
   `--with-jsparser` and the locally built pinned image; without it those details
   are refused and the other details work as in M5a.
 
+## Electron ASAR archives (M5b, contract/3)
+
+Decision `m5b-asar`. An ASAR archive is an uncompressed concatenation of files
+behind a JSON header, so its files are stored child artifacts (`method` 0) of the
+input, verified by `contract.materialize` like stored ZIP members.
+
+- **Format**: a 4-byte little-endian size field equal to 4, the 4-byte header
+  pickle size, then the header pickle (payload size, string length, the JSON
+  header bytes, padding to 4); file data starts right after the header pickle.
+  The header is read with `jsonpos` at most 4 MiB, depth 64 and 262,144 tokens;
+  entries are `{"files": {...}}` directories or file objects with `size` and a
+  decimal-string `offset` relative to the data start; `unpacked`, `link`,
+  `executable` and `integrity` fields are allowed.
+- **Members**: names are the `/`-joined path, escaped as ZIP member names, in
+  header order (depth first); at most 65,536 entries and 128 MiB of file data
+  read per operation; every member range lies inside the input after the header.
+  A member with `unpacked` true (its bytes are outside the archive) gets the flag
+  `asar_unpacked`, a `link` entry the flag `asar_link`, a name failing the ZIP
+  name rules `traversing_name`; flagged members are listed and never read.
+  Overlapping ranges, a size or offset past the input, or a malformed header
+  fail the operation (never a total that looks complete).
+- **Use**: `js.files`, `js.package`, `js.hints` and `jsparser.syntax` treat a
+  valid ASAR input like a ZIP archive (the JavaScript file rule, selectors and
+  budgets unchanged); an input that starts with the ASAR size field but fails the
+  ASAR rules fails the operation, as a refused ZIP does. Artifacts carry
+  `method` 0, `compressed_size` = `size`, the CRC-32 and SHA-256 the host computes.
+  `MEMBER_FLAGS` gains `asar_link` and `asar_unpacked`.
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under
