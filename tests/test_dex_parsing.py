@@ -599,7 +599,7 @@ class DexOperationTests(unittest.TestCase):
                    for key, value in children.items()]
         fake = SimpleNamespace(
             members=lambda _: members,
-            materialize=lambda _, member: (children[member.name], hashlib.sha256(children[member.name]).hexdigest()),
+            _materialize=lambda _, member: (children[member.name], hashlib.sha256(children[member.name]).hexdigest()),
             artifact=lambda member, child: {
                 'member': escape(member.name), 'method': 0, 'data_offset': 0,
                 'compressed_size': len(child), 'size': len(child),
@@ -935,10 +935,70 @@ class DexOperationTests(unittest.TestCase):
             data, _ = zip_bytes(children)
             self.assertEqual(len(spec.handler(data, spec.validate_args({}))), 2)
             data, _ = zip_bytes([*children, ('classes3.dex', self.child)])
-            with patch.object(apk, 'materialize', wraps=apk.materialize) as inflate:
+            with patch.object(apk, '_materialize', wraps=apk._materialize) as inflate:
                 with self.assertRaisesRegex(dex.DexError, '^Invalid DEX structure$'):
                     spec.handler(data, spec.validate_args({'limit': 1}))
                 self.assertEqual(inflate.call_count, 2)
+
+
+class DexArchiveWalkTests(unittest.TestCase):
+    def test_all_dex_operations_and_jadx_preparation_parse_the_archive_once(self):
+        from reverseai.tools import apk, jadx_tool, jadx_verify
+        from tests.test_apk_parsing import zip_bytes
+        child, _ = minimal_dex()
+        data, _ = zip_bytes([('classes.dex', child), ('ignored.txt', b'not a DEX'), ('classes2.dex', child)])
+        cases = (('dex.classes', {}, 2), ('dex.methods', {'class': 'Ldemo/Main;'}, 4),
+                 ('dex.references', {'class': 'Ldemo/Main;', 'method': 'method'}, 8))
+        for operation, args, total in cases:
+            with self.subTest(operation=operation), patch.object(apk, 'members', wraps=apk.members) as directory:
+                spec = dex.TOOL.operations[operation]
+                rows = spec.handler(data, spec.validate_args({**args, 'limit': 1}))
+                self.assertEqual((len(rows), rows[0].value['index'], rows[0].value['total']), (1, 0, total))
+                self.assertEqual(rows[0].artifact['member'], 'classes.dex')
+                self.assertEqual(directory.call_count, 1)
+        with self.subTest(operation='jadx preparation'), patch.object(apk, 'members', wraps=apk.members) as directory:
+            spec = jadx_tool.TOOL.operations['jadx.method']
+            args = spec.validate_args({'class': 'Ldemo/Main;', 'method': 'method'})
+            request, anchors = jadx_verify.prepare(data, args)
+            self.assertEqual((len(request['members']), len(request['targets']), len(anchors)), (2, 4, 4))
+            self.assertEqual([m['member'] for m in request['members']], ['classes.dex', 'classes2.dex'])
+            self.assertEqual(directory.call_count, 1)
+
+    def test_materialization_uses_only_clean_descriptors_from_the_same_walk(self):
+        from reverseai.tools import apk
+        from tests.test_apk_parsing import zip_bytes
+        child, _ = minimal_dex()
+        data, _ = zip_bytes([('classes.dex', child), ('classes2.dex', child), ('asset.dex', b'invalid')])
+        parsed, inflated = [], []
+        directory, core = apk.members, apk._materialize
+        def members(data):
+            result = directory(data)
+            parsed.extend(result)
+            return result
+        def materialize(data, member):
+            self.assertTrue(any(member is item for item in parsed))
+            self.assertFalse(member.flags)
+            inflated.append(member.name)
+            return core(data, member)
+        spec = dex.TOOL.operations['dex.classes']
+        with patch.object(apk, 'members', side_effect=members), patch.object(apk, '_materialize', side_effect=materialize):
+            rows = spec.handler(data, spec.validate_args({}))
+        self.assertEqual(inflated, ['classes.dex', 'classes2.dex'])
+        self.assertEqual([r.value['dex'] for r in rows], inflated)
+
+    def test_flagged_classes_still_refuse_and_explicit_selectors_keep_their_meaning(self):
+        from reverseai.tools import apk
+        from tests.test_apk_parsing import zip_bytes
+        child, _ = minimal_dex()
+        spec = dex.TOOL.operations['dex.classes']
+        data, _ = zip_bytes([('classes.dex', child), ('classes2.dex', child), ('classes2.dex', child)])
+        with patch.object(apk, '_materialize', wraps=apk._materialize) as inflate:
+            with self.assertRaisesRegex(dex.DexError, '^Invalid DEX structure$'):
+                spec.handler(data, spec.validate_args({'limit': 1}))
+            self.assertEqual([call.args[1].name for call in inflate.call_args_list], ['classes.dex'])
+        data, _ = zip_bytes([('classes.dex', b'not selected'), ('assets/custom.dex', child)])
+        rows = spec.handler(data, spec.validate_args({'member': 'assets/custom.dex'}))
+        self.assertEqual([r.value['dex'] for r in rows], ['assets/custom.dex'])
 
 
 class DexChildEvidenceTests(unittest.TestCase):
