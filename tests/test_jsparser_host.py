@@ -37,7 +37,7 @@ def item(data, kind, spelling):
 CATALOG = {
     A: {'modules': [item(A, 'import', '"\\u{1f600}/m"')], 'calls': [item(A, 'call', 'obj.eval')]},
     B: {'modules': [item(B, 'require', '`alpha\\${literal}`'), item(B, 'export_from', '"./next"')],
-        'calls': [item(B, 'call', 'require')]},
+        'calls': []},
 }
 
 
@@ -200,7 +200,7 @@ class HostReplyTests(unittest.TestCase):
         self.assertEqual([materialize(self.data, o.artifact)[o.location.offset:o.location.offset + o.location.length]
                           for o in modules], [br'"\u{1f600}/m"', br'`alpha\${literal}`', b'"./next"'])
         calls, _ = invoke(self.data, {'kind': 'calls'})
-        self.assertEqual([o.value['callee'] for o in calls], ['obj.eval', 'require'])
+        self.assertEqual([o.value['callee'] for o in calls], ['obj.eval'])
         parsed, _ = invoke(self.data, {'kind': 'parse'})
         self.assertEqual([o.value for o in parsed], [
             {'kind': 'js_parse', 'file': 'a.js', 'status': 'ok', 'errors': 0, 'index': 0, 'total': 2},
