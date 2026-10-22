@@ -866,6 +866,68 @@ evaluates the sample.
   package declarations (install-time scripts marked), and hints grouped by
   category; it says plainly that hints are lexical and that M5a reads no syntax.
 
+## JavaScript syntax through a pinned parser (M5b, contract/3)
+
+Decisions `owner-next-m5b`, `owner-m5b-downloads`, `m5b-contract`. A pinned
+parser reads JavaScript text as data in a locked container; the host binds every
+answer to bytes it reads itself. The syntactic role (an import, a call) is the
+parser's reading and stays **derived**; the bytes at each anchor are verified.
+
+- **Image**: `containers/jsparser/`, linux/arm64, from the pinned
+  `python:3.12-slim` base with the five approved downloads: Node.js 24.22.1
+  (`node-v24.22.1-linux-arm64.tar.xz`, `dbabf7a1...336e`) and the npm tarballs
+  `@babel/parser` 8.0.4, `@babel/types` 8.0.4, `@babel/helper-string-parser`
+  8.0.6, `@babel/helper-validator-identifier` 8.0.6 (registry sha512 integrities,
+  REA's lock). No npm client and no install scripts: the build tool checks each
+  tarball and unpacks it. A fixed driver imports `@babel/parser` only. Lock keys:
+  `adapter_version` `8.0.4-r1`, `platform`, `base_digest`, `node_sha256`,
+  `babel_parser_integrity`, `babel_types_integrity`,
+  `helper_string_parser_integrity`, `helper_validator_identifier_integrity`,
+  `driver_sha256`, `worker_sha256`, `image_id`.
+- **Profile** (fixed in `reverseai/contained.py`, proven by the native
+  verifier): the JADX flags with values M5B-W measures and coord records.
+- **Parsing**: each file's bytes are decoded as UTF-8 (a leading BOM skipped;
+  invalid UTF-8 gives status `decode_error`), then parsed with `sourceType`
+  `unambiguous`, `errorRecovery` on, plugins fixed by the file suffix (`jsx` for
+  `.jsx`, `typescript` for `.ts`, `typescript` and `jsx` for `.tsx`, none
+  otherwise); no plugin or option comes from a request. Nothing is evaluated,
+  imported, required or transpiled.
+- **Operation** `jsparser.syntax` (derived): args `file` identity 0..255
+  default "" (as `js.hints`: "" for every JavaScript file but `package.json`),
+  `kind` enum `modules`, `calls`, `parse` default `modules`, `start` int
+  0..1048575 default 0, `limit` int 1..256 default 128. The host resolves the
+  files with the `js` tool's rules (ZIP or single file, flags, budgets; at most
+  64 files, each at most 4 MiB, 32 MiB in all, else a fixed error) and sends the
+  worker their artifacts (or the snapshot for a single file) and their dialects;
+  the worker re-materializes members like the JADX worker.
+- **Reply**: per file, in request order, `status` (`ok`, `syntax_error` when
+  error recovery reported errors, `decode_error`, `too_large`), the error count
+  and items: `{"kind": "import" | "export_from" | "require" | "dynamic_import",
+  "start", "end"}` with the UTF-16 offsets of the module source string literal,
+  and `{"kind": "call", "start", "end"}` with the offsets of a callee that is an
+  identifier or a chain of at most four identifiers joined by dots (`new` calls
+  included) whose last name is in `jshints.CALLEES`. Offsets only: the worker
+  never returns text, names or locations in bytes.
+- **Anchors**: the host converts each UTF-16 offset to a UTF-8 byte offset of
+  the file's own bytes, then re-derives the value from those bytes: for a module
+  item the bytes must be one complete single- or double-quoted string literal
+  (or a template literal without `${`), whose decoded value becomes `source`
+  (escaped, cut at 256 with `truncated`); for a call the bytes must be the
+  identifier chain (identifiers and dots, no other byte), which becomes
+  `callee`. Anything else fails the operation.
+  `{"kind": "js_module", "index", "total", "file", "form", "source",
+  "truncated"}`, `{"kind": "js_call", "index", "total", "file", "callee"}` and
+  `{"kind": "js_parse", "index", "total", "file", "status", "errors"}` (anchored
+  at the first 4,096 bytes of the file; empty files have no rows).
+- **Claims** (inferred, derived pages): `javascript.modules` rows `[file, form,
+  source, truncated]`, `javascript.calls` rows `[file, callee]`,
+  `javascript.parse` rows `[file, status, errors]`. They never contradict and
+  are never contradicted; the lexical hints of M5a stay observed.
+- **Query**: `analyze_javascript_application` gains `detail` values `modules`,
+  `calls` and `parse` (routing `jsparser.syntax` with that `kind`) with
+  `--with-jsparser` and the locally built pinned image; without it those details
+  are refused and the other details work as in M5a.
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under

@@ -46,7 +46,8 @@ class DerivedTests(unittest.TestCase):
         self.assertEqual(claims.DERIVED_CLAIMS, {"code.functions", "code.pseudocode", "code.calls",
                                                  "code.assembly", "code.references", "code.strings",
                                                  "code.function_list", "code.function_info", "code.instructions",
-                                                 "code.callers", "code.xrefs", "android.java"})  # M4b, decision m4b-contract
+                                                 "code.callers", "code.xrefs", "android.java",
+                                             "javascript.modules", "javascript.calls", "javascript.parse"})  # M4b, decision m4b-contract
         finding = make_finding("code", "Functions.", "code.functions", ["entry", "helper"], [e.id for e in FUNCTIONS], "inferred")
         self.assertEqual(verdicts([finding], FUNCTIONS, tool(derived=False))[finding.id].status, "derived")
 

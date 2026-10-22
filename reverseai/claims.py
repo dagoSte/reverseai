@@ -307,10 +307,23 @@ PAGES = {
     "package_field": (("file", "path", "value", "truncated"),
                       lambda o: (_js_file(o["file"]) and _text(o["path"]) and o["path"].startswith("/")
                                  and _cut_text(o["value"], o["truncated"]))),
+    # M5b: the parser's syntactic readings, anchored at bytes the host verified
+    "js_module": (("file", "form", "source", "truncated"),
+                  lambda o: _js_file(o["file"]) and o["form"] in JS_FORMS and _cut_text(o["source"], o["truncated"])),
+    "js_call": (("file", "callee"),
+                lambda o: (_js_file(o["file"]) and _ascii(o["callee"], 1, 255)
+                           and all(part and (part[0].isalpha() or part[0] in "_$")
+                                   and all(c.isalnum() or c in "_$" for c in part)
+                                   for part in o["callee"].split(".")) and o["callee"].count(".") <= 3)),
+    "js_parse": (("file", "status", "errors"),
+                 lambda o: (_js_file(o["file"]) and o["status"] in JS_PARSE_STATUSES and _index(o["errors"])
+                            and (o["status"] == "syntax_error") == (o["errors"] > 0))),
     "js_hint": (("file", "category", "hint", "text", "truncated"),
                 lambda o: (_js_file(o["file"]) and o["category"] in JS_CATEGORIES and _text(o["hint"], 64)
                            and o["text"] != "" and _cut_text(o["text"], o["truncated"]))),
 }
+JS_FORMS = ("import", "export_from", "require", "dynamic_import")
+JS_PARSE_STATUSES = ("ok", "syntax_error", "decode_error", "too_large")
 JS_CATEGORIES = ("endpoint", "dynamic_code", "shell", "filesystem", "network", "credential", "encoding")
 
 
@@ -337,7 +350,8 @@ PAGE_EXTRA = {"xref": {"to"}, "class": {"interfaces", "interfaces_total", "sourc
 PAGE_CLAIMS = frozenset({"segments.list", "symbols.list", "strings.listed", "strings.matches",
                          "code.function_list", "code.xrefs", "android.members", "android.manifest",
                          "android.classes", "android.methods", "android.references",
-                         "javascript.files", "javascript.package", "javascript.hints"})
+                         "javascript.files", "javascript.package", "javascript.hints",
+                         "javascript.modules", "javascript.calls", "javascript.parse"})
 # Verified claims the reviewer checks against the cited bytes themselves: two of them never contradict each other.
 SELF_CHECKED_CLAIMS = frozenset({"bytes.read"})
 # Claims whose findings each name a subset of one set (M4a): several of them never contradict each other.
@@ -462,13 +476,17 @@ RULES = {
     "javascript.files": ("observed", {"js.files": _page("js_file")}),
     "javascript.package": ("observed", {"js.package": _page("package_field")}),
     "javascript.hints": ("observed", {"js.hints": _page("js_hint")}),
+    # M5b: derived, the parser's reading at verified bytes
+    "javascript.modules": ("inferred", {"jsparser.syntax": _page("js_module")}),
+    "javascript.calls": ("inferred", {"jsparser.syntax": _page("js_call")}),
+    "javascript.parse": ("inferred", {"jsparser.syntax": _page("js_parse")}),
     **{f"capability.{name}": ("inferred", {"strings.indicators": _category(name)}) for name in CATEGORIES},
 }
 
 
 # contract/2: claims that are always a tool's reading; the reviewer reports them as derived whatever a ToolSpec says.
 DERIVED_CLAIMS = frozenset(key for key, (_, derivations) in RULES.items()
-                           if all(operation.startswith(("ghidra.", "jadx.")) for operation in derivations))
+                           if all(operation.startswith(("ghidra.", "jadx.", "jsparser.")) for operation in derivations))
 
 
 # claim_key -> the fixed statement a supported finding makes; the value column says what it found.
@@ -509,6 +527,9 @@ STATEMENTS = {
     "javascript.files": "JavaScript files of the application (one page)",
     "javascript.package": "Declarations in the application's package.json (one page)",
     "javascript.hints": "Lexical hints in JavaScript files (occurrences of fixed patterns, not evidence of behaviour; one page)",
+    "javascript.modules": "Module references the parser read in JavaScript files (derived; one page)",
+    "javascript.calls": "Calls of listed names the parser read in JavaScript files (derived, not evidence that they run; one page)",
+    "javascript.parse": "How the parser read each JavaScript file (derived; one page)",
     **{f"capability.{name}": f"String hints of {name.replace('_', ' ')} capability (names only, not behaviour)" for name in CATEGORIES},
 }
 
