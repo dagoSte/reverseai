@@ -6,7 +6,14 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M4b released: decompiled Java through JADX.** Deterministic
+**Status: M5a release candidate: JavaScript applications verified on the host.**
+For a JavaScript ZIP or a single bundle, the host lists files, reads package.json
+declarations with exact byte positions, and finds lexical hints at their matched
+byte ranges. It never runs, imports or evaluates the JavaScript. These results
+verify declarations and lexical occurrences, not behaviour; M5a builds no syntax
+tree and does not resolve modules.
+
+Deterministic
 analysts read file structure (ELF, PE and Mach-O), imports and string indicators in-process,
 alongside APK members, binary manifest attributes, DEX classes, methods and code references.
 The gateway and reviewer independently re-derive bytes inside stored or compressed
@@ -28,7 +35,7 @@ Model-driven agents are not part of the current releases.
 ## How it works
 
 <p align="center">
-  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway serves whole-file analysis or a targeted query through host parsers for native files, APK and DEX, or a locked container per run (LIEF, YARA-X, Ghidra, JADX); the host re-derives every LIEF and YARA-X value and every Ghidra anchor, re-reads referenced strings, and binds JADX's Java to a method its own DEX decoder verified; evidence binds hash, tool, operation and byte range, with member provenance for bytes inside a package; a reviewer independently rebuilds package members and re-checks cited bytes and claim rules; Ghidra and JADX interpretations stay derived; reports separate supported, derived, unsupported and contradicted findings.">
+  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway serves whole-file analysis or a targeted query through host parsers for native files, APK, DEX and JavaScript, or a locked container per run (LIEF, YARA-X, Ghidra, JADX); JavaScript files, package declarations and lexical hints are read without execution or syntax analysis; the host re-derives every LIEF and YARA-X value and every Ghidra anchor, re-reads referenced strings, and binds JADX's Java to a method its own DEX decoder verified; evidence binds hash, tool, operation and byte range, with member provenance for bytes inside a package; a reviewer independently rebuilds package members and re-checks cited bytes and claim rules; Ghidra and JADX interpretations stay derived; reports separate supported, derived, unsupported and contradicted findings.">
 </p>
 
 What this buys, and how each point is checked:
@@ -55,7 +62,8 @@ What this buys, and how each point is checked:
 | M3d | Targeted queries by name, address or text with paging; REA's 16 native query names | released |
 | M4a | APK members, binary manifest and DEX classes, methods and code references verified on the host, including compressed-member evidence (contract/3) | released |
 | M4b | Decompiled Java through the official JADX 1.5.6 in a locked container, bound to host-verified DEX methods (derived) | released |
-| M5 | JavaScript application analysis | planned |
+| M5a | JavaScript files, package.json declarations and lexical hints verified on the host; no sample execution | release candidate |
+| M5b | Syntax trees and module analysis, requiring a pinned parser | planned |
 | M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
 | M7 | Measured comparison with REA Safe Agent on a known-answer corpus | planned |
 | M8 | Clean-room kit: evidence-cited functional specification, contamination check, auditable separation of analysis and implementation rooms, conformance tests | planned |
@@ -77,8 +85,8 @@ not decompile), `omitted` (JADX prints no text for the method by design, such as
 constructor) or `error` (nothing produced).
 Pages show `rows a..b of N` and the next `start` (Java pages: `characters a..b of N`); a missing row is never evidence of absence.
 
-Query-name coverage: 21 of REA's 22 names (16 native, 5 Android). JavaScript analysis
-is planned for M5; behavioural parity is measured in M7.
+Query-name coverage: 22 of REA's 22 query names (16 native, 5 Android, 1 JavaScript).
+This counts names; behavioural parity is measured in M7.
 
 | Query | Question | Result |
 | --- | --- | --- |
@@ -103,7 +111,7 @@ is planned for M5; behavioural parity is measured in M7.
 | `inspect_android_class` | Metadata and declared methods for the exact class; copy its displayed name | Verified (host) |
 | `inspect_android_method` | The class's methods and the selected method's code references; with `--with-jadx`, the method's decompiled Java | Verified (host); Java derived (JADX) |
 | `trace_android_references` | References from or to a method, selected by class, name and optional prototype | Verified (host) |
-| `analyze_javascript_application` | JavaScript application analysis | Planned (M5) |
+| `analyze_javascript_application` | Files, package.json declarations and lexical hints; `detail` selects `summary`, `files`, `package` or `hints` | Verified (host) |
 
 ## Try it
 
@@ -113,8 +121,13 @@ Python 3.12 or later, no Python dependencies:
 python3 -m reverseai analyze path/to/approved-file --out new-report-dir
 python3 -m reverseai query path/to/approved-file --query list_segments --arg limit=16 --out new-query-dir
 python3 -m reverseai query path/to/approved.apk --query search_android_classes --arg query=Main --out new-android-report
+python3 -m reverseai query path/to/approved-js.zip --query analyze_javascript_application --arg detail=summary --out new-js-report
 python3 -B -m unittest discover -s tests -t . -v
 ```
+
+The JavaScript query accepts a ZIP or a single JavaScript bundle, with no Docker
+or downloads. Use `detail=files`, `detail=package` or `detail=hints` to page one
+part of the analysis; `summary` takes the first page of each part.
 
 With Docker and the locally built, pinned images (`tools/build_lief_image.py`,
 `tools/build_yarax_image.py`, `tools/build_ghidra_image.py`, `tools/build_jadx_image.py`),
@@ -147,6 +160,9 @@ Known limits, by design:
   big-endian and universal Mach-O files are identified only. String indicators and signature rules are
   lexical hints, never proof of behaviour.
 - Decompiled Java is JADX's reading of the method: plausible code is not verified source.
+- JavaScript hints are lexical occurrences, including in comments and strings.
+  They do not establish execution or behaviour. M5a has no syntax tree, module
+  resolution or deobfuscation; its fixed patterns and bounded spans can miss other forms.
 - A claim type without a rule in `reverseai/claims.py` is never supported. The
   Markdown report states supported findings in the reviewer's own words.
 - In-process handlers have soft time budgets; contained workers have hard wall,
