@@ -471,7 +471,9 @@ class CliTests(unittest.TestCase):
 
 class AndroidPipelineTests(unittest.TestCase):
     def test_apk_and_dex_tools_are_registered_and_the_analyze_run_does_not_use_them(self):
-        self.assertEqual([tool.ref for tool in pipeline.TOOLS][-2:], [ToolRef("apk", "0.1.0"), ToolRef("dex", "0.1.0")])
+        # the js tool (M5a, decision m5a-contract) is registered after them
+        self.assertEqual([tool.ref for tool in pipeline.TOOLS][-3:],
+                         [ToolRef("apk", "0.1.0"), ToolRef("dex", "0.1.0"), ToolRef("js", "0.1.0")])
         self.assertEqual(pipeline._budget(pipeline.TOOLS), Budget())
         data, _ = fixtures_apk.apk_basic()
         analysis = pipeline.analyze_bytes(data, ref(data, "fixture.apk"))

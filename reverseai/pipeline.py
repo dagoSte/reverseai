@@ -9,10 +9,10 @@ from reverseai.analysts import capability, code, structural, query
 from reverseai.contract import AnalysisResult, AnalysisTask, Budget, ContractError, content_id
 from reverseai.gateway import Gateway
 from reverseai.report import Analysis
-from reverseai.tools import apk, dex, strings, structure
+from reverseai.tools import apk, dex, js, strings, structure
 
 ANALYSTS = (structural, capability, code)
-TOOLS = (structure.TOOL, strings.TOOL, apk.TOOL, dex.TOOL)  # apk and dex: contract/3, M4a
+TOOLS = (structure.TOOL, strings.TOOL, apk.TOOL, dex.TOOL, js.TOOL)  # apk and dex: contract/3, M4a; js: M5a
 # LIEF and YARA-X start a container per operation (45 s limit each), so a run that includes one gets more time.
 CONTAINED_BUDGET = Budget(max_wall_seconds=150)
 # Ghidra's single import-and-analyse run may take its full 240 s profile; the code task allows 300 s.

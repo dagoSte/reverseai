@@ -1,17 +1,22 @@
-"""analyze_javascript_application (M5a): arguments, routing by detail, page conclusions and review, with js operations
-answering from the fixture layouts until codex-support-2's js tool lands."""
+"""analyze_javascript_application (M5a): arguments, routing by detail, page conclusions and review through the js tool;
+js.hints answers from the fixture layouts until the jshints lane is merged."""
 
+import contextlib
 from dataclasses import replace
+import io
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
-from reverseai import claims, pipeline, queries
+from reverseai import claims, cli, pipeline, queries
 from reverseai.contract import (
     ArgSpec, ContractError, InputRef, Location, MAX_EVIDENCE_PER_FINDING, Observation, OperationSpec, ToolRef, ToolSpec,
     sha256_hex,
 )
 from reverseai.gateway import Gateway
-from reverseai.tools import structure
+from reverseai.tools import js, structure
 from tests import fixtures_js as J
 
 NAME = "analyze_javascript_application"
@@ -73,10 +78,15 @@ def standin(layout, *, skip=None):
     })
 
 
+def with_standin_hints(layout):
+    """The js tool, its js.hints answering from the layout until jshints is merged."""
+    return replace(js.TOOL, operations={**js.TOOL.operations, "js.hints": standin(layout).operations["js.hints"]})
+
+
 def run(built, args=None, *, tools=None, name="app.zip"):
     data, layout = built
     ref = InputRef(sha256_hex(data), len(data), name)
-    return pipeline.query_bytes(data, ref, NAME, args or {}, tools=tools or (standin(layout),))
+    return pipeline.query_bytes(data, ref, NAME, args or {}, tools=tools or (with_standin_hints(layout),))
 
 
 def pages(analysis):
@@ -237,6 +247,77 @@ class QueryRunTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "Query operation unavailable"):
             run(built, tools=(partial,))
         self.assertEqual(set(pages(run(built, {"detail": "files"}, tools=(partial,)))), {"javascript.files"})
+
+
+
+class RealToolTests(unittest.TestCase):
+    """The registered js tool through the query, the reviewer and the command (files and package; hints need jshints)."""
+
+    def query(self, built, args, name="app.zip"):
+        data, _ = built
+        return pipeline.query_bytes(data, InputRef(sha256_hex(data), len(data), name), NAME, args)
+
+    def test_the_pipeline_registers_the_js_tool(self):
+        self.assertIn(js.TOOL, pipeline.TOOLS)
+        built = J.app_zip()
+        self.assertEqual(pages(self.query(built, {"detail": "files"})),
+                         {"javascript.files": [("supported", files_page(built[1]))]})
+        found = pages(self.query(built, {"detail": "package", "start": 28}))
+        self.assertEqual(found, {"javascript.package": [("supported", {"start": 28, "total": 30, "rows": [
+            ["package.json", "/optionalDependencies/fsevents", "2.3.3", False],
+            ["package.json", "/bundledDependencies/0", "left-pad", False]]})]})
+
+    def test_edge_cases_reach_the_reviewer(self):
+        data, layout = J.js_edge("empty_file")
+        analysis = self.query((data, layout), {"detail": "files"})
+        self.assertEqual(pages(analysis), {"javascript.files": [("supported", files_page(layout))]})
+        empty = next(item for item in analysis.results[0].evidence if item.observation["file"] == "lib/empty.js")
+        self.assertEqual((empty.artifact, empty.location.offset, empty.location.length),
+                         (None, layout["files"][0]["anchor"]["offset"], layout["files"][0]["anchor"]["length"]))
+        analysis = self.query(J.js_edge("empty_input"), {"detail": "files"}, name="empty.js")
+        self.assertEqual((analysis.results[0].status, pages(analysis)), ("ok", {}))
+        for kind in ("long_value", "package_tie"):
+            data, layout = J.js_edge(kind)
+            (verdict, value), = pages(self.query((data, layout), {"detail": "package"}))["javascript.package"]
+            self.assertEqual((verdict, value["rows"]), ("supported", [
+                [row["row"][field] for field in ("file", "path", "value", "truncated")] for row in layout["package"]["rows"]]))
+
+    def test_refused_documents_and_archives_fail_and_flagged_members_are_never_read(self):
+        for kind in ("duplicate_key", "duplicate_nested_key", "invalid_json", "deep_nesting", "huge_string", "non_utf8",
+                     "long_pointer"):
+            built = J.js_hostile(kind)
+            with self.subTest(kind=kind):
+                self.assertEqual(self.query(built, {"detail": "package"}).results[0].status, "error")
+                self.assertEqual(pages(self.query(built, {"detail": "files"})),
+                                 {"javascript.files": [("supported", files_page(built[1]))]})
+        for text in J.INVALID_JSON.values():
+            self.assertEqual(self.query(J.package_zip(text), {"detail": "package"}).results[0].status, "error")
+        built = J.js_hostile("zip_refused")
+        for detail in ("files", "package"):
+            self.assertEqual(self.query(built, {"detail": detail}).results[0].status, "error")
+        built = J.js_hostile("flagged_members")
+        self.assertEqual(pages(self.query(built, {"detail": "files"})),
+                         {"javascript.files": [("supported", files_page(built[1]))]})
+        analysis = self.query(J.js_hostile("declared_over_128mib"), {"detail": "package"})
+        self.assertEqual((analysis.results[0].status, pages(analysis)), ("ok", {}))
+
+    def test_the_command_writes_both_reports(self):
+        data, layout = J.app_zip()
+        with tempfile.TemporaryDirectory() as folder:
+            sample, out = Path(folder, "app.zip"), Path(folder, "report")
+            sample.write_bytes(data)
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = cli.main(["query", str(sample), "--query", NAME, "--arg", "detail=package", "--arg", "limit=3",
+                                 "--out", str(out)])
+            self.assertEqual(code, 0, stderr.getvalue())
+            parsed = json.loads((out / "report.json").read_text())
+            self.assertEqual([(f["claim_key"], f["verdict"]) for f in parsed["results"][0]["findings"]],
+                             [("javascript.package", "supported")])
+            markdown = (out / "report.md").read_text()
+            self.assertIn("## JavaScript application", markdown)
+            self.assertIn("| 0 | `package.json` | `/name` | `@fixture/app` | `false` | - |", markdown)
+            self.assertNotIn(folder, markdown + json.dumps(parsed))
 
 
 if __name__ == "__main__":
