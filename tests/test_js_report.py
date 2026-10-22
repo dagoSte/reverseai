@@ -136,11 +136,12 @@ class JavaScriptReportTests(unittest.TestCase):
         built = J.archive([F.member("package.json", package), F.member(name, script)], strings={"package.json": strings})
         analysis = run(built)
         statuses = {verdict.finding_id: verdict.status for verdict in analysis.verdicts}
-        rows = {(finding.claim_key, tuple(row)) for finding in analysis.results[0].findings
+        rows = {(finding.claim_key, tuple(tuple(cell) if isinstance(cell, list) else cell for cell in row))
+                for finding in analysis.results[0].findings
                 if statuses[finding.id] == "supported" for row in finding.value["rows"]}
         literal = 'token = "<img src=x>[x](https://evil.example/)`b`"'
         self.assertLessEqual({("javascript.files", (name, len(script), hashlib.sha256(script).hexdigest(), 1,
-                                                    len(script) - 1)),
+                                                    len(script) - 1, ())),
                               ("javascript.hints", (name, "credential", "credential_assignment", literal, False)),
                               ("javascript.package", ("package.json", "/name", hostile, False))}, rows)
         markdown = report.to_markdown(analysis)
