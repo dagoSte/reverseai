@@ -295,7 +295,34 @@ PAGES = {
                            and isinstance(o["target"], str) and len(o["target"]) <= 512 and o["target"].isprintable()
                            and _bool(o["target_truncated"])
                            and (not o["target_truncated"] or (o["ref_kind"] == "string" and len(o["target"]) == 256)))),
+    # M5a: JavaScript applications on the host; "" names a single-file input
+    "js_file": (("file", "size", "sha256", "lines", "max_line"),
+                lambda o: (_js_file(o["file"]) and _uint(o["size"]) and _sha256(o["sha256"]) and _uint(o["lines"])
+                           and _uint(o["max_line"]) and o["max_line"] <= o["size"] and o["lines"] <= o["size"] + 1)),
+    "package_field": (("file", "path", "value", "truncated"),
+                      lambda o: (_js_file(o["file"]) and _text(o["path"]) and o["path"].startswith("/")
+                                 and _cut_text(o["value"], o["truncated"]))),
+    "js_hint": (("file", "category", "hint", "text", "truncated"),
+                lambda o: (_js_file(o["file"]) and o["category"] in JS_CATEGORIES and _text(o["hint"], 64)
+                           and o["text"] != "" and _cut_text(o["text"], o["truncated"]))),
 }
+JS_CATEGORIES = ("endpoint", "dynamic_code", "shell", "filesystem", "network", "credential", "encoding")
+
+
+def _js_file(value):
+    return value == "" or _text(value)
+
+
+def _sha256(value):
+    return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def _cut_text(value, truncated):
+    """A printable string of at most 256 characters, exactly 256 when cut."""
+    return (isinstance(value, str) and len(value) <= 256 and value.isprintable() and _bool(truncated)
+            and (not truncated or len(value) == 256))
+
+
 # Fields a page row carries besides its claimed columns, index and total.
 PAGE_EXTRA = {"xref": {"to"}, "class": {"interfaces", "interfaces_total", "source_file"}}
 
@@ -304,7 +331,8 @@ PAGE_EXTRA = {"xref": {"to"}, "class": {"interfaces", "interfaces_total", "sourc
 # within the task (one query with its arguments) that produced them.
 PAGE_CLAIMS = frozenset({"segments.list", "symbols.list", "strings.listed", "strings.matches",
                          "code.function_list", "code.xrefs", "android.members", "android.manifest",
-                         "android.classes", "android.methods", "android.references"})
+                         "android.classes", "android.methods", "android.references",
+                         "javascript.files", "javascript.package", "javascript.hints"})
 # Verified claims the reviewer checks against the cited bytes themselves: two of them never contradict each other.
 SELF_CHECKED_CLAIMS = frozenset({"bytes.read"})
 # Claims whose findings each name a subset of one set (M4a): several of them never contradict each other.
@@ -426,6 +454,9 @@ RULES = {
     "android.classes": ("observed", {"dex.classes": _page("class")}),
     "android.methods": ("observed", {"dex.methods": _page("method")}),
     "android.references": ("observed", {"dex.references": _page("dex_ref")}),
+    "javascript.files": ("observed", {"js.files": _page("js_file")}),
+    "javascript.package": ("observed", {"js.package": _page("package_field")}),
+    "javascript.hints": ("observed", {"js.hints": _page("js_hint")}),
     **{f"capability.{name}": ("inferred", {"strings.indicators": _category(name)}) for name in CATEGORIES},
 }
 
@@ -470,6 +501,9 @@ STATEMENTS = {
     "android.methods": "Methods one DEX class declares (one page)",
     "android.references": "References in DEX code (declarations, not evidence of execution; one page)",
     "android.java": "Java the decompiler produced for one DEX method (its reading, not verified against the bytes)",
+    "javascript.files": "JavaScript files of the application (one page)",
+    "javascript.package": "Declarations in the application's package.json (one page)",
+    "javascript.hints": "Lexical hints in JavaScript files (occurrences of fixed patterns, not evidence of behaviour; one page)",
     **{f"capability.{name}": f"String hints of {name.replace('_', ' ')} capability (names only, not behaviour)" for name in CATEGORIES},
 }
 

@@ -771,6 +771,76 @@ Java is the decompiler's reading, kept **derived** like Ghidra's pseudocode.
 - **Report**: the derived section shows each method's Java in a fenced block
   with the tool, image and page (`characters a..b of N`, next `start`).
 
+## JavaScript applications on the host (M5a, contract/3)
+
+Decision `owner-next-m5a`: stdlib only, no download. M5a covers REA's
+`analyze_javascript_application` with what the host can verify from the bytes:
+the files of an application, its `package.json` declarations and lexical hints
+anchored at exact bytes. Abstract syntax, module graphs and deobfuscation need a
+pinned parser (M5b, a separate owner question); nothing here executes, imports or
+evaluates the sample.
+
+- **Inputs**: one approved file, as today. When the input is a valid ZIP archive
+  (the APK ZIP parser accepts it, with its limits and flags) the operations read
+  its clean members as child artifacts; otherwise the input itself is one file,
+  named "" in rows. Flagged members are listed by `apk.inventory` but never read.
+  Tar, gzip and ASAR packages are out of M5a.
+- **JavaScript files**: members whose name ends in `.js`, `.mjs`, `.cjs`, `.jsx`,
+  `.ts` or `.tsx` (ASCII case-insensitive), plus `package.json`, in central
+  directory order; the single-file input counts as one.
+- **Tool** `js` 0.1.0 (in-process), `reverseai/tools/js.py`; JSON positions in
+  `reverseai/tools/jsonpos.py`; lexical patterns in `reverseai/tools/jshints.py`.
+  At most 128 MiB of JavaScript read per operation, else the operation fails with
+  a fixed error (never a total that looks complete). Names and texts are escaped
+  as import names; `file` and selector arguments compare with the escaped text
+  rows show.
+- `js.files`: args `start` 0..65535 default 0, `limit` 1..256 default 128.
+  `{"kind": "js_file", "index", "total", "file", "size", "sha256", "lines",
+  "max_line"}` anchored at the first min(size, 4,096) bytes of the file (inside
+  its child artifact for an archive); `sha256` the file's hash (equal to the
+  artifact's), `lines` the count of line feeds plus one when the last byte is
+  not a line feed (0 for an empty file), `max_line` the longest line in bytes (a
+  minified or packed file shows here). Claim `javascript.files` (observed) page
+  rows `[file, size, sha256, lines, max_line]`.
+- `js.package`: args `file` literal 0..255 default "" ("" for the `package.json`
+  with the fewest path segments, the first in central directory order on a tie;
+  for a single-file input, the input), `start` 0..65535, `limit` 1..256 default
+  128. The file is parsed by a bounded JSON reader that records byte positions:
+  at most 1 MiB, depth 64 and 65,536 tokens; invalid JSON or a duplicate key in
+  one object fails the operation. Rows are the string values of these fields, in
+  document order: `name`, `version`, `description`, `main`, `module`, `browser`,
+  `types`, `type`, `license`, `homepage`, `repository` (or `repository/url`),
+  every string under `bin`, `exports` (depth at most 4), `scripts`, `engines`,
+  `dependencies`, `devDependencies`, `peerDependencies`, `optionalDependencies`
+  and the entries of `bundledDependencies` (or `bundleDependencies`).
+  `{"kind": "package_field", "index", "total", "file", "path", "value",
+  "truncated"}` anchored at the value's bytes in the file, quotes included (the
+  first 4,096 when longer); `path` a JSON pointer (`/dependencies/left-pad`),
+  `value` the decoded string escaped, cut at 256 characters with `truncated`.
+  Claim `javascript.package` (observed) page rows `[file, path, value,
+  truncated]`. Scripts are declarations: `preinstall`, `install`, `postinstall`
+  and `prepare` run on install, which the report says, but nothing runs them.
+- `js.hints`: args `file` literal 0..255 default "" (every JavaScript file but
+  `package.json`), `category` enum `all`, `endpoint`, `dynamic_code`, `shell`,
+  `filesystem`, `network`, `credential`, `encoding` default `all`, `start`
+  0..1048575, `limit` 1..256 default 128. Every occurrence of the fixed patterns
+  of `jshints.PATTERNS` (each a name, a category and a bounded regular expression
+  over bytes), in file then offset order, comments and strings included:
+  `{"kind": "js_hint", "index", "total", "file", "category", "hint", "text",
+  "truncated"}` anchored at the matched bytes (at most 4,096); `hint` the pattern
+  name, `text` the matched text escaped, cut at 256 with `truncated`. Claim
+  `javascript.hints` (observed) page rows `[file, category, hint, text,
+  truncated]`: lexical occurrences, not evidence that the code runs.
+  `jshints.scan(data)` yields `(offset, length, category, hint)` for one file's
+  bytes, in offset order, overlapping matches of different patterns allowed.
+- **Query** `analyze_javascript_application` (REA's name): args `detail` enum
+  `summary`, `files`, `package`, `hints` default `summary`, `file`, `category`,
+  `start`, `limit` as above; `summary` routes `js.files`, `js.package` and
+  `js.hints` (first page each), the others one operation.
+- **Report**: a JavaScript section with files (size, lines, longest line),
+  package declarations (install-time scripts marked), and hints grouped by
+  category; it says plainly that hints are lexical and that M5a reads no syntax.
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under
