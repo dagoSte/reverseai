@@ -900,9 +900,15 @@ parser's reading and stays **derived**; the bytes at each anchor are verified.
   64 files, each at most 4 MiB, 32 MiB in all, else a fixed error) and sends the
   worker their artifacts (or the snapshot for a single file) and their dialects;
   the worker re-materializes members like the JADX worker.
+- **Request and paging** (decision `m5b-seams-w`): the host's closed request
+  carries the files (artifacts or the snapshot, dialects), `kind`, `start`,
+  `limit` and `callees`, the sorted `jshints.CALLEES` (always exactly that list;
+  the image need not change when the list does). The worker finds every item of
+  that kind in file then offset order, returns each file's item count and only
+  the items of the page `start`..`start + limit`, each with its file index.
 - **Reply**: per file, in request order, `status` (`ok`, `syntax_error` when
-  error recovery reported errors, `decode_error`, `too_large`), the error count
-  and items: `{"kind": "import" | "export_from" | "require" | "dynamic_import",
+  error recovery reported errors, `decode_error`, `too_large`), the error count,
+  the item count, and the page's items: `{"kind": "import" | "export_from" | "require" | "dynamic_import",
   "start", "end"}` with the UTF-16 offsets of the module source string literal,
   and `{"kind": "call", "start", "end"}` with the offsets of a callee that is an
   identifier or a chain of at most four identifiers joined by dots (`new` calls
