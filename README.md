@@ -6,7 +6,7 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M6 release candidate.**
+**Status: M6 released: version 0.6.0, installable offline, proven on macOS and Linux ARM64.**
 Installable as a Python wheel or from a checkout, with no Python dependencies.
 `reverseai doctor` checks the local setup without running a sample or container.
 Installation checks and native containment proofs are separate; see
@@ -81,7 +81,7 @@ What this buys, and how each point is checked:
 | M5a | JavaScript files, package.json declarations and lexical hints verified on the host; no sample execution | released |
 | M5b | JavaScript syntax through a pinned parser (Node.js 24.22.1, @babel/parser 8.0.4) in a locked container: module sources and sensitive calls anchored at verified bytes (derived) | released |
 | M5c | npm package tarballs (`.tgz`): bounded gzip/tar reading, file and header provenance, existing JavaScript queries | released |
-| M6 | Python packaging, offline installation, read-only doctor, local macOS/Linux ARM64 proof workflow | release candidate |
+| M6 | Python packaging, offline installation, read-only doctor, local macOS/Linux ARM64 proof workflow | released |
 | M6b | Hosted CI, Windows/AMD64 proofs and fully offline LIEF/YARA-X/Ghidra builders | planned; owner decisions pending |
 | M7 | Measured comparison with REA Safe Agent on a known-answer corpus | planned |
 | M8 | Clean-room kit: evidence-cited functional specification, contamination check, auditable separation of analysis and implementation rooms, conformance tests | planned |

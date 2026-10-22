@@ -1,10 +1,9 @@
 # Changelog
 
-## Unreleased: M6 release candidate
+## Unreleased: M6b
 
-Packaging, offline installation, read-only setup checks and local platform
-verification are in preparation. There is no M6 release tag or release date yet.
-Hosted CI and further native platform proofs are outside M6a.
+Hosted CI, Windows and AMD64 platform proofs, fully offline LIEF, YARA-X and
+Ghidra image builders, and the project license wait for the owner's decisions.
 
 ## Released milestones
 
@@ -14,6 +13,7 @@ commit date for lightweight tags. Scope follows the repository's
 
 | Date | Tag | Change |
 | --- | --- | --- |
+| 2026-10-22 | `m6` | Version 0.6.0: Python packaging with a dependency-free in-tree build backend, reproducible wheel and sdist, offline installation, `reverseai --version` and a read-only `doctor`; the whole suite and the installed wheel proven on macOS ARM64 (Python 3.15) and in a Linux ARM64 container (Python 3.12). |
 | 2026-10-22 | `m5c` | npm tarballs: bounded gzip/tar reading, file and header provenance, and existing JavaScript queries without extraction or installation. |
 | 2026-10-22 | `m5b` | JavaScript syntax through a pinned parser in a locked container; module sources and sensitive calls remain derived, with verified byte anchors. |
 | 2026-10-22 | `m5a` | Host-verified JavaScript file inventory, package.json declarations and lexical hints without sample execution. |
