@@ -9,8 +9,8 @@ from collections.abc import Iterable, Mapping
 
 from reverseai import claims
 from reverseai.contract import (
-    AnalysisResult, ContractError, InputRef, ReviewVerdict, ToolSpec, canonical_json, check_artifact, evidence_intact,
-    finding_intact, materialize, sha256_hex,
+    MAX_CHILD_RATIO, MAX_STREAM_BYTES, AnalysisResult, ContractError, InputRef, ReviewVerdict, ToolSpec, canonical_json,
+    check_artifact, evidence_intact, finding_intact, inflate_stream, materialize, sha256_hex,
 )
 
 MAX_REVIEW_CHILD_BYTES = 128 * 1024 * 1024  # contract/3: distinct child artifacts one review re-materializes
@@ -21,6 +21,7 @@ class _Children:
 
     def __init__(self, data):
         self.data, self.cache, self.spent = data, {}, 0
+        self.streams, self.stream_spent = {}, 0  # M5c: each gzip stream inflated once, its bound charged first
 
     def get(self, artifact):
         key = canonical_json(artifact)
@@ -34,8 +35,22 @@ class _Children:
                 if self.spent + artifact["size"] > MAX_REVIEW_CHILD_BYTES:
                     return None, "child artifacts exceed the review budget"
                 self.spent += artifact["size"]
+                if artifact["method"] == 1:
+                    stream = (artifact["data_offset"], artifact["compressed_size"])
+                    if stream not in self.streams:
+                        bound = min(MAX_STREAM_BYTES, MAX_CHILD_RATIO * stream[1])
+                        if self.stream_spent + bound > MAX_STREAM_BYTES:
+                            return None, "gzip streams exceed the review budget"
+                        self.stream_spent += bound
+                        try:
+                            self.streams[stream] = inflate_stream(self.data, *stream)
+                        except ContractError:
+                            self.streams[stream] = None
+                    if self.streams[stream] is None:
+                        self.cache[key] = None
+                        return None, "child artifact does not match the input"
                 try:
-                    self.cache[key] = materialize(self.data, artifact)
+                    self.cache[key] = materialize(self.data, artifact, streams=self.streams)
                 except ContractError:
                     self.cache[key] = None
         child = self.cache[key]

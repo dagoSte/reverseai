@@ -985,6 +985,79 @@ input, verified by `contract.materialize` like stored ZIP members.
   `method` 0, `compressed_size` = `size`, the CRC-32 and SHA-256 the host computes.
   `MEMBER_FLAGS` gains `asar_link` and `asar_unpacked`.
 
+## npm tarballs (M5c, contract/3)
+
+Decisions `owner-next-m5c`, `m5c-contract`. An npm package tarball is one gzip
+stream (RFC 1952) holding a tar archive; its files are children inside the
+inflated stream. Host only, stdlib only, no download.
+
+- **Child artifacts, method 1** (still `reverseai.contract/3`: methods 0 and 8
+  and every existing evidence ID keep their meaning): `{"member", "method": 1,
+  "data_offset", "compressed_size", "inner_offset", "size", "crc32", "sha256"}`
+  names the bytes `inner_offset`..`inner_offset + size` of the stream obtained by
+  inflating the gzip member at `data_offset`..`data_offset + compressed_size` of
+  the input. `contract.inflate_stream` accepts exactly one gzip member filling
+  that range: magic `1f 8b`, method 8, reserved flag bits zero, FEXTRA, FNAME and
+  FCOMMENT skipped inside the range, FHCRC checked when present; inflated within
+  min(128 MiB, 100 x `compressed_size`); then the 8-byte trailer, whose CRC-32
+  and ISIZE equal the inflated bytes, and nothing after it. `inner_offset +
+  size` is at most 128 MiB and at most 100 x `compressed_size`; `size` stays at
+  most 32 MiB as for every child. `contract.materialize(data, artifact,
+  streams=cache)` inflates each distinct stream once per cache. The gateway
+  keeps one cache per operation (at most 128 MiB of inflated streams besides the
+  128 MiB of distinct children, else `budget_exceeded`); the reviewer keeps one
+  per review and charges each distinct stream min(128 MiB, 100 x
+  `compressed_size`) before inflating it, so a stream that fails still spends
+  its charge, and is remembered as failed: every child of it is refused (the
+  rule of `m4a-fix-round-2`).
+- **Tarball** (`reverseai/tools/tarball.py`, its own bounded inflater, tested
+  equal to `contract.inflate_stream`): an input that starts with `1f 8b` is a
+  tarball, and the whole input must be its one gzip member (`data_offset` 0,
+  `compressed_size` the input size). A tarball is accepted only after the whole
+  stream is inflated and verified and the tar is read to its end: there is no
+  prefix reading. Tar headers are 512-byte blocks with a right checksum (the
+  unsigned sum, or the signed sum old tools wrote), magic `ustar\0` with version
+  `00` (POSIX, whose `prefix` field is joined with `/`) or `ustar  \0` (GNU),
+  sizes in octal or base-256. The archive ends with two zero blocks followed by
+  zero bytes only, up to the end of the stream. A missing end, a truncated
+  header or data, a bad checksum or magic, or other bytes after the end fail the
+  operation. At most 65,536 physical headers, extensions and directories
+  included.
+- **Extensions**: a pax `x` record and the GNU `L` (name) and `K` (link name)
+  extensions apply to the next entry; at most 1 MiB per extension body and 4 MiB
+  of extension bodies per archive; a name or link name at most 65,535 UTF-8
+  bytes. Pax records are `<length> <key>=<value>\n` with an exact decimal
+  length; the keys `path`, `linkpath` and `size` (decimal digits) apply, other
+  keys are ignored. A malformed record, a key repeated in one record,
+  `hdrcharset` other than UTF-8, any `GNU.sparse.` key, a pax `g` record with a
+  key other than `comment`, an extension not followed by an entry, and GNU
+  sparse (`S`), multivolume (`M`) or volume (`V`) headers fail the operation.
+- **Entries**: names are decoded as UTF-8; a name that is not valid UTF-8 is
+  listed with backslash escapes and flagged `header_mismatch`, as a ZIP name is.
+  Regular files (`0`, NUL, `7`) are members in archive order; directories (`5`)
+  are counted, not listed; symbolic links (`2`) are flagged `symlink`, hard links
+  (`1`) `hardlink`, other types (`3`, `4`, `6` and unknown ones)
+  `unsupported_type`. Links, directories and devices must declare size 0, else
+  the operation fails; unknown types skip their declared data. The ZIP name
+  rules apply unchanged: `traversing_name`, `long_name` (an escaped name longer
+  than 255 characters, listed as its first 255), `duplicate_name` on every entry
+  whose escaped name repeats, `too_large` past 32 MiB. Flagged entries are listed
+  and never read; link targets are never followed or shown. `MEMBER_FLAGS` gains
+  `hardlink` and `unsupported_type`.
+- **Use**: `js.files`, `js.package`, `js.hints` and `jsparser.syntax` treat a
+  valid tarball as they treat a ZIP or ASAR archive (the JavaScript file rule,
+  selectors and budgets unchanged; names keep the `package/` prefix, so the
+  shallowest `package.json` is `package/package.json`); a refused tarball fails
+  the operation. A file that is read carries a method 1 artifact. A flagged
+  entry's row, and an empty file's, is anchored at the entry's 512-byte header
+  block: a method 1 artifact with `inner_offset` the header's offset, `size` 512
+  and `member` the row's `file` (`tar header` when that is empty).
+- **Worker**: the jsparser worker accepts method 1 artifacts and re-derives them
+  as the host does (one bounded inflation per stream, then the range, size,
+  CRC-32 and SHA-256) inside its fixed profile. Its image is rebuilt offline from
+  the approved downloads already cached (`adapter_version` `8.0.4-r2`), and the
+  native verifier gains a tarball case.
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under

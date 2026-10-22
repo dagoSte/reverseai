@@ -17,7 +17,7 @@ from types import MappingProxyType
 
 from reverseai.contract import (
     AnalysisResult, AnalysisTask, Budget, Evidence, Observation, ToolSpec,
-    canonical_json, make_evidence, materialize, operation_key, sha256_hex,
+    MAX_STREAM_BYTES, canonical_json, make_evidence, materialize, operation_key, sha256_hex,
 )
 
 MAX_RUN_CHILD_BYTES = 128 * 1024 * 1024  # contract/3: distinct child artifacts one operation may materialize
@@ -78,7 +78,7 @@ class Gateway:
             observations = spec.handler(data, MappingProxyType(args))
             if not isinstance(observations, (list, tuple)):
                 raise TypeError("Expected observations")
-            children = {}
+            children, streams = {}, {}
             for index, observation in enumerate(observations):
                 if index >= spec.max_observations:
                     self._finish(execution, "budget_exceeded")
@@ -94,7 +94,10 @@ class Gateway:
                         if sum(len(c) for c in children.values()) + observation.artifact["size"] > MAX_RUN_CHILD_BYTES:
                             self._finish(execution, "budget_exceeded")
                             return
-                        children[key] = materialize(data, observation.artifact)
+                        children[key] = materialize(data, observation.artifact, streams=streams)
+                        if sum(len(s) for s in streams.values()) > MAX_STREAM_BYTES:  # M5c: gzip streams per run
+                            self._finish(execution, "budget_exceeded")
+                            return
                     child = children[key]
                 evidence = make_evidence(data, ref, spec.name, observation, input_sha256=digest, child=child)
                 size = _size(evidence)
