@@ -74,7 +74,7 @@ JADX_JDK_SHA256 = "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e
 JADX_DRIVER_PATH = Path(__file__).resolve().parents[1] / "containers/jadx/driver/ReverseAIJadx.java"
 JADX_WORKER_PATH = Path(__file__).resolve().parents[1] / "containers/jadx/worker.py"
 JADX_CASE_NAMES = ("main_init", "helper_int", "helper_string", "on_create", "marker_init",
-                   "compute", "worker_init", "run", "past_end")
+                   "compute", "worker_init", "run", "helper_overloads", "past_end")
 JADX_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                         *(f"apk_basic.{name}" for name in JADX_CASE_NAMES),
                         "jadx.hostile_reply", "jadx.input_mismatch")
@@ -646,7 +646,7 @@ def verify_jadx_lock(lock):
 # Native forms relayed by coord in m4bv-forms; the Java spelling remains derived.
 JADX_FORMS = {"main_init": "omitted", "helper_int": "java", "helper_string": "java",
               "on_create": "java", "marker_init": "java", "compute": "java",
-              "worker_init": "omitted", "run": "java", "past_end": "java"}
+              "worker_init": "omitted", "run": "java", "helper_overloads": "java", "past_end": "java"}
 
 
 def _jadx_fixture(data):
@@ -670,13 +670,23 @@ def _jadx_targets():
 
 
 def jadx_cases(data):
-    """Fixed public jadx.method args; each case selects one declared method."""
+    """Fixed public jadx.method args, including both declared helper overloads."""
     _jadx_fixture(data)
     fields = ("member", "class", "method", "prototype")
     cases = {label: {**dict(zip(fields, identity)), "start": 0, "max_chars": 1024}
              for label, identity in _jadx_targets().items()}
+    cases["helper_overloads"] = {**cases["helper_int"], "prototype": ""}
     cases["past_end"] = {**cases["helper_int"], "start": 1048575, "max_chars": 64}
     return cases
+
+
+def _jadx_methods(layout, args):
+    methods = sorted((m for c in layout["dex"][args["member"]]["classes"] if c["name"] == args["class"]
+                      for m in c["methods"] if m["name"] == args["method"]
+                      and args["prototype"] in ("", m["prototype"])), key=lambda m: m["index"])
+    need(len(methods) == (2 if args["prototype"] == "" else 1)
+         and all(m["code_offset"] is not None and m["code_units"] > 0 for m in methods), "JadxFixtureMethod")
+    return methods
 
 
 def jadx_prepared_request(data, args):
@@ -686,9 +696,10 @@ def jadx_prepared_request(data, args):
          for case in jadx_cases(data).values()), "JadxRequestChanged")
     members = [dict(row["artifact"]) for row in layout["members"] if row["name"] in layout["dex"]]
     member = next(i for i, artifact in enumerate(members) if artifact["member"] == args["member"])
-    target = {"member": member, **{key: args[key].encode("utf-8").hex()
-              for key in ("class", "method", "prototype")}}
-    return {"members": members, "targets": [target], "start": args["start"], "max_chars": args["max_chars"]}
+    targets = [{"member": member, "class": args["class"].encode("utf-8").hex(),
+                "method": args["method"].encode("utf-8").hex(), "prototype": method["prototype"].encode("utf-8").hex()}
+               for method in _jadx_methods(layout, args)]
+    return {"members": members, "targets": targets, "start": args["start"], "max_chars": args["max_chars"]}
 
 
 def jadx_request_allowed(operation, args):
@@ -713,41 +724,37 @@ def compare_jadx_observations(data, args, observations):
     need(len(matches) == 1, "JadxRequestChanged")
     expected_form = JADX_FORMS.get(matches[0])
     need(expected_form in ("java", "fallback", "omitted", "error"), "JadxOracleMissing")
-    need(isinstance(observations, (list, tuple)) and len(observations) == 1
-         and isinstance(observations[0], Observation), "KnownAnswerShape")
-    method = [m for c in layout["dex"][args["member"]]["classes"] if c["name"] == args["class"]
-              for m in c["methods"] if (m["name"], m["prototype"]) == (args["method"], args["prototype"])]
-    need(len(method) == 1 and method[0]["code_offset"] is not None and method[0]["code_units"] > 0,
-         "JadxFixtureMethod")
-    method = method[0]
+    methods = _jadx_methods(layout, args)
+    need(isinstance(observations, (list, tuple)) and len(observations) == len(methods)
+         and all(isinstance(item, Observation) for item in observations), "KnownAnswerShape")
     artifact = next(row["artifact"] for row in layout["members"] if row["name"] == args["member"])
-    item = observations[0]
-    need(item.location == Location(method["code_offset"] + 16, min(method["code_units"] * 2, 4096)),
-         "JadxKnownAnswerAnchor")
-    need(canonical_json(item.artifact) == canonical_json(artifact), "JadxKnownAnswerArtifact")
-    value = item.value
-    fields = {"kind", "dex", "class", "name", "prototype", "form", "start", "total", "text"}
-    need(isinstance(value, dict) and set(value) == fields, "KnownAnswerShape")
-    identity = {"kind": "java", "dex": args["member"], "class": args["class"],
-                "name": args["method"], "prototype": args["prototype"]}
-    need(all(value[key] == expected for key, expected in identity.items()), "JadxKnownAnswerIdentity")
-    forms = ("java", "fallback", "omitted", "error")
-    need(value["form"] in forms and value["form"] == expected_form,
-         "JadxKnownAnswerForm")
-    need(type(value["start"]) is int and type(value["total"]) is int
-         and 0 <= value["start"] <= value["total"] < 2**32 and type(value["text"]) is str
-         and len(value["text"]) <= args["max_chars"]
-         and all(" " <= c <= "~" or c in "\n\t" for c in value["text"])
-         and len(canonical_json(value).encode()) <= 4096, "JadxKnownAnswerPage")
-    if value["form"] in ("omitted", "error"):
-        need(value["text"] == "" and value["start"] == value["total"] == 0, "JadxKnownAnswerPage")
-    else:
-        need(value["total"] > 0 and value["start"] == min(args["start"], value["total"])
-             and value["start"] + len(value["text"]) <= value["total"]
-             and bool(value["text"]) == (value["start"] < value["total"]), "JadxKnownAnswerPage")
-    if matches[0] == "past_end":
-        need(0 < value["total"] <= args["start"] and value["start"] == value["total"]
-             and value["text"] == "", "JadxKnownAnswerPage")
+    for item, method in zip(observations, methods):
+        need(item.location == Location(method["code_offset"] + 16, min(method["code_units"] * 2, 4096)),
+             "JadxKnownAnswerAnchor")
+        need(canonical_json(item.artifact) == canonical_json(artifact), "JadxKnownAnswerArtifact")
+        value = item.value
+        fields = {"kind", "dex", "class", "name", "prototype", "form", "start", "total", "text"}
+        need(isinstance(value, dict) and set(value) == fields, "KnownAnswerShape")
+        identity = {"kind": "java", "dex": args["member"], "class": args["class"],
+                    "name": args["method"], "prototype": method["prototype"]}
+        need(all(value[key] == expected for key, expected in identity.items()), "JadxKnownAnswerIdentity")
+        forms = ("java", "fallback", "omitted", "error")
+        need(value["form"] in forms and value["form"] == expected_form,
+             "JadxKnownAnswerForm")
+        need(type(value["start"]) is int and type(value["total"]) is int
+             and 0 <= value["start"] <= value["total"] < 2**32 and type(value["text"]) is str
+             and len(value["text"]) <= args["max_chars"]
+             and all(" " <= c <= "~" or c in "\n\t" for c in value["text"])
+             and len(canonical_json(value).encode()) <= 4096, "JadxKnownAnswerPage")
+        if value["form"] in ("omitted", "error"):
+            need(value["text"] == "" and value["start"] == value["total"] == 0, "JadxKnownAnswerPage")
+        else:
+            need(value["total"] > 0 and value["start"] == min(args["start"], value["total"])
+                 and value["start"] + len(value["text"]) <= value["total"]
+                 and bool(value["text"]) == (value["start"] < value["total"]), "JadxKnownAnswerPage")
+        if matches[0] == "past_end":
+            need(0 < value["total"] <= args["start"] and value["start"] == value["total"]
+                 and value["text"] == "", "JadxKnownAnswerPage")
 
 
 def ghidra_fixtures():
