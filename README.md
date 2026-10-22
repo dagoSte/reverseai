@@ -6,12 +6,16 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M5a released: JavaScript applications verified on the host.**
+**Status: M5b release candidate: JavaScript syntax through a pinned parser.**
 For a JavaScript ZIP or a single bundle, the host lists files, reads package.json
 declarations with exact byte positions, and finds lexical hints at their matched
-byte ranges. It never runs, imports or evaluates the JavaScript. These results
-verify declarations and lexical occurrences, not behaviour; M5a builds no syntax
-tree and does not resolve modules.
+byte ranges (M5a). With M5b, a pinned parser (Node.js 24.22.1 with @babel/parser
+8.0.4) reads JavaScript, JSX and TypeScript as data in its own locked container and
+reports where module sources and calls to a fixed list of sensitive functions stand;
+the host turns every answer into exact bytes and re-derives the value from them. No
+part of the application is run, imported, evaluated or resolved. These results
+describe declarations, occurrences and the parser's reading of the syntax, not
+behaviour.
 
 Deterministic
 analysts read file structure (ELF, PE and Mach-O), imports and string indicators in-process,
@@ -22,7 +26,7 @@ declarations in the bytes, not evidence of behaviour. The official JADX 1.5.6, t
 approved download (verified by SHA-256), decompiles a selected DEX method to Java in its
 own locked container; the Java is reported as *derived* and is accepted only for the method
 the host's DEX decoder verified, with JADX's code offset and instruction count equal to it.
-Four pinned open-source tools, LIEF, YARA-X, Ghidra and JADX, run in locked containers. Every value
+Five pinned open-source tools, LIEF, YARA-X, Ghidra, JADX and the JavaScript parser, run in locked containers. Every value
 LIEF and YARA-X report is re-derived by the host from the input bytes before it can
 become evidence, and a reviewer re-checks each claim against those bytes. Ghidra's
 functions, pseudocode, calls, assembly and references from code are its own reading.
@@ -35,7 +39,7 @@ Model-driven agents are not part of the current releases.
 ## How it works
 
 <p align="center">
-  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway serves whole-file analysis or a targeted query through host parsers for native files, APK, DEX and JavaScript, or a locked container per run (LIEF, YARA-X, Ghidra, JADX); JavaScript files, package declarations and lexical hints are read without execution or syntax analysis; the host re-derives every LIEF and YARA-X value and every Ghidra anchor, re-reads referenced strings, and binds JADX's Java to a method its own DEX decoder verified; evidence binds hash, tool, operation and byte range, with member provenance for bytes inside a package; a reviewer independently rebuilds package members and re-checks cited bytes and claim rules; Ghidra and JADX interpretations stay derived; reports separate supported, derived, unsupported and contradicted findings.">
+  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway serves whole-file analysis or a targeted query through host parsers for native files, APK, DEX and JavaScript, or a locked container per run (LIEF, YARA-X, Ghidra, JADX, the JavaScript parser); JavaScript files, package declarations and lexical hints are read on the host without execution, and the parser returns only offsets of module sources and calls, from which the host re-derives every literal and name; the host re-derives every LIEF and YARA-X value and every Ghidra anchor, re-reads referenced strings, and binds JADX's Java to a method its own DEX decoder verified; evidence binds hash, tool, operation and byte range, with member provenance for bytes inside a package; a reviewer independently rebuilds package members and re-checks cited bytes and claim rules; Ghidra and JADX interpretations stay derived; reports separate supported, derived, unsupported and contradicted findings.">
 </p>
 
 What this buys, and how each point is checked:
@@ -43,9 +47,9 @@ What this buys, and how each point is checked:
 | Property | How it holds |
 | --- | --- |
 | A supported finding is backed by exact bytes | The reviewer recomputes the input hash, the byte range and its hash for every cited item, and the claim rule must yield exactly the claimed value. |
-| A compromised tool can hide evidence but not invent verified evidence | The host re-derives every value LIEF and YARA-X report (headers, sections, signature matches) from its own copy of the bytes and refuses the whole reply on any mismatch; for Ghidra it re-derives every anchor; for JADX it requires the code offset and instruction count of the method its own DEX decoder verified. Ghidra's and JADX's interpretations can only ever be reported as derived. |
+| A compromised tool can hide evidence but not invent verified evidence | The host re-derives every value LIEF and YARA-X report (headers, sections, signature matches) from its own copy of the bytes and refuses the whole reply on any mismatch; for Ghidra it re-derives every anchor; for JADX it requires the code offset and instruction count of the method its own DEX decoder verified; for the JavaScript parser it converts every offset to exact bytes and re-derives the literal or call name from them. Ghidra's, JADX's and the parser's interpretations can only ever be reported as derived. |
 | Tools cannot reach the host or the network | One container per run: no network, read-only root, non-root user, every capability dropped, no new privileges, CPU, memory, process and time limits, a single read-only snapshot mount, image pinned by ID. `tests/verify_m2_runtime.py` proves these limits against the real engine. |
-| Interpretations stay labelled | Ghidra's function lists, pseudocode, calls, assembly, references from code and referenced strings, and JADX's Java, are *derived*: the host checks every anchor and re-reads string contents, while interpretations and reference relationships remain the tool's reading. The reviewer re-checks citations and the report lists these findings apart; they never count as verified and never contradict a verified finding. |
+| Interpretations stay labelled | Ghidra's function lists, pseudocode, calls, assembly, references from code and referenced strings, JADX's Java, and the JavaScript parser's module and call roles, are *derived*: the host checks every anchor and re-reads string contents, while interpretations and reference relationships remain the tool's reading. The reviewer re-checks citations and the report lists these findings apart; they never count as verified and never contradict a verified finding. |
 | One claim cannot cancel a verified one | Only findings whose evidence all verifies can contradict each other. |
 | Reports are reproducible | Same input and budget, same report; the report names each tool version and container image. |
 
@@ -63,7 +67,8 @@ What this buys, and how each point is checked:
 | M4a | APK members, binary manifest and DEX classes, methods and code references verified on the host, including compressed-member evidence (contract/3) | released |
 | M4b | Decompiled Java through the official JADX 1.5.6 in a locked container, bound to host-verified DEX methods (derived) | released |
 | M5a | JavaScript files, package.json declarations and lexical hints verified on the host; no sample execution | released |
-| M5b | Syntax trees and module analysis, requiring a pinned parser | planned |
+| M5b | JavaScript syntax through a pinned parser (Node.js 24.22.1, @babel/parser 8.0.4) in a locked container: module sources and sensitive calls anchored at verified bytes (derived) | release candidate |
+| M5c | npm package tarballs (`.tgz`) read like application ZIPs | planned |
 | M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
 | M7 | Measured comparison with REA Safe Agent on a known-answer corpus | planned |
 | M8 | Clean-room kit: evidence-cited functional specification, contamination check, auditable separation of analysis and implementation rooms, conformance tests | planned |
@@ -73,10 +78,10 @@ What this buys, and how each point is checked:
 Ask one question about an approved file without executing it:
 
 ```sh
-python3 -m reverseai query FILE --query NAME [--arg KEY=VALUE ...] --out DIR [--with-ghidra] [--with-jadx]
+python3 -m reverseai query FILE --query NAME [--arg KEY=VALUE ...] --out DIR [--with-ghidra] [--with-jadx] [--with-jsparser]
 ```
 
-Host results are verified from the bytes; Ghidra and JADX results remain derived readings.
+Host results are verified from the bytes; Ghidra, JADX and JavaScript parser results remain derived readings.
 Ghidra queries require `--with-ghidra` and the locally built, pinned image.
 `inspect_android_method` adds the method's decompiled Java with `--with-jadx` and the locally
 built, pinned JADX image; without it the Java part is absent and the report says so.
@@ -111,7 +116,7 @@ This counts names; behavioural parity is measured in M7.
 | `inspect_android_class` | Metadata and declared methods for the exact class; copy its displayed name | Verified (host) |
 | `inspect_android_method` | The class's methods and the selected method's code references; with `--with-jadx`, the method's decompiled Java | Verified (host); Java derived (JADX) |
 | `trace_android_references` | References from or to a method, selected by class, name and optional prototype | Verified (host) |
-| `analyze_javascript_application` | Files, package.json declarations and lexical hints; `detail` selects `summary`, `files`, `package` or `hints` | Verified (host) |
+| `analyze_javascript_application` | Files, package.json declarations and lexical hints (`detail` `summary`, `files`, `package` or `hints`); with `--with-jsparser`, module sources, sensitive calls and parse status (`modules`, `calls`, `parse`) | Verified (host); syntax derived (parser) |
 
 ## Try it
 
@@ -129,9 +134,23 @@ The JavaScript query accepts a ZIP or a single JavaScript bundle, with no Docker
 or downloads. Use `detail=files`, `detail=package` or `detail=hints` to page one
 part of the analysis; `summary` takes the first page of each part.
 
+With `--with-jsparser`, `detail=modules`, `detail=calls` and `detail=parse` add the
+parser's reading. It reports where module sources stand (`import`, `export ... from`,
+`require` and `import()` with a literal) and calls whose name is on a fixed list of
+sensitive functions; common names count only with their receiver (`http.get`,
+`Buffer.from`, `fs.write`), so `map.get(k)` is not a call. The host converts each
+answer to exact byte offsets and re-derives the literal's value or the call's dotted
+name from those bytes, so every anchor is verified; that the bytes are an import or a
+call rather than text in a comment is the parser's reading, reported as *derived*. The
+parser executes, imports, resolves and transpiles nothing and follows no module; a
+call built from strings, computed properties or escapes is not reported. `detail=parse`
+shows each file's status: `ok`, `syntax_error` (rows recovered so far still count),
+`decode_error` (not UTF-8) or `too_large` (over 4 MiB).
+
 With Docker and the locally built, pinned images (`tools/build_lief_image.py`,
-`tools/build_yarax_image.py`, `tools/build_ghidra_image.py`, `tools/build_jadx_image.py`),
-add `--with-lief`, `--with-yarax`, `--with-ghidra` and `--with-jadx`; the command
+`tools/build_yarax_image.py`, `tools/build_ghidra_image.py`, `tools/build_jadx_image.py`,
+`tools/build_jsparser_image.py`), add `--with-lief`, `--with-yarax`, `--with-ghidra`,
+`--with-jadx` and `--with-jsparser`; the command
 refuses cleanly when an image or Docker is missing. The JADX image builds offline from a
 directory that already holds `jadx-1.5.6.zip` (the one approved download, SHA-256
 `545ea2be9c242511bc145755cf4bda2485ade42966e096f8b4d3da2a230e8974`) and the Temurin JDK
@@ -142,7 +161,19 @@ python3 -B tools/build_jadx_image.py --download-dir <private folder with the two
 python3 -m reverseai query path/to/approved.apk --query inspect_android_method --arg class='Lcom/example/Main;' --arg method=onCreate --with-jadx --out new-java-report
 ```
 
-The native containment proof:
+The parser image builds offline from a directory that already holds the five approved
+downloads: `node-v24.22.1-linux-arm64.tar.xz` (SHA-256
+`dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e`) and the npm tarballs of
+`@babel/parser` 8.0.4, `@babel/types` 8.0.4, `@babel/helper-string-parser` 8.0.6 and
+`@babel/helper-validator-identifier` 8.0.6, each checked against its registry sha512
+integrity. The tool never downloads, pulls or runs npm:
+
+```sh
+python3 -B tools/build_jsparser_image.py --download-dir <private folder with the five files>
+python3 -m reverseai query path/to/approved-js.zip --query analyze_javascript_application --arg detail=calls --with-jsparser --out new-js-calls-report
+```
+
+The native containment proof (`--tool yarax`, `ghidra`, `jadx` and `jsparser` likewise):
 
 ```sh
 python3 -B tests/verify_m2_runtime.py --tool lief --profile small --offline --lock containers/lief/image.lock.json --receipt <new file>
@@ -163,8 +194,11 @@ Known limits, by design:
 - JavaScript hints include comments and strings, so false positives remain; calls
   split by comments or long whitespace, indirect calls and filesystem calls without
   a literal `fs` receiver can be missed.
-  They do not establish execution or behaviour. M5a has no syntax tree, module
-  resolution or deobfuscation; its fixed patterns and bounded spans can miss other forms.
+  They do not establish execution or behaviour. The hints use no syntax tree, module
+  resolution or deobfuscation; their fixed patterns and bounded spans can miss other forms.
+- JavaScript syntax rows are the parser's reading of each file on its own: no module
+  resolution, data flow or deobfuscation, at most 64 files, 4 MiB each and 32 MiB in all
+  per query.
 - A claim type without a rule in `reverseai/claims.py` is never supported. The
   Markdown report states supported findings in the reviewer's own words.
 - In-process handlers have soft time budgets; contained workers have hard wall,
