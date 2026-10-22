@@ -1080,7 +1080,8 @@ contract above is unchanged.
   the same bytes: entries sorted, timestamp 1980-01-01 00:00:00, modes 0644):
   every `reverseai/**/*.py` (no `__pycache__`), the five locks copied to
   `reverseai/_locks/<tool>.json` from `containers/<tool>/image.lock.json` (`lief`,
-  `yarax`, `ghidra`, `jadx`, `jsparser`), and `reverseai-0.6.0.dist-info/` with
+  `yarax`, `ghidra`, `jadx`, `jsparser`) with the YARA-X ruleset as
+  `reverseai/_locks/m2_fixture_v1.json` (decision `m6-seams-p`), and `reverseai-0.6.0.dist-info/` with
   `METADATA` (Name, Version, Summary, Requires-Python, the README as Markdown
   description), `WHEEL` (purelib, tag `py3-none-any`), `entry_points.txt`,
   `THIRD_PARTY_NOTICES.md` and a `RECORD` with SHA-256 and sizes. No tests,
@@ -1109,8 +1110,11 @@ contract above is unchanged.
   `.coordination/m6/platform-<os>-<arch>.json` name the Python version, platform,
   commit, counts and base digest. Natives stay Linux arm64 Docker on the Mac.
 - **Docs**: `docs/INSTALL.md` (requirements, install from the wheel or a
-  checkout, building each image offline from its approved download with its
-  SHA-256, the native verifier, `doctor`), `docs/SECURITY.md` (what is trusted,
+  checkout, running the five contained tools offline from locked images already
+  built, building images from their approved downloads with each SHA-256: JADX and
+  jsparser build offline, while the LIEF, YARA-X and Ghidra recipes still pull the
+  pinned base and Ghidra installs build packages, so they need network; decision
+  `m6-seams-builders`), the native verifier, `doctor`), `docs/SECURITY.md` (what is trusted,
   containment profile, verified versus derived, limits, how to report a
   problem), `CHANGELOG.md` (M1 to M6 with tags), and the README install section.
 

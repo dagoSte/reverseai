@@ -1,15 +1,13 @@
 """Allowlisted LIEF operations, reached only through the contained executor."""
 
-from pathlib import Path
-
-from reverseai.contained import DockerExecutor, ContainedError, inspect_image
+from reverseai.contained import DockerExecutor, ContainedError, default_lock, inspect_image
 from reverseai.contract import (
     ArgSpec, ContractError, OperationSpec, ToolRef, ToolSpec, parse_worker_reply, sha256_hex,
 )
 from reverseai.tools import lief_verify, structure
 
 REF = ToolRef("lief", "1.0.0-r2")
-DEFAULT_LOCK = Path(__file__).resolve().parents[2] / "containers/lief/image.lock.json"
+DEFAULT_LOCK = default_lock("lief")
 
 
 def make_tool(executor=None):

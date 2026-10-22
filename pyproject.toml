@@ -1,0 +1,15 @@
+[build-system]
+requires = []
+build-backend = "reverseai_build"
+backend-path = ["tools"]
+
+[project]
+name = "reverseai"
+version = "0.6.0"
+description = "Contained static analysis with verifiable evidence."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+reverseai = "reverseai.cli:main"

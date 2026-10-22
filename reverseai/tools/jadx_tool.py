@@ -1,13 +1,11 @@
 """Contained JADX method pages; identities and byte anchors come from the host."""
 
-from pathlib import Path
-
-from reverseai.contained import ContainedError, DockerExecutor, inspect_image, load_lock
+from reverseai.contained import ContainedError, DockerExecutor, default_lock, inspect_image, load_lock
 from reverseai.contract import ArgSpec, OperationSpec, ToolRef, ToolSpec, sha256_hex
 from reverseai.tools import jadx_verify
 
 REF = ToolRef("jadx", "1.5.6-r1")
-DEFAULT_LOCK = Path(__file__).resolve().parents[2] / "containers/jadx/image.lock.json"
+DEFAULT_LOCK = default_lock("jadx")
 
 
 def make_tool(executor=None):

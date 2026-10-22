@@ -58,6 +58,15 @@ _JSPARSER_PROFILE = MappingProxyType({"pids": 64, "memory": "2g", "cpus": 2,
     "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=64m", "wall_seconds": JSPARSER_WALL_SECONDS})
 
 
+def default_lock(tool):
+    """Resolve installed lock data first, then the source checkout's container lock."""
+    if tool not in ("lief", "yarax", "ghidra", "jadx", "jsparser"):
+        raise ValueError("Unknown contained tool")
+    package = Path(__file__).resolve().parent
+    packaged = package / "_locks" / f"{tool}.json"
+    return packaged if packaged.is_file() else package.parent / "containers" / tool / "image.lock.json"
+
+
 def resource_profile(operation):
     """Only the validated operation selects resources; requests cannot override them."""
     if operation in GHIDRA_OPERATIONS:

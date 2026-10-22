@@ -1,13 +1,11 @@
 """Contained syntax readings with source text and byte anchors re-derived on the host."""
 
-from pathlib import Path
-
-from reverseai.contained import ContainedError, DockerExecutor, inspect_image, load_lock
+from reverseai.contained import ContainedError, DockerExecutor, default_lock, inspect_image, load_lock
 from reverseai.contract import ArgSpec, OperationSpec, ToolRef, ToolSpec, sha256_hex
 from reverseai.tools import jsparser_verify
 
 REF = ToolRef('jsparser', '8.0.4-r2')
-DEFAULT_LOCK = Path(__file__).resolve().parents[2] / 'containers/jsparser/image.lock.json'
+DEFAULT_LOCK = default_lock("jsparser")
 
 
 def make_tool(executor=None):
