@@ -1059,6 +1059,61 @@ inflated stream. Host only, stdlib only, no download.
   the approved downloads already cached (`adapter_version` `8.0.4-r2`), and the
   native verifier gains a tarball case.
 
+## Packaging, setup and platforms (M6, contract/3)
+
+Decisions `owner-next-m6`, `m6-contract`. M6a makes ReverseAI installable and
+checkable without a download, a paid call or a hosted CI run. Hosted CI, amd64
+images and a Windows proof are M6b and wait for the owner. The analysis
+contract above is unchanged.
+
+- **Version**: `reverseai.__version__` is the single source, `0.6.0` for M6;
+  `pyproject.toml` declares the same static version and a test pins the two equal.
+- **pyproject.toml** (PEP 621): name `reverseai`, the version, a one-line
+  description, `readme = "README.md"`, `requires-python = ">=3.12"`, no
+  dependencies, `[project.scripts] reverseai = "reverseai.cli:main"`. No license
+  field until the owner chooses one. `[build-system] requires = []`,
+  `build-backend = "reverseai_build"`, `backend-path = ["tools"]`: an in-tree
+  PEP 517 backend, `tools/reverseai_build.py`, stdlib only, with `build_wheel`,
+  `build_sdist` and `get_requires_for_build_wheel` / `_sdist` returning `[]`, so
+  `pip wheel .` and `pip install .` need no download.
+- **Wheel** `reverseai-0.6.0-py3-none-any.whl`, reproducible (the same tree gives
+  the same bytes: entries sorted, timestamp 1980-01-01 00:00:00, modes 0644):
+  every `reverseai/**/*.py` (no `__pycache__`), the five locks copied to
+  `reverseai/_locks/<tool>.json` from `containers/<tool>/image.lock.json` (`lief`,
+  `yarax`, `ghidra`, `jadx`, `jsparser`), and `reverseai-0.6.0.dist-info/` with
+  `METADATA` (Name, Version, Summary, Requires-Python, the README as Markdown
+  description), `WHEEL` (purelib, tag `py3-none-any`), `entry_points.txt`,
+  `THIRD_PARTY_NOTICES.md` and a `RECORD` with SHA-256 and sizes. No tests,
+  tools or container build contexts: images are built from a checkout.
+- **sdist** `reverseai-0.6.0.tar.gz`, reproducible (sorted, mtime 0, uid and gid
+  0, modes 0644 or 0755 as in Git): the Git-tracked files of `reverseai/`,
+  `tools/`, `containers/`, `docs/`, `tests/`, `media/` and the top-level
+  `README.md`, `THIRD_PARTY_NOTICES.md`, `pyproject.toml`, under one
+  `reverseai-0.6.0/` root with a `PKG-INFO`.
+- **Locks**: each contained tool resolves its default lock through
+  `contained.default_lock(tool)`: the packaged `reverseai/_locks/<tool>.json`
+  when it exists (an installed wheel), else `containers/<tool>/image.lock.json`
+  in the checkout. A test pins the wheel copies equal to the checkout bytes.
+- **CLI**: `reverseai --version` prints `reverseai 0.6.0`. `reverseai doctor`
+  is read-only: it never pulls, builds or runs a container and reads no sample.
+  It reports the Python version and platform, whether each lock loads, whether
+  Docker answers a fixed `docker version` call within 10 s, and for each
+  contained tool whether the locked image ID is present locally (inspect only).
+  Exit 0 when the host features work (Python 3.12 or later), with each contained
+  tool marked available or not; `--json` gives the same facts as JSON.
+- **Platforms (M6a)**: the whole suite on the macOS arm64 host, and in a Linux
+  arm64 container built from the pinned `python:3.12-slim` base already cached
+  (the source copied in from `git archive` of the candidate, no host mount,
+  network none, non-root, read-only root with a tmpfs), plus the wheel built,
+  installed into a fresh venv offline and run there. Receipts
+  `.coordination/m6/platform-<os>-<arch>.json` name the Python version, platform,
+  commit, counts and base digest. Natives stay Linux arm64 Docker on the Mac.
+- **Docs**: `docs/INSTALL.md` (requirements, install from the wheel or a
+  checkout, building each image offline from its approved download with its
+  SHA-256, the native verifier, `doctor`), `docs/SECURITY.md` (what is trusted,
+  containment profile, verified versus derived, limits, how to report a
+  problem), `CHANGELOG.md` (M1 to M6 with tags), and the README install section.
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under
