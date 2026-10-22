@@ -782,8 +782,13 @@ evaluates the sample.
 
 - **Inputs**: one approved file, as today. When the input is a valid ZIP archive
   (the APK ZIP parser accepts it, with its limits and flags) the operations read
-  its clean members as child artifacts; otherwise the input itself is one file,
-  named "" in rows. Flagged members are listed by `apk.inventory` but never read.
+  its clean members as child artifacts; an input that starts with a ZIP local
+  header signature but that the parser refuses fails the operation with a fixed
+  error, so a refused archive is never read as one script; otherwise the input
+  itself is one file, named "" in rows. Explicit `file` selectors name clean
+  `package.json` members for `js.package` and clean JavaScript members for
+  `js.hints`; a selector that names none gives no rows (decision
+  `m5a-seams-p2`). Flagged members are listed by `apk.inventory` but never read.
   Tar, gzip and ASAR packages are out of M5a.
 - **JavaScript files**: members whose name ends in `.js`, `.mjs`, `.cjs`, `.jsx`,
   `.ts` or `.tsx` (ASCII case-insensitive), plus `package.json`, in central
