@@ -11,6 +11,8 @@ import reverseai
 from reverseai import cli, contained, doctor
 from reverseai.tools import yarax_tool
 
+# The only argv doctor may run, written out here rather than read from doctor, so a changed command fails.
+VERSION_ARGV = ["docker", "version", "--format", "{{.Server.Version}}"]
 INSPECT_PREFIX = ["docker", "image", "inspect", "--format", "{{.Id}}"]
 
 
@@ -21,7 +23,7 @@ class StandInDocker:
 
     def __call__(self, argv, *, timeout, max_output, profile="default"):
         self.calls.append((list(argv), timeout))
-        if list(argv) == list(doctor.DOCKER_VERSION_ARGV):
+        if list(argv) == VERSION_ARGV:
             if isinstance(self.server, Exception):
                 raise self.server
             return self.server
@@ -51,7 +53,7 @@ class DoctorTests(unittest.TestCase):
         docker = StandInDocker()
         with patch.object(contained, "run_bounded", docker):
             facts = doctor.collect()
-        self.assertEqual(docker.calls[0], (list(doctor.DOCKER_VERSION_ARGV), 10))
+        self.assertEqual(docker.calls[0], (VERSION_ARGV, 10))
         inspected = [argv[5] for argv, timeout in docker.calls[1:]]
         self.assertTrue(all(argv[:5] == INSPECT_PREFIX and timeout == 5 for argv, timeout in docker.calls[1:]))
         self.assertEqual(inspected, [tool["image_id"] for tool in facts["tools"]])
@@ -70,7 +72,7 @@ class DoctorTests(unittest.TestCase):
             docker = StandInDocker(server=silence)
             with self.subTest(silence=type(silence).__name__), patch.object(contained, "run_bounded", docker):
                 facts = doctor.collect()
-                self.assertEqual(docker.calls, [(list(doctor.DOCKER_VERSION_ARGV), 10)])
+                self.assertEqual(docker.calls, [(VERSION_ARGV, 10)])
                 self.assertEqual(facts["docker"]["answered"], False)
                 self.assertTrue(all(tool["lock_loads"] and tool["image_present"] is None and not tool["available"]
                                     for tool in facts["tools"]))
@@ -81,9 +83,15 @@ class DoctorTests(unittest.TestCase):
         with patch("subprocess.Popen", side_effect=FileNotFoundError("docker")) as popen:
             facts = doctor.collect()
         popen.assert_called_once()
-        self.assertEqual(popen.call_args.args[0], list(doctor.DOCKER_VERSION_ARGV))
+        self.assertEqual(popen.call_args.args[0], VERSION_ARGV)
         self.assertIs(popen.call_args.kwargs["shell"], False)
         self.assertFalse(facts["docker"]["answered"])
+
+    def test_a_changed_docker_command_is_refused_by_the_stand_in(self):
+        for argv in (("docker", "pull", "reverseai-control"), ("docker", "build", "."), ("docker", "run", "x")):
+            with self.subTest(argv=argv), patch.object(doctor, "DOCKER_VERSION_ARGV", argv), \
+                    patch.object(contained, "run_bounded", StandInDocker()), self.assertRaises(AssertionError):
+                doctor.collect()
 
     def test_missing_images_and_unloadable_locks_are_reported_per_tool(self):
         with tempfile.TemporaryDirectory() as folder:

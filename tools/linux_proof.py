@@ -28,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,23 +47,29 @@ RUN_SECONDS = 1800
 SUITE_SECONDS = 1200
 STEP_SECONDS = 300
 TAIL_LINES = 40
+REQUIRED_STEPS = ("suite", "wheel", "venv", "install", "version", "imported_from", "doctor", "fixture", "analyze")
 # Writes the code-built ELF with imports (tests/fixtures_structure.py) to the path in argv[1]; inert bytes, never run.
 FIXTURE = ("import sys\nfrom tests import fixtures_structure as F\n"
            "open(sys.argv[1], 'xb').write(F.elf_imports()[0])\n")
 
 
+def as_text(value):
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else (value or "")
+
+
 def run(argv, *, timeout, cwd=None, env=None):
-    """(exit code, stdout, stderr) of one argv; a timeout gives exit code None."""
+    """(exit code, stdout, stderr) of one argv, always as text; a timeout gives exit code None."""
     try:
         done = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
                               errors="replace", timeout=timeout, shell=False)
     except subprocess.TimeoutExpired as expired:
-        return None, expired.stdout or "", expired.stderr or ""
+        # TimeoutExpired keeps the bytes read so far even with text=True.
+        return None, as_text(expired.stdout), as_text(expired.stderr)
     return done.returncode, done.stdout, done.stderr
 
 
 def tail(text, lines=TAIL_LINES):
-    return (text if isinstance(text, str) else text.decode("utf-8", "replace")).splitlines()[-lines:]
+    return as_text(text).splitlines()[-lines:]
 
 
 def suite_counts(stderr):
@@ -98,7 +105,8 @@ def inside(runner=run, work=Path("/tmp"), source=Path(SOURCE)):
 
     def step(name, argv, *, timeout=STEP_SECONDS, cwd=None):
         code, out, err = runner(argv, timeout=timeout, cwd=cwd, env=env)
-        steps[name] = {"exit": code, "stdout": tail(out), "stderr": tail(err)}
+        out, err = as_text(out), as_text(err)
+        steps[name] = {"exit": code, "timed_out": code is None, "stdout": tail(out), "stderr": tail(err)}
         return code, out, err
 
     code, _, err = step("suite", [sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests", "-t", "."],
@@ -172,8 +180,13 @@ def marker_facts(stdout):
 
 
 def passed(facts, version):
-    suite, doctor, analyze = facts.get("suite"), facts.get("doctor"), facts.get("analyze")
-    return bool(suite and suite["ok"] and suite["failures"] == suite["errors"] == 0
+    """Every required step exited 0 on Linux aarch64, Python 3.12, uid 65534, with a non-empty clean suite."""
+    suite, doctor, analyze, steps = facts.get("suite"), facts.get("doctor"), facts.get("analyze"), facts.get("steps")
+    return bool(facts.get("machine") == "aarch64" and str(facts.get("platform", "")).startswith("Linux-")
+                and str(facts.get("python", "")).startswith("3.12.") and facts.get("uid") == 65534
+                and isinstance(steps, dict) and all((steps.get(name) or {}).get("exit") == 0 for name in REQUIRED_STEPS)
+                and suite and suite["ok"] and suite["ran"] > 0
+                and suite["failures"] == suite["errors"] == suite["unexpected_successes"] == 0
                 and facts.get("wheel") and facts.get("version") == "reverseai " + version
                 and str(facts.get("imported_from", "")).startswith("/tmp/venv/")
                 and doctor and doctor.get("host_ok") is True and doctor.get("reverseai") == version
@@ -186,59 +199,87 @@ def utc():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def prove(commit, receipt, runner=run):
-    """Build, run and remove the throwaway image; write the receipt; return 0 only when every step passed."""
+def absent(runner, kind, ref):
+    """True only when Docker answers that this container or image does not exist; silence is not absence."""
+    code, out, err = runner(["docker", kind, "inspect", "--format", "{{.Id}}", ref], timeout=30)
+    return code not in (0, None) and "no such" in (as_text(out) + as_text(err)).lower()
+
+
+def remove_container(runner, name, *, attempts=10, pause=1.0):
+    """Force-remove the owned, generated container name (--rm may still be removing it); never another name."""
+    for _ in range(attempts):
+        runner(["docker", "rm", "--force", name], timeout=30)
+        if absent(runner, "container", name):
+            return True
+        time.sleep(pause)
+    return False
+
+
+def prove(commit, receipt, runner=run, *, pause=1.0):
+    """Build, run and remove the throwaway image; write the receipt; return 0 only when every step passed.
+
+    After the base check every outcome writes a receipt, and every exit, interrupts included, first removes the
+    owned container (once its run started) and any image the build named, then checks that Docker no longer knows
+    them."""
     code, out, _ = runner(["git", "-C", str(ROOT), "rev-parse", "--verify", commit + "^{commit}"], timeout=30)
     if code != 0 or not re.fullmatch(r"[0-9a-f]{40}", out.strip()):
         raise SystemExit("the commit does not resolve in this repository")
     commit = out.strip()
     if runner(["docker", "image", "inspect", "--format", "{{.Id}}", BASE], timeout=30)[0] != 0:
         raise SystemExit("the pinned base " + BASE + " is not present locally; this tool never pulls")
-    started, image_id, facts, error = utc(), None, None, None
+    started, image_id, facts, error, version, docker_exit = utc(), None, None, None, None, None
     name = "reverseai-linux-proof-" + uuid.uuid4().hex[:16]
+    run_started = False
     try:
         with tempfile.TemporaryDirectory(prefix="reverseai-linux-proof-") as temporary:
             context = Path(temporary)
             archive = context / "source.tar"
-            if runner(["git", "-C", str(ROOT), "archive", "--format=tar", "--prefix=src/", "-o", str(archive),
-                       commit], timeout=120)[0] != 0:
-                raise SystemExit("git archive failed")
             code, out, _ = runner(["git", "-C", str(ROOT), "show", commit + ":reverseai/__init__.py"], timeout=30)
-            version = re.search(r'^__version__ = "([^"]+)"$', out, re.M) if code == 0 else None
+            found = re.search(r'^__version__ = "([^"]+)"$', out, re.M) if code == 0 else None
+            version = found.group(1) if found else None
             if version is None:
-                raise SystemExit("the commit names no reverseai.__version__")
-            version = version.group(1)
-            (context / "Dockerfile").write_text(DOCKERFILE, encoding="ascii")
-            iidfile = context / "image.id"
-            code, _, err = runner(build_argv(context, iidfile, "reverseai-linux-proof:" + commit[:12]),
-                                  timeout=DOCKER_SECONDS)
-            if code == 0 and iidfile.exists():
-                image_id = iidfile.read_text(encoding="ascii").strip()
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id or ""):
-                raise SystemExit("docker build failed: " + " | ".join(tail(err, 5)))
-        code, out, err = runner(run_argv(image_id, name), timeout=RUN_SECONDS)
-        if code is None:
-            runner(["docker", "kill", name], timeout=30)
-            error = "the container did not finish within the time limit"
-        else:
+                error = "the commit names no reverseai.__version__"
+            elif runner(["git", "-C", str(ROOT), "archive", "--format=tar", "--prefix=src/", "-o", str(archive),
+                         commit], timeout=120)[0] != 0:
+                error = "git archive failed"
+            else:
+                (context / "Dockerfile").write_text(DOCKERFILE, encoding="ascii")
+                iidfile = context / "image.id"
+                code, _, err = runner(build_argv(context, iidfile, "reverseai-linux-proof:" + commit[:12]),
+                                      timeout=DOCKER_SECONDS)
+                # An image the build named is ours to remove even when the client then failed.
+                named = iidfile.read_text(encoding="ascii").strip() if iidfile.exists() else ""
+                image_id = named if re.fullmatch(r"sha256:[0-9a-f]{64}", named) else None
+                if code != 0 or image_id is None:
+                    error = f"docker build failed (exit {code}): " + " | ".join(tail(err, 5))
+        if error is None:
+            run_started = True
+            docker_exit, out, err = runner(run_argv(image_id, name), timeout=RUN_SECONDS)
             try:
                 facts = marker_facts(out)
             except ValueError as problem:
-                error = f"{problem}; exit {code}: " + " | ".join(tail(err, 5))
+                error = str(problem)
+            if docker_exit is None:
+                error = "the container did not finish within the time limit"
+            elif docker_exit != 0:
+                error = f"docker run exited {docker_exit}: " + " | ".join(tail(err, 5))
     finally:
-        removed = image_id is None or runner(remove_argv(image_id), timeout=DOCKER_SECONDS)[0] == 0
-        gone = image_id is None or runner(["docker", "image", "inspect", "--format", "{{.Id}}", image_id],
-                                          timeout=30)[0] != 0
-    ok = error is None and facts is not None and passed(facts, version) and removed and gone
+        container_removed = not run_started or remove_container(runner, name, pause=pause)
+        if image_id is not None:
+            runner(remove_argv(image_id), timeout=DOCKER_SECONDS)
+        image_removed = image_id is None or absent(runner, "image", image_id)
+    ok = (error is None and docker_exit == 0 and facts is not None and passed(facts, version)
+          and container_removed and image_removed)
     document = {"commit": commit, "platform": PLATFORM, "base": BASE, "base_digest": BASE_DIGEST,
-                "expected_version": version, "image_id": image_id, "image_removed": removed and gone,
-                "container": name, "started": started, "ended": utc(), "passed": ok, "error": error,
-                "inside": facts}
+                "expected_version": version, "image_id": image_id, "image_removed": image_removed,
+                "container": name, "container_removed": container_removed, "docker_exit": docker_exit,
+                "started": started, "ended": utc(), "passed": ok, "error": error, "inside": facts}
     with open(receipt, "x", encoding="utf-8") as stream:
         stream.write(json.dumps(document, indent=2, sort_keys=True) + "\n")
     suite = (facts or {}).get("suite") or {}
     print(f"{'passed' if ok else 'FAILED'}: {commit[:12]} on {PLATFORM}, Python {(facts or {}).get('python')}, "
-          f"{suite.get('ran')} tests ({suite.get('skipped')} skipped), image removed: {removed and gone}")
+          f"{suite.get('ran')} tests ({suite.get('skipped')} skipped), container removed: {container_removed}, "
+          f"image removed: {image_removed}" + (f"; {error}" if error else ""))
     return 0 if ok else 1
 
 
