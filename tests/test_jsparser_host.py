@@ -20,7 +20,7 @@ from reverseai.tools import apk, jsparser_tool, jshints
 from reverseai.tools import jsparser_verify as verify
 from tests.test_apk_parsing import zip_bytes
 
-LOCK = {'image_id': 'sha256:' + 'a' * 64, 'platform': 'linux/arm64', 'adapter_version': '8.0.4-r1',
+LOCK = {'image_id': 'sha256:' + 'a' * 64, 'platform': 'linux/arm64', 'adapter_version': '8.0.4-r2',
         **contained.JSPARSER_PINS, 'driver_sha256': '1' * 64, 'worker_sha256': '2' * 64}
 BOM = b'\xef\xbb\xbf'
 A = BOM + '// 😀\nimport x from "\\u{1f600}/m";\nobj.eval(code);\n'.encode()
@@ -377,7 +377,7 @@ class BoundaryTests(unittest.TestCase):
 
         request, _ = verify.prepare(A, arguments())
         with tempfile.TemporaryDirectory() as root:
-            executor = contained.DockerExecutor(LOCK, runner, adapter_version='8.0.4-r1',
+            executor = contained.DockerExecutor(LOCK, runner, adapter_version='8.0.4-r2',
                                                inspect=lambda image: image, staging_root=root)
             self.assertEqual(executor.run('jsparser.syntax', request, A, sha256_hex(A)), b'{}')
             self.assertEqual(list(Path(root).iterdir()), [])
@@ -396,7 +396,7 @@ class BoundaryTests(unittest.TestCase):
                     executor.run('jsparser.syntax', request, data, sha256_hex(data))
             self.assertEqual(len(calls), 1)
         with patch.object(contained, 'run_bounded', return_value=b'{}') as bounded:
-            executor = contained.DockerExecutor(LOCK, adapter_version='8.0.4-r1')
+            executor = contained.DockerExecutor(LOCK, adapter_version='8.0.4-r2')
             executor.runner(['trusted'], timeout=120, max_output=20)
             bounded.assert_called_once_with(['trusted'], profile='jsparser', timeout=120, max_output=20)
 
@@ -456,7 +456,7 @@ class BoundaryTests(unittest.TestCase):
                 spec.validate_args(args)
 
     def test_image_lock_requires_every_pin_and_availability_never_runs_a_worker(self):
-        self.assertEqual(contained.load_lock(LOCK, adapter_version='8.0.4-r1'), LOCK)
+        self.assertEqual(contained.load_lock(LOCK, adapter_version='8.0.4-r2'), LOCK)
         for key in LOCK:
             bad = {**LOCK, key: 'bad'}
             with self.subTest(key=key), self.assertRaises(contained.ContainedError):

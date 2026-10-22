@@ -80,7 +80,7 @@ JADX_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                         *(f"apk_basic.{name}" for name in JADX_CASE_NAMES),
                         "jadx.hostile_reply", "jadx.input_mismatch")
 JADX_NATIVE_RUNS = len(JADX_REQUIRED_CHECKS) - 3
-JSPARSER_ADAPTER_VERSION = "8.0.4-r1"
+JSPARSER_ADAPTER_VERSION = "8.0.4-r2"
 JSPARSER_PINS = {
     "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
     "node_sha256": "dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e",
@@ -97,7 +97,8 @@ JSPARSER_WORKER_PATH = Path(__file__).resolve().parents[1] / "containers/jsparse
 # jshints.CALLEES changes these known answers, which must then be renewed (FIX-M5B-V).
 JSPARSER_CALLEES = tuple(sorted(_JSHINTS_CALLEES))
 JSPARSER_CASE_NAMES = ("app_modules", "app_calls", "app_page", "app_parse", "bundle_modules", "bundle_calls",
-                       "dialects_modules", "dialects_calls", "dialects_parse", "boundary_parse", "input_mismatch")
+                       "dialects_modules", "dialects_calls", "dialects_parse", "boundary_parse", "input_mismatch",
+                       "tarball_calls", "tarball_tampered")
 JSPARSER_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                             *(f"jsparser.{name}" for name in JSPARSER_CASE_NAMES))
 JSPARSER_NATIVE_RUNS = len(JSPARSER_REQUIRED_CHECKS) - 3
@@ -835,16 +836,50 @@ def _jsparser_dialects():
     return fixtures_apk.zip_archive([fixtures_apk.member(name, data) for name, data in JSPARSER_DIALECT_SOURCES])
 
 
+# M5c (decision m5c-contract): an npm tarball built in code, its files read through method 1 artifacts.
+JSPARSER_TARBALL_SOURCES = (
+    ("package/package.json", b'{"name": "fixture", "main": "index.js"}\n'),
+    ("package/index.js", b"const cp = require('child_process');\ncp.exec(cmd);\nfetch(url);\n"),
+    ("package/lib/util.ts", b"export const run = (s: string) => eval(s);\nBuffer.from(s, 'base64');\n"),
+)
+
+
+def _jsparser_tarball():
+    """(gzip bytes, [(name, method 1 artifact)]) of a reproducible tar of JSPARSER_TARBALL_SOURCES, built here."""
+    import gzip
+    import tarfile
+    import zlib
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for name, body in JSPARSER_TARBALL_SOURCES:
+            info = tarfile.TarInfo(name)
+            info.size, info.mtime, info.mode, info.uid, info.gid = len(body), 0, 0o644, 0, 0
+            archive.addfile(info, io.BytesIO(body))
+    tar = buffer.getvalue()
+    data = gzip.compress(tar, compresslevel=9, mtime=0)
+    with tarfile.open(fileobj=io.BytesIO(tar)) as archive:
+        rows = [(info.name, {"member": info.name, "method": 1, "data_offset": 0, "compressed_size": len(data),
+                             "inner_offset": info.offset_data, "size": info.size,
+                             "crc32": zlib.crc32(tar[info.offset_data:info.offset_data + info.size]),
+                             "sha256": sha256_hex(tar[info.offset_data:info.offset_data + info.size])})
+                for info in archive.getmembers()]
+    return data, rows
+
+
 def jsparser_fixtures():
     # js_boundary is exactly the 4 MiB a single file may have: the host refuses one byte more before any worker
     # (RD-M5B-CODEX-W R2), so the worker's too_large row is covered by its unit tests, not by a native case.
+    tarball = _jsparser_tarball()[0]
+    # js_tarball_bad flips one bit of the gzip trailer's CRC-32: the worker must refuse the stream ("input")
     return {"js_app": fixtures_js.app_zip()[0], "js_bundle": fixtures_js.bundle_js()[0],
-            "js_dialects": _jsparser_dialects()[0], "js_boundary": b"var a = 1;\n" * 381300 + b"//xx"}
+            "js_dialects": _jsparser_dialects()[0], "js_boundary": b"var a = 1;\n" * 381300 + b"//xx",
+            "js_tarball": tarball, "js_tarball_bad": tarball[:-8] + bytes([tarball[-8] ^ 1]) + tarball[-7:]}
 
 
 def jsparser_cases(fixtures):
     """Fixed public jsparser.syntax requests (fixture name, args), built from the fixtures' own declarations."""
-    need(isinstance(fixtures, dict) and set(fixtures) == {"js_app", "js_bundle", "js_dialects", "js_boundary"} and
+    need(isinstance(fixtures, dict) and set(fixtures) == {"js_app", "js_bundle", "js_dialects", "js_boundary",
+                                                          "js_tarball", "js_tarball_bad"} and
          all(type(fixtures[name]) is bytes and fixtures[name] == value for name, value in jsparser_fixtures().items()),
          "KnownAnswerFixture")
 
@@ -857,6 +892,7 @@ def jsparser_cases(fixtures):
 
     app = entries(fixtures_js.app_zip()[1]["files"])
     dialects = entries(_jsparser_dialects()[1]["members"])
+    tarball = entries({"name": name, "artifact": artifact} for name, artifact in _jsparser_tarball()[1])
     single = [{"artifact": None, "dialect": "js"}]
     tampered = [dict(entry) for entry in app]
     tampered[1] = {**tampered[1], "artifact": {**tampered[1]["artifact"], "sha256": "0" * 64}}
@@ -866,7 +902,9 @@ def jsparser_cases(fixtures):
             "dialects_modules": case("js_dialects", dialects, "modules"),
             "dialects_calls": case("js_dialects", dialects, "calls"),
             "dialects_parse": case("js_dialects", dialects, "parse"),
-            "boundary_parse": case("js_boundary", single, "parse"), "input_mismatch": case("js_app", tampered, "modules")}
+            "boundary_parse": case("js_boundary", single, "parse"), "input_mismatch": case("js_app", tampered, "modules"),
+            "tarball_calls": case("js_tarball", tarball, "calls"),
+            "tarball_tampered": case("js_tarball_bad", tarball, "modules")}
 
 
 def _jsparser_rows(*rows):
@@ -905,6 +943,9 @@ JSPARSER_EXPECTED = {
         ("syntax_error", 1, 0, ())),
     "boundary_parse": _jsparser_rows(("ok", 0, 0, ())),
     "input_mismatch": {"error": "input"},
+    "tarball_calls": _jsparser_rows(("ok", 0, 2, (("call", 37, 44), ("call", 51, 56))),
+        ("ok", 0, 2, (("call", 34, 38), ("call", 43, 54)))),
+    "tarball_tampered": {"error": "input"},
 }
 
 

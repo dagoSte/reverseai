@@ -19,6 +19,7 @@ import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
+import zlib
 
 from tests import fixtures_js as J
 
@@ -150,6 +151,140 @@ class MaterializeTests(unittest.TestCase):
             self.assertIsNone(worker.text_units(raw), raw)
 
 
+def gzip_member(body, *, flags=0, extra=b"", name=b"", comment=b"", trailer=None):
+    """One gzip member (RFC 1952) built here: raw deflate of body between a header with the given optional fields and
+    its trailer; FHCRC (flag 2) is computed over the header written before it."""
+    header = b"\x1f\x8b\x08" + bytes([flags]) + bytes(4) + b"\x00\xff"
+    if flags & 4:
+        header += len(extra).to_bytes(2, "little") + extra
+    if flags & 8:
+        header += name + b"\x00"
+    if flags & 16:
+        header += comment + b"\x00"
+    if flags & 2:
+        header += (zlib.crc32(header) & 0xFFFF).to_bytes(2, "little")
+    packer = zlib.compressobj(9, zlib.DEFLATED, -15)
+    packed = packer.compress(body) + packer.flush()
+    end = trailer if trailer is not None else (zlib.crc32(body).to_bytes(4, "little")
+                                               + (len(body) & 0xFFFFFFFF).to_bytes(4, "little"))
+    return header + packed + end
+
+
+def npm_tarball(files):
+    """(input bytes, [(name, method 1 artifact)]) of a gzip-compressed tar of these files, built in code."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for name, body in files:
+            info = tarfile.TarInfo("package/" + name)
+            info.size = len(body)
+            archive.addfile(info, io.BytesIO(body))
+    tar = buffer.getvalue()
+    data = gzip_member(tar, flags=8, name=b"package.tgz")
+    with tarfile.open(fileobj=io.BytesIO(tar)) as archive:
+        artifacts = [(info.name, {"member": info.name, "method": 1, "data_offset": 0, "compressed_size": len(data),
+                                  "inner_offset": info.offset_data, "size": info.size,
+                                  "crc32": zlib.crc32(tar[info.offset_data:info.offset_data + info.size]),
+                                  "sha256": hashlib.sha256(tar[info.offset_data:info.offset_data + info.size]).hexdigest()})
+                     for info in archive.getmembers()]
+    return data, artifacts
+
+
+TARBALL_FILES = (("index.js", b"const cp = require('child_process');\ncp.exec(cmd);\n"),
+                 ("lib/util.ts", b"export const x: number = 1;\n"))
+
+
+class GzipStreamTests(unittest.TestCase):
+    """M5c method 1 children: the worker's own inflater, equal to contract.inflate_stream on the same inputs."""
+
+    def test_the_inflater_accepts_and_refuses_exactly_as_the_contract_does(self):
+        from reverseai import contract
+        body = b"package/index.js\x00" + bytes(range(256)) * 40
+        good = gzip_member(body)
+        cases = {"plain": good, "extra": gzip_member(body, flags=4, extra=b"AB\x02\x00xy"),
+                 "name_comment": gzip_member(body, flags=8 | 16, name=b"a.tar", comment=b"note"),
+                 "header_crc": gzip_member(body, flags=2 | 8, name=b"a.tar"),
+                 "empty_body": gzip_member(b""),
+                 "bad_magic": b"\x1f\x8c" + good[2:], "bad_method": good[:2] + b"\x07" + good[3:],
+                 "reserved_flag": good[:3] + b"\x20" + good[4:],
+                 "bad_header_crc": gzip_member(body, flags=2)[:10] + b"\x00\x00" + gzip_member(body)[10:],
+                 "bad_trailer_crc": gzip_member(body, trailer=b"\x00" * 4 + len(body).to_bytes(4, "little")),
+                 "bad_isize": gzip_member(body, trailer=zlib.crc32(body).to_bytes(4, "little") + b"\x00" * 4),
+                 "trailing_byte": good + b"\x00", "two_members": good + good, "truncated": good[:-1],
+                 "short": good[:17], "unterminated_name": b"\x1f\x8b\x08\x08" + bytes(6) + b"a" * 30,
+                 "extra_past_end": b"\x1f\x8b\x08\x04" + bytes(6) + b"\xff\xff" + bytes(20),
+                 "not_deflate": b"\x1f\x8b\x08\x00" + bytes(6) + b"\xff" * 12}
+        for name, data in cases.items():
+            with self.subTest(case=name):
+                try:
+                    expected = contract.inflate_stream(data, 0, len(data))
+                except contract.ContractError:
+                    expected = None
+                try:
+                    got = worker.inflate_stream(data, 0, len(data))
+                except worker.InputMismatch:
+                    got = None
+                self.assertEqual(got, expected)
+        self.assertEqual(worker.inflate_stream(cases["plain"], 0, len(good)), body)
+        # inside a larger input, at an offset
+        framed = b"x" * 7 + good + b"y" * 3
+        self.assertEqual(worker.inflate_stream(framed, 7, len(good)), contract.inflate_stream(framed, 7, len(good)))
+        for start, length in ((7, len(good) + 1), (6, len(good)), (0, len(framed) + 1)):
+            with self.assertRaises(worker.InputMismatch):
+                worker.inflate_stream(framed, start, length)
+
+    def test_a_stream_beyond_100_times_its_size_is_refused_in_bounded_chunks(self):
+        bomb = gzip_member(bytes(4 * 1024 * 1024))  # about 4 KiB packed: far past 100 x
+        seen, real = [], zlib.decompressobj
+
+        class Counting:
+            def __init__(self, *args):
+                self.inner = real(*args)
+
+            def decompress(self, data, max_length=0):
+                out = self.inner.decompress(data, max_length)
+                seen.append((max_length, len(out)))
+                return out
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        with patch.object(worker.zlib, "decompressobj", Counting), self.assertRaises(worker.InputMismatch):
+            worker.inflate_stream(bomb, 0, len(bomb))
+        limit = 100 * len(bomb)
+        self.assertTrue(seen and all(0 < cap <= limit + 1 and length <= cap for cap, length in seen))
+        with patch.object(worker, "MAX_STREAM_BYTES", 1024):
+            fine = gzip_member(bytes(range(256)) * 8)  # 2,048 bytes inflated, past a 1,024 limit
+            with self.assertRaises(worker.InputMismatch):
+                worker.inflate_stream(fine, 0, len(fine))
+
+    def test_method_1_artifacts_are_admitted_and_bound_by_their_stream(self):
+        data, artifacts = npm_tarball(TARBALL_FILES)
+        request_files = [{"artifact": artifact, "dialect": "ts" if name.endswith(".ts") else "js"}
+                         for name, artifact in artifacts]
+        files = worker.parse_request(request(request_files))[0]
+        self.assertEqual([f["artifact"]["method"] for f in files], [1, 1])
+        streams = {}
+        self.assertEqual([worker.materialize(data, f["artifact"], streams) for f in files],
+                         [body for _, body in TARBALL_FILES])
+        self.assertEqual(list(streams), [(0, len(data))])
+        base = artifacts[0][1]
+        refused = [{k: v for k, v in base.items() if k != "inner_offset"}, {**base, "method": 0},
+                   {**base, "extra": 1}, {**base, "compressed_size": 17},
+                   {**base, "inner_offset": 100 * base["compressed_size"]}, {**base, "inner_offset": -1},
+                   {**base, "inner_offset": True}, {**base, "inner_offset": 128 * 1024 * 1024}]
+        for artifact in refused:
+            with self.subTest(artifact={k: artifact.get(k) for k in ("method", "compressed_size", "inner_offset")}), \
+                    self.assertRaises(worker.InvalidRequest):
+                worker.parse_request(request([{"artifact": artifact, "dialect": "js"}]))
+        for change in ({"sha256": "0" * 64}, {"crc32": base["crc32"] ^ 1}, {"size": base["size"] + 1},
+                       {"inner_offset": base["inner_offset"] + 1}, {"inner_offset": 10**6},
+                       {"data_offset": 1}, {"compressed_size": len(data) - 1}):
+            with self.subTest(change=change), self.assertRaises(worker.InputMismatch):
+                worker.materialize(data, {**base, **change}, {})
+        with self.assertRaises(worker.InputMismatch):
+            worker.materialize(data[:-1] + bytes([data[-1] ^ 1]), base, {})
+
+
 class AnswerTests(unittest.TestCase):
     def test_rows_become_observations_and_the_page_spans_files(self):
         # three files with 3, 0 and 4 items; the page start 2, limit 3 takes one item of the first and two of the third
@@ -276,6 +411,27 @@ class RunTests(unittest.TestCase):
         with patch.object(worker, "MAX_INPUT_BYTES", len(self.data) - 1):
             self.assertEqual(self.reply(lambda sent: (0, ok, False))["error"], "InputTooLarge")
 
+    def test_tarball_children_reach_the_driver_and_each_stream_is_inflated_once(self):
+        data, artifacts = npm_tarball(TARBALL_FILES)
+        files = [{"artifact": artifact, "dialect": "js"} for _, artifact in artifacts]
+        seen, calls, real = {}, [], worker.inflate_stream
+
+        def counting(*args):
+            calls.append(args[1:])
+            return real(*args)
+
+        def driver(sent):
+            seen["bytes"] = [Path(f["path"]).read_bytes() for f in sent["files"]]
+            return 0, answer(*[row() for _ in sent["files"]]), False
+
+        with patch.object(worker, "inflate_stream", counting):
+            message = worker.reply(request(files), data, driver=driver)
+        self.assertEqual(message["status"], "ok", message)
+        self.assertEqual(seen["bytes"], [body for _, body in TARBALL_FILES])
+        self.assertEqual(calls, [(0, len(data))])
+        tampered = data[:-5] + bytes([data[-5] ^ 1]) + data[-4:]  # trailer CRC-32
+        self.assertEqual(worker.reply(request(files), tampered, driver=driver)["error"], "input")
+
     def test_the_driver_command_is_fixed(self):
         self.assertEqual(worker.driver_argv(), [
             "/opt/node/bin/node", "--max-old-space-size=1536", "--disallow-code-generation-from-strings", "--no-addons",
@@ -283,7 +439,7 @@ class RunTests(unittest.TestCase):
             "/opt/reverseai/driver.mjs"])
         self.assertLess(worker.DRIVER_SECONDS, 120)
         self.assertEqual((worker.ADAPTER_VERSION, worker.MAX_FILES, worker.MAX_FILE_BYTES, worker.MAX_CHILDREN_BYTES),
-                         ("8.0.4-r1", 64, 4 * 1024 * 1024, 32 * 1024 * 1024))
+                         ("8.0.4-r2", 64, 4 * 1024 * 1024, 32 * 1024 * 1024))
 
     def test_a_slow_driver_is_killed_its_output_is_bounded_and_the_heap_marker_is_read(self):
         worker.WORK.mkdir()
@@ -473,7 +629,7 @@ class BuildToolTests(unittest.TestCase):
                                      "babel_types_integrity", "helper_string_parser_integrity",
                                      "helper_validator_identifier_integrity", "driver_sha256", "worker_sha256", "image_id"})
         self.assertEqual((lock["adapter_version"], lock["platform"], lock["image_id"], lock["base_digest"]),
-                         ("8.0.4-r1", "linux/arm64", docker.image_id, build.BASE_DIGEST))
+                         ("8.0.4-r2", "linux/arm64", docker.image_id, build.BASE_DIGEST))
         self.assertEqual(lock["node_sha256"], self.assets["node_sha256"][2].removeprefix("sha256:"))
         self.assertEqual(lock["babel_parser_integrity"], self.assets["babel_parser_integrity"][2])
         self.assertEqual(lock["driver_sha256"], build.file_sha256(build.SOURCE / "driver.mjs"))
