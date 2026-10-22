@@ -68,6 +68,8 @@ def main(argv=None):
     query.add_argument("--with-ghidra", action="store_true", help="Enable the pinned contained Ghidra query worker")
     query.add_argument("--with-jadx", action="store_true",
                        help="Include derived Java for Android method queries using the pinned contained JADX worker")
+    query.add_argument("--with-jsparser", action="store_true",
+                       help="Enable derived JavaScript syntax queries using the pinned contained parser")
     args = parser.parse_args(argv)
 
     if args.command == "query":
@@ -77,6 +79,9 @@ def main(argv=None):
             parser.exit(1, f"reverseai: query refused: {type(error).__name__}\n")
         if queries.TABLE[args.query].role == "code" and not args.with_ghidra:
             parser.exit(1, "reverseai: this query requires --with-ghidra\n")
+        if args.query == "analyze_javascript_application" and checked["detail"] in queries.JS_SYNTAX_DETAILS \
+                and not args.with_jsparser:
+            parser.exit(1, "reverseai: this detail requires --with-jsparser\n")
 
     try:
         unusable = args.out.is_symlink() or (args.out.exists() and (not args.out.is_dir() or any(args.out.iterdir())))
@@ -88,7 +93,8 @@ def main(argv=None):
     for wanted, module, label in ((getattr(args, "with_lief", False), "lief_tool", "LIEF"),
                                   (getattr(args, "with_yarax", False), "yarax_tool", "YARA-X"),
                                   (args.with_ghidra, "ghidra_tool", "Ghidra"),
-                                  (getattr(args, "with_jadx", False), "jadx_tool", "JADX")):
+                                  (getattr(args, "with_jadx", False), "jadx_tool", "JADX"),
+                                  (getattr(args, "with_jsparser", False), "jsparser_tool", "JavaScript parser")):
         if not wanted:
             continue
         from importlib import import_module

@@ -52,7 +52,7 @@ class QueryTableTests(unittest.TestCase):
         spec, args = queries.resolve(NAME, {})
         self.assertEqual(args, {"detail": "summary", "file": "", "category": "all", "start": 0, "limit": 128})
         self.assertEqual(spec.role, "structural")
-        self.assertEqual(spec.operations, ("js.files", "js.package", "js.hints"))
+        self.assertEqual(spec.operations, ("js.files", "js.package", "js.hints", "jsparser.syntax"))
         self.assertEqual(queries.JS_CATEGORIES, ("all", *claims.JS_CATEGORIES))
 
     def test_each_detail_routes_its_operations(self):
