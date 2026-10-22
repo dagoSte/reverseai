@@ -6,7 +6,7 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M4b release candidate: decompiled Java through JADX.** Deterministic
+**Status: M4b released: decompiled Java through JADX.** Deterministic
 analysts read file structure (ELF, PE and Mach-O), imports and string indicators in-process,
 alongside APK members, binary manifest attributes, DEX classes, methods and code references.
 The gateway and reviewer independently re-derive bytes inside stored or compressed
@@ -54,7 +54,7 @@ What this buys, and how each point is checked:
 | M3c | Ghidra assembly, references from code and referenced strings as derived evidence | released |
 | M3d | Targeted queries by name, address or text with paging; REA's 16 native query names | released |
 | M4a | APK members, binary manifest and DEX classes, methods and code references verified on the host, including compressed-member evidence (contract/3) | released |
-| M4b | Decompiled Java through the official JADX 1.5.6 in a locked container, bound to host-verified DEX methods (derived) | release candidate |
+| M4b | Decompiled Java through the official JADX 1.5.6 in a locked container, bound to host-verified DEX methods (derived) | released |
 | M5 | JavaScript application analysis | planned |
 | M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
 | M7 | Measured comparison with REA Safe Agent on a known-answer corpus | planned |
