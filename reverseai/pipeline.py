@@ -19,6 +19,7 @@ CONTAINED_BUDGET = Budget(max_wall_seconds=150)
 GHIDRA_BUDGET = Budget(max_wall_seconds=330)
 # JADX's fixed 120 s worker profile plus host work; the query task allows 150 s.
 JADX_BUDGET = Budget(max_wall_seconds=180)
+ANDROID_QUERY_BUDGET = Budget(max_wall_seconds=120)
 
 
 def _budget(tools):
@@ -77,8 +78,10 @@ def query_bytes(data, ref, name, args, tools=TOOLS):
     with_jadx = any(request.operation == "jadx.method" for request in requests)
     if with_jadx and registered["jadx.method"].ref != query.REFS["jadx"]:
         raise ContractError("Query JADX version unavailable")
-    budget = GHIDRA_BUDGET if spec.role == "code" else JADX_BUDGET if with_jadx else Budget()
-    task_seconds = 300 if spec.role == "code" else 150 if with_jadx else 30
+    with_android = any(request.operation.startswith(("apk.", "dex.")) for request in requests)
+    budget = (GHIDRA_BUDGET if spec.role == "code" else JADX_BUDGET if with_jadx
+              else ANDROID_QUERY_BUDGET if with_android else Budget())
+    task_seconds = 300 if spec.role == "code" else 150 if with_jadx else budget.max_wall_seconds
     task = AnalysisTask(content_id("tk", {"input": ref.sha256, "query": name, "args": checked}), spec.role, ref,
                         requests, Budget(max_concurrency=1, max_wall_seconds=task_seconds))
     partial = Gateway(tools, budget).run(task, data)

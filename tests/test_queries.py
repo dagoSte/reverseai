@@ -339,6 +339,33 @@ class AndroidQueryTests(unittest.TestCase):
         return {finding.claim_key: [f.value for f in analysis.results[0].findings if f.claim_key == finding.claim_key]
                 for finding in analysis.results[0].findings}, analysis
 
+    def test_host_android_budgets_are_120_seconds_and_native_stays_30(self):
+        cases = (
+            ('inspect_android_package', {}),
+            ('search_android_classes', {}),
+            ('inspect_android_class', {'class': fixtures_apk.MAIN}),
+            ('inspect_android_method', {'class': fixtures_apk.MAIN, 'method': 'helper'}),
+            ('trace_android_references', {'class': fixtures_apk.HELPER, 'method': 'compute', 'direction': 'to'}),
+            ('read_bytes', {'length': 16}),
+        )
+        real_run = Gateway.run
+        for name, args in cases:
+            tasks = []
+
+            def capture(gateway, task, data):
+                tasks.append(task)
+                return real_run(gateway, task, data)
+
+            with self.subTest(query=name), patch.object(pipeline, 'Gateway', wraps=Gateway) as factory, \
+                    patch.object(Gateway, 'run', capture):
+                analysis = pipeline.query_bytes(self.data, self.ref, name, args)
+                self.assertEqual([result.status for result in analysis.results], ['ok'])
+                self.assertEqual(len(tasks), 1)
+                expected = 30 if name == 'read_bytes' else 120
+                self.assertEqual((factory.call_args.args[1].max_wall_seconds, tasks[0].budget.max_wall_seconds),
+                                 (expected, expected))
+                self.assertNotIn('jadx.method', [request.operation for request in tasks[0].operations])
+
     def test_routed_arguments_reach_each_operation(self):
         spec, args = queries.resolve("inspect_android_package", {"member_limit": 2, "attribute_start": 3})
         self.assertEqual([(r.operation, dict(r.args)) for r in spec.requests(args)],
