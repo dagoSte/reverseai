@@ -7,7 +7,7 @@ of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
 **Status: M5b release candidate: JavaScript syntax through a pinned parser.**
-For a JavaScript ZIP or a single bundle, the host lists files, reads package.json
+For a JavaScript ZIP, an Electron ASAR archive or a single bundle, the host lists files, reads package.json
 declarations with exact byte positions, and finds lexical hints at their matched
 byte ranges (M5a). With M5b, a pinned parser (Node.js 24.22.1 with @babel/parser
 8.0.4) reads JavaScript, JSX and TypeScript as data in its own locked container and
@@ -130,7 +130,9 @@ python3 -m reverseai query path/to/approved-js.zip --query analyze_javascript_ap
 python3 -B -m unittest discover -s tests -t . -v
 ```
 
-The JavaScript query accepts a ZIP or a single JavaScript bundle, with no Docker
+The JavaScript query accepts a ZIP, an Electron ASAR archive (its files are read as stored
+members; unpacked and link entries are listed with a flag and never read) or a single
+JavaScript bundle, with no Docker
 or downloads. Use `detail=files`, `detail=package` or `detail=hints` to page one
 part of the analysis; `summary` takes the first page of each part.
 
