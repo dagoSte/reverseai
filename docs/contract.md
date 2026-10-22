@@ -885,7 +885,10 @@ parser's reading and stays **derived**; the bytes at each anchor are verified.
   `helper_string_parser_integrity`, `helper_validator_identifier_integrity`,
   `driver_sha256`, `worker_sha256`, `image_id`.
 - **Profile** (fixed in `reverseai/contained.py`, proven by the native
-  verifier): the JADX flags with values M5B-W measures and coord records.
+  verifier; decision `m5b-w-plan`): the JADX flag set with `--memory 2g
+  --memory-swap 2g --cpus 2 --pids-limit 64 --tmpfs /tmp:...,size=64m`, wall
+  120 s, Node heap 1,536 MiB (measured: 32 MiB of JavaScript in 72 s and 784 MiB
+  on one loaded CPU).
 - **Parsing**: each file's bytes are decoded as UTF-8 (a leading BOM skipped;
   invalid UTF-8 gives status `decode_error`), then parsed with `sourceType`
   `unambiguous`, `errorRecovery` on, plugins fixed by the file suffix (`jsx` for
@@ -900,21 +903,41 @@ parser's reading and stays **derived**; the bytes at each anchor are verified.
   64 files, each at most 4 MiB, 32 MiB in all, else a fixed error) and sends the
   worker their artifacts (or the snapshot for a single file) and their dialects;
   the worker re-materializes members like the JADX worker.
-- **Reply**: per file, in request order, `status` (`ok`, `syntax_error` when
-  error recovery reported errors, `decode_error`, `too_large`), the error count
-  and items: `{"kind": "import" | "export_from" | "require" | "dynamic_import",
+- **Request and paging** (decision `m5b-seams-w`): the host's closed request
+  carries the files (artifacts or the snapshot, dialects), `kind`, `start`,
+  `limit` and `callees`, the sorted `jshints.CALLEES` (always exactly that list;
+  the image need not change when the list does). The worker finds every item of
+  that kind in file then offset order, returns each file's item count and only
+  the items of the page `start`..`start + limit`, each with its file index.
+- **Reply** (decision `m5b-seams-h`): the worker/1 observations are one row per
+  file in request order, `{"file": index, "status", "errors", "count", "items"}`:
+  `status` `ok` (errors 0), `syntax_error` (errors > 0, items allowed),
+  `decode_error` or `too_large` (errors, count 0, no items); `count` the file's
+  items of the kind; `items` that file's part of the page, sorted by start, end
+  and form, no duplicates. Offsets count UTF-16 units of the decoded text after
+  one leading BOM is skipped; an offset inside a surrogate pair fails. The
+  concatenated items must be exactly the page the counts define. Items: `{"kind": "import" | "export_from" | "require" | "dynamic_import",
   "start", "end"}` with the UTF-16 offsets of the module source string literal,
   and `{"kind": "call", "start", "end"}` with the offsets of a callee that is an
   identifier or a chain of at most four identifiers joined by dots (`new` calls
-  included) whose last name is in `jshints.CALLEES`. Offsets only: the worker
+  included) whose trailing parts equal an entry of `jshints.CALLEES`: entries
+  are one name for distinctive calls (`eval`, `execSync`, `fetch`) and a
+  receiver plus name for common names (`Buffer.from`, `http.get`,
+  `https.request`, `net.connect`, `fs.write`), so `map.get(k)` is not a call item
+  (decision `m5b-callee-suffix`); `import(...)` is a `dynamic_import` module item,
+  never a call. Offsets only: the worker
   never returns text, names or locations in bytes.
 - **Anchors**: the host converts each UTF-16 offset to a UTF-8 byte offset of
   the file's own bytes, then re-derives the value from those bytes: for a module
   item the bytes must be one complete single- or double-quoted string literal
-  (or a template literal without `${`), whose decoded value becomes `source`
-  (escaped, cut at 256 with `truncated`); for a call the bytes must be the
-  identifier chain (identifiers and dots, no other byte), which becomes
-  `callee`. Anything else fails the operation.
+  (or a template literal without `${`), decoded with every ECMAScript escape
+  (legacy octal and identity escapes included), whose decoded value becomes
+  `source` (escaped, cut at 256 with `truncated`); for a call the bytes must be
+  the identifier chain (ASCII identifiers `[$A-Za-z_][$A-Za-z0-9_]*` and dots, no
+  other byte; the worker omits chains with other identifiers or escapes), which
+  becomes `callee`. Anything else fails the operation. The host checks the
+  bytes, not the syntactic role: that an anchor is code and not a comment is the
+  parser's reading, which is why these pages are derived.
   `{"kind": "js_module", "index", "total", "file", "form", "source",
   "truncated"}`, `{"kind": "js_call", "index", "total", "file", "callee"}` and
   `{"kind": "js_parse", "index", "total", "file", "status", "errors"}` (anchored
