@@ -880,7 +880,7 @@ parser's reading and stays **derived**; the bytes at each anchor are verified.
   8.0.6, `@babel/helper-validator-identifier` 8.0.6 (registry sha512 integrities,
   REA's lock). No npm client and no install scripts: the build tool checks each
   tarball and unpacks it. A fixed driver imports `@babel/parser` only. Lock keys:
-  `adapter_version` `8.0.4-r1`, `platform`, `base_digest`, `node_sha256`,
+  `adapter_version` `8.0.4-r1` (`8.0.4-r2` since M5c, whose worker also reads gzip-stream children), `platform`, `base_digest`, `node_sha256`,
   `babel_parser_integrity`, `babel_types_integrity`,
   `helper_string_parser_integrity`, `helper_validator_identifier_integrity`,
   `driver_sha256`, `worker_sha256`, `image_id`.
