@@ -119,7 +119,7 @@ def build_sdist(sdist_directory, config_settings=None):
     files = {name: (_read(ROOT / name), mode) for name, mode in _source_files()}
     files["PKG-INFO"] = (_metadata(), 0o644)
     with (destination / filename).open("wb") as output:
-        with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0, compresslevel=9) as compressed:
             with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as archive:
                 for name, (data, mode) in sorted(files.items()):
                     info = tarfile.TarInfo(root + "/" + name)

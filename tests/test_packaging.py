@@ -127,6 +127,20 @@ class PackagingTests(unittest.TestCase):
             with mock.patch.object(build, "ROOT", self.source):
                 self.assertEqual(self.sdist.read_bytes(), (other / build.build_sdist(other)).read_bytes())
 
+    def test_sdist_pins_level_nine_when_the_runtime_gzip_default_changes(self):
+        gzip_file = build.gzip.GzipFile
+        archives, levels = [], []
+        for runtime_default in (6, 9):
+            def runtime_gzip(*args, compresslevel=runtime_default, **kwargs):
+                levels.append(compresslevel)
+                return gzip_file(*args, compresslevel=compresslevel, **kwargs)
+
+            destination = self.work / f"gzip-default-{runtime_default}"
+            with mock.patch.object(build, "ROOT", self.source), mock.patch.object(build.gzip, "GzipFile", runtime_gzip):
+                archives.append((destination / build.build_sdist(destination)).read_bytes())
+        self.assertTrue(archives[0] == archives[1], "The runtime gzip default changed the sdist bytes")
+        self.assertEqual(levels, [9, 9])
+
     def test_git_archive_copy_builds_identical_wheel_but_sdist_requires_provenance(self):
         source = self.work / "archive-copy"
         self.copy_sources(source)
