@@ -264,6 +264,63 @@ def _java_details(rows, tools):
     return lines
 
 
+INSTALL_SCRIPTS = ("preinstall", "install", "postinstall", "prepare")  # npm runs these on install
+JAVASCRIPT_PAGES = {
+    "javascript.files": ("File", "Size", "SHA-256", "Lines", "Longest line (bytes)"),
+    "javascript.package": ("File", "Path", "Value", "Truncated", "Runs on install"),
+    "javascript.hints": ("File", "Category", "Hint", "Text", "Truncated"),
+}
+
+
+def _javascript_details(rows):
+    """M5a: files, package.json declarations and hints by category; rows of one page are merged across findings."""
+    lines = ["", "## JavaScript application", "",
+             "Hints are lexical: occurrences of fixed patterns in the bytes, comments and strings included, not evidence "
+             "that the code runs. M5a reads no JavaScript syntax and runs nothing."]
+    pages = {key: ({}, set()) for key in JAVASCRIPT_PAGES}
+    for _, finding in rows:
+        found, totals = pages.get(finding["claim_key"], (None, None))
+        value = finding["value"]
+        if found is None or not isinstance(value, dict) or type(value.get("start")) is not int \
+                or not isinstance(value.get("rows"), list):
+            continue
+        width = len(JAVASCRIPT_PAGES[finding["claim_key"]]) - (finding["claim_key"] == "javascript.package")
+        found.update((index, row) for index, row in enumerate(value["rows"], value["start"])
+                     if isinstance(row, list) and len(row) == width)
+        totals.add(value.get("total"))
+    if not any(found for found, _ in pages.values()):
+        return lines + ["", "No JavaScript row was supported."]
+    for key, (found, totals) in pages.items():
+        if not found:
+            continue
+        first, last = min(found), max(found)
+        total = totals.pop() if len(totals) == 1 else "?"
+        lines += ["", f"### {claims.statement(key)}", "", f"rows {first}..{last} of {total}"]
+        if type(total) is int and last + 1 < total:
+            lines += [f"Next start: {last + 1}"]
+        if key == "javascript.package":
+            lines += ["", "Runs on install marks the scripts npm runs when the package is installed (" +
+                      ", ".join(INSTALL_SCRIPTS) + "); they are declarations, and nothing ran them."]
+        groups = [(None, sorted(found))]
+        if key == "javascript.hints":
+            order = {name: i for i, name in enumerate(claims.JS_CATEGORIES)}
+            categories = sorted({found[i][1] for i in found}, key=lambda c: (order.get(c, len(order)), str(c)))
+            groups = [(category, [i for i in sorted(found) if found[i][1] == category]) for category in categories]
+        columns = JAVASCRIPT_PAGES[key]
+        for category, indexes in groups:
+            if category is not None:
+                lines += ["", f"#### {_cell(category)}"]
+            lines += ["", "| Index | " + " | ".join(columns) + " |", "|---|" + "---|" * len(columns)]
+            for index in indexes:
+                row = list(found[index])
+                if key == "javascript.package":
+                    row.append("yes" if row[1] in tuple("/scripts/" + name for name in INSTALL_SCRIPTS) else "")
+                cells = ["(input)" if i == 0 and cell == "" else cell if i == 4 and key == "javascript.package"
+                         else _cell(cell, limit=512) for i, cell in enumerate(row)]
+                lines.append(f"| {index} | " + " | ".join(cell or "-" for cell in cells) + " |")
+    return lines
+
+
 def to_markdown(analysis):
     report = to_dict(analysis)
     evidence = {e["id"]: e for r in report["results"] for e in r["evidence"]}
@@ -317,6 +374,8 @@ def to_markdown(analysis):
         lines += _java_details(derived, report["tools"])
     if analysis.query is not None:
         lines += _query_details(supported + derived)
+        if analysis.query["name"] == "analyze_javascript_application":
+            lines += _javascript_details(supported + derived)
     lines += ["", "## Rejected or unreviewed claims", ""]
     if rejected:
         lines += ["| Analyst | Claim (analyst wording, unchecked) | Verdict | Reasons |", "|---|---|---|---|"]

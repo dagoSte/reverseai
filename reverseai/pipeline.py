@@ -9,10 +9,10 @@ from reverseai.analysts import capability, code, structural, query
 from reverseai.contract import AnalysisResult, AnalysisTask, Budget, ContractError, content_id
 from reverseai.gateway import Gateway
 from reverseai.report import Analysis
-from reverseai.tools import apk, dex, strings, structure
+from reverseai.tools import apk, dex, js, strings, structure
 
 ANALYSTS = (structural, capability, code)
-TOOLS = (structure.TOOL, strings.TOOL, apk.TOOL, dex.TOOL)  # apk and dex: contract/3, M4a
+TOOLS = (structure.TOOL, strings.TOOL, apk.TOOL, dex.TOOL, js.TOOL)  # apk and dex: contract/3, M4a; js: M5a
 # LIEF and YARA-X start a container per operation (45 s limit each), so a run that includes one gets more time.
 CONTAINED_BUDGET = Budget(max_wall_seconds=150)
 # Ghidra's single import-and-analyse run may take its full 240 s profile; the code task allows 300 s.
@@ -20,6 +20,8 @@ GHIDRA_BUDGET = Budget(max_wall_seconds=330)
 # JADX's fixed 120 s worker profile plus host work; the query task allows 150 s.
 JADX_BUDGET = Budget(max_wall_seconds=180)
 ANDROID_QUERY_BUDGET = Budget(max_wall_seconds=120)
+# Every jshints pattern over up to 128 MiB of JavaScript (decision m5a-js-budget: measured 68 to 94 s)
+JAVASCRIPT_QUERY_BUDGET = Budget(max_wall_seconds=150)
 
 
 def _budget(tools):
@@ -79,8 +81,9 @@ def query_bytes(data, ref, name, args, tools=TOOLS):
     if with_jadx and registered["jadx.method"].ref != query.REFS["jadx"]:
         raise ContractError("Query JADX version unavailable")
     with_android = any(request.operation.startswith(("apk.", "dex.")) for request in requests)
+    with_javascript = any(request.operation.startswith("js.") for request in requests)
     budget = (GHIDRA_BUDGET if spec.role == "code" else JADX_BUDGET if with_jadx
-              else ANDROID_QUERY_BUDGET if with_android else Budget())
+              else ANDROID_QUERY_BUDGET if with_android else JAVASCRIPT_QUERY_BUDGET if with_javascript else Budget())
     task_seconds = 300 if spec.role == "code" else 150 if with_jadx else budget.max_wall_seconds
     task = AnalysisTask(content_id("tk", {"input": ref.sha256, "query": name, "args": checked}), spec.role, ref,
                         requests, Budget(max_concurrency=1, max_wall_seconds=task_seconds))
