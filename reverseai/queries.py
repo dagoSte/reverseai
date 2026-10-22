@@ -1,4 +1,5 @@
-"""Closed query names, typed arguments and fixed operation requests (contract M3d; Android names M4a)."""
+"""Closed query names, typed arguments and fixed operation requests (contract M3d; Android names M4a; JavaScript
+M5a)."""
 
 from dataclasses import dataclass
 import re
@@ -28,17 +29,24 @@ class QuerySpec:
     fixed: object = None
     routes: object = None  # operation -> ({operation argument: query argument}, {operation argument: fixed value})
     optional: tuple = ()  # included only when the tool's operation is registered
+    details: object = None  # M5a: the "detail" argument's value -> routes of the operations it selects
+    check: object = None  # (validated arguments) -> None, raising ContractError when they do not fit together
 
     def validate(self, raw):
-        return OperationSpec("query.arguments", self.args, lambda data, args: ()).validate_args(raw)
+        args = OperationSpec("query.arguments", self.args, lambda data, args: ()).validate_args(raw)
+        if self.check is not None:
+            self.check(args)
+        return args
 
     def requests(self, args, *, available=()):
+        routes = self.details[args["detail"]] if self.details else self.routes
+
         def arguments(name):
-            if self.routes:
-                taken, fixed = self.routes[name]
+            if routes:
+                taken, fixed = routes[name]
                 return {**{key: args[source] for key, source in taken.items()}, **fixed}
             return {} if name == "structure.entry" else {**args, **(self.fixed or {})}
-        return tuple(OperationRequest(name, arguments(name)) for name in self.operations
+        return tuple(OperationRequest(name, arguments(name)) for name in (tuple(routes) if self.details else self.operations)
                      if name not in self.optional or name in available)
 
 
@@ -47,11 +55,22 @@ def _query(operation, args, *, fixed=None):
                      MappingProxyType(fixed or {}))
 
 
+def _routes(routes):
+    return MappingProxyType(
+        {name: (MappingProxyType(dict(zip(taken, taken)) if isinstance(taken, tuple) else taken), MappingProxyType(fixed))
+         for name, (taken, fixed) in routes.items()})
+
+
 def _routed(args, routes, *, optional=()):
     """A query whose operations take different arguments: routes[operation] = ({argument: query argument}, fixed)."""
-    return QuerySpec(tuple(routes), MappingProxyType(args), routes=MappingProxyType(
-        {name: (MappingProxyType(dict(zip(taken, taken)) if isinstance(taken, tuple) else taken), MappingProxyType(fixed))
-         for name, (taken, fixed) in routes.items()}), optional=optional)
+    return QuerySpec(tuple(routes), MappingProxyType(args), routes=_routes(routes), optional=optional)
+
+
+def _detailed(args, details, check):
+    """A query whose "detail" argument selects its operations: details[value] = routes as _routed takes them."""
+    operations = tuple(dict.fromkeys(name for routes in details.values() for name in routes))
+    return QuerySpec(operations, MappingProxyType(args), details=MappingProxyType(
+        {detail: _routes(routes) for detail, routes in details.items()}), check=check)
 
 
 # Android (contract/3): one DEX member by name, or "" for every classes*.dex member (decision m4a-seams-x4);
@@ -60,6 +79,22 @@ ANY_DEX = ArgSpec("identity", 0, 255, default="")
 CLASS = ArgSpec("identity", 1, 255)
 METHOD_ARGS = {"class": CLASS, "method": ArgSpec("identity", 1, 255), "prototype": ArgSpec("identity", 0, 255, default="")}
 ANDROID_LIMIT = _integer(1, 256, 128)
+
+# JavaScript applications (M5a, contract/3): the clean members of a ZIP, or the input itself as file "".
+JS_CATEGORIES = ("all", "endpoint", "dynamic_code", "shell", "filesystem", "network", "credential", "encoding")
+JS_PAGES = {"files": ("js.files", ("start", "limit")), "package": ("js.package", ("file", "start", "limit")),
+            "hints": ("js.hints", ("file", "category", "start", "limit"))}
+JS_DEFAULTS = {"file": "", "category": "all", "start": 0}  # what summary reads: the first page of every operation
+
+
+def _javascript(args):
+    """An argument the detail does not pass on must keep its default, so no part of a question is silently dropped;
+    js.files and js.package page up to 65535 (contract M5a)."""
+    taken = ("limit",) if args["detail"] == "summary" else JS_PAGES[args["detail"]][1]
+    if any(args[name] != default for name, default in JS_DEFAULTS.items() if name not in taken):
+        raise ContractError("Query argument unused by this detail")
+    if args["detail"] in ("files", "package") and args["start"] > 65535:
+        raise ContractError("Integer argument out of range")
 
 
 TABLE = MappingProxyType({
@@ -113,6 +148,15 @@ TABLE = MappingProxyType({
     "trace_android_references": _query("dex.references", {
         "member": ANY_DEX, **METHOD_ARGS, "direction": ArgSpec("enum", choices=("from", "to"), default="from"),
         "start": START, "limit": ANDROID_LIMIT}),
+    # REA's JavaScript name: summary reads the first page of files, package.json declarations and hints
+    "analyze_javascript_application": _detailed(
+        {"detail": ArgSpec("enum", choices=("summary", *JS_PAGES), default="summary"),
+         "file": ArgSpec("literal", 0, 255, default=""), "category": ArgSpec("enum", choices=JS_CATEGORIES, default="all"),
+         "start": HOST_START, "limit": _integer(1, 256, 128)},
+        {"summary": {operation: (("limit",), {name: JS_DEFAULTS[name] for name in taken if name != "limit"})
+                     for operation, taken in JS_PAGES.values()},
+         **{detail: {operation: (taken, {})} for detail, (operation, taken) in JS_PAGES.items()}},
+        _javascript),
 })
 
 

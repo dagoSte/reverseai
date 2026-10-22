@@ -27,6 +27,7 @@ Each builder returns (data, layout):
     layout["files"]     the JavaScript files by the contract rule (names ending in .js, .mjs, .cjs, .jsx, .ts or
                         .tsx, ASCII case-insensitive, plus package.json; central directory order), each with the
                         js.files row it must produce ("row"), its anchor inside the child and the member's artifact
+    layout["packages"]  every package.json built from declared values, by member name, as layout["package"] is
     layout["package"]   the default package.json (fewest path segments, first in central directory order on a tie):
                         the js.package rows in document order, each with its anchor (offset and length inside the
                         child, quotes included, at most 4,096), and every string value of the document with its JSON
@@ -194,15 +195,14 @@ def archive(specs, *, strings=None, marks=None):
                       "artifact": row["artifact"] if child else None, "anchor": anchor,
                       "row": {"file": escaped(row["name"]), "size": len(child), "sha256": hashlib.sha256(child).hexdigest(),
                               "lines": lines, "max_line": max_line}})
-    packages = [f for f in files if f["name"].rsplit("/", 1)[-1] == "package.json"]
-    default = min(packages, key=lambda f: (_segments(f["name"]), f["member"])) if packages else None
-    package = None
-    if default is not None and strings and default["name"] in strings:
-        found = strings[default["name"]]
-        package = {"name": default["name"], "member": default["member"], "artifact": default["artifact"],
-                   "rows": package_rows(found, default["row"]["file"]), "strings": found}
+    manifests = [f for f in files if f["name"].rsplit("/", 1)[-1] == "package.json"]
+    default = min(manifests, key=lambda f: (_segments(f["name"]), f["member"])) if manifests else None
+    packages = {f["name"]: {"name": f["name"], "member": f["member"], "artifact": f["artifact"],
+                            "rows": package_rows(strings[f["name"]], f["row"]["file"]), "strings": strings[f["name"]]}
+                for f in manifests if f["name"] in (strings or {})}
     return data, {"size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "zip": zipped, "files": files,
-                  "package": package, "default_package": default["name"] if default else None,
+                  "packages": packages, "package": packages.get(default["name"]) if default else None,
+                  "default_package": default["name"] if default else None,
                   "marks": {name: found for name, found in (marks or {}).items()}}
 
 
@@ -216,7 +216,8 @@ def single(data, *, strings=None, marks=()):
     package = None if strings is None else {"name": "", "member": None, "artifact": None,
                                             "rows": package_rows(strings, ""), "strings": strings}
     return data, {"size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "zip": None, "files": files,
-                  "package": package, "default_package": "" if strings is not None else None,
+                  "packages": {} if package is None else {"": package}, "package": package,
+                  "default_package": "" if strings is not None else None,
                   "marks": {"": list(marks)}}
 
 
@@ -489,7 +490,7 @@ def js_hostile(kind):
         # operation fails; it is never read as one script
         data, zipped = F.zip_archive([F.member("lib/index.js", INDEX_JS)], zip64=True)
         return data, {"size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "zip": zipped, "files": [],
-                      "package": None, "default_package": None, "marks": {},
+                      "packages": {}, "package": None, "default_package": None, "marks": {},
                       "expect": {"js.files": "refused", "js.package": "refused", "js.hints": "refused"}}
     else:
         raise ValueError(f"unknown hostile kind {kind!r}")

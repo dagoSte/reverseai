@@ -5,7 +5,7 @@ from reverseai.contract import MAX_EVIDENCE_PER_FINDING, ToolRef, evidence_intac
 
 REFS = {"structure": ToolRef("structure", "0.1.0"), "strings": ToolRef("strings", "0.1.0"),
         "ghidra": ToolRef("ghidra", "12.1.4-r6"), "apk": ToolRef("apk", "0.1.0"), "dex": ToolRef("dex", "0.1.0"),
-        "jadx": ToolRef("jadx", "1.5.6-r1")}
+        "jadx": ToolRef("jadx", "1.5.6-r1"), "js": ToolRef("js", "0.1.0")}
 JAVA_FIELDS = ("dex", "class", "name", "prototype", "form", "start", "total", "text")
 PAGES = {
     "structure.segments": ("segment", "segments.list", ("name", "offset", "filesz", "address", "memsz", "readable", "writable", "executable")),
@@ -21,6 +21,10 @@ PAGES = {
     "dex.methods": ("method", "android.methods", ("dex", "class", "name", "prototype", "access", "code_offset", "code_units")),
     "dex.references": ("dex_ref", "android.references",
                        ("dex", "from_class", "from_method", "from_prototype", "at", "ref_kind", "target", "target_truncated")),
+    # M5a: JavaScript applications on the host
+    "js.files": ("js_file", "javascript.files", ("file", "size", "sha256", "lines", "max_line")),
+    "js.package": ("package_field", "javascript.package", ("file", "path", "value", "truncated")),
+    "js.hints": ("js_hint", "javascript.hints", ("file", "category", "hint", "text", "truncated")),
 }
 PERMISSION_ELEMENTS = ("uses-permission", "uses-permission-sdk-23")
 SINGLES = {

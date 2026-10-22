@@ -127,7 +127,7 @@ class QueryTests(unittest.TestCase):
                         self.assertEqual(analysis.results[0].findings, ())
                     self.assertEqual(report.to_json(analysis), report.to_json(pipeline.query_bytes(data, ref, name, args)))
 
-    def test_the_table_has_exactly_the_sixteen_native_and_five_android_names_and_fixed_operations(self):
+    def test_the_table_has_exactly_the_sixteen_native_five_android_and_one_javascript_names_and_fixed_operations(self):
         expected = {
             "binary_overview": ("structure.identify", "structure.headers", "structure.sections", "structure.imports", "structure.entry"),
             "list_segments": ("structure.segments",), "inspect_native_load_image": ("structure.segments", "structure.entry"),
@@ -143,6 +143,8 @@ class QueryTests(unittest.TestCase):
             "inspect_android_class": ("dex.classes", "dex.methods"),
             "inspect_android_method": ("dex.methods", "dex.references"), "trace_android_references": ("dex.references",),
         })
+        # decision m5a-contract: REA's JavaScript name; its default summary detail reads all three js operations
+        expected["analyze_javascript_application"] = ("js.files", "js.package", "js.hints")
         self.assertEqual(set(queries.TABLE), set(expected))
         for name, operations in expected.items():
             args = {"query": "hi"} if name == "search_strings" else {"address": 16} if name == "xrefs" else {}
