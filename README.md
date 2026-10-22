@@ -145,11 +145,15 @@ python3 -m venv .venv
 Or install the approved wheel with
 `.venv/bin/python -m pip install --no-index --no-deps /approved/reverseai-0.6.0-py3-none-any.whl`.
 On Windows, use your Python 3.12-or-later launcher and `.venv\Scripts\python.exe` /
-`.venv\Scripts\reverseai.exe`; Windows platform proof remains experimental.
+`.venv\Scripts\reverseai.exe`. Windows is experimental and has no platform proof
+yet: M6a supports installation, `--version` and `doctor` only. `analyze` and
+`query` refuse `--out` because the required safe directory handles are unavailable;
+Windows analysis output is M6b work.
 
-Host-only analysis needs no Docker. Contained tools need Docker Desktop and their
-locked images already present; `doctor` can exit 0 for host features while those
-tools remain unavailable. It never pulls, builds or runs a container. The
+On supported POSIX systems, host-only analysis needs no Docker. Contained tools
+need Docker Desktop and their locked images already present; `doctor` can exit 0
+for host features while those tools remain unavailable. It never pulls, builds
+or runs a container. The
 [installation guide](docs/INSTALL.md) covers building the wheel/sdist, image
 inputs and hashes, the two offline image builders, the three recipes that still
 need network, and the separate host/native proofs.
