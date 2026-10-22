@@ -885,7 +885,10 @@ parser's reading and stays **derived**; the bytes at each anchor are verified.
   `helper_string_parser_integrity`, `helper_validator_identifier_integrity`,
   `driver_sha256`, `worker_sha256`, `image_id`.
 - **Profile** (fixed in `reverseai/contained.py`, proven by the native
-  verifier): the JADX flags with values M5B-W measures and coord records.
+  verifier; decision `m5b-w-plan`): the JADX flag set with `--memory 2g
+  --memory-swap 2g --cpus 2 --pids-limit 64 --tmpfs /tmp:...,size=64m`, wall
+  120 s, Node heap 1,536 MiB (measured: 32 MiB of JavaScript in 72 s and 784 MiB
+  on one loaded CPU).
 - **Parsing**: each file's bytes are decoded as UTF-8 (a leading BOM skipped;
   invalid UTF-8 gives status `decode_error`), then parsed with `sourceType`
   `unambiguous`, `errorRecovery` on, plugins fixed by the file suffix (`jsx` for
@@ -917,7 +920,12 @@ parser's reading and stays **derived**; the bytes at each anchor are verified.
   "start", "end"}` with the UTF-16 offsets of the module source string literal,
   and `{"kind": "call", "start", "end"}` with the offsets of a callee that is an
   identifier or a chain of at most four identifiers joined by dots (`new` calls
-  included) whose last name is in `jshints.CALLEES`. Offsets only: the worker
+  included) whose trailing parts equal an entry of `jshints.CALLEES`: entries
+  are one name for distinctive calls (`eval`, `execSync`, `fetch`) and a
+  receiver plus name for common names (`Buffer.from`, `http.get`,
+  `https.request`, `net.connect`, `fs.write`), so `map.get(k)` is not a call item
+  (decision `m5b-callee-suffix`); `import(...)` is a `dynamic_import` module item,
+  never a call. Offsets only: the worker
   never returns text, names or locations in bytes.
 - **Anchors**: the host converts each UTF-16 offset to a UTF-8 byte offset of
   the file's own bytes, then re-derives the value from those bytes: for a module
