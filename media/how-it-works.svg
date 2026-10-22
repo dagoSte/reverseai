@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 680" width="1280" height="680" role="img" aria-labelledby="title desc">
   <title id="title">How ReverseAI works</title>
-  <desc id="desc">An approved file is frozen and hashed. The gateway serves whole-file analysis or a targeted query through allowlisted operations within budgets: host parsers for native structure, imports, strings, APK, DEX and JavaScript, and pinned LIEF, YARA-X, Ghidra, JADX and a JavaScript parser (Node.js 24 with @babel/parser 8) in a locked container per run. JavaScript ZIPs, ASAR archives and npm tarballs are read as data on the host. Whole gzip streams and tar headers are checked within fixed limits, and members are bound to their ranges in the original bytes; no files are extracted and no install script runs. JavaScript files, package declarations and lexical hints are read without executing the JavaScript; the parser reads its syntax as data and returns only offsets of module sources and calls. The host re-derives every LIEF and YARA-X value and every Ghidra anchor and re-reads referenced string contents; JADX's Java is bound to a method the host DEX decoder verifies, whose code offset and instruction count JADX must report exactly; every parser offset becomes exact bytes from which the host re-derives the literal or call name. Ghidra, JADX and parser interpretations stay derived. Evidence binds the input hash, tool, operation and byte range, with member provenance for bytes inside a package. The reviewer independently rebuilds stored or compressed members from the package bytes and checks cited ranges and claim rules. Reports separate supported, derived, unsupported and contradicted findings. Declarations and lexical hints are not evidence of behaviour.</desc>
+  <desc id="desc">Setup is separate from analysis: install the package, inspect the environment with read-only doctor, and run the native proof for the actual platform and image. Doctor does not prove containment. An approved file is frozen and hashed. The gateway serves whole-file analysis or a targeted query through allowlisted operations within budgets: host parsers for native structure, imports, strings, APK, DEX and JavaScript, and pinned LIEF, YARA-X, Ghidra, JADX and a JavaScript parser (Node.js 24 with @babel/parser 8) in a locked container per run. JavaScript ZIPs, ASAR archives and npm tarballs are read as data on the host. Whole gzip streams and tar headers are checked within fixed limits, and members are bound to their ranges in the original bytes; no files are extracted and no install script runs. JavaScript files, package declarations and lexical hints are read without executing the JavaScript; the parser reads its syntax as data and returns only offsets of module sources and calls. The host re-derives every LIEF and YARA-X value and every Ghidra anchor and re-reads referenced string contents; JADX's Java is bound to a method the host DEX decoder verifies, whose code offset and instruction count JADX must report exactly; every parser offset becomes exact bytes from which the host re-derives the literal or call name. Ghidra, JADX and parser interpretations stay derived. Evidence binds the input hash, tool, operation and byte range, with member provenance for bytes inside a package. The reviewer independently rebuilds stored or compressed members from the package bytes and checks cited ranges and claim rules. Reports separate supported, derived, unsupported and contradicted findings. Declarations and lexical hints are not evidence of behaviour.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0b1220"/>
@@ -60,6 +60,14 @@
     <text x="565" y="223" class="s" text-anchor="middle">time and output budgets</text>
   </g>
 
+  <!-- Setup is separate from the sample-analysis flow. -->
+  <g>
+    <rect x="1060" y="86" width="190" height="76" rx="12" fill="#0e1a30" stroke="#3b5b80" stroke-width="1.5"/>
+    <text x="1155" y="108" class="h" text-anchor="middle" style="font-size:14px">Install &amp; check</text>
+    <text x="1155" y="130" class="k" text-anchor="middle">wheel / checkout · doctor</text>
+    <text x="1155" y="150" class="s" text-anchor="middle" style="font-size:11.5px">native proof per platform</text>
+  </g>
+
   <!-- Tools column -->
   <g>
     <rect class="box" x="700" y="86" width="320" height="76" rx="12"/>
@@ -105,7 +113,7 @@
   <text x="1038" y="246" class="tag" text-anchor="middle" style="fill:#fbbf24">untrusted</text>
 
   <!-- Return lines to row 2 -->
-  <path class="flow" d="M1020 124 H1266 V380 H1155" />
+  <path class="flow" d="M1020 124 H1042 V74 H1266 V380 H1155" />
   <path class="flow" d="M1155 364 V380 H160 V408" marker-end="url(#arrow)"/>
 
   <!-- Row 2 -->
