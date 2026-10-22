@@ -17,7 +17,8 @@ from types import MappingProxyType
 
 from reverseai.contract import (
     AnalysisResult, AnalysisTask, Budget, Evidence, Observation, ToolSpec,
-    MAX_STREAM_BYTES, canonical_json, make_evidence, materialize, operation_key, sha256_hex,
+    MAX_CHILD_RATIO, MAX_STREAM_BYTES, canonical_json, check_artifact, make_evidence, materialize, operation_key,
+    sha256_hex,
 )
 
 MAX_RUN_CHILD_BYTES = 128 * 1024 * 1024  # contract/3: distinct child artifacts one operation may materialize
@@ -78,7 +79,7 @@ class Gateway:
             observations = spec.handler(data, MappingProxyType(args))
             if not isinstance(observations, (list, tuple)):
                 raise TypeError("Expected observations")
-            children, streams = {}, {}
+            children, streams, charged = {}, {}, {}
             for index, observation in enumerate(observations):
                 if index >= spec.max_observations:
                     self._finish(execution, "budget_exceeded")
@@ -91,9 +92,17 @@ class Gateway:
                 if observation.artifact is not None:  # contract/3: materialize each child once per run, within a budget
                     key = canonical_json(observation.artifact)
                     if key not in children:
+                        check_artifact(observation.artifact)
                         if sum(len(c) for c in children.values()) + observation.artifact["size"] > MAX_RUN_CHILD_BYTES:
                             self._finish(execution, "budget_exceeded")
                             return
+                        if observation.artifact["method"] == 1:  # M5c: a new gzip stream's bound is charged before it inflates
+                            stream = (observation.artifact["data_offset"], observation.artifact["compressed_size"])
+                            if stream not in charged:
+                                charged[stream] = min(MAX_STREAM_BYTES, MAX_CHILD_RATIO * stream[1])
+                                if sum(charged.values()) > MAX_STREAM_BYTES:
+                                    self._finish(execution, "budget_exceeded")
+                                    return
                         children[key] = materialize(data, observation.artifact, streams=streams)
                         if sum(len(s) for s in streams.values()) > MAX_STREAM_BYTES:  # M5c: gzip streams per run
                             self._finish(execution, "budget_exceeded")

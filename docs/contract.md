@@ -1004,7 +1004,8 @@ inflated stream. Host only, stdlib only, no download.
   size` is at most 128 MiB and at most 100 x `compressed_size`; `size` stays at
   most 32 MiB as for every child. `contract.materialize(data, artifact,
   streams=cache)` inflates each distinct stream once per cache. The gateway
-  keeps one cache per operation (at most 128 MiB of inflated streams besides the
+  keeps one cache per operation and charges each new stream min(128 MiB, 100 x
+  `compressed_size`) before inflating it (at most 128 MiB of streams besides the
   128 MiB of distinct children, else `budget_exceeded`); the reviewer keeps one
   per review and charges each distinct stream min(128 MiB, 100 x
   `compressed_size`) before inflating it, so a stream that fails still spends
@@ -1029,7 +1030,7 @@ inflated stream. Host only, stdlib only, no download.
   bytes. Pax records are `<length> <key>=<value>\n` with an exact decimal
   length; the keys `path`, `linkpath` and `size` (decimal digits) apply, other
   keys are ignored. A malformed record, a key repeated in one record,
-  `hdrcharset` other than UTF-8, any `GNU.sparse.` key, a pax `g` record with a
+  `hdrcharset` other than the literal value `UTF-8`, any `GNU.sparse.` key, a pax `g` record with a
   key other than `comment`, an extension not followed by an entry, and GNU
   sparse (`S`), multivolume (`M`) or volume (`V`) headers fail the operation.
 - **Entries**: names are decoded as UTF-8; a name that is not valid UTF-8 is
