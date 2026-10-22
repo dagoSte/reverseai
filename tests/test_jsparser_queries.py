@@ -96,13 +96,19 @@ class JavaScriptSyntaxQueryTests(unittest.TestCase):
             checked = queries.parse_args(NAME, ['detail=' + detail, 'start=0xfffff', 'limit=256', 'file=' + 'x' * 255])
             self.assertEqual((checked['start'], checked['limit'], len(checked['file'])), (1048575, 256, 255))
 
-    def test_query_file_remains_literal_and_the_operation_enforces_identity(self):
-        _, checked = queries.resolve(NAME, {'detail': 'modules', 'file': 'café.js'})
+    def test_syntax_file_selectors_refuse_non_ascii_before_any_operation(self):
         self.assertEqual(queries.TABLE[NAME].args['file'].kind, 'literal')
+        _, checked = queries.resolve(NAME, {'detail': 'hints', 'file': 'café.js'})
         self.assertEqual(checked['file'], 'café.js')
-        analysis = self.run_query({'detail': 'modules', 'file': 'café.js'})
-        self.assertEqual(analysis.results[0].status, 'error')
-        self.assertEqual(analysis.results[0].evidence, ())
+        for detail in SHAPES:
+            for name in ('café.js', '中.js'):
+                with self.subTest(detail=detail, name=name), \
+                        patch.object(Gateway, 'run', side_effect=AssertionError('operation ran')) as run:
+                    with self.assertRaisesRegex(ContractError, 'printable ASCII'):
+                        pipeline.query_bytes(DATA, INPUT, NAME, {'detail': detail, 'file': name}, tools=(self.tool,))
+                    run.assert_not_called()
+            _, checked = queries.resolve(NAME, {'detail': detail, 'file': r'caf\xe9.js'})
+            self.assertEqual(checked['file'], r'caf\xe9.js')
         self.assertEqual(self.calls, [])
 
     def test_pages_chunk_at_64_with_inferred_confidence_and_derived_verdicts(self):
@@ -184,7 +190,7 @@ class JavaScriptSyntaxCliTests(unittest.TestCase):
         self.tool = fake_parser(self.calls)
         self.module = SimpleNamespace(available=lambda: True, make_tool=lambda: self.tool)
 
-    def invoke(self, detail, *, flag=True, module=None):
+    def invoke(self, detail, *, flag=True, module=None, file=None):
         self.stdout, self.stderr, self.written = io.StringIO(), io.StringIO(), {}
         self.imports = []
         original_import = importlib.import_module
@@ -201,6 +207,8 @@ class JavaScriptSyntaxCliTests(unittest.TestCase):
                     '--out', str(Path(directory) / 'reports')]
             if flag:
                 argv.append('--with-jsparser')
+            if file is not None:
+                argv += ['--arg', 'file=' + file]
             with patch('importlib.import_module', side_effect=imported), \
                     patch.object(cli.intake, 'snapshot', return_value=(DATA, INPUT)) as snapshot, \
                     patch.object(cli, 'open_output', return_value=123), patch.object(cli.os, 'close'), \
@@ -226,6 +234,14 @@ class JavaScriptSyntaxCliTests(unittest.TestCase):
             with self.subTest(detail=detail):
                 self.assertEqual(self.invoke(detail, flag=False), (1, 0))
                 self.assertIn('requires --with-jsparser', self.stderr.getvalue())
+                self.assertEqual(self.written, {})
+                self.assertEqual(self.imports, [])
+
+    def test_non_ascii_selector_is_refused_before_worker_input_or_output(self):
+        for detail in SHAPES:
+            with self.subTest(detail=detail):
+                self.assertEqual(self.invoke(detail, file='café.js'), (1, 0))
+                self.assertIn('query refused: ContractError', self.stderr.getvalue())
                 self.assertEqual(self.written, {})
                 self.assertEqual(self.imports, [])
 

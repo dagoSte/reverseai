@@ -173,6 +173,20 @@ class AsarTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             asar.members(archive(alias))
 
+    def test_sizes_require_unsigned_integer_tokens_and_offsets_require_digit_strings(self):
+        self.require_reader()
+        for spelling in (b'1.0', b'1e0', b'1E0', b'1e+0', b'1E-0', b'0.0', b'0e0', b'-0', b'-1', b'true', b'"1"'):
+            raw = b'{"files":{"a.js":{"size":' + spelling + b',"offset":"0"}}}'
+            with self.subTest(size=spelling), self.assertRaises(ContractError):
+                asar.members(archive(None, b'x', raw=raw))
+        for offset in ('1.0', '1e0', '1E0', 0, 1.0, True):
+            with self.subTest(offset=offset), self.assertRaises(ContractError):
+                asar.members(archive({'files': {'a.js': {'size': 0, 'offset': offset}}}))
+        for size in (0, 1):
+            data = archive({'files': {'a.js': {'size': size, 'offset': '0'}}}, b'x')
+            member, = asar.members(data)
+            self.assertEqual(asar.materialize(data, member)[0], b'x'[:size])
+
     def test_invalid_pickle_lengths_and_every_truncation_are_fixed_refusals(self):
         self.require_reader()
         data, _ = app()
