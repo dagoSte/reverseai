@@ -109,6 +109,16 @@ class RequestTests(unittest.TestCase):
                 worker.parse_request(argv)
 
 
+    def test_a_duplicate_key_alone_refuses_an_otherwise_valid_request(self):
+        # RD-M5B-CODEX-W I1: the same envelope without the repeated key is valid, so the refusal is the duplicate's
+        text = request(self.good)[1]
+        self.assertEqual(worker.parse_request(["jsparser.syntax", text])[2], 0)
+        repeated = text.replace('"start": 0', '"start": 0, "start": 0', 1)
+        self.assertNotEqual(repeated, text)
+        with self.assertRaises(worker.InvalidRequest):
+            worker.parse_request(["jsparser.syntax", repeated])
+
+
 class MaterializeTests(unittest.TestCase):
     def test_stored_and_deflated_members_equal_their_children(self):
         data, files = app()
@@ -157,6 +167,14 @@ class AnswerTests(unittest.TestCase):
         statuses = worker.check_answer(answer(row("decode_error"), row("too_large"), row()), [None, "too_large", 0],
                                        "parse", 0, 1)
         self.assertEqual([r["status"] for r in statuses], ["decode_error", "too_large", "ok"])
+
+    def test_a_duplicate_key_alone_refuses_an_otherwise_valid_answer(self):
+        valid = json.dumps(row()).encode()
+        self.assertEqual(len(worker.check_answer(b'{"files": [' + valid + b"]}", [10], "calls", 0, 128)), 1)
+        for raw in (b'{"files": [' + valid + b'], "files": [' + valid + b"]}",
+                    b'{"files": [' + valid.replace(b'"errors": 0', b'"errors": 0, "errors": 0', 1) + b"]}"):
+            with self.subTest(raw=raw[:80]), self.assertRaises(worker.ParserFailed):
+                worker.check_answer(raw, [10], "calls", 0, 128)
 
     def test_every_incoherent_answer_is_refused(self):
         units = [40]

@@ -97,7 +97,7 @@ JSPARSER_WORKER_PATH = Path(__file__).resolve().parents[1] / "containers/jsparse
 # jshints.CALLEES changes these known answers, which must then be renewed (FIX-M5B-V).
 JSPARSER_CALLEES = tuple(sorted(_JSHINTS_CALLEES))
 JSPARSER_CASE_NAMES = ("app_modules", "app_calls", "app_page", "app_parse", "bundle_modules", "bundle_calls",
-                       "dialects_modules", "dialects_calls", "dialects_parse", "large_parse", "input_mismatch")
+                       "dialects_modules", "dialects_calls", "dialects_parse", "boundary_parse", "input_mismatch")
 JSPARSER_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                             *(f"jsparser.{name}" for name in JSPARSER_CASE_NAMES))
 JSPARSER_NATIVE_RUNS = len(JSPARSER_REQUIRED_CHECKS) - 3
@@ -836,13 +836,15 @@ def _jsparser_dialects():
 
 
 def jsparser_fixtures():
+    # js_boundary is exactly the 4 MiB a single file may have: the host refuses one byte more before any worker
+    # (RD-M5B-CODEX-W R2), so the worker's too_large row is covered by its unit tests, not by a native case.
     return {"js_app": fixtures_js.app_zip()[0], "js_bundle": fixtures_js.bundle_js()[0],
-            "js_dialects": _jsparser_dialects()[0], "js_large": b"var a = 1;\n" * (4 * 1024 * 1024 // 11 + 1)}
+            "js_dialects": _jsparser_dialects()[0], "js_boundary": b"var a = 1;\n" * 381300 + b"//xx"}
 
 
 def jsparser_cases(fixtures):
     """Fixed public jsparser.syntax requests (fixture name, args), built from the fixtures' own declarations."""
-    need(isinstance(fixtures, dict) and set(fixtures) == {"js_app", "js_bundle", "js_dialects", "js_large"} and
+    need(isinstance(fixtures, dict) and set(fixtures) == {"js_app", "js_bundle", "js_dialects", "js_boundary"} and
          all(type(fixtures[name]) is bytes and fixtures[name] == value for name, value in jsparser_fixtures().items()),
          "KnownAnswerFixture")
 
@@ -864,7 +866,7 @@ def jsparser_cases(fixtures):
             "dialects_modules": case("js_dialects", dialects, "modules"),
             "dialects_calls": case("js_dialects", dialects, "calls"),
             "dialects_parse": case("js_dialects", dialects, "parse"),
-            "large_parse": case("js_large", single, "parse"), "input_mismatch": case("js_app", tampered, "modules")}
+            "boundary_parse": case("js_boundary", single, "parse"), "input_mismatch": case("js_app", tampered, "modules")}
 
 
 def _jsparser_rows(*rows):
@@ -901,7 +903,7 @@ JSPARSER_EXPECTED = {
     "dialects_parse": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("decode_error", 0, 0, ()),
         ("syntax_error", 1, 0, ()), ("syntax_error", 1, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()),
         ("syntax_error", 1, 0, ())),
-    "large_parse": _jsparser_rows(("too_large", 0, 0, ())),
+    "boundary_parse": _jsparser_rows(("ok", 0, 0, ())),
     "input_mismatch": {"error": "input"},
 }
 

@@ -4701,6 +4701,36 @@ class JsparserNativeContractTests(unittest.TestCase):
             verifier.compare_jsparser_reply(data, "unknown", good)
         self.assertEqual(len(cases), len(verifier.JSPARSER_EXPECTED))
 
+    def test_every_fixed_request_crosses_the_real_executor_and_oversize_input_is_refused_before_it(self):
+        # RD-M5B-CODEX-W R1/R2: the production DockerExecutor, with a fake runner and image inspection, admits each
+        # case's request and data; one byte past 4 MiB in a single file is refused before any runner call.
+        from reverseai import contained
+        lock = json.loads(Path(verifier.JSPARSER_DRIVER_PATH.parent, "image.lock.json").read_text())
+        fixtures = verifier.jsparser_fixtures()
+        root = Path(tempfile.mkdtemp(prefix="jsparser-executor-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        root.chmod(0o700)
+        calls = []
+
+        def runner(argv, *, timeout, max_output):
+            calls.append((argv, timeout))
+            return b"{}"
+
+        executor = contained.DockerExecutor(lock, runner=runner, adapter_version="8.0.4-r1",
+                                            inspect=lambda image_id: image_id, staging_root=root)
+        for case, (fixture, args) in verifier.jsparser_cases(fixtures).items():
+            data = fixtures[fixture]
+            with self.subTest(case=case):
+                self.assertEqual(executor.run("jsparser.syntax", args, data, sha256_hex(data)), b"{}")
+        self.assertEqual(len(calls), len(verifier.JSPARSER_CASE_NAMES))
+        self.assertTrue(all(timeout == 120 for _, timeout in calls))
+        self.assertEqual(len(fixtures["js_boundary"]), 4 * 1024 * 1024)
+        oversize = fixtures["js_boundary"] + b"\n"
+        args = verifier.jsparser_cases(fixtures)["boundary_parse"][1]
+        with self.assertRaisesRegex(contained.ContainedError, "InvalidWorkerArguments"):
+            executor.run("jsparser.syntax", args, oversize, sha256_hex(oversize))
+        self.assertEqual(len(calls), len(verifier.JSPARSER_CASE_NAMES))
+
     def test_a_native_verifier_refuses_a_foreign_profile_or_lock(self):
         self.inert()
         verifier.NativeVerifier(JsparserFakeBoundary(), self.lock(), {"checks": [], "cleanup": []}, tool="jsparser")
