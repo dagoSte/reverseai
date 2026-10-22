@@ -657,7 +657,8 @@ def _dex_files(data, selected):
         _check(not member.flags)
         total += member.size
         _check(total <= MAX_CHILDREN_BYTES)
-        child, _ = apk.materialize(data, member)
+        # Clean descriptor from this same-buffer directory walk; do not reparse per child.
+        child, _ = apk._materialize(data, member)
         yield member.name, child, parse(child, _string_budget=string_budget), apk.artifact(member, child)
 
 
