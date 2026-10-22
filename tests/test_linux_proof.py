@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
@@ -30,16 +31,26 @@ def inside_facts(**changes):
                        "unexpected_successes": 0, "ok": True},
              "wheel": {"name": WHEEL, "size": 1, "sha256": "0" * 64}, "version": "reverseai 0.6.0",
              "imported_from": "/tmp/venv/lib/python3.12/site-packages/reverseai/__init__.py",
-             "doctor": doctor_facts(), "analyze": {"reports": ["report.json", "report.md"]}, "steps": {}}
+             "doctor": doctor_facts(), "analyze": {"reports": ["report.json", "report.md"]},
+             "steps": {name: {"exit": 0} for name in P.REQUIRED_STEPS}}
     facts.update(changes)
     return facts
 
 
+def marker(**changes):
+    return P.MARKER + json.dumps(inside_facts(**changes)) + "\n"
+
+
 class HostDocker:
-    """Stand-in for git and docker on the host; records every argv."""
-    def __init__(self, base=True, run=None, removed=True):
-        self.calls, self.base, self.removed = [], base, removed
-        self.run = (0, "noise\n" + P.MARKER + json.dumps(inside_facts()) + "\n", "") if run is None else run
+    """Stateful stand-in for git and docker on the host; records every argv.
+
+    run is (exit, stdout, stderr) or an exception; leaves says whether --rm removed the container by itself, so a
+    lost client connection (nonzero exit) leaves it running until "docker rm --force" removes it."""
+    def __init__(self, base=True, run=None, leaves=None, build=0, silent=False):
+        self.calls, self.base, self.build, self.silent = [], base, build, silent
+        self.run = (0, "noise\n" + marker(), "") if run is None else run
+        self.leaves = (isinstance(self.run, tuple) and self.run[0] == 0) if leaves is None else leaves
+        self.containers, self.images = set(), set()
 
     def __call__(self, argv, *, timeout, cwd=None, env=None):
         self.calls.append(list(argv))
@@ -50,16 +61,33 @@ class HostDocker:
             return 0, "", ""
         if argv[:4] == ["git", "-C", str(P.ROOT), "show"]:
             return 0, '"""ReverseAI."""\n\n__version__ = "0.6.0"\n', ""
+        if self.silent and argv[:2] == ["docker", "image"] and argv[2] in ("rm", "inspect") and argv[-1] == IMAGE:
+            return None, "", ""
         if argv[:5] == ["docker", "image", "inspect", "--format", "{{.Id}}"]:
             if argv[5] == P.BASE:
-                return (0, "sha256:base\n", "") if self.base else (1, "", "No such image")
-            return (1, "", "No such image") if self.removed else (0, IMAGE, "")
+                return (0, "sha256:base\n", "") if self.base else (1, "", "Error: No such image")
+            return (0, IMAGE, "") if argv[5] in self.images else (1, "", "Error: No such image: " + argv[5])
+        if argv[:5] == ["docker", "container", "inspect", "--format", "{{.Id}}"]:
+            return (0, "id", "") if argv[5] in self.containers else (1, "", "Error: No such container: " + argv[5])
         if argv[:2] == ["docker", "build"]:
             Path(argv[argv.index("--iidfile") + 1]).write_text(IMAGE)
-            return 0, "", ""
+            self.images.add(IMAGE)
+            return self.build, "", "client lost" if self.build else ""
         if argv[:2] == ["docker", "run"]:
+            name = argv[argv.index("--name") + 1]
+            self.containers.add(name)
+            if isinstance(self.run, BaseException):
+                raise self.run
+            if self.leaves:
+                self.containers.discard(name)
             return self.run
-        if argv[:3] == ["docker", "image", "rm"] or argv[:2] == ["docker", "kill"]:
+        if argv[:3] == ["docker", "rm", "--force"]:
+            if argv[3] not in self.containers:
+                return 1, "", "Error: No such container: " + argv[3]
+            self.containers.discard(argv[3])
+            return 0, argv[3], ""
+        if argv[:4] == ["docker", "image", "rm", "--no-prune"]:
+            self.images.discard(argv[4])
             return 0, "", ""
         raise AssertionError(f"unexpected argv {argv}")
 
@@ -108,8 +136,14 @@ class ProveTests(unittest.TestCase):
     def prove(self, docker):
         with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()) as stdout:
             receipt = Path(folder, "platform-linux-arm64.json")
-            code = P.prove("m6-rc1", receipt, runner=docker)
+            code = P.prove("m6-rc1", receipt, runner=docker, pause=0)
             return code, json.loads(receipt.read_text()), stdout.getvalue()
+
+    def assert_cleaned(self, docker, receipt):
+        self.assertEqual((docker.containers, docker.images), (set(), set()))
+        self.assertIn(["docker", "image", "rm", "--no-prune", IMAGE], docker.calls)
+        self.assertTrue(all(argv[3] == receipt["container"] for argv in docker.calls if argv[:2] == ["docker", "rm"]))
+        self.assertEqual((receipt["container_removed"], receipt["image_removed"]), (True, True))
 
     def test_a_passing_run_writes_the_receipt_and_removes_its_image(self):
         docker = HostDocker()
@@ -117,38 +151,59 @@ class ProveTests(unittest.TestCase):
         self.assertEqual(code, 0, receipt)
         self.assertEqual((receipt["commit"], receipt["base_digest"], receipt["platform"], receipt["image_id"]),
                          (COMMIT, P.BASE_DIGEST, "linux/arm64", IMAGE))
-        self.assertEqual((receipt["passed"], receipt["image_removed"], receipt["error"]), (True, True, None))
+        self.assertEqual((receipt["passed"], receipt["docker_exit"], receipt["error"]), (True, 0, None))
         self.assertEqual(receipt["inside"]["suite"]["ran"], 1750)
         self.assertIn("passed: " + COMMIT[:12], printed)
+        self.assert_cleaned(docker, receipt)
         kinds = [" ".join(argv[:3]) for argv in docker.calls]
         self.assertEqual(kinds, ["git -C " + str(P.ROOT), "docker image inspect", "git -C " + str(P.ROOT),
                                  "git -C " + str(P.ROOT), "docker build --platform", "docker run --rm",
-                                 "docker image rm", "docker image inspect"])
-        self.assertIn(["docker", "image", "rm", "--no-prune", IMAGE], docker.calls)
+                                 "docker rm --force", "docker container inspect", "docker image rm",
+                                 "docker image inspect"])
         archive = next(argv for argv in docker.calls if "archive" in argv)
         self.assertEqual(archive[-1], COMMIT)
         self.assertIn("--prefix=src/", archive)
 
-    def test_failures_still_remove_the_image_and_fail_the_receipt(self):
+    def test_failures_still_remove_the_owned_container_and_image_and_fail_the_receipt(self):
+        bad_suite = {"ran": 3, "skipped": 0, "failures": 1, "errors": 0, "expected_failures": 0,
+                     "unexpected_successes": 0, "ok": False}
         cases = {"timeout": (None, "", ""), "no marker": (1, "Traceback", "boom"),
-                 "suite failed": (0, P.MARKER + json.dumps(inside_facts(suite={
-                     "ran": 3, "skipped": 0, "failures": 1, "errors": 0, "expected_failures": 0,
-                     "unexpected_successes": 0, "ok": False})), ""),
-                 "source tree imported": (0, P.MARKER + json.dumps(inside_facts(
-                     imported_from="/opt/src/reverseai/__init__.py")), ""),
-                 "lock from the checkout": (0, P.MARKER + json.dumps(inside_facts(doctor={
-                     **doctor_facts(), "tools": [{**doctor_facts()["tools"][0], "lock": "/opt/src/containers/x"}]})), ""),
-                 "two markers": (0, (P.MARKER + json.dumps(inside_facts()) + "\n") * 2, "")}
+                 "lost client after a success marker": (77, marker(), "connection lost"),
+                 "suite failed": (0, marker(suite=bad_suite), ""),
+                 "source tree imported": (0, marker(imported_from="/opt/src/reverseai/__init__.py"), ""),
+                 "lock from the checkout": (0, marker(doctor={**doctor_facts(), "tools": [
+                     {**doctor_facts()["tools"][0], "lock": "/opt/src/containers/x"}]}), ""),
+                 "two markers": (0, marker() * 2, "")}
         for label, outcome in cases.items():
             with self.subTest(label=label):
                 docker = HostDocker(run=outcome)
                 code, receipt, printed = self.prove(docker)
-                self.assertEqual((code, receipt["passed"], receipt["image_removed"]), (1, False, True))
-                self.assertIn(["docker", "image", "rm", "--no-prune", IMAGE], docker.calls)
+                self.assertEqual((code, receipt["passed"], receipt["docker_exit"]), (1, False, outcome[0]))
+                self.assert_cleaned(docker, receipt)
                 self.assertTrue(printed.startswith("FAILED"))
-                self.assertEqual(any(argv[:2] == ["docker", "kill"] for argv in docker.calls), label == "timeout")
-        code, receipt, _ = self.prove(HostDocker(removed=False))
-        self.assertEqual((code, receipt["image_removed"]), (1, False))
+        _, receipt, _ = self.prove(HostDocker(run=(77, marker(), "connection lost")))
+        self.assertIn("docker run exited 77", receipt["error"])
+        self.assertEqual(receipt["inside"]["suite"]["ran"], 1750)  # kept for diagnosis, not trusted
+
+    def test_an_interrupt_after_the_container_started_still_removes_it_and_the_image(self):
+        docker = HostDocker(run=KeyboardInterrupt())
+        with tempfile.TemporaryDirectory() as folder, self.assertRaises(KeyboardInterrupt):
+            P.prove("m6-rc1", Path(folder, "receipt.json"), runner=docker, pause=0)
+        self.assertEqual((docker.containers, docker.images), (set(), set()))
+        name = next(argv[argv.index("--name") + 1] for argv in docker.calls if argv[:2] == ["docker", "run"])
+        self.assertIn(["docker", "rm", "--force", name], docker.calls)
+
+    def test_a_build_that_named_an_image_and_then_failed_removes_that_image(self):
+        docker = HostDocker(build=1)
+        code, receipt, _ = self.prove(docker)
+        self.assertEqual((code, receipt["passed"], receipt["image_id"]), (1, False, IMAGE))
+        self.assertIn("docker build failed (exit 1)", receipt["error"])
+        self.assertFalse(any(argv[:2] in (["docker", "run"], ["docker", "rm"]) for argv in docker.calls))
+        self.assertEqual((docker.images, receipt["image_removed"], receipt["container_removed"]), (set(), True, True))
+
+    def test_docker_silence_is_not_counted_as_removal(self):
+        code, receipt, _ = self.prove(HostDocker(silent=True))
+        self.assertEqual((code, receipt["passed"], receipt["image_removed"]), (1, False, False))
 
     def test_a_missing_base_refuses_before_any_build(self):
         docker = HostDocker(base=False)
@@ -164,6 +219,21 @@ class ProveTests(unittest.TestCase):
                 P.main(["--commit", "m6-rc1", "--receipt", str(existing)])
             self.assertEqual(raised.exception.code, 2)
             self.assertEqual(existing.read_text(), "{}")
+
+
+class PassedTests(unittest.TestCase):
+    def test_every_required_fact_is_needed(self):
+        self.assertTrue(P.passed(inside_facts(), "0.6.0"))
+        empty = {"ran": 0, "skipped": 0, "failures": 0, "errors": 0, "expected_failures": 0,
+                 "unexpected_successes": 0, "ok": True}
+        changes = {"zero tests": {"suite": empty}, "suite exit 17": {"steps": {
+                       **inside_facts()["steps"], "suite": {"exit": 17}}},
+                   "a missing step": {"steps": {name: {"exit": 0} for name in P.REQUIRED_STEPS[:-1]}},
+                   "x86_64": {"machine": "x86_64"}, "macOS": {"platform": "macOS-27.0-arm64"},
+                   "root": {"uid": 0}, "Python 3.13": {"python": "3.13.1"}, "no wheel": {"wheel": None}}
+        for label, change in changes.items():
+            with self.subTest(label=label):
+                self.assertFalse(P.passed(inside_facts(**change), "0.6.0"))
 
 
 class InsideTests(unittest.TestCase):
@@ -224,8 +294,10 @@ class InsideTests(unittest.TestCase):
         self.assertEqual(facts["suite"]["ran"], 6)
         self.assertEqual(facts["wheel"]["name"], WHEEL)
         self.assertEqual(facts["analyze"]["reports"], ["report.json", "report.md"])
-        self.assertTrue(P.passed({**facts, "imported_from": facts["imported_from"]}, "0.6.0"))
-        self.assertFalse(P.passed(facts, "0.6.1"))
+        container = {"machine": "aarch64", "platform": "Linux-7.0-aarch64-with-glibc2.41", "python": "3.12.15",
+                     "uid": 65534}  # this test runs on the host; the container reports these
+        self.assertTrue(P.passed({**facts, **container}, "0.6.0"))
+        self.assertFalse(P.passed({**facts, **container}, "0.6.1"))
 
     def test_a_failed_wheel_build_stops_before_any_install(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -237,6 +309,27 @@ class InsideTests(unittest.TestCase):
         self.assertEqual(list(facts["steps"]), ["suite", "wheel"])
         self.assertIsNone(facts["wheel"])
         self.assertFalse(P.passed(facts, "0.6.0"))
+
+    def test_a_suite_timeout_with_bytes_output_keeps_structured_timeout_facts(self):
+        def timed_out(argv, *, timeout, cwd=None, env=None):
+            if argv[1:4] == ["-B", "-m", "unittest"]:
+                return None, b"", b"....\nFAIL: test_x (tests.test_y.Z.test_x)\n"
+            return 1, "", ""
+        with tempfile.TemporaryDirectory() as folder:
+            work, source = Path(folder, "tmp"), Path(folder, "src")
+            work.mkdir()
+            source.mkdir()
+            facts = P.inside(runner=timed_out, work=work, source=source)
+        self.assertEqual((facts["suite"], facts["steps"]["suite"]["exit"], facts["steps"]["suite"]["timed_out"]),
+                         (None, None, True))
+        self.assertEqual(facts["steps"]["suite"]["failed_tests"], ["FAIL: test_x (tests.test_y.Z.test_x)"])
+        json.dumps(facts)
+
+    def test_a_real_timeout_returns_text_streams(self):
+        helper = "import sys, time\nsys.stdout.write('out'); sys.stderr.write('err')\nsys.stdout.flush(); sys.stderr.flush()\ntime.sleep(30)"
+        code, out, err = P.run([sys.executable, "-I", "-c", helper], timeout=1)
+        self.assertEqual((code, type(out), type(err)), (None, str, str))
+        self.assertEqual(P.suite_counts(err), None)
 
 
 if __name__ == "__main__":
