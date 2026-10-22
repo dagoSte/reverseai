@@ -369,6 +369,38 @@ class BuildToolTests(unittest.TestCase):
             self.assertFalse(self.lock.exists())
             (source / name).write_bytes(original)
 
+    def test_a_source_edited_right_after_its_copy_writes_no_lock(self):
+        # RR-M4B-CODEX-W RR-I1: the lock must name the copied bytes, not the repository's at hashing time. An edit that
+        # lands after a file is copied and before anything is hashed leaves the image with the old bytes: refused.
+        source = self.private_source()
+        real_copytree, real_copy = shutil.copytree, shutil.copy2
+
+        def edit(path):
+            with open(path, "ab") as stream:
+                stream.write(b"\n# edited right after the copy\n" if path.suffix == ".py" else b"\n// edited right after the copy\n")
+
+        for name in ("worker.py", "driver/ReverseAIJadx.java"):
+            original = (source / name).read_bytes()
+
+            def copytree(src, dst, *args, **kwargs):
+                result = real_copytree(src, dst, *args, **kwargs)
+                if name.startswith(Path(src).name + "/"):
+                    edit(source / name)
+                return result
+
+            def copy(src, dst, *args, **kwargs):
+                result = real_copy(src, dst, *args, **kwargs)
+                if Path(src) == source / name:
+                    edit(source / name)
+                return result
+            docker = FakeDocker()
+            with self.subTest(edited=name), patch.object(build.shutil, "copytree", copytree), \
+                    patch.object(build.shutil, "copy2", copy), self.assertRaisesRegex(SystemExit, "changed during the build"):
+                self.main(docker)
+            self.assertEqual(docker.built[name], hashlib.sha256(original).hexdigest())
+            self.assertFalse(self.lock.exists())
+            (source / name).write_bytes(original)
+
     def test_the_copied_dockerfile_is_checked_again_before_the_build(self):
         self.private_source()
         real_copy = shutil.copy2
