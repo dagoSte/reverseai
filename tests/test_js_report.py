@@ -1,11 +1,15 @@
 """The JavaScript section of query reports (M5a): files, package.json declarations with install-time scripts marked,
 hints grouped by category, a plain statement of what M5a reads, and sample text kept inert."""
 
+from dataclasses import replace
+import hashlib
 import json
 import re
 import unittest
 
 from reverseai import claims, report
+from reverseai.review import review
+from reverseai.tools import js
 from tests import fixtures_apk as F
 from tests import fixtures_js as J
 from tests.test_js_queries import run
@@ -69,6 +73,34 @@ class JavaScriptReportTests(unittest.TestCase):
         self.assertEqual(lines[lines.index("rows 0..2 of 9") + 1], "Next start: 3")
         self.assertNotIn("Next start", "\n".join(section(report.to_markdown(run(J.app_zip(), {"detail": "files"})))))
 
+    def test_a_page_missing_a_finding_shows_each_run_and_continues_at_the_first_missing_row(self):
+        # RD-M5A-CODEX-F R1: one hint page of 192 rows in three findings of 64; drop findings and review again
+        data, _ = J.source(*(("fetch(", ("url_https", f"https://e{i}.example.com/"), ");") for i in range(192)))
+        heading = f"### {claims.statement('javascript.hints')}"
+
+        def shown(args, kept):
+            analysis = run(J.single(data), {"detail": "hints", "category": "endpoint", **args}, name="many.js")
+            result = analysis.results[0]
+            findings = sorted(result.findings, key=lambda finding: finding.value["start"])
+            partial = replace(result, findings=tuple(findings[i] for i in kept))
+            verdicts = tuple(review(data, analysis.input, (partial,), {"js": js.TOOL}))
+            self.assertEqual({verdict.status for verdict in verdicts}, {"supported"})
+            lines = section(report.to_markdown(replace(analysis, results=(partial,), verdicts=verdicts)))
+            at = lines.index(heading)
+            return [(f.value["start"], len(f.value["rows"])) for f in findings], lines[at + 2:at + 4]
+
+        self.assertEqual(shown({"limit": 192}, (0, 1, 2)), ([(0, 64), (64, 64), (128, 64)], ["rows 0..191 of 192", ""]))
+        for kept, expected in (((0, 2), ["rows 0..63, 128..191 of 192", "Next start: 64"]),
+                               ((1, 2), ["rows 64..191 of 192", "Next start: 0"]),
+                               ((0, 1), ["rows 0..127 of 192", "Next start: 128"]),
+                               ((1,), ["rows 64..127 of 192", "Next start: 0"])):
+            with self.subTest(kept=kept):
+                self.assertEqual(shown({"limit": 192}, kept)[1], expected)
+        # a later page continues from its own start
+        self.assertEqual(shown({"start": 64, "limit": 128}, (1,)), ([(64, 64), (128, 64)],
+                                                                    ["rows 128..191 of 192", "Next start: 64"]))
+        self.assertEqual(shown({"start": 64, "limit": 64}, (0,))[1], ["rows 64..127 of 192", "Next start: 128"])
+
     def test_without_rows_the_section_says_so(self):
         analysis = run(J.app_zip(), {"detail": "package", "file": "none/package.json"})
         self.assertEqual(section(report.to_markdown(analysis)),
@@ -77,15 +109,26 @@ class JavaScriptReportTests(unittest.TestCase):
         self.assertNotIn(SECTION, report.to_markdown(analysis).replace(SECTION, "", 1))  # one section only
 
     def test_sample_names_values_and_texts_stay_inert(self):
-        # L0001: HTML, links and backticks from the sample never render
+        # L0001: HTML, links and backticks from the sample never render. RD-M5A-CODEX-F I1: the JavaScript member's
+        # name has no slash or colon, so it is admitted, and its hint text is the matched hostile literal.
         hostile = "<img src=x onerror=alert(1)>[x](https://evil.example/)`b`"
+        name = "<img src=x onerror=alert(1)>[x](y)`b`.js"
         package, strings = J.json_text({"name": hostile, "scripts": {"postinstall": hostile}})
-        script, marks = J.source(("fetch(", ("url_https", "https://evil.example/" + "<img src=x>"), ");"))
-        built = J.archive([F.member("package.json", package), F.member(hostile + ".js", script)],
-                          strings={"package.json": strings}, marks={hostile + ".js": marks})
-        markdown = report.to_markdown(run(built))
+        script = b'const token = "<img src=x>[x](https://evil.example/)`b`";\n'
+        built = J.archive([F.member("package.json", package), F.member(name, script)], strings={"package.json": strings})
+        analysis = run(built)
+        statuses = {verdict.finding_id: verdict.status for verdict in analysis.verdicts}
+        rows = {(finding.claim_key, tuple(row)) for finding in analysis.results[0].findings
+                if statuses[finding.id] == "supported" for row in finding.value["rows"]}
+        literal = 'token = "<img src=x>[x](https://evil.example/)`b`"'
+        self.assertLessEqual({("javascript.files", (name, len(script), hashlib.sha256(script).hexdigest(), 1,
+                                                    len(script) - 1)),
+                              ("javascript.hints", (name, "credential", "credential_assignment", literal, False)),
+                              ("javascript.package", ("package.json", "/name", hostile, False))}, rows)
+        markdown = report.to_markdown(analysis)
         lines = section(markdown)
-        self.assertTrue(any("<img src=x onerror=alert(1)>[x](https://evil.example/)'b'" in line for line in lines))
+        for shown in (hostile, name, literal):  # each inside one code span, its backticks replaced
+            self.assertTrue(any("`" + shown.replace("`", "'") + "`" in line for line in lines), shown)
         for line in markdown.splitlines():
             self.assertNotIn("<img", outside_code(line), line)
             self.assertNotIn("](", outside_code(line), line)

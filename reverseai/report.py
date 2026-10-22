@@ -272,8 +272,20 @@ JAVASCRIPT_PAGES = {
 }
 
 
-def _javascript_details(rows):
-    """M5a: files, package.json declarations and hints by category; rows of one page are merged across findings."""
+def _runs(indexes):
+    """Contiguous (first, last) runs of sorted row indexes."""
+    runs = []
+    for index in indexes:
+        if runs and index == runs[-1][1] + 1:
+            runs[-1][1] = index
+        else:
+            runs.append([index, index])
+    return runs
+
+
+def _javascript_details(rows, args=None):
+    """M5a: files, package.json declarations and hints by category; rows of one page are merged across findings,
+    and a row no supported finding shows is never covered by a displayed range (RD-M5A-CODEX-F R1)."""
     lines = ["", "## JavaScript application", "",
              "Hints are lexical: occurrences of fixed patterns in the bytes, comments and strings included, not evidence "
              "that the code runs. M5a reads no JavaScript syntax and runs nothing."]
@@ -293,11 +305,15 @@ def _javascript_details(rows):
     for key, (found, totals) in pages.items():
         if not found:
             continue
-        first, last = min(found), max(found)
+        runs = _runs(sorted(found))
         total = totals.pop() if len(totals) == 1 else "?"
-        lines += ["", f"### {claims.statement(key)}", "", f"rows {first}..{last} of {total}"]
-        if type(total) is int and last + 1 < total:
-            lines += [f"Next start: {last + 1}"]
+        lines += ["", f"### {claims.statement(key)}", "",
+                  "rows " + ", ".join(f"{first}..{last}" for first, last in runs) + f" of {total}"]
+        # The page asked for rows from its start (0 in a summary): the first one not shown is where to continue.
+        start = (args or {}).get("start", 0) if (args or {}).get("detail") != "summary" else 0
+        following = start if runs[0][0] > start else runs[0][1] + 1
+        if type(total) is int and following < total:
+            lines += [f"Next start: {following}"]
         if key == "javascript.package":
             lines += ["", "Runs on install marks the scripts npm runs when the package is installed (" +
                       ", ".join(INSTALL_SCRIPTS) + "); they are declarations, and nothing ran them."]
@@ -375,7 +391,7 @@ def to_markdown(analysis):
     if analysis.query is not None:
         lines += _query_details(supported + derived)
         if analysis.query["name"] == "analyze_javascript_application":
-            lines += _javascript_details(supported + derived)
+            lines += _javascript_details(supported + derived, analysis.query["args"])
     lines += ["", "## Rejected or unreviewed claims", ""]
     if rejected:
         lines += ["| Analyst | Claim (analyst wording, unchecked) | Verdict | Reasons |", "|---|---|---|---|"]
