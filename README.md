@@ -160,7 +160,9 @@ Known limits, by design:
   big-endian and universal Mach-O files are identified only. String indicators and signature rules are
   lexical hints, never proof of behaviour.
 - Decompiled Java is JADX's reading of the method: plausible code is not verified source.
-- JavaScript hints are lexical occurrences, including in comments and strings.
+- JavaScript hints include comments and strings, so false positives remain; calls
+  split by comments or long whitespace, indirect calls and filesystem calls without
+  a literal `fs` receiver can be missed.
   They do not establish execution or behaviour. M5a has no syntax tree, module
   resolution or deobfuscation; its fixed patterns and bounded spans can miss other forms.
 - A claim type without a rule in `reverseai/claims.py` is never supported. The

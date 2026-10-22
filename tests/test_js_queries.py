@@ -103,7 +103,7 @@ class QueryRunTests(unittest.TestCase):
         self.assertEqual(found["javascript.package"], [("supported", {"start": 0, "total": len(package), "rows": [
             [row["row"][field] for field in ("file", "path", "value", "truncated")] for row in package]})])
         (verdict, hints), = found["javascript.hints"]
-        self.assertEqual((verdict, hints["start"], hints["total"]), ("supported", 0, 18))
+        self.assertEqual((verdict, hints["start"], hints["total"]), ("supported", 0, 17))
         self.assertEqual(hints["rows"][:3], [["lib/index.js", "shell", "child_process", "child_process", False],
                                              ["lib/index.js", "endpoint", "url", "https://api.example.com/v1/collect",
                                               False], ["lib/index.js", "shell", "process_call", "exec(", False]])

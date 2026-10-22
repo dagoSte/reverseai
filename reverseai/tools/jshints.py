@@ -25,6 +25,8 @@ _LITERAL = rb'''(?:"(?:[^"\\\r\n]|\\[^\r\n]){1,512}"|'(?:[^'\\\r\n]|\\[^\r\n]){1
 # Concatenations, interpolated templates and escaped spellings remain hints.
 _PLAIN = rb'''(?:"[^"\\\r\n]{0,1024}"|'[^'\\\r\n]{0,1024}'|`(?:[^`\\$]|\$(?!\{)){0,1024}`)'''
 _DYNAMIC = _WS + rb"(?!" + _PLAIN + _WS + rb"\))[^) \t-\r]"
+_PREVIOUS_DOT = re.compile(rb"\.[ \t-\r]{0,64}\Z")
+_PREVIOUS_NEW = re.compile(_LEFT + rb"new[ \t-\r]{1,64}\Z")
 
 
 def _call(source):
@@ -42,7 +44,7 @@ PATTERNS = tuple((name, category, re.compile(source, flags)) for name, category,
     ("dynamic_import", "dynamic_code", _call(rb"import") + _DYNAMIC, 0),
     ("dynamic_require", "dynamic_code", _call(rb"require") + _DYNAMIC, 0),
     ("child_process", "shell", _LEFT + rb"child_process" + _RIGHT, 0),
-    ("process_call", "shell", _call(rb"(?:exec(?:File)?(?:Sync)?|spawn(?:Sync)?|fork)"), 0),
+    ("process_call", "shell", _call(rb"(?:(?:(?:child_process|childProcess|cp)" + _DOT + rb")?(?P<exec_method>exec)|exec(?:File)?Sync|execFile|spawn(?:Sync)?|fork)"), 0),
     ("fs_mutation", "filesystem", _call(rb"fs" + _DOT + rb"(?:promises" + _DOT + rb")?(?:write(?:File|v)?|appendFile|unlink|rm(?:dir)?|(?:f|l)?chmod)(?:Sync)?"), 0),
     ("process_env", "credential", _LEFT + rb"process" + _DOT + rb"env" + _RIGHT, 0),
     ("fetch", "network", _call(rb"fetch"), 0),
@@ -69,6 +71,13 @@ def _matches(data, order, name, category, pattern):
         start, end = match.span()
         if not 0 < end - start <= MAX_EXCERPT_BYTES:
             raise ContractError("Invalid JavaScript hint span")
+        if name == "function_constructor" or (name == "process_call" and match.lastgroup == "exec_method"):
+            # Three bytes for 'new', up to 64 whitespace bytes, and its boundary.
+            prefix = data[max(0, start - 68):start]
+            if name == "process_call" and _PREVIOUS_DOT.search(prefix):
+                continue
+            if name == "function_constructor" and _PREVIOUS_NEW.search(prefix):
+                continue
         yield start, order, end - start, category, name
 
 
