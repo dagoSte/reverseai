@@ -3,12 +3,14 @@ answering from the fixture layouts until codex-support-2's js tool lands."""
 
 from dataclasses import replace
 import unittest
+from unittest.mock import patch
 
 from reverseai import claims, pipeline, queries
 from reverseai.contract import (
     ArgSpec, ContractError, InputRef, Location, MAX_EVIDENCE_PER_FINDING, Observation, OperationSpec, ToolRef, ToolSpec,
     sha256_hex,
 )
+from reverseai.gateway import Gateway
 from reverseai.tools import structure
 from tests import fixtures_js as J
 
@@ -205,6 +207,25 @@ class QueryRunTests(unittest.TestCase):
         analysis = run(built, {"detail": "files"}, tools=(standin(built[1], skip=1),))
         self.assertEqual(len(analysis.results[0].evidence), len(built[1]["files"]) - 1)
         self.assertEqual(pages(analysis), {})
+
+    def test_every_detail_runs_with_150_seconds_for_task_and_gateway(self):
+        # decision m5a-js-budget; the native 30 s and Android 120 s stay as test_queries pins them
+        built = J.app_zip()
+        real_run = Gateway.run
+        for detail in ("summary", "files", "package", "hints"):
+            tasks = []
+
+            def capture(gateway, task, data):
+                tasks.append(task)
+                return real_run(gateway, task, data)
+
+            with self.subTest(detail=detail), patch.object(pipeline, "Gateway", wraps=Gateway) as factory, \
+                    patch.object(Gateway, "run", capture):
+                analysis = run(built, {"detail": detail})
+                self.assertEqual([result.status for result in analysis.results], ["ok"])
+                self.assertEqual((factory.call_args.args[1].max_wall_seconds, [task.budget.max_wall_seconds
+                                                                                for task in tasks]), (150, [150]))
+        self.assertEqual(pipeline.JAVASCRIPT_QUERY_BUDGET.max_wall_seconds, 150)
 
     def test_the_query_needs_the_js_operations(self):
         data, _ = J.app_zip()
