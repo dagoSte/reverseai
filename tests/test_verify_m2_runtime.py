@@ -10,6 +10,7 @@ import importlib
 import io
 import json
 from pathlib import Path
+import re
 import stat
 import struct
 import tempfile
@@ -4484,6 +4485,226 @@ class JadxNativeFlowTests(unittest.TestCase):
             refused = json.loads(receipt.read_text())
             self.assertFalse(refused['passed'])
             self.assertIn('JadxLockPins', [r.get('reason') for r in refused['checks']])
+
+
+
+JSPARSER_PINS = {"adapter_version": "8.0.4-r1", "platform": "linux/arm64", "image_id": IMAGE_ID, **verifier.JSPARSER_PINS}
+JSPARSER_PROFILE = {"pids": 64, "memory": "2g", "cpus": 2, "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=64m",
+                    "wall_seconds": 120}
+
+
+class JsparserFakeBoundary(FakeBoundary):
+    JSPARSER_WALL_SECONDS = 120
+
+    @staticmethod
+    def resource_profile(operation):
+        if operation != "jsparser.syntax":
+            raise AssertionError("unexpected jsparser profile request")
+        return dict(JSPARSER_PROFILE)
+
+
+def utf16_to_utf8(data):
+    """Byte offset of every UTF-16 offset of the text after one leading BOM; None inside a surrogate pair."""
+    skip = 3 if data.startswith(b"\xef\xbb\xbf") else 0
+    table, at = [skip], skip
+    for char in data[skip:].decode("utf-8"):
+        if ord(char) > 0xFFFF:
+            table.append(None)
+        at += len(char.encode("utf-8"))
+        table.append(at)
+    return table
+
+
+class JsparserNativeContractTests(unittest.TestCase):
+    """M5B-W: the jsparser profile, lock, receipt, fixed requests and known answers of the native verifier."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="jsparser-inert-sources-")
+        self.addCleanup(temporary.cleanup)
+        self.driver, self.worker = Path(temporary.name, "driver.mjs"), Path(temporary.name, "worker.py")
+        self.driver.write_bytes(b"// Inert regression-test driver source.\n")
+        self.worker.write_bytes(b"# Inert regression-test worker source.\n")
+
+    def inert(self):
+        stack = mock.patch.multiple(verifier, JSPARSER_DRIVER_PATH=self.driver, JSPARSER_WORKER_PATH=self.worker)
+        stack.start()
+        self.addCleanup(stack.stop)
+
+    def lock(self):
+        return {**JSPARSER_PINS, "driver_sha256": hashlib.sha256(self.driver.read_bytes()).hexdigest(),
+                "worker_sha256": hashlib.sha256(self.worker.read_bytes()).hexdigest()}
+
+    def receipt(self):
+        checks = verifier.required_checks("jsparser")
+        receipt = receipt_fixture()
+        receipt.update(tool="jsparser", lock=self.lock(), checks=[{"id": name, "status": "passed"} for name in checks],
+                       cleanup=[{"container_id": f"{index + 1:064x}", "verified": True, "staging_removed": True}
+                                for index in range(len(checks) - 3)])
+        return receipt
+
+    def test_tables_profile_and_counts(self):
+        self.assertEqual(verifier.limits("jsparser"),
+                         (64, 2 * 1024**3, 2_000_000_000, "rw,noexec,nosuid,nodev,size=64m", 120))
+        checks = verifier.required_checks("jsparser")
+        self.assertEqual(len(checks), 3 + len(verifier.CONTROL_NAMES) + 11)
+        self.assertEqual(verifier.native_runs("jsparser"), len(verifier.CONTROL_NAMES) + 11)
+        self.assertEqual(verifier.lock_options("jsparser"), {"adapter_version": "8.0.4-r1"})
+        verifier.verify_jsparser_executor_profile(JsparserFakeBoundary())
+        for change in ({"pids": 256}, {"memory": "512m"}, {"cpus": 1}, {"cpus": 2.0}, {"wall_seconds": 240},
+                       {"tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=512m"}, {"extra": 1}):
+            boundary = JsparserFakeBoundary()
+            boundary.resource_profile = lambda operation, change=change: {**JSPARSER_PROFILE, **change}
+            with self.subTest(change=change), self.assertRaisesRegex(verifier.VerificationError, "ExecutorJsparserProfile"):
+                verifier.verify_jsparser_executor_profile(boundary)
+        boundary = JsparserFakeBoundary()
+        boundary.JSPARSER_WALL_SECONDS = 45
+        with self.assertRaises(verifier.VerificationError):
+            verifier.verify_jsparser_executor_profile(boundary)
+
+    def test_the_lock_names_the_pins_and_the_committed_sources(self):
+        committed = json.loads(Path(verifier.JSPARSER_DRIVER_PATH.parent, "image.lock.json").read_text())
+        verifier.verify_jsparser_lock(committed)  # the real lock and the real driver and worker
+        self.inert()
+        verifier.verify_jsparser_lock(self.lock())
+        bad = [{**self.lock(), key: value} for key, value in (
+            ("adapter_version", "1.5.6-r1"), ("platform", "linux/amd64"), ("base_digest", "sha256:" + "0" * 64),
+            ("node_sha256", "0" * 64), ("babel_parser_integrity", "sha512-x"), ("image_id", "sha256:abc"),
+            ("driver_sha256", "0" * 64), ("worker_sha256", "0" * 64))]
+        bad += [{**self.lock(), "extra": 1}, {k: v for k, v in self.lock().items() if k != "babel_types_integrity"}]
+        for lock in bad:
+            with self.subTest(lock=sorted(set(lock.items()) - set(self.lock().items()))), \
+                    self.assertRaises(verifier.VerificationError):
+                verifier.verify_jsparser_lock(lock)
+
+    def test_a_complete_receipt_passes_and_any_gap_fails(self):
+        self.inert()
+        self.assertTrue(verifier.receipt_passes(self.receipt()))
+        for change in ("drop_case", "drop_cleanup", "lock", "tool"):
+            receipt = copy.deepcopy(self.receipt())
+            if change == "drop_case":
+                receipt["checks"] = [r for r in receipt["checks"] if r["id"] != "jsparser.dialects_calls"]
+            elif change == "drop_cleanup":
+                receipt["cleanup"].pop()
+            elif change == "lock":
+                receipt["lock"]["node_sha256"] = "0" * 64
+            else:
+                receipt["tool"] = "jadx"
+            with self.subTest(change=change):
+                self.assertFalse(verifier.receipt_passes(receipt))
+
+    def test_the_fixed_requests_and_their_allowlist(self):
+        fixtures = verifier.jsparser_fixtures()
+        cases = verifier.jsparser_cases(fixtures)
+        self.assertEqual(tuple(cases), verifier.JSPARSER_CASE_NAMES)
+        self.assertEqual(cases, verifier.jsparser_cases(verifier.jsparser_fixtures()))
+        for case, (fixture, args) in cases.items():
+            self.assertEqual(args["callees"], sorted(verifier.JSPARSER_CALLEES))
+            self.assertTrue(verifier.jsparser_request_allowed("jsparser.syntax", args), case)
+            # A single-file request names no artifact, so bundle and large requests of one kind are the same request;
+            # known_answer binds each to its fixture's bytes.
+            for change in ({"start": args["start"] + 1}, {"limit": 1}, {"kind": "ast"}, {"callees": ["eval"]},
+                           {"files": args["files"][:1] + args["files"]}, {"extra": 1}):
+                with self.subTest(case=case, change=change):
+                    self.assertFalse(verifier.jsparser_request_allowed("jsparser.syntax", {**args, **change}))
+            self.assertFalse(verifier.jsparser_request_allowed("jadx.method", args))
+        changed = dict(fixtures, js_bundle=fixtures["js_bundle"] + b"\n")
+        with self.assertRaisesRegex(verifier.VerificationError, "KnownAnswerFixture"):
+            verifier.jsparser_cases(changed)
+        self.assertEqual(cases["input_mismatch"][1]["files"][1]["artifact"]["sha256"], "0" * 64)
+
+    def test_the_known_answers_bind_to_the_fixture_bytes(self):
+        """An independent reading of the pinned answers: statuses from the bytes, items at quoted literals or callee
+        chains whose trailing parts are an entry, counts and pages coherent."""
+        import zipfile
+        fixtures = verifier.jsparser_fixtures()
+        entries = set(verifier.JSPARSER_CALLEES)
+        chain = re.compile(rb"[$A-Za-z_][$A-Za-z0-9_]*(?:\.[$A-Za-z_][$A-Za-z0-9_]*){0,3}")
+        for case, (fixture, args) in verifier.jsparser_cases(fixtures).items():
+            expected = verifier.JSPARSER_EXPECTED[case]
+            if case == "input_mismatch":
+                self.assertEqual(expected, {"error": "input"})
+                continue
+            data = fixtures[fixture]
+            if args["files"][0]["artifact"] is None:
+                children = [data]
+            else:
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    children = [archive.read(entry["artifact"]["member"]) for entry in args["files"]]
+            self.assertEqual([row["file"] for row in expected], list(range(len(children))))
+            before = 0
+            for child, row in zip(children, expected):
+                with self.subTest(case=case, file=row["file"]):
+                    try:
+                        child[3 if child.startswith(b"\xef\xbb\xbf") else 0:].decode("utf-8")
+                        valid = True
+                    except UnicodeDecodeError:
+                        valid = False
+                    if len(child) > 4 * 1024 * 1024:
+                        self.assertEqual((row["status"], row["count"], row["items"]), ("too_large", 0, []))
+                        continue
+                    if not valid:
+                        self.assertEqual((row["status"], row["errors"], row["count"], row["items"]), ("decode_error", 0, 0, []))
+                        continue
+                    self.assertEqual(row["status"] == "ok", row["errors"] == 0)
+                    table = utf16_to_utf8(child)
+                    if args["kind"] == "parse":
+                        self.assertEqual((row["count"], row["items"]), (0, []))
+                    wanted = max(0, min(before + row["count"], args["start"] + args["limit"]) - max(before, args["start"]))
+                    self.assertEqual(len(row["items"]), wanted)
+                    before += row["count"]
+                    for item in row["items"]:
+                        start, end = table[item["start"]], table[item["end"]]
+                        self.assertIsNotNone(start)
+                        self.assertIsNotNone(end)
+                        raw = child[start:end]
+                        if item["kind"] == "call":
+                            self.assertRegex(raw, chain)
+                            parts = raw.decode().split(".")
+                            self.assertTrue(parts[-1] in entries or ".".join(parts[-2:]) in entries, raw)
+                        else:
+                            self.assertIn(raw[:1], (b'"', b"'", b"`"), raw)
+                            self.assertEqual(raw[:1], raw[-1:], raw)
+        page = [item for row in verifier.JSPARSER_EXPECTED["app_page"] for item in row["items"]]
+        everything = [item for row in verifier.JSPARSER_EXPECTED["app_calls"] for item in row["items"]]
+        self.assertEqual(page, everything[3:7])
+        statuses = [row["status"] for row in verifier.JSPARSER_EXPECTED["dialects_parse"]]
+        self.assertEqual(sorted(set(statuses)), ["decode_error", "ok", "syntax_error"])
+
+    def test_the_reply_must_equal_its_known_answer(self):
+        fixtures = verifier.jsparser_fixtures()
+        cases = verifier.jsparser_cases(fixtures)
+        data = fixtures["js_app"]
+        good = {"protocol": "reverseai.worker/1", "status": "ok", "snapshot_sha256": sha256_hex(data),
+                "observations": copy.deepcopy(verifier.JSPARSER_EXPECTED["app_calls"])}
+        self.assertEqual(verifier.compare_jsparser_reply(data, "app_calls", copy.deepcopy(good)), 7)
+        changed = [dict(good, snapshot_sha256="0" * 64), dict(good, extra=1), dict(good, status="error"),
+                   dict(good, observations=good["observations"][:-1])]
+        moved = copy.deepcopy(good)
+        moved["observations"][1]["items"][0]["start"] += 1
+        counted = copy.deepcopy(good)
+        counted["observations"][1]["count"] = 5
+        for value in changed + [moved, counted]:
+            with self.subTest(value=str(value)[:120]), self.assertRaises(verifier.VerificationError):
+                verifier.compare_jsparser_reply(data, "app_calls", value)
+        error = {"protocol": "reverseai.worker/1", "status": "error", "snapshot_sha256": sha256_hex(data), "error": "input"}
+        self.assertEqual(verifier.compare_jsparser_reply(data, "input_mismatch", error), 0)
+        for value in (dict(error, error="memory"), good):
+            with self.assertRaises(verifier.VerificationError):
+                verifier.compare_jsparser_reply(data, "input_mismatch", value)
+        with self.assertRaisesRegex(verifier.VerificationError, "JsparserOracleMissing"):
+            verifier.compare_jsparser_reply(data, "unknown", good)
+        self.assertEqual(len(cases), len(verifier.JSPARSER_EXPECTED))
+
+    def test_a_native_verifier_refuses_a_foreign_profile_or_lock(self):
+        self.inert()
+        verifier.NativeVerifier(JsparserFakeBoundary(), self.lock(), {"checks": [], "cleanup": []}, tool="jsparser")
+        boundary = JsparserFakeBoundary()
+        boundary.resource_profile = lambda operation: {**JSPARSER_PROFILE, "memory": "512m"}
+        with self.assertRaises(verifier.VerificationError):
+            verifier.NativeVerifier(boundary, self.lock(), {"checks": [], "cleanup": []}, tool="jsparser")
+        with self.assertRaises(verifier.VerificationError):
+            verifier.NativeVerifier(JsparserFakeBoundary(), {**self.lock(), "node_sha256": "0" * 64},
+                                    {"checks": [], "cleanup": []}, tool="jsparser")
 
 
 if __name__ == "__main__":
