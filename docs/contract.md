@@ -782,8 +782,13 @@ evaluates the sample.
 
 - **Inputs**: one approved file, as today. When the input is a valid ZIP archive
   (the APK ZIP parser accepts it, with its limits and flags) the operations read
-  its clean members as child artifacts; otherwise the input itself is one file,
-  named "" in rows. Flagged members are listed by `apk.inventory` but never read.
+  its clean members as child artifacts; an input that starts with a ZIP local
+  header signature but that the parser refuses fails the operation with a fixed
+  error, so a refused archive is never read as one script; otherwise the input
+  itself is one file, named "" in rows. Explicit `file` selectors name clean
+  `package.json` members for `js.package` and clean JavaScript members for
+  `js.hints`; a selector that names none gives no rows (decision
+  `m5a-seams-p2`). Flagged members are listed by `apk.inventory` but never read.
   Tar, gzip and ASAR packages are out of M5a.
 - **JavaScript files**: members whose name ends in `.js`, `.mjs`, `.cjs`, `.jsx`,
   `.ts` or `.tsx` (ASCII case-insensitive), plus `package.json`, in central
@@ -800,7 +805,9 @@ evaluates the sample.
   its child artifact for an archive); `sha256` the file's hash (equal to the
   artifact's), `lines` the count of line feeds plus one when the last byte is
   not a line feed (0 for an empty file), `max_line` the longest line in bytes (a
-  minified or packed file shows here). Claim `javascript.files` (observed) page
+  minified or packed file shows here). An empty archive member is anchored at its
+  central directory entry in the input instead (no artifact); an empty
+  single-file input has no rows (decision `m5a-seams-p`). Claim `javascript.files` (observed) page
   rows `[file, size, sha256, lines, max_line]`.
 - `js.package`: args `file` literal 0..255 default "" ("" for the `package.json`
   with the fewest path segments, the first in central directory order on a tie;
@@ -815,7 +822,12 @@ evaluates the sample.
   and the entries of `bundledDependencies` (or `bundleDependencies`).
   `{"kind": "package_field", "index", "total", "file", "path", "value",
   "truncated"}` anchored at the value's bytes in the file, quotes included (the
-  first 4,096 when longer); `path` a JSON pointer (`/dependencies/left-pad`),
+  first 4,096 when longer); `path` an RFC 6901 JSON pointer of the decoded keys
+  (`/dependencies/left-pad`, `~0` and `~1` escapes), escaped for display, and a
+  pointer longer than 255 characters fails the operation; `exports` strings at
+  most four object or array edges below `exports`, `repository` only as a string
+  or its direct `url`, `browser` only as a string; a UTF-8 byte order mark is
+  refused; the file must hold one JSON object;
   `value` the decoded string escaped, cut at 256 characters with `truncated`.
   Claim `javascript.package` (observed) page rows `[file, path, value,
   truncated]`. Scripts are declarations: `preinstall`, `install`, `postinstall`
