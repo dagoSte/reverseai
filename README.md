@@ -146,8 +146,9 @@ name from those bytes, so every anchor is verified; that the bytes are an import
 call rather than text in a comment is the parser's reading, reported as *derived*. The
 parser executes, imports, resolves and transpiles nothing and follows no module; a
 call built from strings, computed properties or escapes is not reported. `detail=parse`
-shows each file's status: `ok`, `syntax_error` (rows recovered so far still count),
-`decode_error` (not UTF-8) or `too_large` (over 4 MiB).
+shows each file's status: `ok`, `syntax_error` (rows recovered so far still count) or
+`decode_error` (not UTF-8). More than 64 files, a file over 4 MiB or more than 32 MiB in
+all refuse the whole operation before the parser runs.
 
 With Docker and the locally built, pinned images (`tools/build_lief_image.py`,
 `tools/build_yarax_image.py`, `tools/build_ghidra_image.py`, `tools/build_jadx_image.py`,
@@ -199,8 +200,8 @@ Known limits, by design:
   They do not establish execution or behaviour. The hints use no syntax tree, module
   resolution or deobfuscation; their fixed patterns and bounded spans can miss other forms.
 - JavaScript syntax rows are the parser's reading of each file on its own: no module
-  resolution, data flow or deobfuscation, at most 64 files, 4 MiB each and 32 MiB in all
-  per query.
+  resolution, data flow or deobfuscation. A syntax query takes at most 64 files, 4 MiB
+  each and 32 MiB in all; a larger input is refused, never read in part.
 - A claim type without a rule in `reverseai/claims.py` is never supported. The
   Markdown report states supported findings in the reviewer's own words.
 - In-process handlers have soft time budgets; contained workers have hard wall,
