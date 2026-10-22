@@ -4597,8 +4597,12 @@ class JsparserNativeContractTests(unittest.TestCase):
         cases = verifier.jsparser_cases(fixtures)
         self.assertEqual(tuple(cases), verifier.JSPARSER_CASE_NAMES)
         self.assertEqual(cases, verifier.jsparser_cases(verifier.jsparser_fixtures()))
+        from reverseai import contained
+        from reverseai.tools.jshints import CALLEES
         for case, (fixture, args) in cases.items():
-            self.assertEqual(args["callees"], sorted(verifier.JSPARSER_CALLEES))
+            self.assertEqual(args["callees"], sorted(CALLEES))
+            # FIX-M5B-V: every fixed request passes the executor's own request check
+            contained._validated_args("jsparser.syntax", args)
             self.assertTrue(verifier.jsparser_request_allowed("jsparser.syntax", args), case)
             # A single-file request names no artifact, so bundle and large requests of one kind are the same request;
             # known_answer binds each to its fixture's bytes.
@@ -4616,8 +4620,10 @@ class JsparserNativeContractTests(unittest.TestCase):
         """An independent reading of the pinned answers: statuses from the bytes, items at quoted literals or callee
         chains whose trailing parts are an entry, counts and pages coherent."""
         import zipfile
+        from reverseai.tools.jshints import CALLEES
         fixtures = verifier.jsparser_fixtures()
-        entries = set(verifier.JSPARSER_CALLEES)
+        entries = set(CALLEES)  # FIX-M5B-V: the host's catalog, the only list the executor admits
+        self.assertEqual(verifier.JSPARSER_CALLEES, tuple(sorted(CALLEES)))
         chain = re.compile(rb"[$A-Za-z_][$A-Za-z0-9_]*(?:\.[$A-Za-z_][$A-Za-z0-9_]*){0,3}")
         for case, (fixture, args) in verifier.jsparser_cases(fixtures).items():
             expected = verifier.JSPARSER_EXPECTED[case]

@@ -27,6 +27,7 @@ if __package__ in (None, ""):
 
 from reverseai.contract import ContractError, Location, MAX_WORKER_REPLY_BYTES, Observation, canonical_json, parse_worker_reply, sha256_hex
 from reverseai.tools import structure, ghidra_verify
+from reverseai.tools.jshints import CALLEES as _JSHINTS_CALLEES
 from tests.fixtures_structure import elf, pe
 from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code, elf_refs, pe_refs, macho_refs
 from tests import fixtures_apk, fixtures_js
@@ -92,9 +93,9 @@ JSPARSER_PINS = {
 }
 JSPARSER_DRIVER_PATH = Path(__file__).resolve().parents[1] / "containers/jsparser/driver.mjs"
 JSPARSER_WORKER_PATH = Path(__file__).resolve().parents[1] / "containers/jsparser/worker.py"
-# The verifier's own callee entries: its known answers never move when jshints.CALLEES does.
-JSPARSER_CALLEES = ("Buffer.from", "WebSocket", "XMLHttpRequest", "atob", "eval", "exec", "execSync", "fetch",
-                    "http.get", "require")
+# The host's catalog, the only list reverseai.contained admits (validate_jsparser_request); a change to
+# jshints.CALLEES changes these known answers, which must then be renewed (FIX-M5B-V).
+JSPARSER_CALLEES = tuple(sorted(_JSHINTS_CALLEES))
 JSPARSER_CASE_NAMES = ("app_modules", "app_calls", "app_page", "app_parse", "bundle_modules", "bundle_calls",
                        "dialects_modules", "dialects_calls", "dialects_parse", "large_parse", "input_mismatch")
 JSPARSER_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
@@ -876,30 +877,27 @@ def _jsparser_rows(*rows):
 JSPARSER_EXPECTED = {
     "app_modules": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 2, (("require", 119, 134), ("require", 156, 160))),
         ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ())),
-    "app_calls": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 4, (("call", 111, 118), ("call", 148, 155),
-        ("call", 239, 243), ("call", 337, 342))), ("ok", 0, 3, (("call", 92, 97), ("call", 189, 193),
-        ("call", 277, 286))), ("ok", 0, 2, (("call", 324, 335), ("call", 410, 414))),
-        ("ok", 0, 1, (("call", 1322, 1336),)), ("ok", 0, 0, ()), ("ok", 0, 0, ())),
-    "app_page": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 4, (("call", 337, 342),)), ("ok", 0, 3, (("call", 92, 97),
-        ("call", 189, 193), ("call", 277, 286))), ("ok", 0, 2, ()), ("ok", 0, 1, ()), ("ok", 0, 0, ()),
-        ("ok", 0, 0, ())),
+    "app_calls": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 1, (("call", 337, 342),)), ("ok", 0, 4, (("call", 92, 97),
+        ("call", 189, 193), ("call", 220, 228), ("call", 277, 286))), ("ok", 0, 2, (("call", 324, 335),
+        ("call", 410, 414))), ("ok", 0, 1, (("call", 1322, 1336),)), ("ok", 0, 0, ()), ("ok", 0, 0, ())),
+    "app_page": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 1, ()), ("ok", 0, 4, (("call", 220, 228),
+        ("call", 277, 286))), ("ok", 0, 2, (("call", 324, 335), ("call", 410, 414))), ("ok", 0, 1, ()),
+        ("ok", 0, 0, ()), ("ok", 0, 0, ())),
     "app_parse": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()),
         ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ())),
     "bundle_modules": _jsparser_rows(("ok", 0, 1, (("require", 173, 188),))),
-    "bundle_calls": _jsparser_rows(("ok", 0, 5, (("call", 105, 109), ("call", 136, 140), ("call", 165, 172),
-        ("call", 190, 200), ("call", 211, 216)))),
+    "bundle_calls": _jsparser_rows(("ok", 0, 5, (("call", 105, 109), ("call", 136, 140), ("call", 190, 200),
+        ("call", 211, 216), ("call", 494, 502)))),
     "dialects_modules": _jsparser_rows(("ok", 0, 1, (("import", 18, 25),)), ("ok", 0, 1, (("require", 26, 31),)),
         ("ok", 0, 2, (("require", 20, 24), ("import", 50, 55))), ("decode_error", 0, 0, ()),
         ("syntax_error", 1, 1, (("require", 34, 47),)), ("syntax_error", 1, 0, ()),
         ("ok", 0, 1, (("require", 8, 13),)), ("ok", 0, 1, (("require", 31, 45),)),
         ("syntax_error", 1, 5, (("import", 14, 17), ("export_from", 33, 36), ("export_from", 56, 59),
         ("require", 79, 82), ("dynamic_import", 92, 95)))),
-    "dialects_calls": _jsparser_rows(("ok", 0, 1, (("call", 84, 89),)), ("ok", 0, 2, (("call", 18, 25),
-        ("call", 34, 38))), ("ok", 0, 1, (("call", 81, 92),)), ("decode_error", 0, 0, ()),
-        ("syntax_error", 1, 2, (("call", 26, 33), ("call", 50, 55))), ("syntax_error", 1, 0, ()),
-        ("ok", 0, 2, (("call", 0, 7), ("call", 16, 20))), ("ok", 0, 2, (("call", 23, 30), ("call", 48, 66))),
-        ("syntax_error", 1, 7, (("call", 71, 78), ("call", 98, 105), ("call", 113, 120), ("call", 131, 138),
-        ("call", 152, 161), ("call", 182, 192), ("call", 259, 267)))),
+    "dialects_calls": _jsparser_rows(("ok", 0, 1, (("call", 84, 89),)), ("ok", 0, 1, (("call", 34, 38),)),
+        ("ok", 0, 2, (("call", 57, 73), ("call", 81, 92))), ("decode_error", 0, 0, ()),
+        ("syntax_error", 1, 1, (("call", 50, 55),)), ("syntax_error", 1, 0, ()), ("ok", 0, 1, (("call", 16, 20),)),
+        ("ok", 0, 1, (("call", 48, 66),)), ("syntax_error", 1, 2, (("call", 152, 161), ("call", 259, 267)))),
     "dialects_parse": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("decode_error", 0, 0, ()),
         ("syntax_error", 1, 0, ()), ("syntax_error", 1, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()),
         ("syntax_error", 1, 0, ())),
