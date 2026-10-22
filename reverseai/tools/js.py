@@ -4,7 +4,7 @@ from reverseai.contract import (
     ArgSpec, ContractError, Location, MAX_EXCERPT_BYTES, Observation, OperationSpec,
     ToolRef, ToolSpec, sha256_hex,
 )
-from reverseai.tools import apk, asar, jsonpos
+from reverseai.tools import apk, asar, jsonpos, tarball
 
 MAX_READ_BYTES = 128 * 1024 * 1024
 _SUFFIXES = ('.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx')
@@ -25,6 +25,9 @@ def _javascript_name(name):
 
 
 def _members(data, *, include_flagged=False):
+    if data.startswith(tarball.MAGIC):
+        return tuple(member for member in tarball.members(data)
+                     if _javascript_name(member.name) and (include_flagged or not member.flags))
     if data.startswith(asar.MAGIC):
         return tuple(member for member in asar.members(data)
                      if _javascript_name(member.name) and (include_flagged or not member.flags))
@@ -52,9 +55,11 @@ def _sources(data, members):
         if total > MAX_READ_BYTES:
             raise ContractError('JavaScript read budget exceeded')
         # These clean descriptors came from one parse of these exact bytes.
-        archive = asar if isinstance(member, asar.AsarMember) else apk
+        archive = (tarball if isinstance(member, tarball.TarMember)
+                   else asar if isinstance(member, asar.AsarMember) else apk)
         child, _ = archive._materialize(data, member)
-        yield apk.escape(member.name), child, archive.artifact(member, child), member
+        artifact = None if archive is tarball and not child else archive.artifact(member, child)
+        yield apk.escape(member.name), child, artifact, member
 
 
 def _page(rows, args):
@@ -79,18 +84,25 @@ def _line_stats(data):
     return lines + int(bool(data) and data[-1] != 10), max(longest, pending)
 
 
+def _header_location(member):
+    if isinstance(member, tarball.TarMember):
+        return Location(0, tarball.BLOCK), tarball.header_artifact(member)
+    return Location(member.central_offset, min(member.central_length, MAX_EXCERPT_BYTES)), None
+
+
 def _files(data, args):
     def rows():
         for name, child, artifact, member in _sources(data, _members(data, include_flagged=True)):
             if member is not None and member.flags:
-                yield Location(member.central_offset, min(member.central_length, MAX_EXCERPT_BYTES)), dict(
+                location, artifact = _header_location(member)
+                yield location, dict(
                     kind='js_file', file=name, size=member.size, sha256=None, lines=None, max_line=None,
-                    flags=list(member.flags)), None
+                    flags=list(member.flags)), artifact
                 continue
             if not child:
                 if member is None:
                     continue  # There is no byte range to cite in an empty input.
-                location, artifact = Location(member.central_offset, min(member.central_length, MAX_EXCERPT_BYTES)), None
+                location, artifact = _header_location(member)
             else:
                 location = Location(0, min(len(child), MAX_EXCERPT_BYTES))
             lines, longest = _line_stats(child)
