@@ -22,7 +22,7 @@ import reverseai
 
 from reverseai.contract import (
     ContractError, Location, Observation, MAX_WORKER_REPLY_BYTES, WORKER_PROTOCOL,
-    parse_worker_reply, sha256_hex,
+    canonical_json, parse_worker_reply, sha256_hex,
 )
 from tests import verify_m2_runtime as verifier
 from tests.fixtures_structure import elf, pe
@@ -3943,12 +3943,26 @@ class JadxNativeContractTests(unittest.TestCase):
             with self.subTest(tool=tool), self.assertRaises(verifier.VerificationError):
                 verifier.validate_probe("wall", jadx_probe_fixture("wall"), tool=tool)
 
-    def test_complete_jadx_receipt_has_24_checks_and_21_distinct_cleanup_rows(self):
+    def test_complete_jadx_receipt_has_25_checks_and_22_distinct_cleanup_rows(self):
         receipt = self.receipt()
-        self.assertEqual(len(receipt["checks"]), 24)
-        self.assertEqual(len(receipt["cleanup"]), 21)
-        self.assertEqual(verifier.native_runs("jadx"), 21)
+        self.assertEqual(len(receipt["checks"]), 25)
+        self.assertEqual(len(receipt["cleanup"]), 22)
+        self.assertEqual(verifier.native_runs("jadx"), 22)
         self.assertTrue(verifier.receipt_passes(receipt))
+
+    def test_two_target_case_is_required_by_the_jadx_receipt(self):
+        receipt = self.receipt()
+        checks = [row['id'] for row in receipt['checks']]
+        self.assertIn('apk_basic.helper_overloads', checks)
+        self.assertEqual((len(checks), len(receipt['cleanup'])), (25, 22))
+        self.assertTrue(verifier.receipt_passes(receipt))
+        for remove_cleanup in (False, True):
+            changed = copy.deepcopy(receipt)
+            changed['checks'] = [row for row in changed['checks'] if row['id'] != 'apk_basic.helper_overloads']
+            if remove_cleanup:
+                changed['cleanup'].pop()
+            with self.subTest(remove_cleanup=remove_cleanup):
+                self.assertFalse(verifier.receipt_passes(changed))
 
     def test_foreign_profile_locks_or_check_sets_cannot_impersonate_jadx(self):
         positive = self.receipt()
@@ -4023,6 +4037,41 @@ class JadxNativeContractTests(unittest.TestCase):
             prepared, _ = host.prepare(data, args)
             result[name] = prepared
         return data, checked, result
+
+    def test_helper_overloads_add_exactly_one_closed_prepared_request(self):
+        data = fixtures_apk.apk_basic()[0]
+        cases = verifier.jadx_cases(data)
+        self.assertIn('helper_overloads', cases)
+        self.assertEqual(len(cases), 10)
+        public = cases['helper_overloads']
+        self.assertEqual(public, {'member': 'classes.dex', 'class': fixtures_apk.MAIN,
+                                 'method': 'helper', 'prototype': '', 'start': 0, 'max_chars': 1024})
+        request = verifier.jadx_prepared_request(data, public)
+        host = importlib.import_module('reverseai.tools.jadx_verify')
+        self.assertEqual(request, host.prepare(data, public)[0])
+        self.assertEqual(request['targets'], [
+            {'member': 0, 'class': fixtures_apk.MAIN.encode().hex(), 'method': b'helper'.hex(),
+             'prototype': prototype.encode().hex()}
+            for prototype in ('(I)I', '(Ljava/lang/String;)I')])
+        old = [verifier.jadx_prepared_request(data, args) for name, args in cases.items()
+               if name != 'helper_overloads']
+        self.assertEqual(len({canonical_json(value) for value in old + [request]}), 10)
+        for value in old + [request]:
+            self.assertTrue(verifier.jadx_request_allowed('jadx.method', value))
+        # Either singleton is an already approved single-method case, not an expansion.
+        for target in request['targets']:
+            single = {**request, 'targets': [target]}
+            self.assertIn(single, old)
+            self.assertTrue(verifier.jadx_request_allowed('jadx.method', single))
+        wrong = copy.deepcopy(request)
+        wrong['targets'][1]['prototype'] = b'()V'.hex()
+        changed = [wrong, {**request, 'targets': request['targets'][::-1]},
+                   {**request, 'targets': [request['targets'][0]] * 2},
+                   {**request, 'targets': request['targets'] + request['targets'][:1]},
+                   {**request, 'start': 1}, {**request, 'max_chars': 64}]
+        for value in changed:
+            with self.subTest(request=value):
+                self.assertFalse(verifier.jadx_request_allowed('jadx.method', value))
 
     def test_request_allowlist_accepts_only_fixed_prepared_fixture_dictionaries(self):
         data, public, prepared = self.prepared_cases()
@@ -4121,9 +4170,34 @@ class JadxKnownAnswerTests(unittest.TestCase):
                 return verifier.compare_jadx_observations(self.data, verifier.jadx_cases(self.data)[label], rows)
         return verifier.compare_jadx_observations(self.data, verifier.jadx_cases(self.data)[label], rows)
 
+    def test_helper_overloads_have_two_ordered_java_observations(self):
+        cases = verifier.jadx_cases(self.data)
+        self.assertIn('helper_overloads', cases)
+        rows = (self.observation('helper_int'), self.observation('helper_string', text='a different derived reading'))
+        self.assertEqual([row.value['prototype'] for row in rows], ['(I)I', '(Ljava/lang/String;)I'])
+        self.assertIsNone(self.compare('helper_overloads', rows))
+        methods = sorted((m for c in self.layout['dex']['classes.dex']['classes'] if c['name'] == fixtures_apk.MAIN
+                          for m in c['methods'] if m['name'] == 'helper'), key=lambda m: m['index'])
+        self.assertEqual([row.location for row in rows],
+                         [Location(m['code_offset'] + 16, min(2 * m['code_units'], 4096)) for m in methods])
+
+    def test_helper_overloads_refuse_missing_duplicate_reordered_or_forged_second_rows(self):
+        self.assertIn('helper_overloads', verifier.jadx_cases(self.data))
+        first, second = self.observation('helper_int'), self.observation('helper_string')
+        malformed = [(), (first,), (first, first), (second, first), (first, second, first), (first, {}),
+                     (first, replace(second, location=Location(second.location.offset + 1, second.location.length))),
+                     (first, replace(second, artifact={**second.artifact, 'sha256': '0' * 64}))]
+        for field, wrong in (('prototype', '(I)I'), ('class', fixtures_apk.HELPER), ('name', 'compute'),
+                             ('kind', 'method'), ('form', 'fallback'), ('text', ''), ('start', 1)):
+            malformed.append((first, replace(second, value={**second.value, field: wrong})))
+        for rows in malformed:
+            with self.subTest(rows=repr(rows)), self.assertRaises(verifier.VerificationError):
+                self.compare('helper_overloads', rows)
+        self.assertIsNone(self.compare('helper_overloads', (first, second)))
+
     def test_public_requests_pin_all_eight_fixture_methods_and_the_past_end_case(self):
         cases = verifier.jadx_cases(self.data)
-        self.assertEqual(tuple(cases), (*JADX_TARGETS, "past_end"))
+        self.assertEqual(tuple(cases), (*JADX_TARGETS, "helper_overloads", "past_end"))
         for label, identity in JADX_TARGETS.items():
             expected = dict(zip(("member", "class", "method", "prototype"), identity))
             self.assertEqual(cases[label], {**expected, "start": 0, "max_chars": 1024})
@@ -4164,7 +4238,7 @@ class JadxKnownAnswerTests(unittest.TestCase):
                 verifier.jadx_cases(data)
             with self.assertRaises(verifier.VerificationError):
                 verifier.compare_jadx_observations(data, args, (row,))
-        changes = ({"member": ""}, {"class": "Lunknown;"}, {"method": "helper", "prototype": ""},
+        changes = ({"member": ""}, {"class": "Lunknown;"}, {"method": "helper", "prototype": "()V"},
                    {"start": 1}, {"start": False}, {"max_chars": 64}, {"extra": "x"})
         for change in changes:
             with self.subTest(args=change), self.assertRaises(verifier.VerificationError):
@@ -4237,27 +4311,65 @@ class JadxNativeFlowTests(unittest.TestCase):
 
     def reply(self, case='compute'):
         args = verifier.jadx_cases(self.data)[case]
-        method, = [m for c in self.layout['dex'][args['member']]['classes'] if c['name'] == args['class']
-                   for m in c['methods'] if (m['name'], m['prototype']) == (args['method'], args['prototype'])]
+        methods = sorted((m for c in self.layout['dex'][args['member']]['classes'] if c['name'] == args['class']
+                          for m in c['methods'] if m['name'] == args['method']
+                          and args['prototype'] in ('', m['prototype'])), key=lambda m: m['index'])
         form = verifier.JADX_FORMS[case]
-        text = 'static int synthetic() { return 1; }'
-        row = {'target': 0, 'status': 'ok', 'code_offset': method['code_offset'],
-               'insns_count': method['code_units'], 'total': len(text),
-               'text': text[args['start']:args['start'] + args['max_chars']]}
-        if form == 'omitted':
-            row.update(status='omitted', code_offset=None, insns_count=None, total=0, text='')
+        rows = []
+        for index, method in enumerate(methods):
+            text = f'static int synthetic() {{ return {index}; }}'
+            row = {'target': index, 'status': 'ok', 'code_offset': method['code_offset'],
+                   'insns_count': method['code_units'], 'total': len(text),
+                   'text': text[args['start']:args['start'] + args['max_chars']]}
+            if form == 'omitted':
+                row.update(status='omitted', code_offset=None, insns_count=None, total=0, text='')
+            rows.append(row)
         return {'protocol': WORKER_PROTOCOL, 'status': 'ok', 'snapshot_sha256': sha256_hex(self.data),
-                'observations': [row]}
+                'observations': rows}
 
-    def test_all_nine_cases_use_real_host_admission_and_the_independent_oracle(self):
+    def test_all_ten_cases_use_real_host_admission_and_the_independent_oracle(self):
         from reverseai.tools import jadx_verify
         for case, args in verifier.jadx_cases(self.data).items():
             raw = json.dumps(self.reply(case)).encode()
             with self.subTest(case=case), mock.patch.object(self.native, 'invoke', return_value=raw) as invoke:
                 evidence = self.native.known_answer(self.data, 'jadx.method', args)
-                self.assertEqual(evidence['observations'], 1)
+                self.assertEqual(evidence['observations'], 2 if case == 'helper_overloads' else 1)
                 self.assertEqual(evidence['args'], args)
                 invoke.assert_called_once_with(self.data, 'jadx.method', jadx_verify.prepare(self.data, args)[0])
+
+    def test_helper_overloads_run_once_and_reject_bad_two_target_replies(self):
+        from reverseai.tools import jadx_verify
+        cases = verifier.jadx_cases(self.data)
+        self.assertIn('helper_overloads', cases)
+        args = cases['helper_overloads']
+        good = self.reply('helper_overloads')
+        request, _ = jadx_verify.prepare(self.data, args)
+        self.assertEqual(len(request['targets']), 2)
+        with mock.patch.object(self.native, 'invoke', return_value=json.dumps(good).encode()) as invoke:
+            result = self.native.known_answer(self.data, 'jadx.method', args)
+            self.assertEqual(result['observations'], 2)
+            invoke.assert_called_once_with(self.data, 'jadx.method', request)
+        for mode in ('missing', 'extra', 'duplicate', 'reordered', 'second_anchor', 'second_form'):
+            bad = copy.deepcopy(good)
+            rows = bad['observations']
+            if mode == 'missing':
+                rows.pop()
+            elif mode == 'extra':
+                rows.append({**rows[1], 'target': 2})
+            elif mode == 'duplicate':
+                rows[1] = {**rows[0], 'target': 1}
+            elif mode == 'reordered':
+                bad['observations'] = [{**rows[1], 'target': 0}, {**rows[0], 'target': 1}]
+            elif mode == 'second_anchor':
+                rows[1]['code_offset'] += 1
+            else:
+                rows[1]['status'] = 'fallback'
+            error = verifier.VerificationError if mode == 'second_form' else ContractError
+            with self.subTest(mode=mode), \
+                    mock.patch.object(self.native, 'invoke', return_value=json.dumps(bad).encode()) as invoke, \
+                    self.assertRaises(error):
+                self.native.known_answer(self.data, 'jadx.method', args)
+            invoke.assert_called_once_with(self.data, 'jadx.method', request)
 
     def test_unknown_public_requests_refuse_before_invoking_the_executor(self):
         args = verifier.jadx_cases(self.data)['compute']
@@ -4312,7 +4424,7 @@ class JadxNativeFlowTests(unittest.TestCase):
                     self.assertRaises(verifier.VerificationError):
                 self.native.jadx_known_answer(self.data, args, negative=negative)
 
-    def test_full_plan_requires_24_checks_and_21_unique_verified_cleanups(self):
+    def test_full_plan_requires_25_checks_and_22_unique_verified_cleanups(self):
         calls = []
 
         def inspected(label):
@@ -4332,21 +4444,21 @@ class JadxNativeFlowTests(unittest.TestCase):
         self.assertEqual([r['id'] for r in self.receipt['checks']],
                          [name for name in verifier.JADX_REQUIRED_CHECKS if name != 'container'] + ['container'])
         self.assertEqual({r['status'] for r in self.receipt['checks']}, {'passed'})
-        self.assertEqual(len(calls), 21)
+        self.assertEqual(len(calls), 22)
         self.assertEqual(calls[:10], list(verifier.CONTROL_NAMES))
-        self.assertEqual(calls[10:19], list(verifier.jadx_cases(self.data).values()))
+        self.assertEqual(calls[10:20], list(verifier.jadx_cases(self.data).values()))
         self.assertEqual(calls[-2:], ['shape', 'input'])
         receipt = receipt_fixture()
         receipt.update(tool='jadx', lock=self.lock, **self.receipt)
         self.assertTrue(verifier.receipt_passes(receipt))
-        self.native.inspected = 20
+        self.native.inspected = 21
         self.assertFalse(self.native.record('container', lambda: verifier.need(
             self.native.inspected == self.native.native_runs, 'ContainerInspectionMissing')))
 
     def test_cli_loads_exact_jadx_profile_and_refuses_bad_lock_before_native_work(self):
         def finish(native):
             native.receipt.update(checks=[{'id': name, 'status': 'passed'} for name in verifier.JADX_REQUIRED_CHECKS],
-                cleanup=[{'container_id': f'{i + 1:064x}', 'verified': True, 'staging_removed': True} for i in range(21)],
+                cleanup=[{'container_id': f'{i + 1:064x}', 'verified': True, 'staging_removed': True} for i in range(22)],
                 image_id=native.lock['image_id'])
 
         with tempfile.TemporaryDirectory() as folder:
