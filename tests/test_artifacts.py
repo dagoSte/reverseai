@@ -229,6 +229,21 @@ class AndroidReviewerFixTests(unittest.TestCase):
         b = make_finding("structural", "Permissions.", "android.permissions", ["android.permission.B"], [second.id], "observed")
         self.assertEqual(self.judge([a, b], [first, second]), ["supported", "supported"])
 
+    def test_permission_page_metadata_must_be_coherent(self):
+        # m4a-deferred 5 (decision next-carries): one total, distinct indexes below it.
+        def permission(offset, name, index, total):
+            return make_evidence(DATA, self.apk, "apk.manifest", Observation(Location(offset, 20), {
+                "kind": "manifest_attribute", "index": index, "total": total, "element_index": index,
+                "element": "uses-permission", "attribute": "android:name", "type": "string", "value": name}, artifact()))
+        for pair in ((permission(0, "p.A", 1, 5), permission(20, "p.B", 2, 5)),):
+            good = make_finding("structural", "P.", "android.permissions", ["p.A", "p.B"], [i.id for i in pair], "observed")
+            self.assertEqual(self.judge([good], list(pair)), ["supported"])
+        for bad in ((permission(0, "p.A", 5, 5), permission(20, "p.B", 2, 5)),
+                    (permission(0, "p.A", 1, 5), permission(20, "p.B", 2, 6)),
+                    (permission(0, "p.A", 1, 5), permission(20, "p.B", 1, 5))):
+            finding = make_finding("structural", "P.", "android.permissions", ["p.A", "p.B"], [i.id for i in bad], "observed")
+            self.assertEqual(self.judge([finding], list(bad)), ["unsupported"])
+
 
 class SharedFindingTests(unittest.TestCase):
     def test_a_finding_in_two_tasks_is_judged_the_same_whatever_the_order(self):

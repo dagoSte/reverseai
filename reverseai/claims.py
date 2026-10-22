@@ -349,6 +349,10 @@ def _permissions(observations):
     if not all(o["element"] in ("uses-permission", "uses-permission-sdk-23") and o["attribute"] == "android:name"
                and o["type"] == "string" and o["value"] for o in rows):
         return None
+    # The page metadata the cited attributes carry must be coherent too (m4a-deferred 5): one total, distinct indexes.
+    if not (all(_index(o["index"]) and _index(o["total"]) and o["index"] < o["total"] for o in rows)
+            and len({o["total"] for o in rows}) == 1 and len({o["index"] for o in rows}) == len(rows)):
+        return None
     return sorted({o["value"] for o in rows})
 
 

@@ -631,7 +631,8 @@ and needs an owner-approved download. Decision `m4a-contract`.
   int or a bool. Claims (observed): `android.manifest` page rows `[element_index,
   element, attribute, type, value]`; `android.permissions` = sorted unique values
   of the cited `uses-permission` (and `uses-permission-sdk-23`) `android:name`
-  string attributes; more than 64 are split into several findings, each a subset,
+  string attributes, whose `index` and `total` must be coherent (one total,
+  distinct indexes below it); more than 64 are split into several findings, each a subset,
   which never contradict each other (decision `m4a-fix-round`).
 - `dex.classes`: args `member` literal 0..255 default "" (one DEX member by name;
   "" for every `classes*.dex` member in central directory order), `query` literal
@@ -732,7 +733,9 @@ Java is the decompiler's reading, kept **derived** like Ghidra's pseudocode.
   `m4b-omitted`) or `error` (nothing produced); `omitted` and `error` have
   `text` "", `start` = `total` = 0; `total` the length in
   characters of the method's whole text; `text` its characters from `start`, at
-  most `max_chars`; after checking the worker's whole row the host cuts it to the
+  most `max_chars` (for `java` and `fallback` exactly min(`max_chars`, `total` -
+  `start`) characters, else the operation fails; decision `next-carries`); after
+  checking the worker's whole row the host cuts it to the
   longest prefix whose observation fits 4,096 bytes, never inside a `\uXXXX`
   escape (decision `m4b-fix-round`). The text is printable ASCII, newline and tab only: the driver
   writes every other UTF-16 unit as a Java `\uXXXX` escape, and `start` and
