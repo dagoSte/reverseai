@@ -923,7 +923,9 @@ parser's reading and stays **derived**; the bytes at each anchor are verified.
   included) whose trailing parts equal an entry of `jshints.CALLEES`: entries
   are one name for distinctive calls (`eval`, `execSync`, `fetch`) and a
   receiver plus name for common names (`Buffer.from`, `http.get`,
-  `https.request`, `net.connect`, `fs.write`), so `map.get(k)` is not a call item
+  `https.request`, `net.connect`, `fs.write`, and `exec` only as
+  `child_process.exec`, `childProcess.exec` or `cp.exec`, so a regular
+  expression's `exec` is not a call item; decision `m5b-fix-round`), so `map.get(k)` is not a call item
   (decision `m5b-callee-suffix`); `import(...)` is a `dynamic_import` module item,
   never a call. Offsets only: the worker
   never returns text, names or locations in bytes.
