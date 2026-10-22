@@ -6,7 +6,7 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M5b release candidate: JavaScript syntax through a pinned parser.**
+**Status: M5b released: JavaScript syntax through a pinned parser.**
 For a JavaScript ZIP, an Electron ASAR archive or a single bundle, the host lists files, reads package.json
 declarations with exact byte positions, and finds lexical hints at their matched
 byte ranges (M5a). With M5b, a pinned parser (Node.js 24.22.1 with @babel/parser
@@ -67,7 +67,7 @@ What this buys, and how each point is checked:
 | M4a | APK members, binary manifest and DEX classes, methods and code references verified on the host, including compressed-member evidence (contract/3) | released |
 | M4b | Decompiled Java through the official JADX 1.5.6 in a locked container, bound to host-verified DEX methods (derived) | released |
 | M5a | JavaScript files, package.json declarations and lexical hints verified on the host; no sample execution | released |
-| M5b | JavaScript syntax through a pinned parser (Node.js 24.22.1, @babel/parser 8.0.4) in a locked container: module sources and sensitive calls anchored at verified bytes (derived) | release candidate |
+| M5b | JavaScript syntax through a pinned parser (Node.js 24.22.1, @babel/parser 8.0.4) in a locked container: module sources and sensitive calls anchored at verified bytes (derived) | released |
 | M5c | npm package tarballs (`.tgz`) read like application ZIPs | planned |
 | M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
 | M7 | Measured comparison with REA Safe Agent on a known-answer corpus | planned |
