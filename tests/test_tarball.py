@@ -295,6 +295,26 @@ class TarballTests(unittest.TestCase):
         raw[:512] = checksum(raw[:512])
         self.assertIn('header_mismatch', tarball.members(packed(bytes(raw)))[0].flags)
 
+    def test_invalid_link_text_only_flags_links_and_keeps_pax_byte_bounds(self):
+        for kind, body, flags in ((b'0', b'inert', ()),
+                                  (b'1', b'', ('hardlink', 'header_mismatch')),
+                                  (b'2', b'', ('header_mismatch', 'symlink'))):
+            with self.subTest(kind=kind):
+                raw = bytearray(record(body=body, kind=kind))
+                raw[157:159] = b'\xff\0'
+                raw[:512] = checksum(raw[:512])
+                data = packed(bytes(raw))
+                member, = tarball.members(data)
+                self.assertEqual(member.flags, flags)
+                if not flags:
+                    self.assertEqual(tarball.materialize(data, member)[0], body)
+                else:
+                    with self.assertRaises(tarball.TarballError):
+                        tarball.materialize(data, member)
+        extension = record('Extension', pax(b'linkpath', b'x' * 65536), kind=b'x')
+        with self.assertRaises(tarball.TarballError):
+            tarball.members(packed(extension, record(body=b'inert')))
+
     def test_signed_checksum_and_nul_regular_file(self):
         raw = bytearray(record('package/é.js', b'x', kind=b'\0'))
         raw[148:156] = b'        '

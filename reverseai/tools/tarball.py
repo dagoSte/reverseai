@@ -253,7 +253,7 @@ def members(data):
                 _check(size == 0)
             if kind != b'5':
                 flags = set()
-                if invalid_name or invalid_link:
+                if invalid_name or (invalid_link and kind in (b'1', b'2')):
                     flags.add('header_mismatch')
                 if apk._traversing(name):
                     flags.add('traversing_name')
