@@ -140,29 +140,89 @@ class Observation:
 MAX_CHILD_BYTES = 32 * 1024 * 1024
 MAX_CHILD_RATIO = 100
 ARTIFACT_KEYS = frozenset({"member", "method", "data_offset", "compressed_size", "size", "crc32", "sha256"})
+# M5c: method 1 is a range of one whole gzip stream (RFC 1952) inside the input, after inflating it (decision m5c-contract).
+GZIP_ARTIFACT_KEYS = ARTIFACT_KEYS | {"inner_offset"}
+MAX_STREAM_BYTES = 128 * 1024 * 1024
 
 
 def check_artifact(artifact):
-    require(isinstance(artifact, dict) and set(artifact) == ARTIFACT_KEYS, "Invalid child artifact")
+    require(isinstance(artifact, dict) and set(artifact) == (GZIP_ARTIFACT_KEYS if artifact.get("method") == 1
+                                                             else ARTIFACT_KEYS), "Invalid child artifact")
     member = artifact["member"]
     require(isinstance(member, str) and 0 < len(member) <= 255 and member.isprintable(), "Invalid child artifact member")
-    require(type(artifact["method"]) is int and artifact["method"] in (0, 8), "Unsupported child artifact method")
+    require(type(artifact["method"]) is int and artifact["method"] in (0, 1, 8), "Unsupported child artifact method")
     require(all(type(artifact[key]) is int and 0 <= artifact[key] < 2**64
-                for key in ("data_offset", "compressed_size", "size", "crc32")), "Invalid child artifact field")
+                for key in ("data_offset", "compressed_size", "size", "crc32", "inner_offset") if key in artifact),
+            "Invalid child artifact field")
     require(0 < artifact["size"] <= MAX_CHILD_BYTES and artifact["crc32"] < 2**32, "Invalid child artifact size")
     require(isinstance(artifact["sha256"], str) and _SHA256.match(artifact["sha256"]), "Invalid child artifact sha256")
     if artifact["method"] == 0:
         require(artifact["compressed_size"] == artifact["size"], "Stored child artifact sizes differ")
-    else:
+    elif artifact["method"] == 8:
         require(0 < artifact["compressed_size"] and artifact["size"] <= MAX_CHILD_RATIO * artifact["compressed_size"],
                 "Child artifact expands past the ratio limit")
+    else:
+        end = artifact["inner_offset"] + artifact["size"]
+        require(0 < artifact["compressed_size"] and end <= MAX_STREAM_BYTES
+                and end <= MAX_CHILD_RATIO * artifact["compressed_size"], "Child artifact expands past the ratio limit")
 
 
-def materialize(data, artifact) -> bytes:
-    """The child's bytes, re-derived from the input: in range, fully inflated to exactly its size, CRC and hash equal."""
+def inflate_stream(data, start, length) -> bytes:
+    """One whole gzip member (RFC 1952) at data[start:start + length]: header checked, inflated within
+    min(MAX_STREAM_BYTES, 100 x length), trailer CRC-32 and size equal, nothing after it."""
+    require(type(start) is int and type(length) is int and 0 <= start and 18 <= length
+            and start + length <= len(data), "Gzip stream outside the input")
+    raw = bytes(data[start:start + length])
+    require(raw[:3] == b"\x1f\x8b\x08" and raw[3] & 0xE0 == 0, "Invalid gzip header")
+    flags, at = raw[3], 10
+    if flags & 4:
+        require(at + 2 <= len(raw), "Invalid gzip header")
+        at += 2 + int.from_bytes(raw[at:at + 2], "little")
+    for flag in (8, 16):
+        if flags & flag:
+            end = raw.find(b"\x00", at, len(raw) - 8)
+            require(end != -1, "Invalid gzip header")
+            at = end + 1
+    if flags & 2:
+        require(at + 2 <= len(raw) and int.from_bytes(raw[at:at + 2], "little") == zlib.crc32(raw[:at]) & 0xFFFF,
+                "Invalid gzip header")
+        at += 2
+    require(at <= len(raw) - 8, "Invalid gzip header")
+    limit = min(MAX_STREAM_BYTES, MAX_CHILD_RATIO * length)
+    inflater = zlib.decompressobj(-15)
+    try:
+        stream = inflater.decompress(raw[at:], limit + 1)
+    except zlib.error:
+        raise ContractError("Gzip stream does not inflate") from None
+    require(len(stream) <= limit and inflater.eof and not inflater.unconsumed_tail and len(inflater.unused_data) == 8,
+            "Gzip stream does not inflate within its limits")
+    trailer = inflater.unused_data
+    require(int.from_bytes(trailer[:4], "little") == zlib.crc32(stream)
+            and int.from_bytes(trailer[4:], "little") == len(stream) & 0xFFFFFFFF, "Gzip stream trailer does not match")
+    return stream
+
+
+def materialize(data, artifact, *, streams=None) -> bytes:
+    """The child's bytes, re-derived from the input: in range, fully inflated to exactly its size, CRC and hash equal.
+
+    streams, when given, caches inflated gzip streams by (data_offset, compressed_size) for method 1 children.
+    """
     check_artifact(artifact)
     start, length, size = artifact["data_offset"], artifact["compressed_size"], artifact["size"]
     require(start + length <= len(data), "Child artifact outside the input")
+    if artifact["method"] == 1:
+        key = (start, length)
+        stream = streams.get(key) if streams is not None else None
+        if stream is None:
+            stream = inflate_stream(data, start, length)
+            if streams is not None:
+                streams[key] = stream
+        inner = artifact["inner_offset"]
+        require(inner + size <= len(stream), "Child artifact outside its gzip stream")
+        child = stream[inner:inner + size]
+        require(zlib.crc32(child) == artifact["crc32"] and sha256_hex(child) == artifact["sha256"],
+                "Child artifact does not match its declared bytes")
+        return child
     raw = bytes(data[start:start + length])
     if artifact["method"] == 0:
         child = raw

@@ -226,8 +226,9 @@ SYMBOL_TYPES = ("func", "object", "notype", "tls", "common", "ifunc", "other", "
 BINDINGS = ("local", "global", "weak", "other")
 XREF_TYPES = ("call", "jump", "read", "write", "read_write", "data")
 
-MEMBER_FLAGS = ("asar_link", "asar_unpacked", "crc", "duplicate_name", "encrypted", "header_mismatch", "long_name", "ratio",
-                "symlink", "too_large", "traversing_name", "unsupported_method")
+MEMBER_FLAGS = ("asar_link", "asar_unpacked", "crc", "duplicate_name", "encrypted", "hardlink", "header_mismatch",
+                "long_name", "ratio", "symlink", "too_large", "traversing_name", "unsupported_method",
+                "unsupported_type")
 MANIFEST_TYPES = ("string", "int", "bool", "reference", "other")
 REF_KINDS = ("method", "field", "string", "type")
 

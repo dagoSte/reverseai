@@ -115,9 +115,9 @@ class ChildEvidenceTests(unittest.TestCase):
         import reverseai.gateway as gateway_module
         real = gateway_module.materialize
 
-        def counting(data, value):
+        def counting(data, value, **options):
             calls.append(value["method"])
-            return real(data, value)
+            return real(data, value, **options)
 
         def handler(data, args):
             return [observation(), observation(offset=0, length=4, kind="head"), observation(artifact(0), offset=0,
@@ -299,9 +299,9 @@ class ReviewerBudgetAndShapeTests(unittest.TestCase):
                     for i, item in enumerate(evidence)]
         calls, real, budget = [], review_module.materialize, review_module.MAX_REVIEW_CHILD_BYTES
 
-        def counting(data, value):
+        def counting(data, value, **options):
             calls.append(value["member"])
-            return real(data, value)
+            return real(data, value, **options)
         review_module.materialize, review_module.MAX_REVIEW_CHILD_BYTES = counting, 2 * len(CHILD)
         try:
             result = AnalysisResult(content_id("tk", {"t": "budget"}), "structural", "ok", tuple(evidence), tuple(findings))
