@@ -6,7 +6,12 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M5c released: npm package tarballs as byte-anchored inputs.**
+**Status: M6 release candidate.**
+Installable as a Python wheel or from a checkout, with no Python dependencies.
+`reverseai doctor` checks the local setup without running a sample or container.
+Installation checks and native containment proofs are separate; see
+[Install](docs/INSTALL.md), [Security](docs/SECURITY.md) and [Changelog](CHANGELOG.md).
+
 For a JavaScript ZIP, an Electron ASAR archive, an npm tarball (`.tgz`) or a single
 bundle, the host lists files, reads package.json declarations with exact byte
 positions, and finds lexical hints at their matched byte ranges.
@@ -46,7 +51,7 @@ Model-driven agents are not part of the current releases.
 ## How it works
 
 <p align="center">
-  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway serves whole-file analysis or a targeted query through host parsers for native files, APK, DEX and JavaScript, or a locked container per run (LIEF, YARA-X, Ghidra, JADX, the JavaScript parser); JavaScript files, package declarations and lexical hints from ZIP, ASAR and npm tarball inputs are read on the host without execution, and the parser returns only offsets of module sources and calls, from which the host re-derives every literal and name; the host re-derives every LIEF and YARA-X value and every Ghidra anchor, re-reads referenced strings, and binds JADX's Java to a method its own DEX decoder verified; evidence binds hash, tool, operation and byte range, with member provenance for bytes inside a package; a reviewer independently rebuilds package members and re-checks cited bytes and claim rules; Ghidra and JADX interpretations stay derived; reports separate supported, derived, unsupported and contradicted findings.">
+  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: package installation and read-only doctor check setup, while native proof is separate for each platform; an approved file is frozen and hashed; a gateway serves whole-file analysis or a targeted query through host parsers for native files, APK, DEX and JavaScript, or a locked container per run (LIEF, YARA-X, Ghidra, JADX, the JavaScript parser); JavaScript files, package declarations and lexical hints from ZIP, ASAR and npm tarball inputs are read on the host without execution, and the parser returns only offsets of module sources and calls, from which the host re-derives every literal and name; the host re-derives every LIEF and YARA-X value and every Ghidra anchor, re-reads referenced strings, and binds JADX's Java to a method its own DEX decoder verified; evidence binds hash, tool, operation and byte range, with member provenance for bytes inside a package; a reviewer independently rebuilds package members and re-checks cited bytes and claim rules; Ghidra and JADX interpretations stay derived; reports separate supported, derived, unsupported and contradicted findings.">
 </p>
 
 What this buys, and how each point is checked:
@@ -76,7 +81,8 @@ What this buys, and how each point is checked:
 | M5a | JavaScript files, package.json declarations and lexical hints verified on the host; no sample execution | released |
 | M5b | JavaScript syntax through a pinned parser (Node.js 24.22.1, @babel/parser 8.0.4) in a locked container: module sources and sensitive calls anchored at verified bytes (derived) | released |
 | M5c | npm package tarballs (`.tgz`): bounded gzip/tar reading, file and header provenance, existing JavaScript queries | released |
-| M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
+| M6 | Python packaging, offline installation, read-only doctor, local macOS/Linux ARM64 proof workflow | release candidate |
+| M6b | Hosted CI, Windows/AMD64 proofs and fully offline LIEF/YARA-X/Ghidra builders | planned; owner decisions pending |
 | M7 | Measured comparison with REA Safe Agent on a known-answer corpus | planned |
 | M8 | Clean-room kit: evidence-cited functional specification, contamination check, auditable separation of analysis and implementation rooms, conformance tests | planned |
 
@@ -124,6 +130,29 @@ This counts names; behavioural parity is measured in M7.
 | `inspect_android_method` | The class's methods and the selected method's code references; with `--with-jadx`, the method's decompiled Java | Verified (host); Java derived (JADX) |
 | `trace_android_references` | References from or to a method, selected by class, name and optional prototype | Verified (host) |
 | `analyze_javascript_application` | Files, package.json declarations and lexical hints (`detail` `summary`, `files`, `package` or `hints`); with `--with-jsparser`, module sources, sensitive calls and parse status (`modules`, `calls`, `parse`) | Verified (host); syntax derived (parser) |
+
+## Install
+
+Python 3.12 or later, with pip and venv already available. From a trusted checkout:
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install --no-index --no-deps .
+.venv/bin/reverseai --version
+.venv/bin/reverseai doctor
+```
+
+Or install the approved wheel with
+`.venv/bin/python -m pip install --no-index --no-deps /approved/reverseai-0.6.0-py3-none-any.whl`.
+On Windows, use your Python 3.12-or-later launcher and `.venv\Scripts\python.exe` /
+`.venv\Scripts\reverseai.exe`; Windows platform proof remains experimental.
+
+Host-only analysis needs no Docker. Contained tools need Docker Desktop and their
+locked images already present; `doctor` can exit 0 for host features while those
+tools remain unavailable. It never pulls, builds or runs a container. The
+[installation guide](docs/INSTALL.md) covers building the wheel/sdist, image
+inputs and hashes, the two offline image builders, the three recipes that still
+need network, and the separate host/native proofs.
 
 ## Try it
 
