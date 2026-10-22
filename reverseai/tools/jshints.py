@@ -12,13 +12,14 @@ from reverseai.contract import ContractError, MAX_EXCERPT_BYTES
 
 MAX_BYTES = 128 * 1024 * 1024
 CALLEES = frozenset((
-    "eval", "Function", "exec", "execSync", "execFile", "execFileSync", "spawn", "spawnSync", "fork",
+    "eval", "Function", "child_process.exec", "childProcess.exec", "cp.exec",
+    "execSync", "execFile", "execFileSync", "spawn", "spawnSync", "fork",
     "runInNewContext", "runInThisContext", "runInContext", "fetch", "XMLHttpRequest", "WebSocket",
     "atob", "btoa", "fromCharCode", "Buffer.from", "http.get", "https.get", "http.request", "https.request",
     "net.connect", "tls.connect", "net.createConnection", "dgram.createSocket",
     "fs.write", "fs.writeSync", "fs.writev", "fs.writevSync", "writeFile", "writeFileSync", "appendFile", "appendFileSync",
     "unlink", "unlinkSync", "rm", "rmSync", "rmdir", "rmdirSync", "chmod", "chmodSync", "fchmod", "fchmodSync",
-    "lchmod", "lchmodSync", "setTimeout", "setInterval", "require",
+    "lchmod", "lchmodSync",
 ))
 _LEFT = rb"(?<![A-Za-z0-9_$])"
 _RIGHT = rb"(?![A-Za-z0-9_$])"
