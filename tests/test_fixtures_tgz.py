@@ -163,3 +163,22 @@ class TarballFixtureTests(unittest.TestCase):
     def test_unknown_hostile_kind_is_an_explicit_fixture_error(self):
         with self.assertRaisesRegex(ValueError, 'Unknown hostile'):
             F.tgz_hostile('typo')
+
+    def test_method_one_artifacts_rebuild_the_declared_file_or_its_header(self):
+        from reverseai.contract import materialize
+        for kind in (None, 'symlink', 'hardlink', 'traversal', 'duplicate', 'long_name'):
+            data, layout = F.npm_tgz() if kind is None else F.tgz_hostile(kind)
+            tar, streams = gzip.decompress(data), {}
+            for file in layout['files']:
+                with self.subTest(kind=kind, file=file['name']):
+                    artifact = file['artifact']
+                    child = materialize(data, artifact, streams=streams)
+                    self.assertEqual(artifact['method'], 1)
+                    self.assertEqual(artifact['compressed_size'], len(data))
+                    self.assertEqual(child, tar[artifact['inner_offset']:artifact['inner_offset'] + artifact['size']])
+                    if file['row']['flags'] or not file['data']:
+                        self.assertEqual((artifact['inner_offset'], artifact['size']), (file['header_offset'], 512))
+                    else:
+                        self.assertEqual(child, file['data'])
+                    self.assertEqual(file['location'], {'offset': 0, 'length': min(len(child), 4096)})
+            self.assertEqual(len(streams), 1)

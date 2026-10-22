@@ -6,8 +6,8 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M5b released: JavaScript syntax through a pinned parser.**
-For a JavaScript ZIP, an Electron ASAR archive or a single bundle, the host lists files, reads package.json
+**Status: M5c — npm package tarballs as byte-anchored inputs.**
+For a JavaScript ZIP, an Electron ASAR archive, an npm tarball (`.tgz`) or a single bundle, the host lists files, reads package.json
 declarations with exact byte positions, and finds lexical hints at their matched
 byte ranges (M5a). With M5b, a pinned parser (Node.js 24.22.1 with @babel/parser
 8.0.4) reads JavaScript, JSX and TypeScript as data in its own locked container and
@@ -16,6 +16,12 @@ the host turns every answer into exact bytes and re-derives the value from them.
 part of the application is run, imported, evaluated or resolved. These results
 describe declarations, occurrences and the parser's reading of the syntax, not
 behaviour.
+
+M5c reads an npm tarball directly, with no extraction or package installation.
+It checks the whole gzip stream and tar archive before reporting a file; every
+result points to an exact range rebuilt from the original compressed bytes.
+Links and unsafe names are listed with flags, and their payloads are kept out of
+the analysis. Install scripts remain declarations in `package.json`; nothing runs them.
 
 Deterministic
 analysts read file structure (ELF, PE and Mach-O), imports and string indicators in-process,
@@ -39,7 +45,7 @@ Model-driven agents are not part of the current releases.
 ## How it works
 
 <p align="center">
-  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway serves whole-file analysis or a targeted query through host parsers for native files, APK, DEX and JavaScript, or a locked container per run (LIEF, YARA-X, Ghidra, JADX, the JavaScript parser); JavaScript files, package declarations and lexical hints are read on the host without execution, and the parser returns only offsets of module sources and calls, from which the host re-derives every literal and name; the host re-derives every LIEF and YARA-X value and every Ghidra anchor, re-reads referenced strings, and binds JADX's Java to a method its own DEX decoder verified; evidence binds hash, tool, operation and byte range, with member provenance for bytes inside a package; a reviewer independently rebuilds package members and re-checks cited bytes and claim rules; Ghidra and JADX interpretations stay derived; reports separate supported, derived, unsupported and contradicted findings.">
+  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and hashed; a gateway serves whole-file analysis or a targeted query through host parsers for native files, APK, DEX and JavaScript, or a locked container per run (LIEF, YARA-X, Ghidra, JADX, the JavaScript parser); JavaScript files, package declarations and lexical hints from ZIP, ASAR and npm tarball inputs are read on the host without execution, and the parser returns only offsets of module sources and calls, from which the host re-derives every literal and name; the host re-derives every LIEF and YARA-X value and every Ghidra anchor, re-reads referenced strings, and binds JADX's Java to a method its own DEX decoder verified; evidence binds hash, tool, operation and byte range, with member provenance for bytes inside a package; a reviewer independently rebuilds package members and re-checks cited bytes and claim rules; Ghidra and JADX interpretations stay derived; reports separate supported, derived, unsupported and contradicted findings.">
 </p>
 
 What this buys, and how each point is checked:
@@ -68,7 +74,7 @@ What this buys, and how each point is checked:
 | M4b | Decompiled Java through the official JADX 1.5.6 in a locked container, bound to host-verified DEX methods (derived) | released |
 | M5a | JavaScript files, package.json declarations and lexical hints verified on the host; no sample execution | released |
 | M5b | JavaScript syntax through a pinned parser (Node.js 24.22.1, @babel/parser 8.0.4) in a locked container: module sources and sensitive calls anchored at verified bytes (derived) | released |
-| M5c | npm package tarballs (`.tgz`) read like application ZIPs | planned |
+| M5c | npm package tarballs (`.tgz`): bounded gzip/tar reading, file and header provenance, existing JavaScript queries | implemented |
 | M6 | Professional release: packaging, setup, CI, multi-platform proofs | planned |
 | M7 | Measured comparison with REA Safe Agent on a known-answer corpus | planned |
 | M8 | Clean-room kit: evidence-cited functional specification, contamination check, auditable separation of analysis and implementation rooms, conformance tests | planned |
@@ -127,13 +133,16 @@ python3 -m reverseai analyze path/to/approved-file --out new-report-dir
 python3 -m reverseai query path/to/approved-file --query list_segments --arg limit=16 --out new-query-dir
 python3 -m reverseai query path/to/approved.apk --query search_android_classes --arg query=Main --out new-android-report
 python3 -m reverseai query path/to/approved-js.zip --query analyze_javascript_application --arg detail=summary --out new-js-report
+python3 -m reverseai query path/to/approved-package.tgz --query analyze_javascript_application --arg detail=summary --out new-tarball-report
 python3 -B -m unittest discover -s tests -t . -v
 ```
 
 The JavaScript query accepts a ZIP, an Electron ASAR archive (its files are read as stored
-members; unpacked and link entries are listed with a flag and never read) or a single
-JavaScript bundle, with no Docker
-or downloads. Use `detail=files`, `detail=package` or `detail=hints` to page one
+members; unpacked and link entries are listed with a flag and never read), an npm
+tarball or a single JavaScript bundle, with no Docker or downloads. Tarball names
+keep their `package/` prefix: copy the displayed name when selecting a file, such as
+`--arg file=package/package.json`. Names never become host paths; no package manager
+or install script is invoked. Use `detail=files`, `detail=package` or `detail=hints` to page one
 part of the analysis; `summary` takes the first page of each part.
 
 With `--with-jsparser`, `detail=modules`, `detail=calls` and `detail=parse` add the
@@ -189,6 +198,13 @@ not proof of behaviour. The contract between components is in
 [docs/contract.md](docs/contract.md).
 
 Known limits, by design:
+
+- An npm tarball must contain exactly one valid gzip member and a complete tar.
+  Inflation is capped at 128 MiB and 100 times the compressed input size; the tar
+  has at most 65,536 physical headers, including extensions and directories.
+  Trailing data, concatenated gzip streams, truncation and bad checksums refuse
+  the operation. Symlinks, hard links and unsafe names are flagged; their rows
+  cite the tar header rather than passing a payload to an analyzer.
 
 - ELF, PE and thin little-endian Mach-O headers, sections and imports are parsed;
   big-endian and universal Mach-O files are identified only. String indicators and signature rules are

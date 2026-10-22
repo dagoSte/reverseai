@@ -2,7 +2,8 @@
 
 npm_tgz() and tgz_hostile(kind) return (gzip bytes, layout). Offsets in members,
 files, package, hints, modules and calls refer to the decompressed tar or its
-declared child as named; no nested artifact representation is assumed here.
+declared child as named. Accepted files carry contract/3 method 1 artifacts;
+flagged and empty rows cite their own 512-byte header as a child of the gzip.
 """
 
 import hashlib
@@ -78,7 +79,38 @@ def tar_bytes(entries):
 
 def _wrapped(tar, layout, *, level=6):
     data = gzip_bytes(tar, level=level)
-    return data, {**layout, 'tar_size': len(tar), 'tar_sha256': hashlib.sha256(tar).hexdigest(),
+    files = []
+    names = [F.escaped(member['name'])[:255] for member in layout.get('members', ())]
+    for member, name in zip(layout.get('members', ()), names):
+        if member['kind'] == '5' or not F.is_javascript(member['name']):
+            continue
+        flags = set()
+        if member['kind'] in ('1', '2'):
+            flags.add('hardlink' if member['kind'] == '1' else 'symlink')
+        if member['name'].startswith('../'):
+            flags.add('traversing_name')
+        if names.count(name) > 1:
+            flags.add('duplicate_name')
+        if len(F.escaped(member['name'])) > 255:
+            flags.add('long_name')
+        child = member['data']
+        header = bool(flags) or not child
+        at = member['header_offset'] if header else member['data_offset']
+        payload = tar[at:at + BLOCK] if header else child
+        artifact = {'member': name or 'tar header', 'method': 1, 'data_offset': 0,
+                    'compressed_size': len(data), 'inner_offset': at, 'size': len(payload),
+                    'crc32': zlib.crc32(payload), 'sha256': hashlib.sha256(payload).hexdigest()}
+        lines, max_line = F.line_metrics(child)
+        files.append({'name': member['name'], 'data': child, 'header_offset': member['header_offset'],
+                      'data_offset': member['data_offset'], 'anchor_space': 'tar' if header else 'child',
+                      'anchor': {'offset': at if header else 0, 'length': min(len(payload), 4096)},
+                      'location': {'offset': 0, 'length': min(len(payload), 4096)},
+                      'artifact': artifact,
+                      'row': {'file': name, 'size': len(child),
+                              'sha256': None if flags else hashlib.sha256(child).hexdigest(),
+                              'lines': None if flags else lines, 'max_line': None if flags else max_line,
+                              'flags': sorted(flags)}})
+    return data, {**layout, 'files': files, 'tar_size': len(tar), 'tar_sha256': hashlib.sha256(tar).hexdigest(),
                   'gzip_size': len(data), 'gzip_sha256': hashlib.sha256(data).hexdigest()}
 
 
@@ -106,20 +138,6 @@ def npm_tgz():
                ('package/README.md', b'Inert fixture; no installation or execution.\n', b'0', '')]
     tar, layout = tar_bytes(entries)
     marks = {'package/index.js': imarks, 'package/lib/net.mjs': nmarks, 'package/src/types.ts': tmarks}
-    files = []
-    for member in layout['members']:
-        if member['kind'] != '0' or not F.is_javascript(member['name']):
-            continue
-        child = member['data']
-        lines, max_line = F.line_metrics(child)
-        anchor = ({'offset': 0, 'length': min(len(child), 4096)} if child else
-                  {'offset': member['header_offset'], 'length': BLOCK})
-        files.append({'name': member['name'], 'data': child, 'header_offset': member['header_offset'],
-                      'data_offset': member['data_offset'], 'anchor': anchor,
-                      'anchor_space': 'child' if child else 'tar',
-                      'row': {'file': F.escaped(member['name']), 'size': len(child),
-                              'sha256': hashlib.sha256(child).hexdigest(), 'lines': lines,
-                              'max_line': max_line, 'flags': []}})
     hints, modules, calls = [], [], []
     categories = {'child_process': 'shell', 'url': 'endpoint', 'process_call': 'shell', 'fetch': 'network',
                   'dynamic_import': 'dynamic_code', 'web_socket': 'network', 'atob': 'encoding'}
@@ -138,7 +156,7 @@ def npm_tgz():
                                 'length': size + 2 if label == 'child_process' else size,
                                 'row': {'file': name, 'form': 'require' if label == 'child_process' else 'import',
                                         'source': source, 'truncated': False}})
-    layout.update(files=files, marks=marks, hints=hints, modules=modules, calls=calls,
+    layout.update(marks=marks, hints=hints, modules=modules, calls=calls,
                   package={'name': 'package/package.json', 'data': package, 'strings': strings,
                            'rows': F.package_rows(strings, 'package/package.json')})
     return _wrapped(tar, layout)
