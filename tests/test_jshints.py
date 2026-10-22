@@ -126,6 +126,64 @@ class JsHintsTests(unittest.TestCase):
                     if name != "vm_run":
                         self.assertEqual(only(api + b"Extra(x)", name), [])
 
+    def test_process_calls_distinguish_bare_and_known_receivers_from_object_methods(self):
+        for api in (b"exec", b"execSync", b"execFile", b"execFileSync", b"spawn", b"spawnSync", b"fork"):
+            for receiver in (b"", b"child_process.", b"childProcess.", b"cp."):
+                token = receiver + api + b"("
+                with self.subTest(api=api, receiver=receiver):
+                    at = 3 if api == b"exec" else 3 + len(receiver)
+                    self.assertEqual(only(b"// " + token + b"x)", "process_call"), [
+                        (at, len(token) - (at - 3), "shell", "process_call"),
+                    ])
+            for receiver in (b"pattern.", b"/a(b)/.", b"other.", b"c."):
+                with self.subTest(api=api, excluded=receiver):
+                    expected = [] if api == b"exec" else [(len(receiver), len(api) + 1, "shell", "process_call")]
+                    self.assertEqual(only(receiver + api + b"(line)", "process_call"), expected)
+
+    def test_process_call_receiver_whitespace_and_identifier_boundaries(self):
+        for gap in (b"", b" ", b"\t", b"\n", b"\r", b"\v", b"\f", b" " * 64):
+            for receiver in (b"child_process", b"childProcess", b"cp"):
+                token = receiver + gap + b"." + gap + b"exec" + gap + b"("
+                with self.subTest(receiver=receiver, gap=gap):
+                    self.assertEqual(only(token + b"x)", "process_call"), [
+                        (0, len(token), "shell", "process_call"),
+                    ])
+            for receiver in (b"pattern", b"/re/"):
+                with self.subTest(excluded=receiver, gap=gap):
+                    self.assertEqual(only(receiver + gap + b"." + gap + b"exec(x)", "process_call"), [])
+        for prefix in (b"_", b"$", b"a", b"0", b".", b". "):
+            for call in (b"exec", b"cp.exec", b"childProcess.exec", b"child_process.exec"):
+                with self.subTest(prefix=prefix, call=call):
+                    self.assertEqual(only(prefix + call + b"(x)", "process_call"), [])
+        self.assertEqual(only(b"exec" + b" " * 65 + b"(x)", "process_call"), [])
+        for call in (b"execSync", b"execFile", b"execFileSync", b"spawn", b"spawnSync", b"fork"):
+            token = b"unknown . " + call + b" ("
+            with self.subTest(process_specific=call):
+                self.assertEqual(only(token + b"x)", "process_call"), [
+                    (10, len(call) + 2, "shell", "process_call"),
+                ])
+
+    def test_new_function_emits_one_hint_and_preserves_plain_constructors(self):
+        for gap in (b" ", b"\t", b"\n", b"\r", b"\v", b"\f", b" " * 64):
+            token = b"new" + gap + b"Function" + gap + b"("
+            with self.subTest(gap=gap):
+                self.assertEqual(list(jshints.scan(b"// " + token + b"x)")), [
+                    (3, len(token), "dynamic_code", "new_function"),
+                ])
+        for prefix in (b"", b"renew ", b"newer ", b"xnew ", b"$new ", b"_new "):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(list(jshints.scan(prefix + b"Function(x)")), [
+                    (len(prefix), 9, "dynamic_code", "function_constructor"),
+                ])
+
+    def test_constructor_deduplication_keeps_later_and_overlapping_hints(self):
+        data = b"Function(x); new Function(x); new\tFunction (x); eval(x)"
+        expected = []
+        for token, name in ((b"Function(", "function_constructor"), (b"new Function(", "new_function"),
+                            (b"new\tFunction (", "new_function"), (b"eval(", "eval")):
+            expected.append((data.index(token), len(token), "dynamic_code", name))
+        self.assertEqual(list(jshints.scan(data)), expected)
+
     def test_credentials_have_literal_values_and_exact_id_boundaries(self):
         for key in (b"api_key", b"apiKey", b"API-KEY", b"secret", b"token", b'"token"', b"'secret'"):
             for sep in (b":", b"="):
@@ -186,9 +244,7 @@ class JsHintsTests(unittest.TestCase):
                     if label in direct:
                         category, name = direct[label]
                         expected.append((at, length, category, name))
-                    if label == "new_function":
-                        expected.append((at + 4, 9, "dynamic_code", "function_constructor"))
-                    elif label == "require_child_process":
+                    if label == "require_child_process":
                         expected.append((at + 9, 13, "shell", "child_process"))
                     elif label in ("websocket", "xhr"):
                         name = "web_socket" if label == "websocket" else "xml_http_request"
@@ -208,7 +264,6 @@ class JsHintsTests(unittest.TestCase):
             (0, 29, "credential", "credential_assignment"),
             (7, 21, "endpoint", "url"), (15, 13, "endpoint", "ipv4_port"),
             (31, 13, "dynamic_code", "new_function"),
-            (35, 9, "dynamic_code", "function_constructor"),
             (48, 5, "dynamic_code", "eval"),
         ])
         patterns = (("z_first", "shell", re.compile(b"x")), ("a_second", "network", re.compile(b"xy")))
