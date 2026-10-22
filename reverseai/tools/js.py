@@ -4,7 +4,7 @@ from reverseai.contract import (
     ArgSpec, ContractError, Location, MAX_EXCERPT_BYTES, Observation, OperationSpec,
     ToolRef, ToolSpec, sha256_hex,
 )
-from reverseai.tools import apk, jsonpos
+from reverseai.tools import apk, asar, jsonpos
 
 MAX_READ_BYTES = 128 * 1024 * 1024
 _SUFFIXES = ('.js', '.mjs', '.cjs', '.jsx', '.ts', '.tsx')
@@ -25,6 +25,9 @@ def _javascript_name(name):
 
 
 def _members(data, *, include_flagged=False):
+    if data.startswith(asar.MAGIC):
+        return tuple(member for member in asar.members(data)
+                     if _javascript_name(member.name) and (include_flagged or not member.flags))
     try:
         return tuple(member for member in apk.members(data)
                      if _javascript_name(member.name) and (include_flagged or not member.flags))
@@ -49,8 +52,9 @@ def _sources(data, members):
         if total > MAX_READ_BYTES:
             raise ContractError('JavaScript read budget exceeded')
         # These clean descriptors came from one parse of these exact bytes.
-        child, _ = apk._materialize(data, member)
-        yield apk.escape(member.name), child, apk.artifact(member, child), member
+        archive = asar if isinstance(member, asar.AsarMember) else apk
+        child, _ = archive._materialize(data, member)
+        yield apk.escape(member.name), child, archive.artifact(member, child), member
 
 
 def _page(rows, args):

@@ -48,8 +48,9 @@ class Document:
 
 
 class _Reader:
-    def __init__(self, data):
+    def __init__(self, data, max_tokens):
         self.data, self.position, self.tokens = data, 0, []
+        self.max_tokens = max_tokens
         self.current = self.next()
 
     def next(self):
@@ -58,7 +59,7 @@ class _Reader:
         if start == len(data):
             self.position = start
             return None
-        _check(len(self.tokens) < MAX_TOKENS)
+        _check(len(self.tokens) < self.max_tokens)
         byte, end = data[start], start + 1
         if byte in b'{}[]:,':
             kind = value = chr(byte)
@@ -131,16 +132,19 @@ class _Reader:
         return Node(value, token.start, end, tuple(children))
 
 
-def parse(data):
+def parse(data, *, max_bytes=None, max_tokens=None):
     """Return Document(root, tokens); all spans address the original bytes.
 
     At most 64 nested containers are admitted. Strings and object keys decode
     JSON escapes; duplicate decoded keys and isolated UTF-16 surrogates fail.
     """
-    _check(isinstance(data, bytes) and len(data) <= MAX_BYTES)
+    max_bytes = MAX_BYTES if max_bytes is None else max_bytes
+    max_tokens = MAX_TOKENS if max_tokens is None else max_tokens
+    _check(type(max_bytes) is int and max_bytes >= 0 and type(max_tokens) is int and max_tokens >= 0)
+    _check(isinstance(data, bytes) and len(data) <= max_bytes)
     _check(not data.startswith(b"\xef\xbb\xbf"))
     try:
-        reader = _Reader(data)
+        reader = _Reader(data, max_tokens)
         root = reader.node()
         _check(reader.current is None)
         return Document(root, tuple(reader.tokens))
