@@ -1080,7 +1080,8 @@ contract above is unchanged.
   the same bytes: entries sorted, timestamp 1980-01-01 00:00:00, modes 0644):
   every `reverseai/**/*.py` (no `__pycache__`), the five locks copied to
   `reverseai/_locks/<tool>.json` from `containers/<tool>/image.lock.json` (`lief`,
-  `yarax`, `ghidra`, `jadx`, `jsparser`), and `reverseai-0.6.0.dist-info/` with
+  `yarax`, `ghidra`, `jadx`, `jsparser`) with the YARA-X ruleset as
+  `reverseai/_locks/m2_fixture_v1.json` (decision `m6-seams-p`), and `reverseai-0.6.0.dist-info/` with
   `METADATA` (Name, Version, Summary, Requires-Python, the README as Markdown
   description), `WHEEL` (purelib, tag `py3-none-any`), `entry_points.txt`,
   `THIRD_PARTY_NOTICES.md` and a `RECORD` with SHA-256 and sizes. No tests,
