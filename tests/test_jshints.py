@@ -48,19 +48,20 @@ def only(data, hint):
 
 class JsHintsTests(unittest.TestCase):
     def test_parser_callees_are_the_closed_names_of_the_hint_call_families(self):
-        expected = frozenset('''eval Function exec execSync execFile execFileSync spawn spawnSync fork
+        expected = frozenset('''eval Function child_process.exec childProcess.exec cp.exec
+            execSync execFile execFileSync spawn spawnSync fork
             runInNewContext runInThisContext runInContext fetch XMLHttpRequest WebSocket
             atob btoa fromCharCode Buffer.from http.get https.get http.request https.request
             net.connect tls.connect net.createConnection dgram.createSocket fs.write fs.writeSync fs.writev fs.writevSync
             writeFile writeFileSync appendFile appendFileSync unlink unlinkSync rm rmSync rmdir rmdirSync chmod chmodSync
-            fchmod fchmodSync lchmod lchmodSync setTimeout setInterval require'''.split())
+            fchmod fchmodSync lchmod lchmodSync'''.split())
         self.assertIsInstance(getattr(jshints, 'CALLEES', None), frozenset)
         self.assertEqual(jshints.CALLEES, expected)
         self.assertNotIn('readFile', jshints.CALLEES)
         self.assertNotIn('runInUnknownContext', jshints.CALLEES)
         self.assertTrue(jshints.CALLEES.isdisjoint({
             'import', 'get', 'from', 'request', 'connect', 'createConnection', 'createSocket',
-            'write', 'writeSync', 'writev', 'writevSync',
+            'write', 'writeSync', 'writev', 'writevSync', 'exec', 'setTimeout', 'setInterval', 'require',
         }))
 
     def test_catalog_names_categories_bytes_and_order(self):
