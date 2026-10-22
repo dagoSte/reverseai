@@ -1,13 +1,11 @@
 """Derived Ghidra analysis through the contained worker; the host verifies its anchors."""
 
-from pathlib import Path
-
-from reverseai.contained import ContainedError, DockerExecutor, inspect_image, load_lock
+from reverseai.contained import ContainedError, DockerExecutor, default_lock, inspect_image, load_lock
 from reverseai.contract import ArgSpec, ContractError, OperationSpec, ToolRef, ToolSpec, WorkerError, parse_worker_reply, sha256_hex
 from reverseai.tools import ghidra_verify
 
 REF = ToolRef("ghidra", "12.1.4-r6")
-DEFAULT_LOCK = Path(__file__).resolve().parents[2] / "containers/ghidra/image.lock.json"
+DEFAULT_LOCK = default_lock("ghidra")
 
 
 def make_tool(executor=None):
