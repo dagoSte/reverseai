@@ -6,7 +6,7 @@ from reverseai.contained import ContainedError, DockerExecutor, inspect_image, l
 from reverseai.contract import ArgSpec, OperationSpec, ToolRef, ToolSpec, sha256_hex
 from reverseai.tools import jsparser_verify
 
-REF = ToolRef('jsparser', '8.0.4-r1')
+REF = ToolRef('jsparser', '8.0.4-r2')
 DEFAULT_LOCK = Path(__file__).resolve().parents[2] / 'containers/jsparser/image.lock.json'
 
 

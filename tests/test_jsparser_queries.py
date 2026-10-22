@@ -23,7 +23,7 @@ from reverseai.gateway import Gateway
 NAME = 'analyze_javascript_application'
 DATA = b'/* inert Python-built fixture; never evaluated */\n' * 32
 INPUT = InputRef(sha256_hex(DATA), len(DATA), 'fixture.js')
-REF = ToolRef('jsparser', '8.0.4-r1')
+REF = ToolRef('jsparser', '8.0.4-r2')
 SCHEMA = {
     'file': ArgSpec('identity', 0, 255, default=''),
     'kind': ArgSpec('enum', choices=('modules', 'calls', 'parse'), default='modules'),
@@ -77,7 +77,7 @@ class JavaScriptSyntaxQueryTests(unittest.TestCase):
     def test_new_details_require_an_exact_registered_pin_before_the_gateway(self):
         for detail in SHAPES:
             for tools, reason in (((), 'Query operation unavailable'),
-                                  ((replace(self.tool, ref=ToolRef('jsparser', '8.0.4-r2')),),
+                                  ((replace(self.tool, ref=ToolRef('jsparser', '8.0.4-r1')),),
                                    'Query JavaScript parser version unavailable')):
                 with self.subTest(detail=detail, tools=bool(tools)), \
                         patch.object(Gateway, 'run', side_effect=AssertionError('operation ran')) as run:
@@ -176,7 +176,7 @@ class JavaScriptSyntaxQueryTests(unittest.TestCase):
         self.assertEqual(len(query.conclude(task, (good,))), 1)
         module = {'kind': 'js_module', 'index': 0, 'total': 1, **SHAPES['modules'][1]}
         for item in (make_evidence(b'x' * len(DATA), REF, 'jsparser.syntax', Observation(Location(0, 1), value)),
-                     make_evidence(DATA, ToolRef('jsparser', '8.0.4-r2'), 'jsparser.syntax', Observation(Location(0, 1), value)),
+                     make_evidence(DATA, ToolRef('jsparser', '8.0.4-r1'), 'jsparser.syntax', Observation(Location(0, 1), value)),
                      make_evidence(DATA, REF, 'jsparser.other', Observation(Location(0, 1), value)),
                      make_evidence(DATA, REF, 'jsparser.syntax', Observation(Location(0, 1), module)),
                      make_evidence(DATA, REF, 'jsparser.syntax', Observation(Location(0, 1), {**value, 'index': True}))):
@@ -268,7 +268,7 @@ class JavaScriptSyntaxCliTests(unittest.TestCase):
                 self.assertEqual(self.written, {})
 
     def test_wrong_pin_and_failed_parser_write_no_reports(self):
-        bad = replace(self.tool, ref=ToolRef('jsparser', '8.0.4-r2'))
+        bad = replace(self.tool, ref=ToolRef('jsparser', '8.0.4-r1'))
         failed = fake_parser([], failure=ContractError(SECRET))
         for tool in (bad, failed):
             with self.subTest(version=tool.ref.version):

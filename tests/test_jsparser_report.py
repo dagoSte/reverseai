@@ -15,7 +15,7 @@ from reverseai.review import review
 
 DATA = b"/* inert report fixture; never evaluated */\n" * 32
 INPUT = InputRef(sha256_hex(DATA), len(DATA), "fixture.js")
-PARSER = ToolRef("jsparser", "8.0.4-r1")
+PARSER = ToolRef("jsparser", "8.0.4-r2")
 DERIVED = "## Derived by analysis tools (not verified against the bytes)"
 SYNTAX = "### JavaScript syntax (parser's reading)"
 CASES = {

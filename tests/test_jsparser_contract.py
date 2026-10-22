@@ -11,7 +11,7 @@ from reverseai.review import review
 
 DATA = bytes(range(256)) * 4
 INPUT = InputRef(sha256_hex(DATA), len(DATA), "app.zip")
-PARSER = ToolRef("jsparser", "8.0.4-r1")
+PARSER = ToolRef("jsparser", "8.0.4-r2")
 CASES = {
     ("javascript.modules", "js_module"): (
         {"file": "lib/index.js", "form": "require", "source": "child_process", "truncated": False},
