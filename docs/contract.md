@@ -811,7 +811,8 @@ evaluates the sample.
   rows `[file, size, sha256, lines, max_line]`.
 - `js.package`: args `file` literal 0..255 default "" ("" for the `package.json`
   with the fewest path segments, the first in central directory order on a tie;
-  for a single-file input, the input), `start` 0..65535, `limit` 1..256 default
+  for a single-file input, the input when its first byte that is not JSON
+  whitespace is `{`, else no rows; decision `m5a-bundle-summary`), `start` 0..65535, `limit` 1..256 default
   128. The file is parsed by a bounded JSON reader that records byte positions:
   at most 1 MiB, depth 64 and 65,536 tokens; invalid JSON or a duplicate key in
   one object fails the operation. Rows are the string values of these fields, in
