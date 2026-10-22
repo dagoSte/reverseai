@@ -6,10 +6,11 @@ ReverseAI is an experimental project for coordinated, static reverse engineering
 of untrusted files. Specialist agents will use narrowly defined analysis tools
 in parallel, then a reviewer will check the evidence behind their conclusions.
 
-**Status: M5c — npm package tarballs as byte-anchored inputs.**
-For a JavaScript ZIP, an Electron ASAR archive, an npm tarball (`.tgz`) or a single bundle, the host lists files, reads package.json
-declarations with exact byte positions, and finds lexical hints at their matched
-byte ranges (M5a). With M5b, a pinned parser (Node.js 24.22.1 with @babel/parser
+**Status: M5c: npm package tarballs as byte-anchored inputs.**
+For a JavaScript ZIP, an Electron ASAR archive, an npm tarball (`.tgz`) or a single
+bundle, the host lists files, reads package.json declarations with exact byte
+positions, and finds lexical hints at their matched byte ranges.
+With M5b, a pinned parser (Node.js 24.22.1 with @babel/parser
 8.0.4) reads JavaScript, JSX and TypeScript as data in its own locked container and
 reports where module sources and calls to a fixed list of sensitive functions stand;
 the host turns every answer into exact bytes and re-derives the value from them. No
@@ -205,7 +206,6 @@ Known limits, by design:
   Trailing data, concatenated gzip streams, truncation and bad checksums refuse
   the operation. Symlinks, hard links and unsafe names are flagged; their rows
   cite the tar header rather than passing a payload to an analyzer.
-
 - ELF, PE and thin little-endian Mach-O headers, sections and imports are parsed;
   big-endian and universal Mach-O files are identified only. String indicators and signature rules are
   lexical hints, never proof of behaviour.
