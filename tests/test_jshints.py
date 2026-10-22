@@ -47,6 +47,17 @@ def only(data, hint):
 
 
 class JsHintsTests(unittest.TestCase):
+    def test_parser_callees_are_the_closed_names_of_the_hint_call_families(self):
+        expected = frozenset('''eval Function exec execSync execFile execFileSync spawn spawnSync fork
+            runInNewContext runInThisContext runInContext fetch XMLHttpRequest WebSocket request get connect
+            createConnection createSocket atob btoa fromCharCode from write writeSync writeFile writeFileSync
+            writev writevSync appendFile appendFileSync unlink unlinkSync rm rmSync rmdir rmdirSync chmod chmodSync
+            fchmod fchmodSync lchmod lchmodSync setTimeout setInterval import require'''.split())
+        self.assertIsInstance(getattr(jshints, 'CALLEES', None), frozenset)
+        self.assertEqual(jshints.CALLEES, expected)
+        self.assertNotIn('readFile', jshints.CALLEES)
+        self.assertNotIn('runInUnknownContext', jshints.CALLEES)
+
     def test_catalog_names_categories_bytes_and_order(self):
         self.assertIsInstance(jshints.PATTERNS, tuple)
         self.assertEqual([(name, category) for name, category, _ in jshints.PATTERNS],
