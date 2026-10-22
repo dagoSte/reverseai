@@ -216,12 +216,13 @@ class HostTests(unittest.TestCase):
     def test_byte_clipping_keeps_a_complete_unicode_escape(self):
         args = {'prototype': '(I)I', 'start': 7, 'max_chars': 2048}
         base, _ = self.admitted(args, change=lambda r: [{**r[0], 'total': 2055, 'text': '\\' * 2048}])
-        begin = len(base[0].value['text']) - 2
+        begin = len(base[0].value['text']) - 3
         text = '\\' * begin + r'\u1234' + '\\' * (2048 - begin - 6)
         plain_cut = max(i for i in range(len(text) + 1) if len(canonical_json(
             {**base[0].value, 'text': text[:i]}).encode()) <= MAX_OBSERVATION_BYTES)
-        self.assertLess(begin, plain_cut)
-        self.assertLess(plain_cut, begin + 6)
+        # Keep the fourth hex digit beyond the byte limit: a three-digit
+        # escape matcher must not mistake this prefix for a complete escape.
+        self.assertEqual(plain_cut, begin + 5)
         rows, _ = self.admitted(args, change=lambda r: [{**r[0], 'total': 2055, 'text': text}])
         self.assertEqual(rows[0].value['text'], text[:begin])
         self.assertEqual((rows[0].value['start'], rows[0].value['total']), (7, 2055))
@@ -238,14 +239,44 @@ class HostTests(unittest.TestCase):
                     self.invoke({'start': start}, change=lambda rows: [
                         {**r, 'status': status, 'total': 0, 'text': ''} for r in rows])
 
+    def test_success_pages_have_exact_worker_length_before_byte_clipping(self):
+        # Decision next-carries requires a full worker page before host clipping.
+        for status in ('ok', 'fallback'):
+            for start, total, maximum in ((0, 1, 64), (0, 200, 64), (7, 200, 64),
+                                          (7, 20, 64), (7, 2055, 2048),
+                                          (20, 20, 64), (21, 20, 64)):
+                with self.subTest(status=status, start=start, total=total, maximum=maximum):
+                    expected = min(maximum, total - min(start, total))
+                    text = '"' * expected
+                    def page(rows):
+                        return [{**r, 'status': status, 'total': total, 'text': text} for r in rows]
+                    rows, _ = self.admitted({'start': start, 'max_chars': maximum}, change=page)
+                    self.assertEqual(len(rows), 2)
+                    for row in rows:
+                        self.assertEqual((row.value['start'], row.value['total']), (min(start, total), total))
+                        self.assertEqual(row.value['form'], 'java' if status == 'ok' else 'fallback')
+                        self.assertLessEqual(len(canonical_json(row.value).encode()), MAX_OBSERVATION_BYTES)
+                        if maximum == 64:
+                            self.assertEqual(row.value['text'], text)
+                        else:
+                            self.assertLess(len(row.value['text']), len(text))
+                    if expected:
+                        for length in sorted({0, expected - 1}):
+                            with self.subTest(length=length), self.assertRaisesRegex(ContractError, jadx_verify.REFUSED):
+                                self.invoke({'start': start, 'max_chars': maximum}, change=lambda r: [
+                                    page(r)[0], {**page(r)[1], 'text': text[:length]}])
+
     def test_explicit_member_must_name_a_classes_dex_member(self):
         child, _ = F.classes_dex()
         data, _ = zip_bytes([('classes.dex', child), ('assets/x.dex', child)])
         for member in ('assets/x.dex', 'missing.dex', 'classes3.dex'):
-            executor = Executor(self.layout)
-            with self.subTest(member=member), self.assertRaisesRegex(ContractError, jadx_verify.REFUSED):
-                self.invoke({'member': member}, executor=executor, data=data)
-            self.assertEqual(executor.calls, [])
+            with self.subTest(member=member):
+                executor = Executor(self.layout)
+                # Decision next-carries gives member selection its own fixed message.
+                with self.assertRaises(ContractError) as caught:
+                    self.invoke({'member': member}, executor=executor, data=data)
+                self.assertEqual(str(caught.exception), 'JADX member is not a classes*.dex member of the input')
+                self.assertEqual(executor.calls, [])
         rows, executor = self.invoke({'member': 'classes.dex', 'method': 'absent'})
         self.assertEqual((rows, executor.calls), ((), []))
 
