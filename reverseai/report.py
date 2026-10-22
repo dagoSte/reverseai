@@ -270,6 +270,11 @@ JAVASCRIPT_PAGES = {
     "javascript.package": ("File", "Path", "Value", "Truncated", "Runs on install"),
     "javascript.hints": ("File", "Category", "Hint", "Text", "Truncated"),
 }
+JAVASCRIPT_SYNTAX_PAGES = {
+    "javascript.modules": ("File", "Form", "Source", "Truncated"),
+    "javascript.calls": ("File", "Callee"),
+    "javascript.parse": ("File", "Status", "Errors"),
+}
 
 
 def _runs(indexes):
@@ -283,31 +288,35 @@ def _runs(indexes):
     return runs
 
 
-def _javascript_details(rows, args=None):
-    """M5a: files, package.json declarations and hints by category; rows of one page are merged across findings,
-    and a row no supported finding shows is never covered by a displayed range (RD-M5A-CODEX-F R1)."""
-    lines = ["", "## JavaScript application", "",
-             "Hints are lexical: occurrences of fixed patterns in the bytes, comments and strings included, not evidence "
-             "that the code runs. M5a reads no JavaScript syntax and runs nothing."]
-    pages = {key: ({}, set()) for key in JAVASCRIPT_PAGES}
+def _javascript_details(rows, args=None, *, syntax=False):
+    """M5a lexical or M5b derived syntax pages, combining findings without spanning unshown rows."""
+    columns_by_key = JAVASCRIPT_SYNTAX_PAGES if syntax else JAVASCRIPT_PAGES
+    lines = (["", "### JavaScript syntax (parser's reading)", "",
+              "Syntax roles are the pinned parser's reading (derived); their anchors cite host-checked bytes. "
+              "The sample was not executed."] if syntax else
+             ["", "## JavaScript application", "",
+              "Hints are lexical: occurrences of fixed patterns in the bytes, comments and strings included, not evidence "
+              "that the code runs. M5a reads no JavaScript syntax and runs nothing."])
+    pages = {key: ({}, set()) for key in columns_by_key}
     for _, finding in rows:
         found, totals = pages.get(finding["claim_key"], (None, None))
         value = finding["value"]
         if found is None or not isinstance(value, dict) or type(value.get("start")) is not int \
                 or not isinstance(value.get("rows"), list):
             continue
-        width = len(JAVASCRIPT_PAGES[finding["claim_key"]]) - (finding["claim_key"] == "javascript.package")
+        width = len(columns_by_key[finding["claim_key"]]) - (finding["claim_key"] == "javascript.package")
         found.update((index, row) for index, row in enumerate(value["rows"], value["start"])
                      if isinstance(row, list) and len(row) == width)
         totals.add(value.get("total"))
     if not any(found for found, _ in pages.values()):
-        return lines + ["", "No JavaScript row was supported."]
+        return [] if syntax else lines + ["", "No JavaScript row was supported."]
     for key, (found, totals) in pages.items():
         if not found:
             continue
         runs = _runs(sorted(found))
         total = totals.pop() if len(totals) == 1 else "?"
-        lines += ["", f"### {claims.statement(key)}", "",
+        level = "####" if syntax else "###"
+        lines += ["", f"{level} {claims.statement(key)}", "",
                   "rows " + ", ".join(f"{first}..{last}" for first, last in runs) + f" of {total}"]
         # The page asked for rows from its start (0 in a summary): the first one not shown is where to continue.
         start = (args or {}).get("start", 0) if (args or {}).get("detail") != "summary" else 0
@@ -322,7 +331,7 @@ def _javascript_details(rows, args=None):
             order = {name: i for i, name in enumerate(claims.JS_CATEGORIES)}
             categories = sorted({found[i][1] for i in found}, key=lambda c: (order.get(c, len(order)), str(c)))
             groups = [(category, [i for i in sorted(found) if found[i][1] == category]) for category in categories]
-        columns = JAVASCRIPT_PAGES[key]
+        columns = columns_by_key[key]
         for category, indexes in groups:
             if category is not None:
                 lines += ["", f"#### {_cell(category)}"]
@@ -390,9 +399,11 @@ def to_markdown(analysis):
         lines += ["", "## Derived by analysis tools (not verified against the bytes)", ""] + table(derived)
         lines += _code_details(derived)
         lines += _java_details(derived, report["tools"])
+        lines += _javascript_details(derived, analysis.query["args"] if analysis.query is not None else None, syntax=True)
     if analysis.query is not None:
         lines += _query_details(supported + derived)
-        if analysis.query["name"] == "analyze_javascript_application":
+        if analysis.query["name"] == "analyze_javascript_application" and analysis.query["args"].get("detail") in (
+                "summary", "files", "package", "hints"):
             lines += _javascript_details(supported + derived, analysis.query["args"])
     lines += ["", "## Rejected or unreviewed claims", ""]
     if rejected:

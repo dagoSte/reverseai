@@ -80,8 +80,11 @@ def query_bytes(data, ref, name, args, tools=TOOLS):
     with_jadx = any(request.operation == "jadx.method" for request in requests)
     if with_jadx and registered["jadx.method"].ref != query.REFS["jadx"]:
         raise ContractError("Query JADX version unavailable")
+    with_jsparser = any(request.operation == "jsparser.syntax" for request in requests)
+    if with_jsparser and registered["jsparser.syntax"].ref != query.REFS["jsparser"]:
+        raise ContractError("Query JavaScript parser version unavailable")
     with_android = any(request.operation.startswith(("apk.", "dex.")) for request in requests)
-    with_javascript = any(request.operation.startswith("js.") for request in requests)
+    with_javascript = any(request.operation.startswith(("js.", "jsparser.")) for request in requests)
     budget = (GHIDRA_BUDGET if spec.role == "code" else JADX_BUDGET if with_jadx
               else ANDROID_QUERY_BUDGET if with_android else JAVASCRIPT_QUERY_BUDGET if with_javascript else Budget())
     task_seconds = 300 if spec.role == "code" else 150 if with_jadx else budget.max_wall_seconds

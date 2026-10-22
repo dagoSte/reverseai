@@ -5,7 +5,8 @@ from reverseai.contract import MAX_EVIDENCE_PER_FINDING, ToolRef, evidence_intac
 
 REFS = {"structure": ToolRef("structure", "0.1.0"), "strings": ToolRef("strings", "0.1.0"),
         "ghidra": ToolRef("ghidra", "12.1.4-r6"), "apk": ToolRef("apk", "0.1.0"), "dex": ToolRef("dex", "0.1.0"),
-        "jadx": ToolRef("jadx", "1.5.6-r1"), "js": ToolRef("js", "0.1.0")}
+        "jadx": ToolRef("jadx", "1.5.6-r1"), "js": ToolRef("js", "0.1.0"),
+        "jsparser": ToolRef("jsparser", "8.0.4-r1")}
 JAVA_FIELDS = ("dex", "class", "name", "prototype", "form", "start", "total", "text")
 PAGES = {
     "structure.segments": ("segment", "segments.list", ("name", "offset", "filesz", "address", "memsz", "readable", "writable", "executable")),
@@ -26,6 +27,12 @@ PAGES = {
     "js.package": ("package_field", "javascript.package", ("file", "path", "value", "truncated")),
     "js.hints": ("js_hint", "javascript.hints", ("file", "category", "hint", "text", "truncated")),
 }
+PARSER_PAGES = {
+    "modules": ("js_module", "javascript.modules", ("file", "form", "source", "truncated")),
+    "calls": ("js_call", "javascript.calls", ("file", "callee")),
+    "parse": ("js_parse", "javascript.parse", ("file", "status", "errors")),
+}
+PARSER_CLAIMS = frozenset(page[1] for page in PARSER_PAGES.values())
 PERMISSION_ELEMENTS = ("uses-permission", "uses-permission-sdk-23")
 SINGLES = {
     ("structure.entry", "entry"): ("load.entry", ("address", "offset")),
@@ -55,7 +62,8 @@ def conclude(task, evidence):
 
     def emit(key, value, items):
         findings.append(make_finding(task.role, "Query result.", key, value, [item.id for item in items],
-                                     "inferred" if key.startswith("code.") or key == "android.java" else "observed"))
+                                     "inferred" if key.startswith("code.") or key == "android.java"
+                                     or key in PARSER_CLAIMS else "observed"))
 
     # The overview reuses the existing structural conclusions; imports are additional query results.
     if "structure.identify" in allowed:
@@ -66,8 +74,13 @@ def conclude(task, evidence):
             for item in items:
                 if item.observation.get("kind") == "java" and set(JAVA_FIELDS) <= set(item.observation):
                     emit("android.java", {field: item.observation[field] for field in JAVA_FIELDS}, [item])
-        if operation in PAGES:
-            kind, key, fields = PAGES[operation]
+        page = PAGES.get(operation)
+        if operation == "jsparser.syntax":
+            selected = next(request.args.get("kind", "modules") for request in task.operations
+                            if request.operation == operation)
+            page = PARSER_PAGES.get(selected) if isinstance(selected, str) else None
+        if page is not None:
+            kind, key, fields = page
             rows = [item for item in items if item.observation.get("kind") == kind]
             if not rows or any(type(item.observation.get("index")) is not int
                                or type(item.observation.get("total")) is not int
