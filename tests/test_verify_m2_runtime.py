@@ -4488,7 +4488,7 @@ class JadxNativeFlowTests(unittest.TestCase):
 
 
 
-JSPARSER_PINS = {"adapter_version": "8.0.4-r1", "platform": "linux/arm64", "image_id": IMAGE_ID, **verifier.JSPARSER_PINS}
+JSPARSER_PINS = {"adapter_version": "8.0.4-r2", "platform": "linux/arm64", "image_id": IMAGE_ID, **verifier.JSPARSER_PINS}
 JSPARSER_PROFILE = {"pids": 64, "memory": "2g", "cpus": 2, "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=64m",
                     "wall_seconds": 120}
 
@@ -4546,9 +4546,9 @@ class JsparserNativeContractTests(unittest.TestCase):
         self.assertEqual(verifier.limits("jsparser"),
                          (64, 2 * 1024**3, 2_000_000_000, "rw,noexec,nosuid,nodev,size=64m", 120))
         checks = verifier.required_checks("jsparser")
-        self.assertEqual(len(checks), 3 + len(verifier.CONTROL_NAMES) + 11)
-        self.assertEqual(verifier.native_runs("jsparser"), len(verifier.CONTROL_NAMES) + 11)
-        self.assertEqual(verifier.lock_options("jsparser"), {"adapter_version": "8.0.4-r1"})
+        self.assertEqual(len(checks), 3 + len(verifier.CONTROL_NAMES) + 13)
+        self.assertEqual(verifier.native_runs("jsparser"), len(verifier.CONTROL_NAMES) + 13)
+        self.assertEqual(verifier.lock_options("jsparser"), {"adapter_version": "8.0.4-r2"})
         verifier.verify_jsparser_executor_profile(JsparserFakeBoundary())
         for change in ({"pids": 256}, {"memory": "512m"}, {"cpus": 1}, {"cpus": 2.0}, {"wall_seconds": 240},
                        {"tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=512m"}, {"extra": 1}):
@@ -4615,6 +4615,12 @@ class JsparserNativeContractTests(unittest.TestCase):
         with self.assertRaisesRegex(verifier.VerificationError, "KnownAnswerFixture"):
             verifier.jsparser_cases(changed)
         self.assertEqual(cases["input_mismatch"][1]["files"][1]["artifact"]["sha256"], "0" * 64)
+        # M5c: the tarball cases read method 1 children of one gzip stream; the tampered one differs only in its trailer
+        good, bad = fixtures["js_tarball"], fixtures["js_tarball_bad"]
+        self.assertEqual((len(good), good[:-8], good[-7:]), (len(bad), bad[:-8], bad[-7:]))
+        self.assertNotEqual(good[-8], bad[-8])
+        self.assertEqual({entry["artifact"]["method"] for entry in cases["tarball_calls"][1]["files"]}, {1})
+        self.assertEqual(cases["tarball_calls"][1]["files"], cases["tarball_tampered"][1]["files"])
 
     def test_the_known_answers_bind_to_the_fixture_bytes(self):
         """An independent reading of the pinned answers: statuses from the bytes, items at quoted literals or callee
@@ -4627,12 +4633,17 @@ class JsparserNativeContractTests(unittest.TestCase):
         chain = re.compile(rb"[$A-Za-z_][$A-Za-z0-9_]*(?:\.[$A-Za-z_][$A-Za-z0-9_]*){0,3}")
         for case, (fixture, args) in verifier.jsparser_cases(fixtures).items():
             expected = verifier.JSPARSER_EXPECTED[case]
-            if case == "input_mismatch":
+            if case in ("input_mismatch", "tarball_tampered"):
                 self.assertEqual(expected, {"error": "input"})
                 continue
             data = fixtures[fixture]
             if args["files"][0]["artifact"] is None:
                 children = [data]
+            elif args["files"][0]["artifact"]["method"] == 1:  # M5c: ranges of the inflated gzip stream
+                import gzip
+                stream = gzip.decompress(data)
+                children = [stream[entry["artifact"]["inner_offset"]:entry["artifact"]["inner_offset"]
+                                   + entry["artifact"]["size"]] for entry in args["files"]]
             else:
                 with zipfile.ZipFile(io.BytesIO(data)) as archive:
                     children = [archive.read(entry["artifact"]["member"]) for entry in args["files"]]
@@ -4716,7 +4727,7 @@ class JsparserNativeContractTests(unittest.TestCase):
             calls.append((argv, timeout))
             return b"{}"
 
-        executor = contained.DockerExecutor(lock, runner=runner, adapter_version="8.0.4-r1",
+        executor = contained.DockerExecutor(lock, runner=runner, adapter_version="8.0.4-r2",
                                             inspect=lambda image_id: image_id, staging_root=root)
         for case, (fixture, args) in verifier.jsparser_cases(fixtures).items():
             data = fixtures[fixture]

@@ -27,7 +27,7 @@ GHIDRA_VERSION = "12.1.4-r6"
 GHIDRA_OPERATIONS = frozenset(("ghidra.analyze", "ghidra.functions", "ghidra.function", "ghidra.xrefs"))
 JADX_VERSION = "1.5.6-r1"
 JADX_WALL_SECONDS = 120
-JSPARSER_VERSION = "8.0.4-r1"
+JSPARSER_VERSION = "8.0.4-r2"
 JSPARSER_WALL_SECONDS = 120
 GHIDRA_PINS = MappingProxyType({
     "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",

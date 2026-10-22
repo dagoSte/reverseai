@@ -4,12 +4,16 @@ Entrypoint (docs/contract.md, "JavaScript syntax through a pinned parser (M5b, c
     python3 -I -B /opt/reverseai/worker.py jsparser.syntax <canonical JSON of the request>
 
 The request (decision m5b-seams-w) is {"files": [{"artifact", "dialect"}], "kind", "start", "limit", "callees"}: 1..64
-files in the host's order, each a ZIP member named by its contract artifact (member, method, data_offset,
-compressed_size, size, crc32, sha256; at most 32 MiB in all) or, for a single file, null for the snapshot itself; the
+files in the host's order, each a ZIP or ASAR member named by its contract artifact (member, method, data_offset,
+compressed_size, size, crc32, sha256; at most 32 MiB in all), a file inside an npm tarball named by a method 1 artifact
+(the same keys and inner_offset, decision m5c-contract), or, for a single file, null for the snapshot itself; the
 dialect js, jsx, ts or tsx (it fixes the parser plugins); kind modules, calls or parse; the page start and limit; and
 the callee entries, sorted, one name or a receiver and a name (decision m5b-callee-suffix). The worker re-materializes
 every member from the snapshot into /tmp with a bounded inflate and refuses the run ("input") unless its size, CRC-32
-and SHA-256 equal the artifact. It then runs the fixed driver baked into the image (Node.js 24.22.1 and @babel/parser
+and SHA-256 equal the artifact. A method 1 artifact names a range of the stream obtained by inflating one whole gzip
+member at data_offset..data_offset + compressed_size, checked as contract.inflate_stream checks it (header, bounded
+chunks within min(128 MiB, 100 x compressed_size), trailer CRC-32 and ISIZE, nothing after it); each distinct stream
+is inflated once per run. It then runs the fixed driver baked into the image (Node.js 24.22.1 and @babel/parser
 8.0.4, decision m5b-w-plan) with a fixed heap, code generation from strings disallowed, the permission model limited to
 reading the driver's folder and the work folder, and a timeout below the 120 s wall. It checks the driver's answer
 before emitting one reply whose observations are one row per file in request order (decision m5b-seams-h):
@@ -33,7 +37,7 @@ import sys
 import zlib
 
 PROTOCOL = "reverseai.worker/1"
-ADAPTER_VERSION = "8.0.4-r1"
+ADAPTER_VERSION = "8.0.4-r2"
 OPERATION = "jsparser.syntax"
 SNAPSHOT = "/snapshot/input"
 MAX_INPUT_BYTES = 64 * 1024 * 1024
@@ -52,6 +56,8 @@ STATUSES = ("ok", "syntax_error", "decode_error", "too_large")
 FORMS = {"modules": ("import", "export_from", "require", "dynamic_import"), "calls": ("call",), "parse": ()}
 ORDER = ("import", "export_from", "require", "dynamic_import", "call")
 ARTIFACT_KEYS = frozenset({"member", "method", "data_offset", "compressed_size", "size", "crc32", "sha256"})
+GZIP_ARTIFACT_KEYS = ARTIFACT_KEYS | {"inner_offset"}  # method 1 (M5c): a range of an inflated gzip stream
+MAX_STREAM_BYTES = 128 * 1024 * 1024
 CALLEE = re.compile(r"[$A-Za-z_][$A-Za-z0-9_]{0,63}(?:\.[$A-Za-z_][$A-Za-z0-9_]{0,63})?")
 NODE = "/opt/node/bin/node"
 DRIVER = "/opt/reverseai/driver.mjs"
@@ -112,18 +118,23 @@ def _int(value, low, high):
 
 
 def _artifact(value):
-    if not (isinstance(value, dict) and set(value) == ARTIFACT_KEYS):
+    if not (isinstance(value, dict) and set(value) == (GZIP_ARTIFACT_KEYS if value.get("method") == 1 else ARTIFACT_KEYS)):
         raise InvalidRequest()
     member, method, sha = value["member"], value["method"], value["sha256"]
     if not (isinstance(member, str) and 0 < len(member) <= 255 and member.isprintable()
-            and type(method) is int and method in (0, 8)
-            and all(_int(value[key], 0, 2**64 - 1) for key in ("data_offset", "compressed_size", "size", "crc32"))
+            and type(method) is int and method in (0, 1, 8)
+            and all(_int(value[key], 0, 2**64 - 1)
+                    for key in ("data_offset", "compressed_size", "size", "crc32", "inner_offset") if key in value)
             and value["crc32"] < 2**32 and 0 < value["size"] <= MAX_CHILDREN_BYTES
             and isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{64}", sha)):
         raise InvalidRequest()
     if method == 0 and value["compressed_size"] != value["size"]:
         raise InvalidRequest()
     if method == 8 and not (0 < value["compressed_size"] and value["size"] <= MAX_RATIO * value["compressed_size"]):
+        raise InvalidRequest()
+    if method == 1 and not (18 <= value["compressed_size"]
+                            and value["inner_offset"] + value["size"] <= min(MAX_STREAM_BYTES,
+                                                                             MAX_RATIO * value["compressed_size"])):
         raise InvalidRequest()
     return dict(value)
 
@@ -162,11 +173,72 @@ def parse_request(argv):
     return checked, args["kind"], args["start"], args["limit"], list(callees)
 
 
-def materialize(data, artifact):
-    """The member's bytes from the snapshot: in range, inflated in bounded chunks to exactly its size, CRC and hash equal."""
+def inflate_stream(data, start, length):
+    """One whole gzip member (RFC 1952) at data[start:start + length], as contract.inflate_stream accepts it: magic,
+    method 8, reserved flags zero, FEXTRA, FNAME and FCOMMENT inside the range, FHCRC checked; inflated in bounded
+    chunks within min(MAX_STREAM_BYTES, 100 x length); the 8-byte trailer's CRC-32 and ISIZE equal; nothing after it."""
+    if not (type(start) is int and type(length) is int and 0 <= start and 18 <= length and start + length <= len(data)):
+        raise InputMismatch()
+    raw = bytes(data[start:start + length])
+    if raw[:3] != b"\x1f\x8b\x08" or raw[3] & 0xE0:
+        raise InputMismatch()
+    flags, at = raw[3], 10
+    if flags & 4:
+        if at + 2 > len(raw):
+            raise InputMismatch()
+        at += 2 + int.from_bytes(raw[at:at + 2], "little")
+    for flag in (8, 16):
+        if flags & flag:
+            end = raw.find(b"\x00", at, len(raw) - 8)
+            if end == -1:
+                raise InputMismatch()
+            at = end + 1
+    if flags & 2:
+        if at + 2 > len(raw) or int.from_bytes(raw[at:at + 2], "little") != zlib.crc32(raw[:at]) & 0xFFFF:
+            raise InputMismatch()
+        at += 2
+    if at > len(raw) - 8:
+        raise InputMismatch()
+    limit = min(MAX_STREAM_BYTES, MAX_RATIO * length)
+    body = memoryview(raw)[at:]
+    inflater, stream, position = zlib.decompressobj(-15), bytearray(), 0
+    try:
+        while position < len(body) and not inflater.eof:
+            chunk = body[position:position + CHUNK]
+            position += len(chunk)
+            stream += inflater.decompress(chunk, limit + 1 - len(stream))
+            if len(stream) > limit or inflater.unconsumed_tail:
+                raise InputMismatch()
+    except zlib.error:
+        raise InputMismatch() from None
+    trailer = inflater.unused_data + bytes(body[position:])
+    if (not inflater.eof or len(trailer) != 8 or int.from_bytes(trailer[:4], "little") != zlib.crc32(stream)
+            or int.from_bytes(trailer[4:], "little") != len(stream) & 0xFFFFFFFF):
+        raise InputMismatch()
+    return bytes(stream)
+
+
+def materialize(data, artifact, streams=None):
+    """The member's bytes from the snapshot: in range, inflated in bounded chunks to exactly its size, CRC and hash equal.
+
+    streams caches inflated gzip streams by (data_offset, compressed_size), so each is inflated once per run."""
     start, length, size = artifact["data_offset"], artifact["compressed_size"], artifact["size"]
     if start + length > len(data):
         raise InputMismatch()
+    if artifact["method"] == 1:
+        key = (start, length)
+        stream = streams.get(key) if streams is not None else None
+        if stream is None:
+            stream = inflate_stream(data, start, length)
+            if streams is not None:
+                streams[key] = stream
+        inner = artifact["inner_offset"]
+        if inner + size > len(stream):
+            raise InputMismatch()
+        child = stream[inner:inner + size]
+        if zlib.crc32(child) != artifact["crc32"] or hashlib.sha256(child).hexdigest() != artifact["sha256"]:
+            raise InputMismatch()
+        return child
     raw = memoryview(data)[start:start + length]
     if artifact["method"] == 0:
         child = bytes(raw)
@@ -271,9 +343,9 @@ def check_answer(raw, units, kind, start, limit):
 def run(files, kind, start, limit, callees, data, driver=run_driver):
     shutil.rmtree(WORK, ignore_errors=True)
     WORK.mkdir(mode=0o700)
-    paths, units = [], []
+    paths, units, streams = [], [], {}
     for index, file in enumerate(files):
-        child = data if file["artifact"] is None else materialize(data, file["artifact"])
+        child = data if file["artifact"] is None else materialize(data, file["artifact"], streams)
         path = WORK / f"{index}.src"
         path.write_bytes(child)
         paths.append({"path": str(path), "dialect": file["dialect"]})

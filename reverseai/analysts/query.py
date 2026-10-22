@@ -6,7 +6,7 @@ from reverseai.contract import MAX_EVIDENCE_PER_FINDING, ToolRef, evidence_intac
 REFS = {"structure": ToolRef("structure", "0.1.0"), "strings": ToolRef("strings", "0.1.0"),
         "ghidra": ToolRef("ghidra", "12.1.4-r6"), "apk": ToolRef("apk", "0.1.0"), "dex": ToolRef("dex", "0.1.0"),
         "jadx": ToolRef("jadx", "1.5.6-r1"), "js": ToolRef("js", "0.1.0"),
-        "jsparser": ToolRef("jsparser", "8.0.4-r1")}
+        "jsparser": ToolRef("jsparser", "8.0.4-r2")}
 JAVA_FIELDS = ("dex", "class", "name", "prototype", "form", "start", "total", "text")
 PAGES = {
     "structure.segments": ("segment", "segments.list", ("name", "offset", "filesz", "address", "memsz", "readable", "writable", "executable")),
