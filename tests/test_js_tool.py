@@ -211,8 +211,8 @@ class PackageTests(unittest.TestCase):
 
     def test_json_and_pointer_bounds_fail_the_operation_instead_of_cutting_totals(self):
         for data in (b'{"name":"a","name":"b"}', b'{"unknown":{"k":0,"k":1}}', b'{"name":"a",}',
-                     b'[]', b'null', b'"value"', b'\xef\xbb\xbf{}', b'{"name":"\\ud800"}',
-                     b'{"unknown":' + b'[' * 65 + b'0' + b']' * 65 + b'}', b' ' * (1024 * 1024 + 1)):
+                     b'\xef\xbb\xbf{}', b'{"name":"\\ud800"}',
+                     b'{"unknown":' + b'[' * 65 + b'0' + b']' * 65 + b'}', b'{' + b' ' * (1024 * 1024) + b'}'):
             with self.subTest(data=data[:50]), self.assertRaises(ContractError):
                 run('package', data)
         for key in ('k' * 247, 'k' * 248):
@@ -222,6 +222,28 @@ class PackageTests(unittest.TestCase):
                     run('package', data, start=100)
             else:
                 self.assertEqual(len(run('package', data)[0].value['path']), 255)
+
+    def test_single_bundle_has_no_package_and_object_inputs_remain_strict(self):
+        # Decision m5a-bundle-summary selects only object-like single-file JSON.
+        for data in (shared.bundle_js()[0], b'', b'[]', b'null', b'"value"', b' \t\r\nconst x = 1;',
+                     b'\xef\xbb\xbf' + shared.bundle_js()[0], b'\xef\xbb\xbf \tconst x = 1;'):
+            with self.subTest(data=data[:30]):
+                try:
+                    rows = run('package', data)
+                except ContractError as error:
+                    self.fail(f'Non-package single file was refused: {error}')
+                self.assertEqual(rows, [])
+        data, layout = shared.package_only()
+        rows = run('package', b' \t\r\n' + data)
+        self.assertEqual([r.value['value'] for r in rows], [r['row']['value'] for r in layout['package']['rows']])
+        self.assertEqual(rows[0].location.offset, layout['package']['rows'][0]['offset'] + 4)
+        for data in (b'{not json', b'{"name":"x","name":"y"}', b' \t{bad', b'\xef\xbb\xbf{}', b'\xef\xbb\xbf \t{}'):
+            with self.subTest(invalid=data), self.assertRaises(ContractError):
+                run('package', data)
+        for data in (b'[]', b'null', b'"value"', b'const x = 1;'):
+            archive, _ = shared.package_zip(data)
+            with self.subTest(archive=data), self.assertRaises(ContractError):
+                run('package', archive)
 
     def test_shared_application_and_single_file_known_answers_match_every_value_and_anchor(self):
         for builder in (shared.app_zip, shared.bundle_js, shared.package_only):
