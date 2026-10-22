@@ -1,5 +1,5 @@
 """Closed query names, typed arguments and fixed operation requests (contract M3d; Android names M4a; JavaScript
-M5a)."""
+M5a/M5b)."""
 
 from dataclasses import dataclass
 import re
@@ -84,13 +84,17 @@ ANDROID_LIMIT = _integer(1, 256, 128)
 JS_CATEGORIES = ("all", "endpoint", "dynamic_code", "shell", "filesystem", "network", "credential", "encoding")
 JS_PAGES = {"files": ("js.files", ("start", "limit")), "package": ("js.package", ("file", "start", "limit")),
             "hints": ("js.hints", ("file", "category", "start", "limit"))}
+JS_SYNTAX_DETAILS = ("modules", "calls", "parse")
 JS_DEFAULTS = {"file": "", "category": "all", "start": 0}  # what summary reads: the first page of every operation
 
 
 def _javascript(args):
     """An argument the detail does not pass on must keep its default, so no part of a question is silently dropped;
     js.files and js.package page up to 65535 (contract M5a)."""
-    taken = ("limit",) if args["detail"] == "summary" else JS_PAGES[args["detail"]][1]
+    if args["detail"] in JS_SYNTAX_DETAILS:
+        taken = ("file", "start", "limit")
+    else:
+        taken = ("limit",) if args["detail"] == "summary" else JS_PAGES[args["detail"]][1]
     if any(args[name] != default for name, default in JS_DEFAULTS.items() if name not in taken):
         raise ContractError("Query argument unused by this detail")
     if args["detail"] in ("files", "package") and args["start"] > 65535:
@@ -150,12 +154,14 @@ TABLE = MappingProxyType({
         "start": START, "limit": ANDROID_LIMIT}),
     # REA's JavaScript name: summary reads the first page of files, package.json declarations and hints
     "analyze_javascript_application": _detailed(
-        {"detail": ArgSpec("enum", choices=("summary", *JS_PAGES), default="summary"),
+        {"detail": ArgSpec("enum", choices=("summary", *JS_PAGES, *JS_SYNTAX_DETAILS), default="summary"),
          "file": ArgSpec("literal", 0, 255, default=""), "category": ArgSpec("enum", choices=JS_CATEGORIES, default="all"),
          "start": HOST_START, "limit": _integer(1, 256, 128)},
         {"summary": {operation: (("limit",), {name: JS_DEFAULTS[name] for name in taken if name != "limit"})
                      for operation, taken in JS_PAGES.values()},
-         **{detail: {operation: (taken, {})} for detail, (operation, taken) in JS_PAGES.items()}},
+         **{detail: {operation: (taken, {})} for detail, (operation, taken) in JS_PAGES.items()},
+         **{detail: {"jsparser.syntax": (("file", "start", "limit"), {"kind": detail})}
+            for detail in JS_SYNTAX_DETAILS}},
         _javascript),
 })
 
