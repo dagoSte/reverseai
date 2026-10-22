@@ -6,7 +6,8 @@ from pathlib import Path
 import stat
 import sys
 
-from reverseai import intake, pipeline, queries, report
+import reverseai
+from reverseai import doctor, intake, pipeline, queries, report
 
 # Reports hold text taken from untrusted samples: private to the user.
 DIRECTORY_MODE = 0o700
@@ -51,7 +52,10 @@ def write_new(directory, name, text):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="reverseai", description="Static analysis with verifiable evidence (M1 prototype).")
+    parser.add_argument("--version", action="version", version="reverseai " + reverseai.__version__)
     commands = parser.add_subparsers(dest="command", required=True)
+    check = commands.add_parser("doctor", help="Report Python, Docker and the contained tools' locks and images, read-only")
+    check.add_argument("--json", action="store_true", help="Print the same facts as JSON")
     analyze = commands.add_parser("analyze", help="Analyse one approved file without executing it")
     analyze.add_argument("file", type=Path)
     analyze.add_argument("--out", type=Path, required=True, help="New or empty directory for report.json and report.md")
@@ -72,6 +76,8 @@ def main(argv=None):
                        help="Enable derived JavaScript syntax queries using the pinned contained parser")
     args = parser.parse_args(argv)
 
+    if args.command == "doctor":
+        return doctor.main(as_json=args.json)
     if args.command == "query":
         try:
             checked = queries.parse_args(args.query, args.arg)
