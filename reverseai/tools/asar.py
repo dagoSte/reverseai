@@ -1,7 +1,6 @@
 """Bounded Electron ASAR headers and stored children; no paths are opened."""
 
 from dataclasses import dataclass
-from decimal import Decimal
 import struct
 import zlib
 
@@ -26,10 +25,12 @@ def _check(condition):
         raise AsarError('Invalid or over-budget ASAR archive')
 
 
-def _uint(value):
-    _check(isinstance(value, Decimal) and value.is_finite() and 0 <= value < 2**64
-           and value == value.to_integral_value())
-    return int(value)
+def _uint(node, header):
+    raw = header[node.start:node.end]
+    _check(0 < len(raw) <= 20 and all(48 <= byte <= 57 for byte in raw))
+    value = int(raw)
+    _check(value < 2**64)
+    return value
 
 
 def _offset(value):
@@ -73,8 +74,9 @@ def members(data):
     pickle_size, payload_size, text_size = struct.unpack_from('<III', data, 4)
     _check(text_size <= MAX_HEADER_BYTES and payload_size == 4 + ((text_size + 3) // 4) * 4
            and pickle_size == payload_size + 4 and 8 + pickle_size <= len(data))
+    header = data[16:16 + text_size]
     try:
-        root = jsonpos.parse(data[16:16 + text_size], max_bytes=MAX_HEADER_BYTES,
+        root = jsonpos.parse(header, max_bytes=MAX_HEADER_BYTES,
                              max_tokens=MAX_HEADER_TOKENS).root
     except ContractError:
         raise AsarError('Invalid or over-budget ASAR archive') from None
@@ -109,7 +111,7 @@ def members(data):
             link = 'link' in value
             _check(not link or isinstance(value['link'], str) and bool(value['link']))
             _check(link or 'size' in value)
-            size = _uint(value['size']) if 'size' in value else 0
+            size = _uint(fields['size'], header) if 'size' in value else 0
             relative = _offset(value['offset']) if 'offset' in value else None
             _check(link or unpacked or relative is not None)
             flags = set()

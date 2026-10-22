@@ -92,6 +92,8 @@ def _javascript(args):
     """An argument the detail does not pass on must keep its default, so no part of a question is silently dropped;
     js.files and js.package page up to 65535 (contract M5a)."""
     if args["detail"] in JS_SYNTAX_DETAILS:
+        if not args["file"].isascii():
+            raise ContractError("Syntax query file must be printable ASCII")
         taken = ("file", "start", "limit")
     else:
         taken = ("limit",) if args["detail"] == "summary" else JS_PAGES[args["detail"]][1]
