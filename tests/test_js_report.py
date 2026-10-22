@@ -46,8 +46,8 @@ class JavaScriptReportTests(unittest.TestCase):
         credential = lines.index("#### `credential`")
         self.assertEqual(lines[credential + 2:credential + 6], [
             "| Index | File | Category | Hint | Text | Truncated |", "|---|---|---|---|---|---|",
-            f"| 11 | `src/config.ts` | `credential` | `aws_access_key` | `{J.FAKE_AWS_KEY_ID}` | `false` |",
-            f"| 12 | `src/config.ts` | `credential` | `private_key` | `{J.PRIVATE_KEY_BEGIN}` | `false` |"])
+            f"| 12 | `src/config.ts` | `credential` | `aws_access_key` | `{J.FAKE_AWS_KEY_ID}` | `false` |",
+            f"| 13 | `src/config.ts` | `credential` | `private_key` | `{J.PRIVATE_KEY_BEGIN}` | `false` |"])
 
     def test_install_time_scripts_are_marked_and_nothing_else(self):
         package, strings = J.json_text({"name": "marks", "scripts": {

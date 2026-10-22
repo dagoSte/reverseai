@@ -1,5 +1,5 @@
-"""analyze_javascript_application (M5a): arguments, routing by detail, page conclusions and review through the js tool;
-js.hints answers from the fixture layouts until the jshints lane is merged."""
+"""analyze_javascript_application (M5a): arguments, routing by detail, page conclusions and review through the js tool
+on the fixtures, with exact answers from their layouts."""
 
 import contextlib
 from dataclasses import replace
@@ -11,82 +11,25 @@ import unittest
 from unittest.mock import patch
 
 from reverseai import claims, cli, pipeline, queries
-from reverseai.contract import (
-    ArgSpec, ContractError, InputRef, Location, MAX_EVIDENCE_PER_FINDING, Observation, OperationSpec, ToolRef, ToolSpec,
-    sha256_hex,
-)
+from reverseai.contract import ContractError, InputRef, MAX_EVIDENCE_PER_FINDING, materialize, sha256_hex
 from reverseai.gateway import Gateway
 from reverseai.tools import js, structure
 from tests import fixtures_js as J
 
 NAME = "analyze_javascript_application"
-JS = ToolRef("js", "0.1.0")
-# Stand-in hints: the fixture's mark labels as jshints catalog names (decision m5a-seams-l)
-STANDIN_HINTS = {
-    "url_https": ("endpoint", "url"), "url_http": ("endpoint", "url"), "url_wss": ("endpoint", "url"),
-    "eval_call": ("dynamic_code", "eval"), "new_function": ("dynamic_code", "new_function"),
-    "dynamic_import": ("dynamic_code", "dynamic_import"), "require_child_process": ("shell", "child_process"),
-    "exec_call": ("shell", "process_call"), "fetch_call": ("network", "fetch"), "websocket": ("network", "web_socket"),
-    "xhr": ("network", "xml_http_request"), "aws_key_id": ("credential", "aws_access_key"),
-    "private_key": ("credential", "private_key"), "atob_call": ("encoding", "atob"),
-    "buffer_from": ("encoding", "buffer_decode"),
-}
-FILE = ArgSpec("literal", 0, 255, default="")
-LIMIT = ArgSpec("int", 1, 256, default=128)
 
 
-def standin(layout, *, skip=None):
-    """js.files, js.package and js.hints with the contract's arguments, answering from a fixture layout; skip drops
-    one row index from every page, as a faulty tool would."""
-    def page(rows, args):
-        return [Observation(location, {**value, "index": index, "total": len(rows)}, artifact)
-                for index, (location, value, artifact) in enumerate(rows)
-                if args["start"] <= index < args["start"] + args["limit"] and index != skip]
-
-    def files(data, args):
-        return page([(Location(**f["anchor"]), {"kind": "js_file", **f["row"]}, f["artifact"])
-                     for f in layout["files"]], args)
-
-    def package(data, args):
-        chosen = layout["packages"].get(args["file"] or layout["default_package"])
-        rows = chosen["rows"] if chosen is not None and (not args["file"] or chosen["member"] is not None) else []
-        return page([(Location(row["offset"], row["length"]), {"kind": "package_field", **row["row"]},
-                      chosen["artifact"]) for row in rows], args)
-
-    def hints(data, args):
-        rows = []
-        for f in layout["files"]:
-            if f["name"].rsplit("/", 1)[-1] == "package.json" or args["file"] not in ("", f["row"]["file"]):
-                continue
-            for mark in sorted(layout["marks"].get(f["name"], ()), key=lambda m: m["offset"]):
-                category, hint = STANDIN_HINTS.get(mark["label"], (None, None))
-                if hint and args["category"] in ("all", category):
-                    text, truncated = J.cut(mark["text"])
-                    rows.append((Location(mark["offset"], mark["length"]),
-                                 {"kind": "js_hint", "file": f["row"]["file"], "category": category, "hint": hint,
-                                  "text": text, "truncated": truncated}, f["artifact"]))
-        return page(rows, args)
-
-    return ToolSpec(JS, {
-        "js.files": OperationSpec("js.files", {"start": ArgSpec("int", 0, 65535, default=0), "limit": LIMIT}, files,
-                                  max_observations=256),
-        "js.package": OperationSpec("js.package", {"file": FILE, "start": ArgSpec("int", 0, 65535, default=0),
-                                                   "limit": LIMIT}, package, max_observations=256),
-        "js.hints": OperationSpec("js.hints", {
-            "file": FILE, "category": ArgSpec("enum", choices=queries.JS_CATEGORIES, default="all"),
-            "start": ArgSpec("int", 0, 1048575, default=0), "limit": LIMIT}, hints, max_observations=256),
-    })
+def dropping(index):
+    """The js tool with a faulty js.files that leaves one row out of its page."""
+    files = js.TOOL.operations["js.files"]
+    handler = files.handler
+    return replace(js.TOOL, operations={**js.TOOL.operations, "js.files": replace(
+        files, handler=lambda data, args: [row for row in handler(data, args) if row.value["index"] != index])})
 
 
-def with_standin_hints(layout):
-    """The js tool, its js.hints answering from the layout until jshints is merged."""
-    return replace(js.TOOL, operations={**js.TOOL.operations, "js.hints": standin(layout).operations["js.hints"]})
-
-
-def run(built, args=None, *, tools=None, name="app.zip"):
-    data, layout = built
-    ref = InputRef(sha256_hex(data), len(data), name)
-    return pipeline.query_bytes(data, ref, NAME, args or {}, tools=tools or (with_standin_hints(layout),))
+def run(built, args=None, *, tools=(js.TOOL,), name="app.zip"):
+    data, _ = built
+    return pipeline.query_bytes(data, InputRef(sha256_hex(data), len(data), name), NAME, args or {}, tools=tools)
 
 
 def pages(analysis):
@@ -152,17 +95,27 @@ class QueryTableTests(unittest.TestCase):
 class QueryRunTests(unittest.TestCase):
     def test_summary_reads_the_first_page_of_files_package_and_hints(self):
         built = J.app_zip()
-        found = pages(run(built))
+        analysis = run(built)
+        found = pages(analysis)
         self.assertEqual(set(found), {"javascript.files", "javascript.package", "javascript.hints"})
         self.assertEqual(found["javascript.files"], [("supported", files_page(built[1]))])
         package = built[1]["package"]["rows"]
         self.assertEqual(found["javascript.package"], [("supported", {"start": 0, "total": len(package), "rows": [
             [row["row"][field] for field in ("file", "path", "value", "truncated")] for row in package]})])
         (verdict, hints), = found["javascript.hints"]
-        self.assertEqual(verdict, "supported")
-        self.assertEqual(hints["rows"][0], ["lib/index.js", "shell", "child_process", "require('child_process')", False])
+        self.assertEqual((verdict, hints["start"], hints["total"]), ("supported", 0, 18))
+        self.assertEqual(hints["rows"][:3], [["lib/index.js", "shell", "child_process", "child_process", False],
+                                             ["lib/index.js", "endpoint", "url", "https://api.example.com/v1/collect",
+                                              False], ["lib/index.js", "shell", "process_call", "exec(", False]])
         self.assertEqual({row[0] for row in hints["rows"]},
-                         {"lib/index.js", "lib/loader.mjs", "src/config.ts", "dist/app.min.js"})
+                         {"lib/index.js", "lib/loader.mjs", "src/config.ts", "dist/app.min.js"})  # never README.md
+        # every hint cites the bytes of its text inside its member
+        data = built[0]
+        for item in analysis.results[0].evidence:
+            if item.observation["kind"] == "js_hint":
+                child = materialize(data, item.artifact)
+                cited = child[item.location.offset:item.location.offset + item.location.length]
+                self.assertEqual(cited.decode("latin-1"), item.observation["text"])
 
     def test_files_pages_cite_each_child_from_its_first_byte(self):
         built = J.app_zip()
@@ -201,8 +154,8 @@ class QueryRunTests(unittest.TestCase):
         found = pages(run(built, {"detail": "hints", "category": "credential"}))
         self.assertEqual([row[1:3] for row in found["javascript.hints"][0][1]["rows"]],
                          [["credential", "aws_access_key"], ["credential", "private_key"]])
-        data, marks = J.source(*(("fetch(", ("url_https", f"https://e{i}.example.com/"), ");") for i in range(100)))
-        found = pages(run(J.single(data, marks=marks), {"detail": "hints", "limit": 100}, name="many.js"))
+        data, _ = J.source(*(("fetch(", ("url_https", f"https://e{i}.example.com/"), ");") for i in range(100)))
+        found = pages(run(J.single(data), {"detail": "hints", "category": "endpoint", "limit": 100}, name="many.js"))
         self.assertEqual([(verdict, value["start"], len(value["rows"]), value["total"])
                           for verdict, value in found["javascript.hints"]],
                          [("supported", 0, MAX_EVIDENCE_PER_FINDING, 100), ("supported", 64, 36, 100)])
@@ -214,7 +167,7 @@ class QueryRunTests(unittest.TestCase):
 
     def test_a_page_with_a_missing_row_concludes_nothing(self):
         built = J.app_zip()
-        analysis = run(built, {"detail": "files"}, tools=(standin(built[1], skip=1),))
+        analysis = run(built, {"detail": "files"}, tools=(dropping(1),))
         self.assertEqual(len(analysis.results[0].evidence), len(built[1]["files"]) - 1)
         self.assertEqual(pages(analysis), {})
 
@@ -242,8 +195,7 @@ class QueryRunTests(unittest.TestCase):
         with self.assertRaisesRegex(ContractError, "Query operation unavailable"):
             pipeline.query_bytes(data, InputRef(sha256_hex(data), len(data), "app.zip"), NAME, {}, tools=(structure.TOOL,))
         built = J.app_zip()
-        tool = standin(built[1])
-        partial = replace(tool, operations={k: v for k, v in tool.operations.items() if k != "js.hints"})
+        partial = replace(js.TOOL, operations={k: v for k, v in js.TOOL.operations.items() if k != "js.hints"})
         with self.assertRaisesRegex(ContractError, "Query operation unavailable"):
             run(built, tools=(partial,))
         self.assertEqual(set(pages(run(built, {"detail": "files"}, tools=(partial,)))), {"javascript.files"})
@@ -251,7 +203,7 @@ class QueryRunTests(unittest.TestCase):
 
 
 class RealToolTests(unittest.TestCase):
-    """The registered js tool through the query, the reviewer and the command (files and package; hints need jshints)."""
+    """The registered tools through the query, the reviewer and the command."""
 
     def query(self, built, args, name="app.zip"):
         data, _ = built
