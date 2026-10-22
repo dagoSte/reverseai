@@ -1076,8 +1076,8 @@ contract above is unchanged.
   PEP 517 backend, `tools/reverseai_build.py`, stdlib only, with `build_wheel`,
   `build_sdist` and `get_requires_for_build_wheel` / `_sdist` returning `[]`, so
   `pip wheel .` and `pip install .` need no download.
-- **Wheel** `reverseai-0.6.0-py3-none-any.whl`, reproducible (the same tree gives
-  the same bytes: entries sorted, timestamp 1980-01-01 00:00:00, modes 0644):
+- **Wheel** `reverseai-0.6.0-py3-none-any.whl`, reproducible (the same clean tree
+  gives the same bytes; untracked files under `reverseai/` would enter it: entries sorted, timestamp 1980-01-01 00:00:00, modes 0644):
   every `reverseai/**/*.py` (no `__pycache__`), the five locks copied to
   `reverseai/_locks/<tool>.json` from `containers/<tool>/image.lock.json` (`lief`,
   `yarax`, `ghidra`, `jadx`, `jsparser`) with the YARA-X ruleset as
@@ -1087,7 +1087,8 @@ contract above is unchanged.
   `THIRD_PARTY_NOTICES.md` and a `RECORD` with SHA-256 and sizes. No tests,
   tools or container build contexts: images are built from a checkout.
 - **sdist** `reverseai-0.6.0.tar.gz`, reproducible (sorted, mtime 0, uid and gid
-  0, modes 0644 or 0755 as in Git): the Git-tracked files of `reverseai/`,
+  0, modes 0644 or 0755 as in Git, gzip level 9 fixed, so the bytes do not
+  depend on the Python version's default; decision `m6-fix-round`): the Git-tracked files of `reverseai/`,
   `tools/`, `containers/`, `docs/`, `tests/`, `media/` and the top-level
   `README.md`, `THIRD_PARTY_NOTICES.md`, `pyproject.toml`, under one
   `reverseai-0.6.0/` root with a `PKG-INFO`.
