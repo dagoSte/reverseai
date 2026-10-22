@@ -967,7 +967,9 @@ input, verified by `contract.materialize` like stored ZIP members.
   decimal-string `offset` relative to the data start; `unpacked`, `link`,
   `executable` and `integrity` fields are allowed.
 - **Members**: names are the `/`-joined path, escaped as ZIP member names, in
-  header order (depth first); at most 65,536 entries and 128 MiB of file data
+  header order (depth first); each joined raw path at most 65,535 UTF-8 bytes and
+  at most 32 MiB of joined raw path bytes per archive, checked before joining
+  (decision `m5b-asar-names`); at most 65,536 entries and 128 MiB of file data
   read per operation; every member range lies inside the input after the header.
   A member with `unpacked` true (its bytes are outside the archive) gets the flag
   `asar_unpacked`, a `link` entry the flag `asar_link`, a name failing the ZIP
