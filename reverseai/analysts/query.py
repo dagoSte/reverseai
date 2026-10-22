@@ -22,7 +22,7 @@ PAGES = {
     "dex.references": ("dex_ref", "android.references",
                        ("dex", "from_class", "from_method", "from_prototype", "at", "ref_kind", "target", "target_truncated")),
     # M5a: JavaScript applications on the host
-    "js.files": ("js_file", "javascript.files", ("file", "size", "sha256", "lines", "max_line")),
+    "js.files": ("js_file", "javascript.files", ("file", "size", "sha256", "lines", "max_line", "flags")),
     "js.package": ("package_field", "javascript.package", ("file", "path", "value", "truncated")),
     "js.hints": ("js_hint", "javascript.hints", ("file", "category", "hint", "text", "truncated")),
 }

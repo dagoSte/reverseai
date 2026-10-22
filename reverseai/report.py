@@ -266,7 +266,7 @@ def _java_details(rows, tools):
 
 INSTALL_SCRIPTS = ("preinstall", "install", "postinstall", "prepare")  # npm runs these on install
 JAVASCRIPT_PAGES = {
-    "javascript.files": ("File", "Size", "SHA-256", "Lines", "Longest line (bytes)"),
+    "javascript.files": ("File", "Size", "SHA-256", "Lines", "Longest line (bytes)", "Flags"),
     "javascript.package": ("File", "Path", "Value", "Truncated", "Runs on install"),
     "javascript.hints": ("File", "Category", "Hint", "Text", "Truncated"),
 }
@@ -329,6 +329,8 @@ def _javascript_details(rows, args=None):
             lines += ["", "| Index | " + " | ".join(columns) + " |", "|---|" + "---|" * len(columns)]
             for index in indexes:
                 row = list(found[index])
+                if key == "javascript.files" and row[5]:
+                    row[2:5] = ["not read"] * 3
                 if key == "javascript.package":
                     row.append("yes" if row[1] in tuple("/scripts/" + name for name in INSTALL_SCRIPTS) else "")
                 cells = ["(input)" if i == 0 and cell == "" else cell if i == 4 and key == "javascript.package"

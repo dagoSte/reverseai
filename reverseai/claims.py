@@ -296,9 +296,14 @@ PAGES = {
                            and _bool(o["target_truncated"])
                            and (not o["target_truncated"] or (o["ref_kind"] == "string" and len(o["target"]) == 256)))),
     # M5a: JavaScript applications on the host; "" names a single-file input
-    "js_file": (("file", "size", "sha256", "lines", "max_line"),
-                lambda o: (_js_file(o["file"]) and _uint(o["size"]) and _sha256(o["sha256"]) and _uint(o["lines"])
-                           and _uint(o["max_line"]) and o["max_line"] <= o["size"] and o["lines"] <= o["size"] + 1)),
+    "js_file": (("file", "size", "sha256", "lines", "max_line", "flags"),
+                lambda o: (_js_file(o["file"]) and _uint(o["size"])
+                           and isinstance(o["flags"], list) and all(isinstance(flag, str) for flag in o["flags"])
+                           and o["flags"] == sorted(set(o["flags"])) and all(flag in MEMBER_FLAGS for flag in o["flags"])
+                           and ((o["flags"] and all(o[key] is None for key in ("sha256", "lines", "max_line")))
+                                or (not o["flags"] and _sha256(o["sha256"]) and _uint(o["lines"]) and _uint(o["max_line"])
+                                    and o["max_line"] <= o["size"] and o["lines"] <= o["size"]
+                                    and (o["lines"] == 0) == (o["size"] == 0))))),
     "package_field": (("file", "path", "value", "truncated"),
                       lambda o: (_js_file(o["file"]) and _text(o["path"]) and o["path"].startswith("/")
                                  and _cut_text(o["value"], o["truncated"]))),

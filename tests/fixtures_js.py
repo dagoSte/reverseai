@@ -26,7 +26,8 @@ Each builder returns (data, layout):
 
     layout["files"]     the JavaScript files by the contract rule (names ending in .js, .mjs, .cjs, .jsx, .ts or
                         .tsx, ASCII case-insensitive, plus package.json; central directory order), each with the
-                        js.files row it must produce ("row"), its anchor inside the child and the member's artifact
+                        js.files row it must produce ("row", including flags), its anchor inside the child and the
+                        member's artifact; flagged files instead cite their central entry and have no artifact
     layout["packages"]  every package.json built from declared values, by member name, as layout["package"] is
     layout["package"]   the default package.json (fewest path segments, first in central directory order on a tie):
                         the js.package rows in document order, each with its anchor (offset and length inside the
@@ -194,7 +195,7 @@ def archive(specs, *, strings=None, marks=None):
         files.append({"member": row["index"], "name": row["name"], "data": child,
                       "artifact": row["artifact"] if child else None, "anchor": anchor,
                       "row": {"file": escaped(row["name"]), "size": len(child), "sha256": hashlib.sha256(child).hexdigest(),
-                              "lines": lines, "max_line": max_line}})
+                              "lines": lines, "max_line": max_line, "flags": []}})
     manifests = [f for f in files if f["name"].rsplit("/", 1)[-1] == "package.json"]
     default = min(manifests, key=lambda f: (_segments(f["name"]), f["member"])) if manifests else None
     packages = {f["name"]: {"name": f["name"], "member": f["member"], "artifact": f["artifact"],
@@ -212,7 +213,7 @@ def single(data, *, strings=None, marks=()):
     files = [{"member": None, "name": "", "data": data, "artifact": None,
               "anchor": {"offset": 0, "length": min(len(data), MAX_ANCHOR)},
               "row": {"file": "", "size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "lines": lines,
-                      "max_line": max_line}}] if data else []
+                      "max_line": max_line, "flags": []}}] if data else []
     package = None if strings is None else {"name": "", "member": None, "artifact": None,
                                             "rows": package_rows(strings, ""), "strings": strings}
     return data, {"size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "zip": None, "files": files,
@@ -424,6 +425,18 @@ def js_edge(kind):
     raise ValueError(f"unknown edge kind {kind!r}")
 
 
+def _flagged_files(layout, flags):
+    layout["flags"] = flags
+    for file in layout["files"]:
+        member = layout["zip"]["members"][file["member"]]
+        refused = flags[file["member"]]
+        if refused:
+            file.update(artifact=None, anchor={"offset": member["central_offset"],
+                                              "length": min(member["central_length"], MAX_ANCHOR)})
+            file["row"].update(file=escaped(file["name"])[:255], size=member["size"], sha256=None,
+                               lines=None, max_line=None, flags=refused)
+
+
 def js_hostile(kind):
     """(data, layout) of one problem; layout["expect"] maps each js operation to "ok", "refused" or "no rows"."""
     if kind == "duplicate_key":
@@ -456,19 +469,19 @@ def js_hostile(kind):
         # decision m5a-seams-p: a JSON pointer longer than 255 characters fails js.package
         built = package_zip(b'{"name": "a", "dependencies": {"' + b"k" * 300 + b'": "1.0.0"}}\n')
     elif kind == "flagged_members":
-        # Only ok.js and package.json are clean; the others are listed by apk.inventory with these flags, never read
+        # Decision m5a-fix-round: all JS names are listed; flagged members are never read.
         package, strings = json_text({"name": "flagged"})
         specs = [F.member("package.json", package), F.member("ok.js", INDEX_JS),
                  F.member("../escape.js", INDEX_JS), F.member("../package.json", b'{"name": "outside"}'),
                  F.member("link.js", b"ok.js", 0, made_by=F.MADE_BY_UNIX, external_attr=0o120777 << 16),
                  F.member("locked.js", INDEX_JS, flags=F.ENCRYPTED),
                  F.member("dup.js", INDEX_JS), F.member("dup.js", b"var other = 2;\n"),
-                 F.member("packed.js", INDEX_JS, 12)]
+                 F.member("packed.js", INDEX_JS, 12), F.member("x" * 256 + ".js", INDEX_JS)]
         data, layout = archive(specs, strings={"package.json": strings})
         flags = {"../escape.js": ["traversing_name"], "../package.json": ["traversing_name"], "link.js": ["symlink"],
-                 "locked.js": ["encrypted"], "dup.js": ["duplicate_name"], "packed.js": ["unsupported_method"]}
-        layout["flags"] = [flags.get(row["name"], []) for row in layout["zip"]["members"]]
-        layout["files"] = [f for f in layout["files"] if not flags.get(f["name"])]
+                 "locked.js": ["encrypted"], "dup.js": ["duplicate_name"], "packed.js": ["unsupported_method"],
+                 "x" * 256 + ".js": ["long_name"]}
+        _flagged_files(layout, [flags.get(row["name"], []) for row in layout["zip"]["members"]])
         layout["expect"] = {"js.files": "ok", "js.package": "ok", "js.hints": "ok"}
         return data, layout
     elif kind == "declared_over_128mib":
@@ -480,10 +493,11 @@ def js_hostile(kind):
         for row in layout["zip"]["members"]:
             struct.pack_into("<I", patched, row["local_header_offset"] + 22, 30 * 1024 * 1024)
             struct.pack_into("<I", patched, row["central_offset"] + 24, 30 * 1024 * 1024)
+            row["size"] = 30 * 1024 * 1024
         data = bytes(patched)
-        layout.update(size=len(data), sha256=hashlib.sha256(data).hexdigest(), files=[],
-                      flags=[["ratio", "too_large"]] * len(specs),
-                      expect={"js.files": "no rows", "js.package": "no rows", "js.hints": "no rows"})
+        _flagged_files(layout, [["ratio", "too_large"] for _ in specs])
+        layout.update(size=len(data), sha256=hashlib.sha256(data).hexdigest(),
+                      expect={"js.files": "ok", "js.package": "no rows", "js.hints": "no rows"})
         return data, layout
     elif kind == "zip_refused":
         # decision m5a-seams-p2: it starts with a ZIP local header but the parser refuses it (ZIP64), so every js

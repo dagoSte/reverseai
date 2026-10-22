@@ -87,7 +87,7 @@ class ApplicationFixtureTests(unittest.TestCase):
             data = row["data"]
             self.assertEqual(row["member"], index if index < 9 else None)
             self.assertEqual(row["row"], {"file": row["name"], "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
-                                          "lines": metrics(data)[0], "max_line": metrics(data)[1]})
+                                          "lines": metrics(data)[0], "max_line": metrics(data)[1], "flags": []})
             self.assertEqual(row["anchor"], {"offset": 0, "length": min(len(data), 4096)})
             self.assertEqual(row["artifact"]["sha256"], hashlib.sha256(data).hexdigest())
         rows = {row["name"]: row["row"] for row in self.layout["files"]}
@@ -157,7 +157,7 @@ class SingleFileTests(unittest.TestCase):
             apk.members(data)
         row, = layout["files"]
         self.assertEqual(row["row"], {"file": "", "size": len(data), "sha256": BUNDLE_SHA256, "lines": 3,
-                                      "max_line": metrics(data)[1]})
+                                  "max_line": metrics(data)[1], "flags": []})
         self.assertGreater(row["row"]["max_line"], 400)
         for mark in layout["marks"][""]:
             self.assertEqual(data[mark["offset"]:mark["offset"] + mark["length"]], mark["text"].encode())
@@ -184,7 +184,7 @@ class EdgeAndHostileTests(unittest.TestCase):
         data, layout = J.js_edge("empty_file")
         empty = layout["files"][0]
         self.assertEqual(empty["row"], {"file": "lib/empty.js", "size": 0, "sha256": hashlib.sha256(b"").hexdigest(),
-                                        "lines": 0, "max_line": 0})
+                                    "lines": 0, "max_line": 0, "flags": []})
         central = layout["zip"]["members"][0]
         self.assertEqual((empty["anchor"], empty["artifact"]),
                          ({"offset": central["central_offset"], "length": central["central_length"]}, None))
@@ -236,13 +236,24 @@ class EdgeAndHostileTests(unittest.TestCase):
 
     def test_flagged_members_and_declared_sizes(self):
         data, layout = J.js_hostile("flagged_members")
-        self.assertEqual([list(m.flags) for m in apk.members(data)], layout["flags"])
-        self.assertEqual([row["name"] for row in layout["files"]], ["package.json", "ok.js"])
+        members = apk.members(data)
+        self.assertEqual([list(m.flags) for m in members], layout["flags"])
+        self.assertEqual([row["name"] for row in layout["files"]], [member.name for member in members])
+        for file, member in zip(layout['files'], members):
+            self.assertEqual(file['row']['flags'], list(member.flags))
+            if member.flags:
+                self.assertEqual(file['row'], {'file': J.escaped(member.name)[:255], 'size': member.size,
+                                               'sha256': None, 'lines': None, 'max_line': None,
+                                               'flags': list(member.flags)})
+                self.assertIsNone(file['artifact'])
+                self.assertEqual(file['anchor'], {'offset': member.central_offset,
+                                                  'length': min(member.central_length, 4096)})
         data, layout = J.js_hostile("declared_over_128mib")
         self.assertEqual([list(m.flags) for m in apk.members(data)], layout["flags"])
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             self.assertEqual(sum(info.file_size for info in archive.infolist()), 150 * 1024 * 1024)
-        self.assertEqual(layout["files"], [])
+        self.assertEqual([file['row']['size'] for file in layout['files']], [30 * 1024 * 1024] * 5)
+        self.assertTrue(all(file['row']['sha256'] is None and file['artifact'] is None for file in layout['files']))
         data, layout = J.js_hostile("zip_refused")
         self.assertTrue(data.startswith(b"PK\x03\x04"))
         with self.assertRaisesRegex(ContractError, "ZIP64"):

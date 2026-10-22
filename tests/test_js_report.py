@@ -32,6 +32,24 @@ def outside_code(line):
 
 
 class JavaScriptReportTests(unittest.TestCase):
+    def test_flagged_files_show_the_declared_size_and_why_they_were_not_read(self):
+        analysis = run(J.js_hostile('flagged_members'), {'detail': 'files'})
+        lines = section(report.to_markdown(analysis))
+        self.assertIn('| Index | File | Size | SHA-256 | Lines | Longest line (bytes) | Flags |', lines)
+        observations = analysis.results[0].evidence
+        flagged = [item for item in observations if item.observation.get('flags')]
+        self.assertGreaterEqual(len(flagged), 7)
+        for item in flagged:
+            value = item.observation
+            line, = [line for line in lines if line.startswith(f"| {value['index']} | ")]
+            self.assertIn(f"| `{value['size']}` | `not read` | `not read` | `not read` |", line)
+            for flag in value['flags']:
+                self.assertIn(flag, line)
+        document = json.loads(report.to_json(analysis))
+        rows = document['results'][0]['findings'][0]['value']['rows']
+        self.assertTrue(all(row[2:5] == [None, None, None] for row in rows if row[5]))
+        self.assertTrue(all(finding['verdict'] == 'supported' for finding in document['results'][0]['findings']))
+
     def test_the_summary_shows_files_declarations_and_hints_by_category(self):
         built = J.app_zip()
         lines = section(report.to_markdown(run(built)))
@@ -39,10 +57,10 @@ class JavaScriptReportTests(unittest.TestCase):
         headings = [line for line in lines if line.startswith("### ")]
         self.assertEqual(headings, [f"### {claims.statement(key)}" for key in
                                     ("javascript.files", "javascript.package", "javascript.hints")])
-        self.assertIn("| Index | File | Size | SHA-256 | Lines | Longest line (bytes) |", lines)
+        self.assertIn("| Index | File | Size | SHA-256 | Lines | Longest line (bytes) | Flags |", lines)
         minified = next(f["row"] for f in built[1]["files"] if f["name"] == "dist/app.min.js")
         self.assertIn(f"| 6 | `dist/app.min.js` | `{minified['size']}` | `{minified['sha256']}` | `1` | "
-                      f"`{minified['max_line']}` |", lines)
+                      f"`{minified['max_line']}` | `[]` |", lines)
         self.assertIn("rows 0..8 of 9", lines)
         categories = [line[5:] for line in lines if line.startswith("#### ")]
         self.assertEqual(categories, ["`endpoint`", "`dynamic_code`", "`shell`", "`network`", "`credential`",

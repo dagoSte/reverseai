@@ -44,7 +44,7 @@ def pages(analysis):
 def files_page(layout, start=0, stop=None):
     rows = layout["files"][start:stop]
     return {"start": start, "total": len(layout["files"]),
-            "rows": [[f["row"][field] for field in ("file", "size", "sha256", "lines", "max_line")] for f in rows]}
+            "rows": [[f["row"][field] for field in ("file", "size", "sha256", "lines", "max_line", "flags")] for f in rows]}
 
 
 class QueryTableTests(unittest.TestCase):

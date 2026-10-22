@@ -44,6 +44,62 @@ def scanner(function=scan):
 
 
 class JavaScriptFilesTests(unittest.TestCase):
+    def test_flagged_files_are_disclosed_in_order_without_reading_their_payloads(self):
+        data, _ = shared.js_hostile('flagged_members')
+        members = apk.members(data)
+        original = apk._materialize
+        read = []
+
+        def checked(data, member):
+            self.assertFalse(member.flags)
+            read.append(member.name)
+            return original(data, member)
+
+        with patch.object(apk, '_materialize', side_effect=checked), \
+                scanner(lambda child: iter(((0, 1, 'dynamic_code', 'eval'),))):
+            rows = run('files', data)
+            self.assertEqual(len(rows), len(members))
+            self.assertEqual([row.value['file'] for row in rows], [apk.escape(m.name) for m in members])
+            for index, (row, member) in enumerate(zip(rows, members)):
+                self.assertEqual((row.value['index'], row.value['total'], row.value['flags']),
+                                 (index, len(members), list(member.flags)))
+                if member.flags:
+                    self.assertEqual((row.value['size'], row.value['sha256'], row.value['lines'], row.value['max_line']),
+                                     (member.size, None, None, None))
+                    self.assertEqual(row.location, Location(member.central_offset, min(member.central_length, 4096)))
+                    self.assertIsNone(row.artifact)
+            self.assertEqual(read, ['package.json', 'ok.js'])
+            self.assertEqual([row.value['value'] for row in run('package', data)], ['flagged'])
+            self.assertEqual({row.value['file'] for row in run('hints', data)}, {'ok.js'})
+        page = run('files', data, start=2, limit=3)
+        self.assertEqual([row.value['index'] for row in page], [2, 3, 4])
+        self.assertEqual([row.value['total'] for row in page], [len(members)] * 3)
+
+    def test_flagged_only_files_have_bounded_parent_anchors_and_cost_no_read_budget(self):
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, 'w') as archive:
+            member = zipfile.ZipInfo('../blocked.js')
+            member.comment = b'c' * 5000
+            archive.writestr(member, b'eval(x)')
+            archive.writestr('../package.json', b'{"name":"blocked"}')
+        data = stream.getvalue()
+        with patch.object(apk, '_materialize', side_effect=AssertionError('flagged payload read')), \
+                patch.object(js, 'MAX_READ_BYTES', 0), scanner():
+            rows = run('files', data)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0].location.length, 4096)
+            self.assertTrue(all(row.artifact is None for row in rows))
+            self.assertEqual(run('package', data), [])
+            self.assertEqual(run('hints', data), [])
+            self.assertEqual(run('package', data, file='../package.json'), [])
+            self.assertEqual(run('hints', data, file='../blocked.js'), [])
+        data, layout = shared.js_hostile('declared_over_128mib')
+        with patch.object(apk, '_materialize', side_effect=AssertionError('declared size allocated')):
+            rows = run('files', data)
+        self.assertEqual(len(rows), 5)
+        self.assertEqual([row.value['size'] for row in rows], [30 * 1024 * 1024] * 5)
+        self.assertEqual([row.value['flags'] for row in rows], [['ratio', 'too_large']] * 5)
+
     def test_archive_members_keep_order_exact_hashes_lines_and_child_anchors(self):
         entries = [('ignored.txt', b'eval(ignored)'), ('lib/B.TSX', b'a\nb\n'),
                    ('package.json', b'{"name":"app"}'), ('index.cjs', b'abc\r\ndef'),
@@ -76,7 +132,7 @@ class JavaScriptFilesTests(unittest.TestCase):
                 expected_lines = data.count(b'\n') + int(data[-1] != 10)
                 self.assertEqual(row.value, {'kind': 'js_file', 'index': 0, 'total': 1, 'file': '',
                     'size': len(data), 'sha256': sha256_hex(data), 'lines': expected_lines,
-                    'max_line': max(map(len, data.split(b'\n')))})
+                    'max_line': max(map(len, data.split(b'\n'))), 'flags': []})
                 self.assertIsNone(row.artifact)
         self.assertEqual(run('files', b''), [])  # Decision m5a-seams-p: no bytes to cite.
         archive, _ = zip_bytes([])
@@ -108,13 +164,14 @@ class JavaScriptFilesTests(unittest.TestCase):
             self.assertNotEqual(member.name, 'data.bin')
             return original(data, member)
         with patch.object(apk, '_materialize', side_effect=checked) as called, scanner():
-            self.assertEqual([r.value['file'] for r in run('files', data)], ['safe.js', 'package.json'])
+            self.assertEqual([r.value['file'] for r in run('files', data)], ['../bad.js', 'safe.js', 'package.json'])
             self.assertEqual(run('hints', data, file='../bad.js'), [])
             self.assertEqual(run('package', data, file='../bad.js'), [])
             self.assertTrue(called.call_count)
         only_flagged, _ = zip_bytes([('../bad.js', b'eval(x)')])
         with scanner():
-            self.assertEqual(run('files', only_flagged), [])
+            row, = run('files', only_flagged)
+            self.assertEqual(row.value['flags'], ['traversing_name'])
             self.assertEqual(run('hints', only_flagged), [])
 
     def test_read_budget_fails_even_beyond_the_requested_page(self):
