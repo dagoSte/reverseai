@@ -24,9 +24,10 @@ def _javascript_name(name):
     return name.translate(_ASCII_LOWER).endswith(_SUFFIXES) or _package_name(name)
 
 
-def _members(data):
+def _members(data, *, include_flagged=False):
     try:
-        return tuple(member for member in apk.members(data) if not member.flags and _javascript_name(member.name))
+        return tuple(member for member in apk.members(data)
+                     if _javascript_name(member.name) and (include_flagged or not member.flags))
     except apk.ApkError:
         if data.startswith(b'PK\x03\x04'):
             raise ContractError('Invalid JavaScript ZIP container') from None
@@ -41,6 +42,9 @@ def _sources(data, members):
         return
     total = 0
     for member in members:
+        if member.flags:
+            yield apk.escape(member.name), None, None, member
+            continue
         total += member.size
         if total > MAX_READ_BYTES:
             raise ContractError('JavaScript read budget exceeded')
@@ -73,7 +77,12 @@ def _line_stats(data):
 
 def _files(data, args):
     def rows():
-        for name, child, artifact, member in _sources(data, _members(data)):
+        for name, child, artifact, member in _sources(data, _members(data, include_flagged=True)):
+            if member is not None and member.flags:
+                yield Location(member.central_offset, min(member.central_length, MAX_EXCERPT_BYTES)), dict(
+                    kind='js_file', file=name, size=member.size, sha256=None, lines=None, max_line=None,
+                    flags=list(member.flags)), None
+                continue
             if not child:
                 if member is None:
                     continue  # There is no byte range to cite in an empty input.
@@ -82,7 +91,7 @@ def _files(data, args):
                 location = Location(0, min(len(child), MAX_EXCERPT_BYTES))
             lines, longest = _line_stats(child)
             yield location, dict(kind='js_file', file=name, size=len(child), sha256=sha256_hex(child),
-                                 lines=lines, max_line=longest), artifact
+                                 lines=lines, max_line=longest, flags=[]), artifact
     return _page(rows(), args)
 
 

@@ -16,7 +16,7 @@ TOOLS = {"js": ToolSpec(JS, {name: OperationSpec(name, {}, lambda d, a: []) for 
                              ("js.files", "js.package", "js.hints")})}
 CASES = {
     ("javascript.files", "js.files", "js_file"): (
-        {"file": "app/index.js", "size": 120, "sha256": "ab" * 32, "lines": 4, "max_line": 60},
+        {"file": "app/index.js", "size": 120, "sha256": "ab" * 32, "lines": 4, "max_line": 60, "flags": []},
         [("file", "a\nb"), ("size", -1), ("sha256", "AB" * 32), ("sha256", "ab"), ("lines", 122),
          ("max_line", 121), ("max_line", None)]),
     ("javascript.package", "js.package", "package_field"): (
@@ -40,6 +40,32 @@ def judge(key, operation, kind, row):
 
 
 class JavaScriptClaimTests(unittest.TestCase):
+    def test_clean_file_line_statistics_have_exact_empty_and_nonempty_bounds(self):
+        key, operation, kind = 'javascript.files', 'js.files', 'js_file'
+        row = {'file': 'a.js', 'size': 1, 'sha256': 'ab' * 32, 'lines': 1, 'max_line': 1, 'flags': []}
+        for size, lines, longest in ((0, 0, 0), (1, 1, 0), (1, 1, 1), (2, 2, 0), (2, 1, 2)):
+            with self.subTest(valid=(size, lines, longest)):
+                self.assertEqual(judge(key, operation, kind, {**row, 'size': size, 'lines': lines, 'max_line': longest}),
+                                 'supported')
+        for size, lines, longest in ((0, 1, 0), (1, 2, 0), (1, 0, 0), (1, 0, 1), (0, 0, 1),
+                                     (2, 1, 3), (1, True, 0), (1, 1, False), (True, 1, 1)):
+            with self.subTest(invalid=(size, lines, longest)):
+                self.assertEqual(judge(key, operation, kind, {**row, 'size': size, 'lines': lines, 'max_line': longest}),
+                                 'unsupported')
+
+    def test_flagged_files_admit_only_sorted_known_flags_and_null_computed_metadata(self):
+        key, operation, kind = 'javascript.files', 'js.files', 'js_file'
+        row = {'file': '../a.js', 'size': 30 * 1024 * 1024, 'sha256': None, 'lines': None, 'max_line': None,
+               'flags': ['ratio', 'too_large', 'traversing_name']}
+        for flags in (['encrypted'], list(claims.MEMBER_FLAGS), row['flags']):
+            with self.subTest(valid=flags):
+                self.assertEqual(judge(key, operation, kind, {**row, 'flags': flags}), 'supported')
+        for field, value in (('flags', []), ('flags', None), ('flags', ['unknown']), ('flags', ['crc', 'crc']),
+                             ('flags', ['too_large', 'ratio']), ('flags', [True]), ('flags', [[]]),
+                             ('sha256', 'ab' * 32), ('lines', 0), ('max_line', 0), ('size', -1)):
+            with self.subTest(invalid=(field, value)):
+                self.assertEqual(judge(key, operation, kind, {**row, field: value}), 'unsupported')
+
     def test_each_page_kind_accepts_its_row_and_refuses_each_bad_field(self):
         for (key, operation, kind), (row, bad) in CASES.items():
             self.assertIn(key, claims.PAGE_CLAIMS)
