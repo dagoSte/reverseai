@@ -1,9 +1,9 @@
 # Install and check ReverseAI
 
 M6 is a release candidate. Installing the Python package enables host-only
-analysis. Contained tools additionally require their exact local images and a
-separately verified Docker environment. Installation and `doctor` do not prove
-containment.
+analysis on supported POSIX systems. Contained tools additionally require their
+exact local images and a separately verified Docker environment. Installation
+and `doctor` do not prove containment.
 
 ## Requirements
 
@@ -52,9 +52,12 @@ py -3.12 -m venv .venv
 .venv\Scripts\reverseai.exe doctor --json
 ```
 
-Windows is experimental in M6a: these commands describe the expected path, with
-its own platform proof still pending. Substitute your Python 3.12-or-later
-launcher when using a newer installed version.
+Windows is experimental in M6a and has no platform proof yet. Only installation,
+`reverseai --version` and `reverseai doctor` are available there. Both `analyze`
+and `query` refuse `--out` because Windows lacks the required `O_DIRECTORY`,
+`O_NOFOLLOW` and `dir_fd` support for safe report-directory handles. Windows
+analysis output is M6b work. Substitute your Python 3.12-or-later launcher when
+using a newer installed version.
 
 The version command prints `reverseai 0.6.0`. `doctor` reports Python, OS and
 architecture, lock validity, whether Docker answers its version probe within
@@ -63,7 +66,7 @@ never pulls, builds or runs a container. Exit 0 means the host Python requiremen
 is met; all contained tools can still be unavailable. Inspect the tool rows or
 JSON `tools` array, not just the exit code. A present image is not a native proof.
 
-After installation, a host-only query needs no Docker:
+On supported POSIX systems, a host-only query needs no Docker:
 
 ```sh
 .venv/bin/reverseai query /approved/file --query list_segments --arg limit=16 --out new-query-report
@@ -74,7 +77,9 @@ sensitive strings and derived text from that input.
 
 ## Build distribution artifacts
 
-From the checkout root, using Python 3.12 or later:
+Build from a clean checkout root using Python 3.12 or later. Check that no local
+changes or untracked Python files are present under `reverseai/`: the wheel
+includes modules from the working tree, including untracked `.py` files.
 
 ```sh
 python3 -B tools/reverseai_build.py wheel --out dist
