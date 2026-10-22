@@ -13,7 +13,7 @@ from reverseai.contract import ContractError, MAX_EXCERPT_BYTES
 MAX_BYTES = 128 * 1024 * 1024
 _LEFT = rb"(?<![A-Za-z0-9_$])"
 _RIGHT = rb"(?![A-Za-z0-9_$])"
-_WS = rb"[ \t\r\n]{0,64}"
+_WS = rb"[ \t-\r]{0,64}"
 _DOT = _WS + rb"\." + _WS
 _OPEN = _WS + rb"\("
 _OCTET = rb"(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
@@ -24,7 +24,7 @@ _LITERAL = rb'''(?:"(?:[^"\\\r\n]|\\[^\r\n]){1,512}"|'(?:[^'\\\r\n]|\\[^\r\n]){1
 # A closed, plain literal is the only loading argument excluded by this rule.
 # Concatenations, interpolated templates and escaped spellings remain hints.
 _PLAIN = rb'''(?:"[^"\\\r\n]{0,1024}"|'[^'\\\r\n]{0,1024}'|`(?:[^`\\$]|\$(?!\{)){0,1024}`)'''
-_DYNAMIC = _WS + rb"(?!" + _PLAIN + _WS + rb"\))[^) \t\r\n]"
+_DYNAMIC = _WS + rb"(?!" + _PLAIN + _WS + rb"\))[^) \t-\r]"
 
 
 def _call(source):
@@ -35,7 +35,7 @@ PATTERNS = tuple((name, category, re.compile(source, flags)) for name, category,
     ("url", "endpoint", _LEFT + rb'''(?:https?|wss?|ftp)://[A-Za-z0-9\[][^\x00-\x20\x7f"'<>`\\]{0,4079}''', 0),
     ("ipv4_port", "endpoint", rb"(?<![A-Za-z0-9_$.])" + _OCTET + rb"(?:\." + _OCTET + rb"){3}:" + _PORT + rb"(?![A-Za-z0-9_$.])", 0),
     ("eval", "dynamic_code", _call(rb"eval"), 0),
-    ("new_function", "dynamic_code", _call(rb"new" + rb"[ \t\r\n]{1,64}" + rb"Function"), 0),
+    ("new_function", "dynamic_code", _call(rb"new" + rb"[ \t-\r]{1,64}" + rb"Function"), 0),
     ("function_constructor", "dynamic_code", _call(rb"Function"), 0),
     ("timer_string", "dynamic_code", _call(rb"set(?:Timeout|Interval)") + _WS + rb'''["'`]''', 0),
     ("vm_run", "dynamic_code", _call(rb"vm" + _DOT + rb"runIn[A-Za-z0-9_$]{1,64}"), 0),

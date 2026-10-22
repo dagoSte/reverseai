@@ -219,6 +219,12 @@ class JsHintsTests(unittest.TestCase):
             ])
 
     def test_whitespace_and_first_argument_limits(self):
+        for gap in (b" ", b"\t", b"\n", b"\r", b"\v", b"\f"):
+            with self.subTest(gap=gap):
+                self.assertEqual(only(b"eval" + gap + b"(x)", "eval"), [(0, 6, "dynamic_code", "eval")])
+                self.assertEqual(only(b"new" + gap + b"Function(x)", "new_function"), [(0, 13, "dynamic_code", "new_function")])
+                self.assertEqual(only(b"require(" + gap + b"'x')", "dynamic_require"), [])
+                self.assertEqual(only(b"import(" + gap + b")", "dynamic_import"), [])
         for gap in (b" " * 64, b"\n\t" * 32):
             self.assertEqual(only(b"eval" + gap + b"(x)", "eval"), [(0, 69, "dynamic_code", "eval")])
             self.assertEqual(only(b"require(" + gap + b"'x')", "dynamic_require"), [])
