@@ -1,6 +1,6 @@
-"""Native LIEF/YARA-X/Ghidra/JADX checks; ordinary unittest discovery never runs Docker.
+"""Native LIEF/YARA-X/Ghidra/JADX/jsparser checks; ordinary unittest discovery never runs Docker.
 
-Run from the repository root with --tool lief (or yarax/ghidra/jadx), --profile small --offline,
+Run from the repository root with --tool lief (or yarax/ghidra/jadx/jsparser), --profile small --offline,
 --lock containers/<tool>/image.lock.json --receipt NEW_PRIVATE_FILE.
 Unit tests establish validator behaviour; only a successful native run supplies
 runtime evidence for its exact image, platform, executor and verifier hashes.
@@ -29,7 +29,7 @@ from reverseai.contract import ContractError, Location, MAX_WORKER_REPLY_BYTES, 
 from reverseai.tools import structure, ghidra_verify
 from tests.fixtures_structure import elf, pe
 from tests.fixtures_code import elf_code, pe_code, elf_data_only, macho_code, elf_refs, pe_refs, macho_refs
-from tests import fixtures_apk
+from tests import fixtures_apk, fixtures_js
 
 
 PLATFORM = "linux/arm64"
@@ -79,6 +79,27 @@ JADX_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
                         *(f"apk_basic.{name}" for name in JADX_CASE_NAMES),
                         "jadx.hostile_reply", "jadx.input_mismatch")
 JADX_NATIVE_RUNS = len(JADX_REQUIRED_CHECKS) - 3
+JSPARSER_ADAPTER_VERSION = "8.0.4-r1"
+JSPARSER_PINS = {
+    "base_digest": "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e",
+    "node_sha256": "dbabf7a1cbf947e6059ffad2c27b80041db97dea1e553b62afdee7f13fca336e",
+    "babel_parser_integrity": "sha512-srpptsAkEbbNIC/q8nT7o+m6CQe8CJUTV/t7MYc9NnWlgYVtHOb7JH6SorxMhN0kuRJjVqXbKClG6xSbPtzz+g==",
+    "babel_types_integrity": "sha512-eY+Yn3dCqTGmyiq2QRU66lA5FL8lqqqvecHt0fF3uHONIa7ToYsaCiWV8lOKqAs0Rb2SjixiKFROngnulPtt2g==",
+    "helper_string_parser_integrity":
+        "sha512-+6HYEBnsDRZHJtUTAEfMQd0zMDqdFHS7C+5vAsEZqBUr3vEMWOWlHJ0Jz1gS8jJIlCvLsuA6ivmeoqzH936YcA==",
+    "helper_validator_identifier_integrity":
+        "sha512-HYx0YmuchRxRSpnjvcNffnPS8DCauKNmnumIuHG3jnQAVewRA7kfJGwF13ayEpSZs7s4R/oBH4eppuXcAQd5JQ==",
+}
+JSPARSER_DRIVER_PATH = Path(__file__).resolve().parents[1] / "containers/jsparser/driver.mjs"
+JSPARSER_WORKER_PATH = Path(__file__).resolve().parents[1] / "containers/jsparser/worker.py"
+# The verifier's own callee entries: its known answers never move when jshints.CALLEES does.
+JSPARSER_CALLEES = ("Buffer.from", "WebSocket", "XMLHttpRequest", "atob", "eval", "exec", "execSync", "fetch",
+                    "http.get", "require")
+JSPARSER_CASE_NAMES = ("app_modules", "app_calls", "app_page", "app_parse", "bundle_modules", "bundle_calls",
+                       "dialects_modules", "dialects_calls", "dialects_parse", "large_parse", "input_mismatch")
+JSPARSER_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES,
+                            *(f"jsparser.{name}" for name in JSPARSER_CASE_NAMES))
+JSPARSER_NATIVE_RUNS = len(JSPARSER_REQUIRED_CHECKS) - 3
 # Measured on r6 image sha256:d4c9076d0f6b0e4123704851f4300f08ab5d2f96ae6e4f37faadbcdf7d96492a.
 # Source: coordinator-forwarded m3d-w-native-oracle.json, SHA-256 d8baabf89e32d3147ec08ea231415e9fd68dadf21fdfb3438e888d75f471674d.
 GHIDRA_QUERY_EXPECTED = {'84a2fe7a4e67702df1bfa4434c1c57aa6fee8d21df4717ed47a1f3688d162e4f': {'function_add': [{'location': {'length': 10,
@@ -430,7 +451,9 @@ def need(condition, reason):
 
 def limits(tool):
     """Independent fixed expectations: pids, memory, nanocpus, tmpfs, wall."""
-    need(tool in ("lief", "yarax", "ghidra", "jadx"), "VerifierTool")
+    need(tool in ("lief", "yarax", "ghidra", "jadx", "jsparser"), "VerifierTool")
+    if tool == "jsparser":  # decision m5b-w-plan
+        return (64, 2 * 1024**3, 2_000_000_000, "rw,noexec,nosuid,nodev,size=64m", 120)
     if tool in ("ghidra", "jadx"):
         return (256, 2 * 1024**3, 2_000_000_000, "rw,noexec,nosuid,nodev,size=512m",
                 240 if tool == "ghidra" else 120)
@@ -438,9 +461,9 @@ def limits(tool):
 
 
 def required_checks(tool):
-    need(tool in ("lief", "yarax", "ghidra", "jadx"), "VerifierTool")
-    return {"lief": REQUIRED_CHECKS, "yarax": YARAX_REQUIRED_CHECKS,
-            "ghidra": GHIDRA_REQUIRED_CHECKS, "jadx": JADX_REQUIRED_CHECKS}[tool]
+    need(tool in ("lief", "yarax", "ghidra", "jadx", "jsparser"), "VerifierTool")
+    return {"lief": REQUIRED_CHECKS, "yarax": YARAX_REQUIRED_CHECKS, "ghidra": GHIDRA_REQUIRED_CHECKS,
+            "jadx": JADX_REQUIRED_CHECKS, "jsparser": JSPARSER_REQUIRED_CHECKS}[tool]
 
 
 def native_runs(tool):
@@ -448,6 +471,8 @@ def native_runs(tool):
 
 
 def lock_options(tool):
+    if tool == "jsparser":
+        return {"adapter_version": JSPARSER_ADAPTER_VERSION}
     if tool == "jadx":
         return {"adapter_version": JADX_ADAPTER_VERSION}
     if tool == "ghidra":
@@ -473,6 +498,14 @@ def verify_jadx_executor_profile(boundary):
     need(dict(profile) == expected and all(type(profile[key]) is type(value) for key, value in expected.items()) and
          type(boundary.JADX_WALL_SECONDS) is int and boundary.JADX_WALL_SECONDS == 120,
          "ExecutorJadxProfile")
+
+
+def verify_jsparser_executor_profile(boundary):
+    expected = {"pids": 64, "memory": "2g", "cpus": 2, "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=64m", "wall_seconds": 120}
+    profile = boundary.resource_profile("jsparser.syntax")
+    need(dict(profile) == expected and all(type(profile[key]) is type(value) for key, value in expected.items()) and
+         type(boundary.JSPARSER_WALL_SECONDS) is int and boundary.JSPARSER_WALL_SECONDS == 120,
+         "ExecutorJsparserProfile")
 
 
 def _unique(pairs):
@@ -757,6 +790,148 @@ def compare_jadx_observations(data, args, observations):
                  and value["text"] == "", "JadxKnownAnswerPage")
 
 
+def verify_jsparser_lock(lock):
+    pins = {"adapter_version": JSPARSER_ADAPTER_VERSION, "platform": PLATFORM, **JSPARSER_PINS}
+    need(isinstance(lock, dict) and set(lock) == {*pins, "driver_sha256", "worker_sha256", "image_id"},
+         "JsparserLockPins")
+    need(all(type(lock[key]) is str and lock[key] == value for key, value in pins.items()) and
+         isinstance(lock["image_id"], str) and re.fullmatch(r"sha256:[0-9a-f]{64}", lock["image_id"]),
+         "JsparserLockPins")
+    try:
+        need(lock["driver_sha256"] == sha256_hex(JSPARSER_DRIVER_PATH.read_bytes()) and
+             lock["worker_sha256"] == sha256_hex(JSPARSER_WORKER_PATH.read_bytes()), "JsparserSourcePins")
+    except OSError:
+        raise VerificationError("JsparserSourcePins") from None
+
+
+# Code-built sources of the dialect archive (M5B-W probe): every status, dialect, module form and callee rule.
+JSPARSER_DIALECT_SOURCES = (
+    ("view.tsx", b'import React from "react";\nexport const C = (p: {n: string}) => '
+                 b'<div onClick={() => fetch("/x")}>{p.n}</div>;\n'),
+    ("plain.jsx", b'const v = <App/>;\nrequire("./x");\neval("1");\n'),
+    ("types.ts", b'import fs = require("fs");\nimport type { T } from "./t";\nfs.writeFileSync(p, d);\n'
+                 b'Buffer.from(s, "base64");\n'),
+    ("latin1.js", b'var s = "caf\xe9";\nrequire("x");\n'),
+    ("recover.js", b'const a = 1;\nconst a = 2;\nrequire("still-found");\nfetch(u);\n'),
+    ("fatal.js", b'let a = ;\nrequire("lost");\n'),
+    ("bom.js", b'\xef\xbb\xbfrequire("bom");\neval(x);\n'),
+    ("astral.js", ('const s = "' + chr(0x1F600) * 2 + ' caf' + chr(0xE9) + '";\nrequire("after-astral");\n'
+                   'child_process.exec(c);\n').encode()),
+    ("forms.js", b'import x from "a";\nexport * from "b";\nexport { y } from \'c\';\nconst z = require(`d`);\n'
+                 b'import("e");\nrequire(name);\nrequire(`f${g}`);\nrequire(`h\\08`);\nnew WebSocket("wss://x.example");\n'
+                 b'a.b.c.exec();\na.b.c.d.exec();\nwindow["eval"]("x");\nobj?.fetch();\nmap.get(k);\nhttp.get(u);\n'
+                 b'(0, eval)(s);\na . b.eval(1);\n\\u0065val(2);\n'),
+)
+
+
+def _jsparser_dialect(name):
+    lowered = name.lower()
+    return "tsx" if lowered.endswith(".tsx") else "ts" if lowered.endswith(".ts") else (
+        "jsx" if lowered.endswith(".jsx") else "js")
+
+
+def _jsparser_dialects():
+    return fixtures_apk.zip_archive([fixtures_apk.member(name, data) for name, data in JSPARSER_DIALECT_SOURCES])
+
+
+def jsparser_fixtures():
+    return {"js_app": fixtures_js.app_zip()[0], "js_bundle": fixtures_js.bundle_js()[0],
+            "js_dialects": _jsparser_dialects()[0], "js_large": b"var a = 1;\n" * (4 * 1024 * 1024 // 11 + 1)}
+
+
+def jsparser_cases(fixtures):
+    """Fixed public jsparser.syntax requests (fixture name, args), built from the fixtures' own declarations."""
+    need(isinstance(fixtures, dict) and set(fixtures) == {"js_app", "js_bundle", "js_dialects", "js_large"} and
+         all(type(fixtures[name]) is bytes and fixtures[name] == value for name, value in jsparser_fixtures().items()),
+         "KnownAnswerFixture")
+
+    def entries(rows):
+        return [{"artifact": dict(row["artifact"]), "dialect": _jsparser_dialect(row["name"])} for row in rows
+                if row["name"].rsplit("/", 1)[-1] != "package.json"]
+
+    def case(fixture, files, kind, start=0, limit=256):
+        return fixture, {"files": files, "kind": kind, "start": start, "limit": limit, "callees": list(JSPARSER_CALLEES)}
+
+    app = entries(fixtures_js.app_zip()[1]["files"])
+    dialects = entries(_jsparser_dialects()[1]["members"])
+    single = [{"artifact": None, "dialect": "js"}]
+    tampered = [dict(entry) for entry in app]
+    tampered[1] = {**tampered[1], "artifact": {**tampered[1]["artifact"], "sha256": "0" * 64}}
+    return {"app_modules": case("js_app", app, "modules"), "app_calls": case("js_app", app, "calls"),
+            "app_page": case("js_app", app, "calls", 3, 4), "app_parse": case("js_app", app, "parse"),
+            "bundle_modules": case("js_bundle", single, "modules"), "bundle_calls": case("js_bundle", single, "calls"),
+            "dialects_modules": case("js_dialects", dialects, "modules"),
+            "dialects_calls": case("js_dialects", dialects, "calls"),
+            "dialects_parse": case("js_dialects", dialects, "parse"),
+            "large_parse": case("js_large", single, "parse"), "input_mismatch": case("js_app", tampered, "modules")}
+
+
+def _jsparser_rows(*rows):
+    return [{"file": index, "status": status, "errors": errors, "count": count,
+             "items": [{"kind": kind, "start": start, "end": end} for kind, start, end in items]}
+            for index, (status, errors, count, items) in enumerate(rows)]
+
+
+# Known answers (M5B-W probe, checked natively): one tuple per file, (status, errors, count, page items).
+JSPARSER_EXPECTED = {
+    "app_modules": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 2, (("require", 119, 134), ("require", 156, 160))),
+        ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ())),
+    "app_calls": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 4, (("call", 111, 118), ("call", 148, 155),
+        ("call", 239, 243), ("call", 337, 342))), ("ok", 0, 3, (("call", 92, 97), ("call", 189, 193),
+        ("call", 277, 286))), ("ok", 0, 2, (("call", 324, 335), ("call", 410, 414))),
+        ("ok", 0, 1, (("call", 1322, 1336),)), ("ok", 0, 0, ()), ("ok", 0, 0, ())),
+    "app_page": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 4, (("call", 337, 342),)), ("ok", 0, 3, (("call", 92, 97),
+        ("call", 189, 193), ("call", 277, 286))), ("ok", 0, 2, ()), ("ok", 0, 1, ()), ("ok", 0, 0, ()),
+        ("ok", 0, 0, ())),
+    "app_parse": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()),
+        ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ())),
+    "bundle_modules": _jsparser_rows(("ok", 0, 1, (("require", 173, 188),))),
+    "bundle_calls": _jsparser_rows(("ok", 0, 5, (("call", 105, 109), ("call", 136, 140), ("call", 165, 172),
+        ("call", 190, 200), ("call", 211, 216)))),
+    "dialects_modules": _jsparser_rows(("ok", 0, 1, (("import", 18, 25),)), ("ok", 0, 1, (("require", 26, 31),)),
+        ("ok", 0, 2, (("require", 20, 24), ("import", 50, 55))), ("decode_error", 0, 0, ()),
+        ("syntax_error", 1, 1, (("require", 34, 47),)), ("syntax_error", 1, 0, ()),
+        ("ok", 0, 1, (("require", 8, 13),)), ("ok", 0, 1, (("require", 31, 45),)),
+        ("syntax_error", 1, 5, (("import", 14, 17), ("export_from", 33, 36), ("export_from", 56, 59),
+        ("require", 79, 82), ("dynamic_import", 92, 95)))),
+    "dialects_calls": _jsparser_rows(("ok", 0, 1, (("call", 84, 89),)), ("ok", 0, 2, (("call", 18, 25),
+        ("call", 34, 38))), ("ok", 0, 1, (("call", 81, 92),)), ("decode_error", 0, 0, ()),
+        ("syntax_error", 1, 2, (("call", 26, 33), ("call", 50, 55))), ("syntax_error", 1, 0, ()),
+        ("ok", 0, 2, (("call", 0, 7), ("call", 16, 20))), ("ok", 0, 2, (("call", 23, 30), ("call", 48, 66))),
+        ("syntax_error", 1, 7, (("call", 71, 78), ("call", 98, 105), ("call", 113, 120), ("call", 131, 138),
+        ("call", 152, 161), ("call", 182, 192), ("call", 259, 267)))),
+    "dialects_parse": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("decode_error", 0, 0, ()),
+        ("syntax_error", 1, 0, ()), ("syntax_error", 1, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()),
+        ("syntax_error", 1, 0, ())),
+    "large_parse": _jsparser_rows(("too_large", 0, 0, ())),
+    "input_mismatch": {"error": "input"},
+}
+
+
+def jsparser_request_allowed(operation, args):
+    """Only the fixed case requests may reach the worker during a native run."""
+    try:
+        allowed = {canonical_json(request) for _, request in jsparser_cases(jsparser_fixtures()).values()}
+        return operation == "jsparser.syntax" and canonical_json(args) in allowed
+    except (VerificationError, TypeError, ValueError):
+        return False
+
+
+def compare_jsparser_reply(data, case, value):
+    """The worker's reply equals the case's known answer exactly (rows, statuses, counts, page items), or its error."""
+    need(case in JSPARSER_EXPECTED, "JsparserOracleMissing")
+    expected = JSPARSER_EXPECTED[case]
+    need(isinstance(value, dict) and value.get("protocol") == "reverseai.worker/1" and
+         value.get("snapshot_sha256") == sha256_hex(data), "JsparserReplyIdentity")
+    if isinstance(expected, dict):
+        need(set(value) == {"protocol", "status", "snapshot_sha256", "error"} and value["status"] == "error" and
+             value["error"] == expected["error"], "JsparserKnownAnswerError")
+        return 0
+    need(set(value) == {"protocol", "status", "snapshot_sha256", "observations"} and value["status"] == "ok" and
+         canonical_json(value["observations"]) == canonical_json(expected), "JsparserKnownAnswer")
+    return len(expected)
+
+
 def ghidra_fixtures():
     return dict(zip(GHIDRA_FIXTURE_NAMES, (elf_code()[0], pe_code()[0], elf_data_only()[0], macho_code()[0],
                                          elf_refs()[0], pe_refs()[0], macho_refs()[0])))
@@ -995,17 +1170,18 @@ def receipt_passes(receipt):
     try:
         tool = receipt.get("tool")
         need(receipt.get("schema") == "reverseai.m2-runtime/1" and receipt.get("platform") == PLATFORM and
-             tool in ("lief", "yarax", "ghidra", "jadx") and receipt.get("profile") == "small" and receipt.get("offline") is True,
+             tool in ("lief", "yarax", "ghidra", "jadx", "jsparser") and receipt.get("profile") == "small" and
+             receipt.get("offline") is True,
              "ReceiptIdentity")
         for key in ("lock_sha256", "verifier_sha256", "executor_sha256"):
             need(bool(re.fullmatch(r"[0-9a-f]{64}", receipt.get(key, ""))), "ReceiptBinding")
         pins = receipt["lock"]
         need(pins["platform"] == PLATFORM and receipt["image_id"] == pins["image_id"] and
              bool(re.fullmatch(r"sha256:[0-9a-f]{64}", pins["image_id"])), "ReceiptImage")
-        if tool in ("ghidra", "jadx"):
-            (verify_ghidra_lock if tool == "ghidra" else verify_jadx_lock)(pins)
+        if tool in ("ghidra", "jadx", "jsparser"):
+            {"ghidra": verify_ghidra_lock, "jadx": verify_jadx_lock, "jsparser": verify_jsparser_lock}[tool](pins)
             need("ruleset_sha256" not in receipt and "wheel_sha256" not in receipt,
-                 "ReceiptGhidraPins" if tool == "ghidra" else "ReceiptJadxPins")
+                 {"ghidra": "ReceiptGhidraPins", "jadx": "ReceiptJadxPins", "jsparser": "ReceiptJsparserPins"}[tool])
         else:
             need(bool(re.fullmatch(r"sha256:[0-9a-f]{64}", pins["base_digest"])) and
                  bool(re.fullmatch(r"[0-9a-f]{64}", pins["wheel_sha256"])) and
@@ -1140,7 +1316,7 @@ class NativeVerifier:
     """A native controller; constructors and all unit validators are Docker-free."""
 
     def __init__(self, boundary, lock, receipt, *, tool="lief", ruleset=None):
-        need(tool in ("lief", "yarax", "ghidra", "jadx"), "VerifierTool")
+        need(tool in ("lief", "yarax", "ghidra", "jadx", "jsparser"), "VerifierTool")
         need(tool != "yarax" or isinstance(ruleset, dict), "YaraxRulesetShape")
         if tool == "yarax":
             verify_yarax_lock(lock)
@@ -1150,6 +1326,9 @@ class NativeVerifier:
         if tool == "jadx":
             verify_jadx_lock(lock)
             verify_jadx_executor_profile(boundary)
+        if tool == "jsparser":
+            verify_jsparser_lock(lock)
+            verify_jsparser_executor_profile(boundary)
         self.boundary, self.lock, self.receipt = boundary, lock, receipt
         self.tool, self.ruleset = tool, ruleset
         self.native_runs = native_runs(tool)
@@ -1163,7 +1342,7 @@ class NativeVerifier:
         return self.boundary.run_bounded(["docker", *args], timeout=5, max_output=cap)
 
     def run_bounded(self, argv, *, timeout, max_output):
-        options = {"profile": self.tool} if self.tool in ("ghidra", "jadx") else {}
+        options = {"profile": self.tool} if self.tool in ("ghidra", "jadx", "jsparser") else {}
         return self.boundary.run_bounded(argv, timeout=timeout, max_output=max_output, **options)
 
     def one_inspect(self, args):
@@ -1242,6 +1421,8 @@ class NativeVerifier:
             need(ghidra_request_allowed(operation, args), "GhidraRequestChanged")
         if self.tool == "jadx":
             need(jadx_request_allowed(operation, args), "JadxRequestChanged")
+        if self.tool == "jsparser":
+            need(jsparser_request_allowed(operation, args), "JsparserRequestChanged")
         need(argv == self.boundary.build_argv(self.lock["image_id"], name, snapshot, operation, args), "BuilderMismatch")
         code = probe_code(self.active, tool=self.tool) if self.active is not None else None
         created = derive_control_argv(argv, self.lock["image_id"], code)
@@ -1332,11 +1513,19 @@ class NativeVerifier:
             operation, args = "ghidra.analyze", ghidra_args()
         if self.tool == "jadx":
             operation, args = "jadx.method", jadx_prepared_request(data, jadx_cases(data)["compute"])
+        if self.tool == "jsparser":
+            operation, args = "jsparser.syntax", jsparser_cases(jsparser_fixtures())["app_calls"][1]
         value = decode(self.invoke(data, operation, args, probe=name))
         validate_probe(name, value, tool=self.tool)
         return value
 
     def known_answer(self, data, operation, args=None):
+        if self.tool == "jsparser":
+            case = operation
+            fixture, request = jsparser_cases(jsparser_fixtures())[case]
+            need(data == jsparser_fixtures()[fixture] and args is None, "JsparserRequestChanged")
+            rows = compare_jsparser_reply(data, case, decode(self.invoke(data, "jsparser.syntax", request)))
+            return {"input_sha256": sha256_hex(data), "input_bytes": len(data), "case": case, "rows": rows}
         if self.tool == "jadx":
             need(operation == "jadx.method", "JadxRequestChanged")
             return self.jadx_known_answer(data, args)
@@ -1416,10 +1605,16 @@ class NativeVerifier:
         if not self.record("local_daemon", self.local_daemon) or not self.record("image", self.image_check):
             return
         values = (fixtures() if self.tool == "lief" else yarax_fixtures() if self.tool == "yarax"
-                  else {"apk_basic": fixtures_apk.apk_basic()[0]} if self.tool == "jadx" else ghidra_fixtures())
-        control_data = values[{"lief": "elf64le", "yarax": "upx_markers", "ghidra": "elf_code", "jadx": "apk_basic"}[self.tool]]
+                  else {"apk_basic": fixtures_apk.apk_basic()[0]} if self.tool == "jadx"
+                  else jsparser_fixtures() if self.tool == "jsparser" else ghidra_fixtures())
+        control_data = values[{"lief": "elf64le", "yarax": "upx_markers", "ghidra": "elf_code", "jadx": "apk_basic",
+                               "jsparser": "js_app"}[self.tool]]
         for name in CONTROL_NAMES:
             self.record(name, lambda name=name: self.control(name, control_data))
+        if self.tool == "jsparser":
+            for case, (fixture, _) in jsparser_cases(values).items():
+                self.record(f"jsparser.{case}", lambda case=case, data=values[fixture]: self.known_answer(data, case))
+            values = {}
         for name, data in values.items():
             if self.tool == "jadx":
                 for case, args in jadx_cases(data).items():
@@ -1450,7 +1645,7 @@ def write_receipt(path, receipt):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--tool", choices=("lief", "yarax", "ghidra", "jadx"), required=True)
+    parser.add_argument("--tool", choices=("lief", "yarax", "ghidra", "jadx", "jsparser"), required=True)
     parser.add_argument("--profile", choices=("small",), required=True)
     parser.add_argument("--offline", action="store_true", required=True)
     parser.add_argument("--lock", type=Path, required=True)
@@ -1476,6 +1671,9 @@ def main(argv=None):
         if args.tool == "jadx":
             verify_jadx_lock(candidate_lock)
             verify_jadx_executor_profile(contained)
+        if args.tool == "jsparser":
+            verify_jsparser_lock(candidate_lock)
+            verify_jsparser_executor_profile(contained)
         receipt["lock"] = contained.load_lock(candidate_lock, **lock_options(args.tool))
         ruleset = None
         if args.tool == "yarax":
