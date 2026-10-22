@@ -21,7 +21,8 @@ APP_FILES = ("node_modules/left-pad/package.json", "node_modules/left-pad/index.
 
 
 def strict_json(data):
-    """RFC 8259 as the contract's reader: UTF-8, no duplicate key, no NaN or Infinity, no lone surrogate."""
+    """RFC 8259 as the contract's reader: UTF-8 without a byte order mark, one object, no duplicate key, no NaN or
+    Infinity, no lone surrogate."""
     def pairs(items):
         keys = [key for key, _ in items]
         if len(set(keys)) != len(keys):
@@ -33,6 +34,8 @@ def strict_json(data):
 
     value = json.loads(data.decode("utf-8"), object_pairs_hook=pairs, parse_constant=constant)
     json.dumps(value, ensure_ascii=False).encode("utf-8")  # a lone surrogate cannot be encoded
+    if data.startswith(b"\xef\xbb\xbf") or not isinstance(value, dict):
+        raise ValueError("not one JSON object")
     return value
 
 
@@ -179,9 +182,16 @@ class EdgeAndHostileTests(unittest.TestCase):
         self.assertEqual(layout["default_package"], "b/package.json")
         self.assertEqual([row["row"]["value"] for row in layout["package"]["rows"]], ["second-by-name"])
         data, layout = J.js_edge("empty_file")
-        self.assertEqual(layout["files"][0]["row"], {"file": "lib/empty.js", "size": 0,
-                                                     "sha256": hashlib.sha256(b"").hexdigest(), "lines": 0, "max_line": 0})
-        self.assertEqual(layout["files"][0]["anchor"]["length"], 0)
+        empty = layout["files"][0]
+        self.assertEqual(empty["row"], {"file": "lib/empty.js", "size": 0, "sha256": hashlib.sha256(b"").hexdigest(),
+                                        "lines": 0, "max_line": 0})
+        central = layout["zip"]["members"][0]
+        self.assertEqual((empty["anchor"], empty["artifact"]),
+                         ({"offset": central["central_offset"], "length": central["central_length"]}, None))
+        self.assertEqual(data[empty["anchor"]["offset"]:empty["anchor"]["offset"] + 4], b"PK\x01\x02")
+        self.assertIsNotNone(layout["files"][1]["artifact"])
+        data, layout = J.js_edge("empty_input")
+        self.assertEqual((data, layout["files"], layout["expect"]["js.files"]), (b"", [], "no rows"))
         with self.assertRaises(ValueError):
             J.js_edge("unknown")
 
@@ -189,11 +199,14 @@ class EdgeAndHostileTests(unittest.TestCase):
         for name, text in J.INVALID_JSON.items():
             with self.subTest(name=name), self.assertRaises(ValueError):
                 strict_json(text)
-        for kind in ("duplicate_key", "duplicate_nested_key", "invalid_json", "non_utf8"):
+        for kind in ("duplicate_key", "duplicate_nested_key", "invalid_json", "non_utf8", "long_pointer"):
             data, layout = J.js_hostile(kind)
             package = next(row["data"] for row in layout["files"] if row["name"] == "package.json")
-            with self.subTest(kind=kind), self.assertRaises(ValueError):
-                strict_json(package)
+            if kind == "long_pointer":  # valid JSON whose pointer /dependencies/k... is 314 characters
+                self.assertEqual(len("/dependencies/" + next(iter(strict_json(package)["dependencies"]))), 314)
+            else:
+                with self.subTest(kind=kind), self.assertRaises(ValueError):
+                    strict_json(package)
             self.assertEqual(layout["expect"]["js.package"], "refused")
             self.assertEqual([m.flags for m in apk.members(data)], [()] * len(layout["files"]))
 
@@ -230,6 +243,11 @@ class EdgeAndHostileTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             self.assertEqual(sum(info.file_size for info in archive.infolist()), 150 * 1024 * 1024)
         self.assertEqual(layout["files"], [])
+        data, layout = J.js_hostile("zip_refused")
+        self.assertTrue(data.startswith(b"PK\x03\x04"))
+        with self.assertRaisesRegex(ContractError, "ZIP64"):
+            apk.members(data)
+        self.assertEqual(set(layout["expect"].values()), {"refused"})
         with self.assertRaises(ValueError):
             J.js_hostile("unknown")
 

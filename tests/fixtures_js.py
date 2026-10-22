@@ -17,7 +17,8 @@ app_zip() builds a small application archive from declared values, members in ce
 
 bundle_js() is one file that is not a ZIP: a webpack-like bundle on one long line, then a source map comment.
 package_only() is the app's package.json alone, a single-file input for js.package (file "").
-js_edge(kind) builds the clean edge cases of EDGE_KINDS, js_hostile(kind) the problems of HOSTILE_KINDS;
+js_edge(kind) builds the clean edge cases of EDGE_KINDS, js_hostile(kind) the problems of HOSTILE_KINDS (decisions
+m5a-seams-p and m5a-seams-p2 included);
 INVALID_JSON names package.json texts a strict RFC 8259 reader refuses, and package_zip(text) puts any of them in an
 application ZIP; nested_json(depth) is an object nested to an exact depth for boundary tests.
 
@@ -32,7 +33,8 @@ Each builder returns (data, layout):
                         pointer and token span ("strings")
     layout["marks"]     per file, named spans of hint-worthy text (labels of this module, not jshints pattern names),
                         so the hint lanes can pin their own exact matches
-    layout["expect"]    hostile and edge cases only: what each js operation must do
+    layout["expect"]    hostile and edge cases only: what each js operation must do ("ok", "refused" for a failed
+                        operation, "no rows")
 
 Conventions this module states for the lanes (contract M5a): lines counts line feeds, plus one when the last byte is
 not a line feed (0 when empty); max_line is the longest run of bytes between line feeds, a carriage return counting as
@@ -185,8 +187,11 @@ def archive(specs, *, strings=None, marks=None):
         if not is_javascript(row["name"]):
             continue
         lines, max_line = line_metrics(child)
-        files.append({"member": row["index"], "name": row["name"], "data": child, "artifact": row["artifact"],
-                      "anchor": {"offset": 0, "length": min(len(child), MAX_ANCHOR)},
+        # an empty member is anchored at its central directory entry in the input, without an artifact
+        anchor = ({"offset": 0, "length": min(len(child), MAX_ANCHOR)} if child else
+                  {"offset": row["central_offset"], "length": row["central_length"]})
+        files.append({"member": row["index"], "name": row["name"], "data": child,
+                      "artifact": row["artifact"] if child else None, "anchor": anchor,
                       "row": {"file": escaped(row["name"]), "size": len(child), "sha256": hashlib.sha256(child).hexdigest(),
                               "lines": lines, "max_line": max_line}})
     packages = [f for f in files if f["name"].rsplit("/", 1)[-1] == "package.json"]
@@ -202,12 +207,12 @@ def archive(specs, *, strings=None, marks=None):
 
 
 def single(data, *, strings=None, marks=()):
-    """(data, layout) of a single-file input, named "" in rows."""
+    """(data, layout) of a single-file input, named "" in rows; an empty input has no rows."""
     lines, max_line = line_metrics(data)
     files = [{"member": None, "name": "", "data": data, "artifact": None,
               "anchor": {"offset": 0, "length": min(len(data), MAX_ANCHOR)},
               "row": {"file": "", "size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "lines": lines,
-                      "max_line": max_line}}]
+                      "max_line": max_line}}] if data else []
     package = None if strings is None else {"name": "", "member": None, "artifact": None,
                                             "rows": package_rows(strings, ""), "strings": strings}
     return data, {"size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "zip": None, "files": files,
@@ -355,9 +360,9 @@ def package_only():
 
 # ---- edge and hostile cases ----
 
-EDGE_KINDS = ("long_value", "package_tie", "empty_file")
+EDGE_KINDS = ("long_value", "package_tie", "empty_file", "empty_input")
 HOSTILE_KINDS = ("duplicate_key", "duplicate_nested_key", "invalid_json", "deep_nesting", "huge_string", "non_utf8",
-                 "flagged_members", "declared_over_128mib")
+                 "long_pointer", "flagged_members", "declared_over_128mib", "zip_refused")
 INVALID_JSON = {
     "trailing_comma": b'{"name": "a",}',
     "single_quotes": b"{'name': 'a'}",
@@ -371,6 +376,9 @@ INVALID_JSON = {
     "two_values": b'{"name": "a"} {}',
     "empty": b"",
     "bare_word": b"package",
+    "byte_order_mark": b'\xef\xbb\xbf{"name": "a"}',  # decision m5a-seams-p: a UTF-8 BOM is refused
+    "top_level_array": b'["name"]',  # the file must hold one JSON object
+    "top_level_string": b'"name"',
 }
 INDEX_JS = b"module.exports = 1;\n"
 
@@ -403,9 +411,14 @@ def js_edge(kind):
         built[1]["expect"] = {"js.package": "ok", "default": "b/package.json"}
         return built
     if kind == "empty_file":
-        # Open in the contract: an empty file has no byte to anchor (Location length is at least 1)
+        # decision m5a-seams-p: an empty member is anchored at its central directory entry, without an artifact
         built = archive([F.member("lib/empty.js", b"", 0), F.member("lib/index.js", INDEX_JS)])
-        built[1]["expect"] = {"js.files": "open: an empty file has no anchor", "lines": 0, "max_line": 0}
+        built[1]["expect"] = {"js.files": "ok", "js.hints": "ok"}
+        return built
+    if kind == "empty_input":
+        # decision m5a-seams-p: an empty single-file input has no rows
+        built = single(b"")
+        built[1]["expect"] = {"js.files": "no rows", "js.hints": "no rows"}
         return built
     raise ValueError(f"unknown edge kind {kind!r}")
 
@@ -438,6 +451,9 @@ def js_hostile(kind):
         built[1]["marks"] = {"lib/latin1.js": marks}
         built[1]["expect"] = {"js.files": "ok", "js.package": "refused", "js.hints": "ok"}
         return built
+    elif kind == "long_pointer":
+        # decision m5a-seams-p: a JSON pointer longer than 255 characters fails js.package
+        built = package_zip(b'{"name": "a", "dependencies": {"' + b"k" * 300 + b'": "1.0.0"}}\n')
     elif kind == "flagged_members":
         # Only ok.js and package.json are clean; the others are listed by apk.inventory with these flags, never read
         package, strings = json_text({"name": "flagged"})
@@ -466,8 +482,15 @@ def js_hostile(kind):
         data = bytes(patched)
         layout.update(size=len(data), sha256=hashlib.sha256(data).hexdigest(), files=[],
                       flags=[["ratio", "too_large"]] * len(specs),
-                      expect={"js.files": "no rows", "js.package": "refused", "js.hints": "no rows"})
+                      expect={"js.files": "no rows", "js.package": "no rows", "js.hints": "no rows"})
         return data, layout
+    elif kind == "zip_refused":
+        # decision m5a-seams-p2: it starts with a ZIP local header but the parser refuses it (ZIP64), so every js
+        # operation fails; it is never read as one script
+        data, zipped = F.zip_archive([F.member("lib/index.js", INDEX_JS)], zip64=True)
+        return data, {"size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "zip": zipped, "files": [],
+                      "package": None, "default_package": None, "marks": {},
+                      "expect": {"js.files": "refused", "js.package": "refused", "js.hints": "refused"}}
     else:
         raise ValueError(f"unknown hostile kind {kind!r}")
     built[1]["expect"] = {"js.files": "ok", "js.package": "refused", "js.hints": "ok"}
