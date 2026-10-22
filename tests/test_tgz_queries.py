@@ -190,7 +190,8 @@ class TarballSyntaxQueries(unittest.TestCase):
         self.assertEqual(len(self.executor.calls[-1]['files']), 1)
 
     def test_bad_streams_are_refused_before_invoking_the_parser_executor(self):
-        for kind in ('gzip_crc', 'gzip_trailing_data', 'gzip_concatenated', 'bad_tar_checksum', 'ratio'):
+        for kind in ('gzip_crc', 'gzip_isize', 'gzip_trailing_data', 'gzip_concatenated',
+                     'bad_tar_checksum', 'truncated_tar', 'not_gzip', 'ratio'):
             with self.subTest(kind=kind):
                 self.executor.calls.clear()
                 analysis = run(F.tgz_hostile(kind), {'detail': 'modules'}, tools=(self.tool,))
