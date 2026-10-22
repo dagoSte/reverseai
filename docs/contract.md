@@ -851,7 +851,11 @@ evaluates the sample.
   truncated]`: lexical occurrences, not evidence that the code runs. Known
   limits: a call split by a comment or by more than 64 bytes of whitespace, an
   indirect call or a non-literal `fs` receiver is missed; `process_call` matches
-  bare process calls and calls on `child_process`, `childProcess` or `cp` only.
+  `execSync`, `execFile`, `execFileSync`, `spawn`, `spawnSync` and `fork` bare or
+  on any receiver, and `exec` only bare or on `child_process`, `childProcess` or
+  `cp` (so a regular expression's `.exec(` is not a hint); `new Function(` gives
+  one `new_function` hint, not also `function_constructor` (decision
+  `m5a-fix-round`).
   `jshints.scan(data)` yields `(offset, length, category, hint)` for one file's
   bytes, in offset order, overlapping matches of different patterns allowed.
 - **Query** `analyze_javascript_application` (REA's name): args `detail` enum
