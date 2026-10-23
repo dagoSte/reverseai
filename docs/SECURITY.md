@@ -29,6 +29,47 @@ not protected by the worker's container. An exploit there or a container escape
 can cross the intended boundary. No model-provider connection or model-driven
 analysis agent is included in the current analysis runtime.
 
+## Report destinations
+
+POSIX reports are created exclusively relative to a bound, empty directory
+handle, without following a link or replacing an existing report. On Windows,
+each `--out` must name a directory that does not exist. CPython 3.12.4 or later
+creates it with a private ACL; older Windows Pythons refuse output.
+
+Windows opens the new directory as a handle without delete sharing, checks
+that it is an empty directory rather than a reparse point, and keeps it bound
+until writing finishes. Each report is created exclusively relative to that
+handle with `NtCreateFile`, without reopening the directory by path or following
+a report-name reparse point. A bound directory cannot be renamed or replaced
+through the usual file-sharing APIs. Existing output directories, junctions and
+symlinks are refused. The operator must still choose a trusted parent directory;
+these controls do not make a compromised host account safe.
+
+## Installation and manual CI
+
+The package and its build backend are trusted code. An editable install adds
+the absolute checkout root to Python's import path and uses that checkout's
+locks; anyone who can change it can change the installed program. Never install
+a sample project or run its build scripts. The MIT license and preserved
+third-party notices describe redistribution terms, not a security attestation.
+
+The hosted workflow is manually dispatched by the owner, with no automatic
+push, pull-request or scheduled trigger. It grants only `contents: read`, uses
+checkout without persisted credentials, and pins checkout and setup-python to
+full commit SHAs. It references no secrets and has no cache, artifact-upload
+or deployment step. Changing a pin requires reviewing the actual upstream code;
+a SHA binds a version, not its trustworthiness. Hosted runner provisioning is
+separate from the offline package-install commands.
+
+Host proof receipts identify a commit, interpreter, OS/architecture and each
+check's exit status. They use code-built fixtures, never submitted samples.
+On POSIX, a passing receipt requires the whole suite and installed CLI checks.
+On Windows, it requires the real Windows report tests and installed CLI checks;
+the separate whole-suite result is still recorded but does not gate the
+Windows receipt. A passing host receipt is not a successful all-tests Windows
+claim or a proof of native tool containment. A workflow definition or an
+unstarted manual job is not execution evidence; consult the recorded receipt.
+
 ## Contained tools
 
 [`contained.py`](../reverseai/contained.py) builds a fixed command for each
