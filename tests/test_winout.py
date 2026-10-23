@@ -210,6 +210,21 @@ class WindowsOutputTests(unittest.TestCase):
         with patch.object(W.sys, "version_info", (3, 12, 4)):
             self.bind().close()
 
+    def test_cpython_313_prereleases_need_the_private_mkdir_acl_fix(self):
+        for version, allowed in (((3, 13, 0, "alpha", 1), False), ((3, 13, 0, "beta", 1), False),
+                                 ((3, 13, 0, "beta", 2), True), ((3, 13, 0, "final", 0), True)):
+            self.fake.events.clear()
+            self.fake.pages = [entries([".", ".."]), None]
+            with self.subTest(version=version), patch.object(W.sys, "version_info", version):
+                if allowed:
+                    self.bind().close()
+                    self.assertEqual(self.fake.events[0], ("mkdir", "new-output", 0o700))
+                    self.assertEqual(self.fake.events[-1], ("CloseHandle", 1000))
+                else:
+                    with self.assertRaises(W.OutputRefused):
+                        self.bind()
+                    self.assertEqual(self.fake.events, [])
+
     def test_existing_or_uncreatable_directory_never_reaches_createfile(self):
         for failure in ("mkdir-existing", "mkdir"):
             with self.subTest(failure=failure):

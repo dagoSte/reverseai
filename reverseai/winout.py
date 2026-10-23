@@ -162,7 +162,8 @@ class Directory:
 
 
 def open_output(path, *, api=None):
-    if sys.implementation.name != "cpython" or sys.version_info < (3, 12, 4):
+    if sys.implementation.name != "cpython" or sys.version_info < (3, 12, 4) \
+            or (sys.version_info[:2] == (3, 13) and sys.version_info < (3, 13, 0, "beta", 2)):
         raise OutputRefused("Windows output requires CPython 3.12.4 or later")
     api = _load_api() if api is None else api
     try:

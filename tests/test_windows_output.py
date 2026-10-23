@@ -40,7 +40,8 @@ class WindowsOutputTests(unittest.TestCase):
     def assert_refused(self, path):
         code, _, error = self.run_cli("analyze", str(self.sample), "--out", str(path))
         self.assertEqual(code, 1)
-        self.assertIn("refused", error)
+        self.assertTrue(error.startswith(("reverseai: output refused:",
+                                          "reverseai: --out must be a new or empty directory")), error)
         self.assertNotIn("Traceback", error)
         self.assertNotIn(str(self.root), error)
 
