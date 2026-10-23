@@ -24,8 +24,10 @@ CLEAN = "....\nRan 4 tests in 0.1s\n\nOK (skipped=1)\n"
 
 class StandIn:
     """Answers every proof command without running it; suite and windows_tests answers are configurable."""
-    def __init__(self, *, suite=CLEAN, windows_tests="..\nRan 2 tests in 0.1s\n\nOK\n", fail=(), git=0, real=False):
+    def __init__(self, *, suite=CLEAN, windows_tests="..\nRan 2 tests in 0.1s\n\nOK\n", fail=(), git=0, real=False,
+                 doctor=None):
         self.calls, self.suite, self.windows_tests, self.fail, self.git = [], suite, windows_tests, set(fail), git
+        self.doctor = json.dumps({"reverseai": VERSION, "host_ok": True, "tools": []}) if doctor is None else doctor
         self.real = real  # answer the import path with links resolved, as Python does
 
     def __call__(self, argv, *, timeout, cwd=None, env=None):
@@ -51,7 +53,7 @@ class StandIn:
             imported = venv / "lib/python3.12/site-packages/reverseai/__init__.py"
             return 0, (os.path.realpath(imported) if self.real else str(imported)) + "\n", ""
         if name == "doctor":
-            return 0, json.dumps({"reverseai": VERSION, "host_ok": True, "tools": []}), ""
+            return 0, self.doctor, ""
         if name in ("analyze", "query"):
             out = Path(argv[argv.index("--out") + 1])
             out.mkdir()
@@ -160,11 +162,26 @@ class PredicateTests(unittest.TestCase):
         self.assertTrue(H.passed(facts, VERSION, windows=True))
         self.assertFalse(H.passed(facts, VERSION))
         cases = {"report test failure": dict(windows_tests="F\nRan 2 tests in 0.1s\n\nFAILED (failures=1)\n"),
-                 "report tests all skipped": dict(windows_tests="\nRan 0 tests in 0.0s\n\nOK\n")}
+                 "no report test": dict(windows_tests="\nRan 0 tests in 0.0s\n\nOK\n"),
+                 "report tests all skipped": dict(windows_tests="sssssssss\nRan 9 tests in 0.0s\n\nOK (skipped=9)\n"),
+                 "one report test skipped": dict(windows_tests="s.\nRan 2 tests in 0.0s\n\nOK (skipped=1)\n")}
         cases.update({f"{name} exit 1": dict(fail={name}) for name in H.WINDOWS_STEPS})
         for label, runner in cases.items():
             with self.subTest(label=label):
                 self.assertFalse(H.passed(self.facts(windows=True, **runner), VERSION, windows=True))
+
+
+    def test_both_hosts_need_doctor_json_saying_host_ok_for_this_version(self):
+        doctors = {"malformed": "{not json", "a list": "[1]", "a string": json.dumps("ok"),
+                   "host_ok false": json.dumps({"reverseai": VERSION, "host_ok": False, "tools": []}),
+                   "host_ok string": json.dumps({"reverseai": VERSION, "host_ok": "true", "tools": []}),
+                   "another version": json.dumps({"reverseai": VERSION + ".1", "host_ok": True, "tools": []})}
+        for windows in (False, True):
+            for label, output in doctors.items():
+                with self.subTest(windows=windows, doctor=label):
+                    facts = self.facts(windows=windows, doctor=output)
+                    self.assertEqual(facts["steps"]["doctor"]["exit"], 0)
+                    self.assertFalse(H.passed(facts, VERSION, windows=windows))
 
 
 class ProveTests(unittest.TestCase):
