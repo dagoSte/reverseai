@@ -17,7 +17,8 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ("lief", "yarax", "ghidra", "jadx", "jsparser")
 SOURCE_DIRS = ("reverseai", "tools", "containers", "docs", "tests", "media")
-SOURCE_FILES = ("README.md", "THIRD_PARTY_NOTICES.md", "pyproject.toml")
+LICENSE_FILES = ("LICENSE", "THIRD_PARTY_NOTICES.md")
+SOURCE_FILES = ("README.md", *LICENSE_FILES, "pyproject.toml")
 
 
 def _version():
@@ -34,9 +35,12 @@ def _metadata():
     version = _version()
     if project["name"] != "reverseai" or project["version"] != version:
         raise ValueError("Inconsistent ReverseAI project identity")
-    headers = ("Metadata-Version: 2.1", "Name: reverseai", f"Version: {version}",
+    if project.get("license") != "MIT" or project.get("license-files") != list(LICENSE_FILES):
+        raise ValueError("Unsupported project license declaration")
+    headers = ("Metadata-Version: 2.4", "Name: reverseai", f"Version: {version}",
                f"Summary: {project['description']}", f"Requires-Python: {project['requires-python']}",
-               "Description-Content-Type: text/markdown; charset=UTF-8")
+               "Description-Content-Type: text/markdown; charset=UTF-8", "License-Expression: MIT",
+               *(f"License-File: {name}" for name in LICENSE_FILES))
     return ("\n".join(headers) + "\n\n").encode("utf-8") + (ROOT / project["readme"]).read_bytes()
 
 
@@ -46,18 +50,22 @@ def _read(path):
     return path.read_bytes()
 
 
-def _wheel_files():
-    files = {path.relative_to(ROOT).as_posix(): _read(path)
-             for path in (ROOT / "reverseai").rglob("*.py") if "__pycache__" not in path.parts}
-    for tool in TOOLS:
-        files[f"reverseai/_locks/{tool}.json"] = _read(ROOT / "containers" / tool / "image.lock.json")
-    files["reverseai/_locks/m2_fixture_v1.json"] = _read(ROOT / "containers/yarax/m2_fixture_v1.json")
+def _wheel_files(*, editable=False):
+    if editable:
+        files = {"reverseai_editable.pth": (str(ROOT.resolve()) + "\n").encode("utf-8")}
+    else:
+        files = {path.relative_to(ROOT).as_posix(): _read(path)
+                 for path in (ROOT / "reverseai").rglob("*.py") if "__pycache__" not in path.parts}
+        for tool in TOOLS:
+            files[f"reverseai/_locks/{tool}.json"] = _read(ROOT / "containers" / tool / "image.lock.json")
+        files["reverseai/_locks/m2_fixture_v1.json"] = _read(ROOT / "containers/yarax/m2_fixture_v1.json")
     info = f"reverseai-{_version()}.dist-info"
     files[f"{info}/METADATA"] = _metadata()
     files[f"{info}/WHEEL"] = ("Wheel-Version: 1.0\nGenerator: reverseai_build\n"
                              "Root-Is-Purelib: true\nTag: py3-none-any\n").encode("ascii")
     files[f"{info}/entry_points.txt"] = b"[console_scripts]\nreverseai = reverseai.cli:main\n"
-    files[f"{info}/THIRD_PARTY_NOTICES.md"] = _read(ROOT / "THIRD_PARTY_NOTICES.md")
+    for name in LICENSE_FILES:
+        files[f"{info}/licenses/{name}"] = _read(ROOT / name)
     record = f"{info}/RECORD"
     rows = [(name, "sha256=" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode("ascii"),
              str(len(data))) for name, data in files.items()]
@@ -68,19 +76,28 @@ def _wheel_files():
     return files
 
 
-def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
-    """Build the universal wheel without importing the application or any input."""
+def _write_wheel(wheel_directory, files):
     filename = f"reverseai-{_version()}-py3-none-any.whl"
     destination = Path(wheel_directory)
     destination.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(destination / filename, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        for name, data in sorted(_wheel_files().items()):
+        for name, data in sorted(files.items()):
             info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
             info.create_system = 3
             info.external_attr = (stat.S_IFREG | 0o644) << 16
             info.compress_type = zipfile.ZIP_DEFLATED
             archive.writestr(info, data, compresslevel=9)
     return filename
+
+
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    """Build the universal wheel without importing the application or any input."""
+    return _write_wheel(wheel_directory, _wheel_files())
+
+
+def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
+    """Expose this trusted checkout through a .pth, retaining the normal metadata."""
+    return _write_wheel(wheel_directory, _wheel_files(editable=True))
 
 
 def _source_files():
@@ -136,6 +153,10 @@ def get_requires_for_build_wheel(config_settings=None):
 
 
 def get_requires_for_build_sdist(config_settings=None):
+    return []
+
+
+def get_requires_for_build_editable(config_settings=None):
     return []
 
 

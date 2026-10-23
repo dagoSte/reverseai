@@ -11,6 +11,10 @@ and `doctor` do not prove containment.
 - Python 3.12 or later, with `venv` and pip already available for installation.
   ReverseAI has no Python runtime dependencies; its standard-library PEP 517
   backend requires no downloaded build packages.
+- Windows analysis and queries require **CPython 3.12.4 or later** and a new,
+  nonexistent output directory for each call. Existing directories, junctions
+  and symlinks are refused; older Windows Pythons cannot create the required
+  private report directory and refuse output.
 - An approved local wheel or a checkout of the desired revision. The wheel
   includes five image locks and the YARA-X ruleset. Image builders, tests and the
   native verifier require a checkout; they are not in the wheel.
@@ -32,7 +36,7 @@ On macOS or Linux:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install --no-index --no-deps /approved/reverseai-0.6.0-py3-none-any.whl
+.venv/bin/python -m pip install --no-index --no-deps /approved/reverseai-0.6.1-py3-none-any.whl
 .venv/bin/reverseai --version
 .venv/bin/reverseai doctor
 .venv/bin/reverseai doctor --json
@@ -44,23 +48,38 @@ Or, from the checkout root, install the source into that environment:
 .venv/bin/python -m pip install --no-index --no-deps .
 ```
 
-On Windows, for example with Python 3.12 installed:
+For development in a trusted checkout, use an editable install instead:
+
+```sh
+.venv/bin/python -m pip install --no-index --no-deps -e .
+```
+
+The editable wheel adds the absolute checkout root to Python's import path;
+source changes and checkout image locks are used directly. Keep the checkout
+at that path. Reinstall when metadata or entry points change. Never run this
+command on a sample directory or an untrusted project: installing a Python
+project can execute its build backend. The normal wheel carries fixed lock
+copies and does not depend on keeping a checkout.
+
+On Windows, with CPython 3.12.4 or later installed:
 
 ```powershell
 py -3.12 -m venv .venv
-.venv\Scripts\python.exe -m pip install --no-index --no-deps C:\approved\reverseai-0.6.0-py3-none-any.whl
+.venv\Scripts\python.exe -m pip install --no-index --no-deps C:\approved\reverseai-0.6.1-py3-none-any.whl
 .venv\Scripts\reverseai.exe --version
 .venv\Scripts\reverseai.exe doctor --json
+.venv\Scripts\reverseai.exe analyze C:\approved\file.exe --out C:\reports\new-analysis
+.venv\Scripts\reverseai.exe query C:\approved\file.exe --query list_segments --arg limit=16 --out C:\reports\new-query
 ```
 
-Windows is experimental in M6a and has no platform proof yet. Only installation,
-`reverseai --version` and `reverseai doctor` are available there. Both `analyze`
-and `query` refuse `--out` because Windows lacks the required `O_DIRECTORY`,
-`O_NOFOLLOW` and `dir_fd` support for safe report-directory handles. Windows
-analysis output is M6b work. Substitute your Python 3.12-or-later launcher when
-using a newer installed version.
+The parent `C:\reports` must exist; `new-analysis` and `new-query` must not.
+Windows output is bound to a directory handle until both reports are written,
+so the directory cannot be renamed or replaced while bound. Use a different
+new directory for every call. Windows handling remains experimental: consult
+the receipt for the exact tested host and commit. Use your installed Python
+launcher when a different supported version is selected.
 
-The version command prints `reverseai 0.6.0`. `doctor` reports Python, OS and
+The version command prints `reverseai 0.6.1`. `doctor` reports Python, OS and
 architecture, lock validity, whether Docker answers its version probe within
 10 seconds, and whether each locked image is present. It reads no sample and
 never pulls, builds or runs a container. Exit 0 means the host Python requirement
@@ -87,11 +106,15 @@ python3 -B tools/reverseai_build.py wheel --out dist
 python3 -B tools/reverseai_build.py sdist --out dist
 ```
 
-This writes `reverseai-0.6.0-py3-none-any.whl` and `reverseai-0.6.0.tar.gz`.
+This writes `reverseai-0.6.1-py3-none-any.whl` and `reverseai-0.6.1.tar.gz`.
 The backend fixes archive ordering, timestamps and modes for reproducible output
 from the same tree. Source distributions select tracked files; commit new files
 before building a release sdist. Wheels contain application modules, locks,
-ruleset and metadata, not image build contexts or tests.
+ruleset and metadata, not image build contexts or tests. The project uses MIT;
+the wheel's Metadata-Version 2.4 declares `License-Expression: MIT` and the two
+license files, copied under `reverseai-0.6.1.dist-info/licenses/`. The sdist
+includes `LICENSE`, `THIRD_PARTY_NOTICES.md` and the same license headers in
+`PKG-INFO`. Third-party notices and licenses remain applicable.
 
 ## Use local contained images
 
@@ -151,20 +174,28 @@ JADX needs its ZIP and the JDK tarball; the parser needs the Node archive and
 four Babel archives. These builders refuse a missing base instead of pulling
 it, and use network-disabled build steps.
 
-The legacy LIEF, YARA-X and Ghidra recipes are **not fully offline**. Even without
-`--download`, they pull the pinned base; Ghidra's native-build stage also runs
-`apt-get` for its pinned compiler/make packages. Their exact recipes are:
+LIEF and YARA-X also build offline from the approved local wheel and cached
+pinned base. They inspect that base and refuse if it is absent, never pull, and
+use network-disabled build steps. Do not add the optional `--download` flag
+under a no-download policy:
 
 ```sh
 python3 -B tools/build_lief_image.py --wheel-dir /approved/lief-wheel
 python3 -B tools/build_yarax_image.py --wheel-dir /approved/yarax-wheel
+```
+
+Ghidra's builder still pulls the pinned base and its native-build stage runs
+`apt-get` for compiler/make packages. Even with its ZIP and JDK already present,
+this recipe needs network:
+
+```sh
 python3 -B tools/build_ghidra_image.py --download-dir /approved/ghidra-and-jdk
 ```
 
-Do not run these three recipes under a no-download policy such as M6a. Use the
-already-built locked images instead; fully offline builders for them belong to
-M6b. Installing the package, running workers offline and rebuilding images are
-separate operations.
+Do not run the Ghidra recipe under a no-download policy. Use the already-built
+locked image instead; an offline Ghidra build needs separately approved Debian
+packages and is deferred. Installing the Python package, running existing
+workers offline and rebuilding images are separate operations.
 
 ## Verification and platform scope
 
@@ -199,7 +230,29 @@ python3 -B tools/linux_proof.py --commit HEAD --receipt new-linux-arm64-receipt.
 
 This host-suite proof is distinct from native worker proof. A receipt applies to
 its recorded commit, Python version, architecture and base/image bindings.
-Windows remains experimental. Windows/AMD64 proofs, hosted CI and the remaining
-offline builders are M6b work. No Windows, AMD64 or all-OS containment claim
-follows from M6a. Consult the receipts for the release you use, not only an
-earlier milestone's green result.
+Windows remains experimental. No Windows, AMD64 or all-OS containment claim
+follows from a host receipt. Consult the receipts for the release you use,
+not only an earlier milestone's green result.
+
+## Owner-started host proof workflow
+
+The [manual workflow](../.github/workflows/manual-proof.yml) runs only through
+`workflow_dispatch`, after it is on the default branch. The owner selects it
+in GitHub Actions, chooses **Run workflow**, and sets `target` to `linux`,
+`windows` or `both` (default `linux`). It has no push, pull-request or scheduled
+trigger. Do not dispatch it without the owner's instruction.
+
+Each job runs `tools/host_proof.py` on Linux x86-64 or Windows x86-64. It records
+the commit, Python/OS/architecture, suite counts, offline wheel installation,
+installed version and module path, doctor, and analysis/query of code-built
+fixture bytes. The JSON receipt appears after `REVERSEAI-HOST-PROOF ` in the
+log and in the GitHub step summary; there is no artifact-upload step. The
+package install uses no index, but provisioning a hosted runner and Python is
+not an offline operation.
+
+On POSIX, the whole suite gates the host result. On Windows, the real
+`tests.test_windows_output` run and installed CLI checks gate it; the whole
+suite also runs and its failures/skips are recorded, without being treated as
+a successful all-tests Windows proof. A receipt proves only the recorded
+checks on that host and commit, not native worker containment or an AMD64
+container image. No hosted run is claimed by these instructions.

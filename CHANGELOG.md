@@ -2,8 +2,17 @@
 
 ## Unreleased: M6b
 
-Hosted CI, Windows and AMD64 platform proofs, fully offline LIEF, YARA-X and
-Ghidra image builders, and the project license wait for the owner's decisions.
+- MIT license with Metadata-Version 2.4, license expression and preserved license
+  files in wheels/source distributions; offline PEP 660 editable installation.
+- Owner-started manual host proof workflow for Linux and Windows x86-64, with
+  read-only permissions and SHA-pinned actions. A workflow is not a completed run.
+- Experimental Windows report output bound to a directory handle; requires
+  CPython 3.12.4 or later and a new output directory for every call.
+- Offline LIEF and YARA-X builders using approved local wheels and a cached
+  pinned base. Ghidra's online build and AMD64 container images remain deferred.
+
+Platform receipts and release status are recorded separately at the gate;
+these entries describe the unreleased checkout, not a completed hosted proof.
 
 ## Released milestones
 

@@ -51,7 +51,7 @@ Model-driven agents are not part of the current releases.
 ## How it works
 
 <p align="center">
-  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: package installation and read-only doctor check setup, while native proof is separate for each platform; an approved file is frozen and hashed; a gateway serves whole-file analysis or a targeted query through host parsers for native files, APK, DEX and JavaScript, or a locked container per run (LIEF, YARA-X, Ghidra, JADX, the JavaScript parser); JavaScript files, package declarations and lexical hints from ZIP, ASAR and npm tarball inputs are read on the host without execution, and the parser returns only offsets of module sources and calls, from which the host re-derives every literal and name; the host re-derives every LIEF and YARA-X value and every Ghidra anchor, re-reads referenced strings, and binds JADX's Java to a method its own DEX decoder verified; evidence binds hash, tool, operation and byte range, with member provenance for bytes inside a package; a reviewer independently rebuilds package members and re-checks cited bytes and claim rules; Ghidra and JADX interpretations stay derived; reports separate supported, derived, unsupported and contradicted findings.">
+  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: MIT-licensed wheel and editable installs; Windows reports require CPython 3.12.4 or later and a new output directory; manual host CI is owner-started and separate from Linux ARM64 worker proof; package installation and read-only doctor check setup, while native proof is separate for each platform; an approved file is frozen and hashed; a gateway serves whole-file analysis or a targeted query through host parsers for native files, APK, DEX and JavaScript, or a locked container per run (LIEF, YARA-X, Ghidra, JADX, the JavaScript parser); JavaScript files, package declarations and lexical hints from ZIP, ASAR and npm tarball inputs are read on the host without execution, and the parser returns only offsets of module sources and calls, from which the host re-derives every literal and name; the host re-derives every LIEF and YARA-X value and every Ghidra anchor, re-reads referenced strings, and binds JADX's Java to a method its own DEX decoder verified; evidence binds hash, tool, operation and byte range, with member provenance for bytes inside a package; a reviewer independently rebuilds package members and re-checks cited bytes and claim rules; Ghidra and JADX interpretations stay derived; reports separate supported, derived, unsupported and contradicted findings.">
 </p>
 
 What this buys, and how each point is checked:
@@ -82,7 +82,7 @@ What this buys, and how each point is checked:
 | M5b | JavaScript syntax through a pinned parser (Node.js 24.22.1, @babel/parser 8.0.4) in a locked container: module sources and sensitive calls anchored at verified bytes (derived) | released |
 | M5c | npm package tarballs (`.tgz`): bounded gzip/tar reading, file and header provenance, existing JavaScript queries | released |
 | M6 | Python packaging, offline installation, read-only doctor, local macOS/Linux ARM64 proof workflow | released |
-| M6b | Hosted CI, Windows/AMD64 proofs and fully offline LIEF/YARA-X/Ghidra builders | planned; owner decisions pending |
+| M6b | MIT, editable install, manual CI, Windows reports and offline LIEF/YARA-X builders; offline Ghidra and AMD64 container images deferred pending approved downloads | in progress |
 | M7 | Measured comparison with REA Safe Agent on a known-answer corpus | planned |
 | M8 | Clean-room kit: evidence-cited functional specification, contamination check, auditable separation of analysis and implementation rooms, conformance tests | planned |
 
@@ -143,20 +143,48 @@ python3 -m venv .venv
 ```
 
 Or install the approved wheel with
-`.venv/bin/python -m pip install --no-index --no-deps /approved/reverseai-0.6.0-py3-none-any.whl`.
-On Windows, use your Python 3.12-or-later launcher and `.venv\Scripts\python.exe` /
-`.venv\Scripts\reverseai.exe`. Windows is experimental and has no platform proof
-yet: M6a supports installation, `--version` and `doctor` only. `analyze` and
-`query` refuse `--out` because the required safe directory handles are unavailable;
-Windows analysis output is M6b work.
+`.venv/bin/python -m pip install --no-index --no-deps /approved/reverseai-0.6.1-py3-none-any.whl`.
+For development, `.venv/bin/python -m pip install --no-index --no-deps -e .`
+keeps imports and image locks tied to the trusted checkout. Reinstall after
+changing package metadata or entry points; an editable install is not an input
+analysis command and must never target a sample package.
+
+On Windows, use CPython 3.12.4 or later and `.venv\Scripts\python.exe` /
+`.venv\Scripts\reverseai.exe`. Host analysis and queries require a **new, nonexistent
+`--out` directory** on every call; existing directories, junctions and symlinks
+are refused. Windows report handling is experimental: consult the manual proof
+receipt for the exact commit and host, rather than assuming all tests or contained
+tools have been proven there.
 
 On supported POSIX systems, host-only analysis needs no Docker. Contained tools
 need Docker Desktop and their locked images already present; `doctor` can exit 0
 for host features while those tools remain unavailable. It never pulls, builds
 or runs a container. The
 [installation guide](docs/INSTALL.md) covers building the wheel/sdist, image
-inputs and hashes, the two offline image builders, the three recipes that still
-need network, and the separate host/native proofs.
+inputs and hashes, the four offline image builders, the Ghidra recipe that still
+needs network, and the separate host/native proofs.
+
+## Platforms and manual CI
+
+The host package has no native Python dependencies. macOS and Linux host checks
+are separate from the experimental Windows report checks. The committed worker
+images and native containment receipts target Linux ARM64 on Docker Desktop on
+the Mac; a universal Python wheel or an x86-64 host receipt does not supply an
+AMD64 container image or prove containment on another platform.
+
+The [manual proof workflow](.github/workflows/manual-proof.yml) has only a
+`workflow_dispatch` trigger. Once it is on the default branch, the owner can open
+GitHub Actions, select that workflow, choose **Run workflow**, and select `linux`,
+`windows` or `both`. There is no automatic run on a push or pull request. Each
+run needs the owner's instruction; writing or reviewing the workflow does not
+start it. No hosted run is claimed here.
+
+The jobs check the host package on Linux or Windows x86-64, using synthetic
+fixtures, an offline package install and the installed CLI. The JSON receipt in
+the log and step summary identifies the tested commit, host and results. On
+Windows, the real Windows-specific tests and CLI checks gate the receipt; the
+whole-suite result is also recorded but does not gate it. These host checks are
+separate from the native Docker verifier.
 
 ## Try it
 
@@ -274,6 +302,14 @@ The host controller, runtime and relevant kernel/hypervisor remain trusted.
 Agent messages and tool results remain untrusted data. Agreement between agents
 is not proof. Any future model-provider connection must disclose what data
 leaves the machine.
+
+## License
+
+ReverseAI is licensed under the [MIT License](LICENSE), copyright 2026
+Stefano D'Agostino. Retain the license and [third-party notices](THIRD_PARTY_NOTICES.md)
+when redistributing it. Both files are included under the wheel's
+`reverseai-0.6.1.dist-info/licenses/` directory and in source distributions;
+third-party tools retain their own licenses and notices.
 
 ## Development
 
