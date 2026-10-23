@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -23,8 +24,9 @@ CLEAN = "....\nRan 4 tests in 0.1s\n\nOK (skipped=1)\n"
 
 class StandIn:
     """Answers every proof command without running it; suite and windows_tests answers are configurable."""
-    def __init__(self, *, suite=CLEAN, windows_tests="..\nRan 2 tests in 0.1s\n\nOK\n", fail=(), git=0):
+    def __init__(self, *, suite=CLEAN, windows_tests="..\nRan 2 tests in 0.1s\n\nOK\n", fail=(), git=0, real=False):
         self.calls, self.suite, self.windows_tests, self.fail, self.git = [], suite, windows_tests, set(fail), git
+        self.real = real  # answer the import path with links resolved, as Python does
 
     def __call__(self, argv, *, timeout, cwd=None, env=None):
         self.calls.append((list(argv), cwd, env))
@@ -46,7 +48,8 @@ class StandIn:
             return 0, f"reverseai {VERSION}\n", ""
         if name == "imported_from":
             venv = Path(argv[0]).parents[1]
-            return 0, str(venv / "lib/python3.12/site-packages/reverseai/__init__.py") + "\n", ""
+            imported = venv / "lib/python3.12/site-packages/reverseai/__init__.py"
+            return 0, (os.path.realpath(imported) if self.real else str(imported)) + "\n", ""
         if name == "doctor":
             return 0, json.dumps({"reverseai": VERSION, "host_ok": True, "tools": []}), ""
         if name in ("analyze", "query"):
@@ -194,6 +197,25 @@ class ProveTests(unittest.TestCase):
                 self.assertEqual((code, receipt["passed"], summary), (1, False, None))
                 self.assertIn(H.MARKER, printed)
         self.assertIsNone(self.prove(StandIn(git=1))[1]["commit"])
+
+    def test_a_scratch_directory_reached_through_a_link_still_passes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            real, link = Path(folder, "real"), Path(folder, "link")
+            real.mkdir()
+            try:
+                link.symlink_to(real, target_is_directory=True)
+            except OSError:
+                self.skipTest("symbolic links are not available here")
+
+            @contextlib.contextmanager
+            def linked(prefix=None):
+                (real / "work").mkdir()
+                yield str(link / "work")
+
+            with patch.object(H, "tempfile", types.SimpleNamespace(TemporaryDirectory=linked)):
+                code, receipt, _, _ = self.prove(StandIn(real=True))
+        self.assertEqual((code, receipt["passed"]), (0, True))
+        self.assertEqual(receipt["venv"], str(real.resolve() / "work/venv"))
 
     def test_the_windows_receipt_names_windows_and_its_report_tests(self):
         code, receipt, _, _ = self.prove(StandIn(), windows=True)

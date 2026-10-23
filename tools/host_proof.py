@@ -199,7 +199,8 @@ def prove(receipt, runner=run, *, source=ROOT, windows=None):
     code, out, _ = runner(["git", "-C", str(source), "rev-parse", "HEAD"], timeout=30)
     commit = out.strip() if code == 0 and re.fullmatch(r"[0-9a-f]{40}", out.strip()) else None
     with tempfile.TemporaryDirectory(prefix="reverseai-host-proof-") as work:
-        facts = steps(runner, Path(work), source, host_env(), windows=windows)
+        # Resolved, so the venv path matches the import path Python reports (macOS /var is /private/var).
+        facts = steps(runner, Path(work).resolve(), source, host_env(), windows=windows)
     ok = commit is not None and passed(facts, version, windows=windows)
     document = {"commit": commit, "expected_version": version, "os": "windows" if windows else os.name,
                 "python": platform.python_version(), "platform": platform.platform(), "machine": platform.machine(),
