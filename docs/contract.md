@@ -1165,11 +1165,12 @@ Decisions `owner-license-mit`, `owner-ci-manual`, `m6b-contract`. M6b is version
   It writes the receipt JSON and prints it on one line after the marker
   `REVERSEAI-HOST-PROOF `, also appending it to `$GITHUB_STEP_SUMMARY` when set.
   Pass on POSIX: every step exit 0, the whole suite run with zero failures and
-  errors, the counts parsed, version and imported_from inside the venv, both
-  reports present. Pass on Windows (`os.name == "nt"`): the same install,
+  errors, the counts parsed, version and imported_from inside the venv, the
+  `doctor --json` output a JSON object with `host_ok` true and `reverseai` equal
+  to the expected version, both reports present. Pass on Windows (`os.name == "nt"`): the same install,
   version, doctor, fixture, analyze and query checks plus a `windows_tests` step
   running `python -B -m unittest tests.test_windows_output -v` with zero
-  failures and errors and at least one test run; the whole suite still runs and
+  failures, errors and skips and at least one test run (decision `m6b-fix-round`); the whole suite still runs and
   its counts are recorded, but it does not gate the Windows result. The receipt
   names the commit (`git rev-parse HEAD`), Python version, platform, machine and
   each step's exit and output tail. Receipts kept in the repository are
@@ -1187,8 +1188,8 @@ Decisions `owner-license-mit`, `owner-ci-manual`, `m6b-contract`. M6b is version
 - **Windows reports (lane W)**: on Windows (`os.name == "nt"`) `analyze` and
   `query` accept `--out` only for a directory that does not exist yet. It is
   created with `os.mkdir(path, 0o700)`, which on CPython 3.12.4 or later
-  (gh-118486) gives the new directory a private ACL; older Windows Pythons refuse
-  `--out`. The new directory is opened with `CreateFileW` using
+  (gh-118486; for 3.13, 3.13.0b2 or later) gives the new directory a private ACL;
+  older Windows Pythons, including earlier 3.13 prereleases, refuse `--out`. The new directory is opened with `CreateFileW` using
   `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`, share mode without
   `FILE_SHARE_DELETE` (so it cannot be renamed, deleted or replaced while bound),
   and checked through the handle to be a directory, not a reparse point, and
