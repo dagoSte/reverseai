@@ -25,6 +25,14 @@ def safe_directories():
 
 def open_output(path):
     """Bind --out to a directory handle before the analysis, so a later swap of the path cannot redirect the reports."""
+    if os.name == "nt":
+        from reverseai import winout
+        try:
+            return winout.open_output(path)
+        except winout.OutputRefused as error:
+            raise OutputRefused(str(error)) from None
+        except (OSError, ValueError):
+            raise OutputRefused("--out cannot be bound safely on Windows") from None
     if not safe_directories():
         raise OutputRefused("this platform lacks safe directory handles")
     try:
@@ -45,6 +53,9 @@ def open_output(path):
 
 def write_new(directory, name, text):
     """Create the file inside the bound directory or fail; never follow or replace an existing entry."""
+    if os.name == "nt":
+        from reverseai import winout
+        return winout.write_new(directory, name, text)
     descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE, dir_fd=directory)
     with os.fdopen(descriptor, "w", encoding="utf-8", errors="backslashreplace", newline="\n") as handle:
         handle.write(text)
@@ -137,7 +148,15 @@ def main(argv=None):
     except (OSError, ValueError) as error:
         parser.exit(1, f"reverseai: output failed: {type(error).__name__}; written: {', '.join(written) or 'nothing'}\n")
     finally:
-        os.close(directory)
+        if os.name == "nt":
+            pending = sys.exc_info()[0] is not None
+            try:
+                directory.close()
+            except OSError as error:
+                if not pending:
+                    parser.exit(1, f"reverseai: output failed: {type(error).__name__}; written: {', '.join(written) or 'nothing'}\n")
+        else:
+            os.close(directory)
     summary = report.to_dict(analysis)["summary"]
     print(f"{analysis.input.sha256}  " + ", ".join(f"{summary[k]} {k}" for k in summary))
     return 0
