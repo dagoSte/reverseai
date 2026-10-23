@@ -3,8 +3,9 @@
 Usage (from the repository root):
     python3 -B tools/build_yarax_image.py --wheel-dir DIR [--download] [--tag TAG] [--lock PATH]
 
-The base image is pulled by its linux/arm64 manifest digest (the same one as the LIEF
-worker), and the Dockerfile must build FROM exactly that reference and nothing else.
+The digest-pinned linux/arm64 base (the same one as the LIEF worker) must already be
+present locally: the tool never pulls (decision m6b-contract), and the Dockerfile must
+build FROM exactly that reference and nothing else.
 The YARA-X wheel must be in DIR (or, with --download, is fetched from the single PyPI
 URL below, refusing any redirect) and must match the SHA-256 in
 containers/yarax/requirements.txt. The build itself runs with --network none and
@@ -141,7 +142,10 @@ def main(argv=None):
     if file_sha256(wheel) != expected:
         raise SystemExit("wheel does not match the pinned SHA-256")
 
-    docker("pull", "--platform", PLATFORM, BASE)
+    try:
+        docker("image", "inspect", "--format", "{{.Id}}", BASE, capture=True)
+    except subprocess.CalledProcessError:
+        raise SystemExit("the pinned base " + BASE + " is not present locally; this tool never pulls") from None
     with tempfile.TemporaryDirectory(prefix="reverseai-yarax-build-") as temporary:
         context = Path(temporary)
         for name in ("Dockerfile", "requirements.txt", "worker.py", RULESET):
