@@ -166,12 +166,16 @@ def inside_venv(path, venv, windows):
 
 
 def passed(facts, version, *, windows=False):
-    """POSIX: every step exit 0 and a clean whole suite; Windows: the install-to-query steps and the Windows tests."""
+    """POSIX: every step exit 0 and a clean whole suite; Windows: the install-to-query steps and the Windows tests,
+    every one of them run (unittest's count includes skips, so a skip fails). Both need doctor's JSON object to say
+    host_ok true for the expected version."""
     record = facts.get("steps") if isinstance(facts.get("steps"), dict) else {}
     required = WINDOWS_STEPS if windows else POSIX_STEPS
     both = ["report.json", "report.md"]
+    doctor, windows_tests = facts.get("doctor"), facts.get("windows_tests")
     return bool(all((record.get(name) or {}).get("exit") == 0 for name in required)
-                and (clean(facts.get("windows_tests")) if windows else clean(facts.get("suite")))
+                and (clean(windows_tests) and windows_tests["skipped"] == 0 if windows else clean(facts.get("suite")))
+                and isinstance(doctor, dict) and doctor.get("host_ok") is True and doctor.get("reverseai") == version
                 and facts.get("wheel") and facts.get("version") == "reverseai " + version
                 and inside_venv(facts.get("imported_from"), facts.get("venv"), windows)
                 and (facts.get("analyze") or {}).get("reports") == both
