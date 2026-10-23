@@ -6,9 +6,10 @@ Usage (from the repository root, with docker-desktop reserved):
 Nothing is pulled or downloaded. The digest-pinned python:3.12-slim base must already be present locally. The
 commit's Git-tracked files (git archive, no host mount) are added to a throwaway image FROM that base, with no RUN
 step; the container runs as 65534:65534 with the network off, a read-only root, every capability dropped and a tmpfs
-at /tmp. Inside, this file runs again with --inside from the archived copy: the whole suite on the read-only tree,
-then pip builds the wheel from a copy in /tmp (pip wheel --no-index, no sdist), a fresh venv installs it with
---no-index, and the installed reverseai answers --version, doctor --json and one analyze of a code-built ELF. The
+at /tmp. Inside, this file runs again with --inside from the archived copy and runs the steps of tools/host_proof.py (one implementation): the whole suite on
+the read-only tree, then pip builds the wheel from a copy in /tmp (pip wheel --no-index, no sdist), a fresh venv
+installs it with --no-index, and the installed reverseai answers --version, doctor --json, analyze and query of a
+code-built ELF. The
 inside run prints one marker line of JSON; the host writes the receipt (Python version, platform, commit, counts,
 base digest) and removes its image and container whatever the outcome. Every command is an argv list; nothing goes
 through a shell.
@@ -18,14 +19,12 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import platform
 import re
-import shutil
-import subprocess
 import sys
 import tempfile
 import time
@@ -44,110 +43,30 @@ DOCKERFILE = (f"FROM {BASE}\n"
               f'ENTRYPOINT ["python3", "-B", "{SOURCE}/tools/linux_proof.py", "--inside"]\n')
 DOCKER_SECONDS = 120
 RUN_SECONDS = 1800
-SUITE_SECONDS = 1200
-STEP_SECONDS = 300
-TAIL_LINES = 40
-REQUIRED_STEPS = ("suite", "wheel", "venv", "install", "version", "imported_from", "doctor", "fixture", "analyze")
-# Writes the code-built ELF with imports (tests/fixtures_structure.py) to the path in argv[1]; inert bytes, never run.
-FIXTURE = ("import sys\nfrom tests import fixtures_structure as F\n"
-           "open(sys.argv[1], 'xb').write(F.elf_imports()[0])\n")
 
 
-def as_text(value):
-    return value.decode("utf-8", "replace") if isinstance(value, bytes) else (value or "")
+def _host_proof():
+    """tools/host_proof.py, the one implementation of the proof steps, loaded by path from this file's folder."""
+    spec = importlib.util.spec_from_file_location("reverseai_host_proof", Path(__file__).with_name("host_proof.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def run(argv, *, timeout, cwd=None, env=None):
-    """(exit code, stdout, stderr) of one argv, always as text; a timeout gives exit code None."""
-    try:
-        done = subprocess.run(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                              errors="replace", timeout=timeout, shell=False)
-    except subprocess.TimeoutExpired as expired:
-        # TimeoutExpired keeps the bytes read so far even with text=True.
-        return None, as_text(expired.stdout), as_text(expired.stderr)
-    return done.returncode, done.stdout, done.stderr
-
-
-def tail(text, lines=TAIL_LINES):
-    return as_text(text).splitlines()[-lines:]
-
-
-def suite_counts(stderr):
-    """Counts from unittest's closing lines: {"ran", "skipped", "failures", "errors", "ok"}, or None."""
-    ran = re.findall(r"^Ran (\d+) tests? in ", stderr, re.M)
-    last = stderr.rstrip().splitlines()[-1] if stderr.strip() else ""
-    status = re.fullmatch(r"(OK|FAILED)(?: \(([^)]*)\))?", last)
-    if not ran or status is None:
-        return None
-    counts = {"ran": int(ran[-1]), "skipped": 0, "failures": 0, "errors": 0, "expected_failures": 0,
-              "unexpected_successes": 0}
-    for item in filter(None, (status.group(2) or "").split(", ")):
-        key, _, value = item.partition("=")
-        key = key.replace(" ", "_")
-        if key not in counts or not value.isdigit():
-            return None
-        counts[key] = int(value)
-    counts["ok"] = status.group(1) == "OK"
-    return counts
+H = _host_proof()
+as_text, run, tail, suite_counts = H.as_text, H.run, H.tail, H.suite_counts
+REQUIRED_STEPS = H.POSIX_STEPS
 
 
 # --- inside the container -------------------------------------------------------------------------------------------
 
 def inside(runner=run, work=Path("/tmp"), source=Path(SOURCE)):
-    """Run every step inside the container; return the facts the host writes into the receipt."""
-    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(work / "home"), "LANG": "C.UTF-8",
-           "PIP_NO_CACHE_DIR": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INPUT": "1",
-           "PYTHONDONTWRITEBYTECODE": "1"}
+    """Run the shared steps inside the container with a fixed environment; add the container's own facts."""
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": str(work / "home"), "LANG": "C.UTF-8", **H.PIP_ENV}
     (work / "home").mkdir(exist_ok=True)
     facts = {"python": platform.python_version(), "platform": platform.platform(), "machine": platform.machine(),
-             "uid": os.getuid(), "steps": {}}
-    steps = facts["steps"]
-
-    def step(name, argv, *, timeout=STEP_SECONDS, cwd=None):
-        code, out, err = runner(argv, timeout=timeout, cwd=cwd, env=env)
-        out, err = as_text(out), as_text(err)
-        steps[name] = {"exit": code, "timed_out": code is None, "stdout": tail(out), "stderr": tail(err)}
-        return code, out, err
-
-    code, _, err = step("suite", [sys.executable, "-B", "-m", "unittest", "discover", "-s", "tests", "-t", "."],
-                        timeout=SUITE_SECONDS, cwd=source)
-    facts["suite"] = suite_counts(err)
-    steps["suite"]["failed_tests"] = [line for line in err.splitlines() if line.startswith(("FAIL: ", "ERROR: "))][:50]
-    build, dist, venv, scratch = work / "build", work / "dist", work / "venv", work / "run"
-    shutil.copytree(source, build, symlinks=True)
-    scratch.mkdir()
-    code, _, _ = step("wheel", [sys.executable, "-m", "pip", "wheel", "--no-index", "--no-deps", "--wheel-dir",
-                                str(dist), str(build)])
-    wheels = sorted(dist.glob("reverseai-*-py3-none-any.whl")) if code == 0 else []
-    if len(wheels) != 1:
-        facts["wheel"] = None
-        return facts
-    data = wheels[0].read_bytes()
-    facts["wheel"] = {"name": wheels[0].name, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-    if step("venv", [sys.executable, "-m", "venv", str(venv)])[0] != 0:
-        return facts
-    if step("install", [str(venv / "bin/python"), "-m", "pip", "install", "--no-index", "--no-deps",
-                        str(wheels[0])])[0] != 0:
-        return facts
-    reverseai = str(venv / "bin/reverseai")
-    code, out, _ = step("version", [reverseai, "--version"], cwd=scratch)
-    facts["version"] = out.strip() if code == 0 else None
-    code, out, _ = step("imported_from", [str(venv / "bin/python"), "-I", "-c",
-                                          "import reverseai; print(reverseai.__file__)"], cwd=scratch)
-    facts["imported_from"] = out.strip() if code == 0 else None
-    code, out, _ = step("doctor", [reverseai, "doctor", "--json"], cwd=scratch)
-    try:
-        facts["doctor"] = json.loads(out) if code == 0 else None
-    except ValueError:
-        facts["doctor"] = None
-    sample, report = scratch / "input.elf", scratch / "report"
-    if step("fixture", [sys.executable, "-B", "-c", FIXTURE, str(sample)], cwd=source)[0] != 0:
-        return facts
-    code, out, _ = step("analyze", [reverseai, "analyze", str(sample), "--out", str(report)], cwd=scratch)
-    if code == 0:
-        document = json.loads((report / "report.json").read_text(encoding="utf-8"))
-        facts["analyze"] = {"input_sha256": document["input"]["sha256"], "summary": document["summary"],
-                            "reports": sorted(path.name for path in report.iterdir())}
+             "uid": os.getuid()}
+    facts.update(H.steps(runner, work, source, env))
     return facts
 
 
@@ -180,19 +99,14 @@ def marker_facts(stdout):
 
 
 def passed(facts, version):
-    """Every required step exited 0 on Linux aarch64, Python 3.12, uid 65534, with a non-empty clean suite."""
-    suite, doctor, analyze, steps = facts.get("suite"), facts.get("doctor"), facts.get("analyze"), facts.get("steps")
+    """The host predicate, on Linux aarch64, Python 3.12, uid 65534, with every packaged lock loading from the venv."""
+    doctor = facts.get("doctor")
     return bool(facts.get("machine") == "aarch64" and str(facts.get("platform", "")).startswith("Linux-")
                 and str(facts.get("python", "")).startswith("3.12.") and facts.get("uid") == 65534
-                and isinstance(steps, dict) and all((steps.get(name) or {}).get("exit") == 0 for name in REQUIRED_STEPS)
-                and suite and suite["ok"] and suite["ran"] > 0
-                and suite["failures"] == suite["errors"] == suite["unexpected_successes"] == 0
-                and facts.get("wheel") and facts.get("version") == "reverseai " + version
-                and str(facts.get("imported_from", "")).startswith("/tmp/venv/")
+                and H.passed(facts, version)
                 and doctor and doctor.get("host_ok") is True and doctor.get("reverseai") == version
                 and len(doctor.get("tools", ())) == 5
-                and all(tool["lock_loads"] and tool["lock"].startswith("/tmp/venv/") for tool in doctor["tools"])
-                and analyze and analyze["reports"] == ["report.json", "report.md"])
+                and all(tool["lock_loads"] and tool["lock"].startswith("/tmp/venv/") for tool in doctor["tools"]))
 
 
 def utc():

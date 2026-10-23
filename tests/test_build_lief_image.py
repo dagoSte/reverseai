@@ -8,6 +8,7 @@ import io
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -26,9 +27,14 @@ class FakeDocker:
     def __init__(self):
         self.calls = []
         self.context = None
+        self.missing_base = False
 
     def __call__(self, *args, capture=False):
         self.calls.append(args)
+        if args[:2] == ("image", "inspect"):
+            if self.missing_base:
+                raise subprocess.CalledProcessError(1, ["docker", *args])
+            return "sha256:" + "b" * 64
         if args[0] == "build":
             context = Path(args[-1])
             self.context = sorted(str(path.relative_to(context)) for path in context.rglob("*"))
@@ -55,10 +61,11 @@ class BuildTests(unittest.TestCase):
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             return build.main(["--wheel-dir", str(self.wheels), "--lock", str(self.lock), *extra])
 
-    def test_the_base_is_pulled_by_digest_and_the_build_is_offline(self):
+    def test_the_base_is_inspected_never_pulled_and_the_build_is_offline(self):
         self.assertEqual(self.build(), 0)
-        pull, built = self.docker.calls
-        self.assertEqual(pull, ("pull", "--platform", "linux/arm64", build.BASE))
+        inspect, built = self.docker.calls
+        self.assertEqual(inspect, ("image", "inspect", "--format", "{{.Id}}", build.BASE))
+        self.assertFalse(any("pull" in call for call in self.docker.calls))
         self.assertEqual(built[:6], ("build", "--platform", "linux/arm64", "--network", "none", "--pull=false"))
         self.assertEqual(built[6:8], ("--iidfile", built[7]))
         self.assertEqual(built[8:10], ("--tag", "reverseai-lief:1.0.0-r2"))
@@ -68,6 +75,13 @@ class BuildTests(unittest.TestCase):
         self.assertEqual(json.loads(self.lock.read_text()), {
             "image_id": "sha256:" + "d" * 64, "platform": "linux/arm64", "base_digest": build.BASE_DIGEST,
             "wheel_sha256": hashlib.sha256(WHEEL_BYTES).hexdigest(), "adapter_version": "1.0.0-r2"})
+
+    def test_a_missing_base_is_refused_and_never_pulled(self):
+        self.docker.missing_base = True
+        with self.assertRaisesRegex(SystemExit, "is not present locally; this tool never pulls"):
+            self.build()
+        self.assertEqual(self.docker.calls, [("image", "inspect", "--format", "{{.Id}}", build.BASE)])
+        self.assertFalse(self.lock.exists())
 
     def test_the_dockerfile_installs_only_the_hashed_local_wheel(self):
         text = (build.SOURCE / "Dockerfile").read_text()

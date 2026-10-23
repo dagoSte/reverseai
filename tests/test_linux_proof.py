@@ -32,6 +32,7 @@ def inside_facts(**changes):
              "wheel": {"name": WHEEL, "size": 1, "sha256": "0" * 64}, "version": "reverseai 0.6.1",
              "imported_from": "/tmp/venv/lib/python3.12/site-packages/reverseai/__init__.py",
              "doctor": doctor_facts(), "analyze": {"reports": ["report.json", "report.md"]},
+             "query": {"reports": ["report.json", "report.md"]}, "venv": "/tmp/venv",
              "steps": {name: {"exit": 0} for name in P.REQUIRED_STEPS}}
     facts.update(changes)
     return facts
@@ -261,7 +262,7 @@ class InsideTests(unittest.TestCase):
                 return 0, json.dumps(doctor_facts()), ""
             if argv[1:3] == ["-B", "-c"]:
                 return 0, "", ""
-            if argv[1] == "analyze":
+            if argv[1] in ("analyze", "query"):
                 out = Path(argv[argv.index("--out") + 1])
                 out.mkdir()
                 (out / "report.json").write_text(json.dumps({"input": {"sha256": "1" * 64}, "summary": {"supported": 3}}))
@@ -280,7 +281,8 @@ class InsideTests(unittest.TestCase):
             facts = P.inside(runner=run, work=work, source=source)
         names = list(facts["steps"])
         self.assertEqual(names, ["suite", "wheel", "venv", "install", "version", "imported_from", "doctor", "fixture",
-                                 "analyze"])
+                                 "analyze", "query"])
+        self.assertEqual(tuple(names), P.REQUIRED_STEPS)
         argvs = [argv for argv, _, _ in calls]
         self.assertIn("--no-index", argvs[1])
         self.assertEqual(argvs[1][-1], str(work / "build"))
@@ -295,7 +297,7 @@ class InsideTests(unittest.TestCase):
         self.assertEqual(facts["wheel"]["name"], WHEEL)
         self.assertEqual(facts["analyze"]["reports"], ["report.json", "report.md"])
         container = {"machine": "aarch64", "platform": "Linux-7.0-aarch64-with-glibc2.41", "python": "3.12.15",
-                     "uid": 65534}  # this test runs on the host; the container reports these
+                     "uid": 65534, "venv": "/tmp/venv"}  # this test runs on the host; the container reports these
         self.assertTrue(P.passed({**facts, **container}, "0.6.1"))
         self.assertFalse(P.passed({**facts, **container}, "0.6.2"))
 

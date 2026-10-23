@@ -9,6 +9,7 @@ import io
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -28,9 +29,14 @@ class FakeDocker:
         self.calls = []
         self.context = None
         self.ruleset = None
+        self.missing_base = False
 
     def __call__(self, *args, capture=False):
         self.calls.append(args)
+        if args[:2] == ("image", "inspect"):
+            if self.missing_base:
+                raise subprocess.CalledProcessError(1, ["docker", *args])
+            return "sha256:" + "b" * 64
         if args[0] == "build":
             context = Path(args[-1])
             self.context = sorted(str(path.relative_to(context)) for path in context.rglob("*"))
@@ -63,10 +69,18 @@ class BuildTests(unittest.TestCase):
         shutil.copytree(build.SOURCE, source, ignore=shutil.ignore_patterns("image.lock.json"))
         return source
 
-    def test_the_base_is_pulled_by_digest_the_build_is_offline_and_the_lock_has_the_ruleset_hash(self):
+    def test_a_missing_base_is_refused_and_never_pulled(self):
+        self.docker.missing_base = True
+        with self.assertRaisesRegex(SystemExit, "is not present locally; this tool never pulls"):
+            self.build()
+        self.assertEqual(self.docker.calls, [("image", "inspect", "--format", "{{.Id}}", build.BASE)])
+        self.assertFalse(self.lock.exists())
+
+    def test_the_base_is_inspected_never_pulled_the_build_is_offline_and_the_lock_has_the_ruleset_hash(self):
         self.assertEqual(self.build(), 0)
-        pull, built = self.docker.calls
-        self.assertEqual(pull, ("pull", "--platform", "linux/arm64", build.BASE))
+        inspect, built = self.docker.calls
+        self.assertEqual(inspect, ("image", "inspect", "--format", "{{.Id}}", build.BASE))
+        self.assertFalse(any("pull" in call for call in self.docker.calls))
         self.assertEqual(built[:6], ("build", "--platform", "linux/arm64", "--network", "none", "--pull=false"))
         self.assertEqual(built[6:8], ("--iidfile", built[7]))
         self.assertEqual(built[8:10], ("--tag", "reverseai-yarax:1.21.0-r2"))
