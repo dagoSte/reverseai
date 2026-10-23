@@ -61,6 +61,9 @@ command on a sample directory or an untrusted project: installing a Python
 project can execute its build backend. The normal wheel carries fixed lock
 copies and does not depend on keeping a checkout.
 
+Use a dedicated virtual environment: the checkout's top-level packages, such as
+`tests`, also become importable through the editable install.
+
 On Windows, with CPython 3.12.4 or later installed:
 
 ```powershell

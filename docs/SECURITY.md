@@ -36,14 +36,15 @@ handle, without following a link or replacing an existing report. On Windows,
 each `--out` must name a directory that does not exist. CPython 3.12.4 or later
 creates it with a private ACL; older Windows Pythons refuse output.
 
-Windows opens the new directory as a handle without delete sharing, checks
-that it is an empty directory rather than a reparse point, and keeps it bound
+The Windows binding is designed to prevent the output directory from being
+renamed or replaced: it opens the new directory as a handle without delete
+sharing, checks that it is empty rather than a reparse point, and keeps it bound
 until writing finishes. Each report is created exclusively relative to that
 handle with `NtCreateFile`, without reopening the directory by path or following
-a report-name reparse point. A bound directory cannot be renamed or replaced
-through the usual file-sharing APIs. Existing output directories, junctions and
-symlinks are refused. The operator must still choose a trusted parent directory;
-these controls do not make a compromised host account safe.
+a report-name reparse point. Existing output directories, junctions and symlinks
+are refused by design. These Windows properties await confirmation by the first
+owner-started Windows proof receipt. The operator must still choose a trusted
+parent directory; these controls do not make a compromised host account safe.
 
 ## Installation and manual CI
 
