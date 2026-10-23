@@ -26,7 +26,7 @@ from tools import reverseai_build as build
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ("lief", "yarax", "ghidra", "jadx", "jsparser")
-INFO = "reverseai-0.6.0.dist-info"
+INFO = "reverseai-0.6.1.dist-info"
 
 
 class PackagingTests(unittest.TestCase):
@@ -57,7 +57,7 @@ class PackagingTests(unittest.TestCase):
     def test_project_identity_and_dependency_free_build_contract(self):
         value = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
         project = value["project"]
-        self.assertEqual((project["name"], project["version"], __version__), ("reverseai", "0.6.0", "0.6.0"))
+        self.assertEqual((project["name"], project["version"], __version__), ("reverseai", "0.6.1", "0.6.1"))
         self.assertEqual(project["requires-python"], ">=3.12")
         self.assertEqual(project["readme"], "README.md")
         self.assertEqual(project["dependencies"], [])
@@ -74,7 +74,7 @@ class PackagingTests(unittest.TestCase):
         expected.update(f"reverseai/_locks/{name}.json" for name in TOOLS)
         expected.add("reverseai/_locks/m2_fixture_v1.json")  # decision m6-seams-p: required by the host verifier
         expected.update(f"{INFO}/{name}" for name in ("METADATA", "WHEEL", "entry_points.txt", "THIRD_PARTY_NOTICES.md", "RECORD"))
-        self.assertEqual(self.wheel.name, "reverseai-0.6.0-py3-none-any.whl")
+        self.assertEqual(self.wheel.name, "reverseai-0.6.1-py3-none-any.whl")
         with zipfile.ZipFile(self.wheel) as archive:
             self.assertEqual(archive.namelist(), sorted(expected))
             self.assertEqual(len(archive.namelist()), len(expected))
@@ -94,7 +94,7 @@ class PackagingTests(unittest.TestCase):
             raw = archive.read(f"{INFO}/METADATA")
             metadata = BytesParser().parsebytes(raw)
             self.assertEqual(dict(metadata), {
-                "Metadata-Version": "2.1", "Name": "reverseai", "Version": "0.6.0",
+                "Metadata-Version": "2.1", "Name": "reverseai", "Version": "0.6.1",
                 "Summary": "Contained static analysis with verifiable evidence.", "Requires-Python": ">=3.12",
                 "Description-Content-Type": "text/markdown; charset=UTF-8"})
             self.assertEqual(raw.split(b"\n\n", 1)[1], (ROOT / "README.md").read_bytes())
@@ -172,7 +172,7 @@ class PackagingTests(unittest.TestCase):
                     if name in ("README.md", "THIRD_PARTY_NOTICES.md", "pyproject.toml")
                     or name.split("/", 1)[0] in ("reverseai", "tools", "containers", "docs", "tests", "media")}
         selected["PKG-INFO"] = 0o644
-        prefix = "reverseai-0.6.0/"
+        prefix = "reverseai-0.6.1/"
         with tarfile.open(self.sdist, "r:gz") as archive, zipfile.ZipFile(self.wheel) as wheel:
             self.assertEqual(archive.getnames(), [prefix + name for name in sorted(selected)])
             for entry in archive.getmembers():
@@ -216,9 +216,9 @@ class PackagingTests(unittest.TestCase):
                 return_value=subprocess.CompletedProcess([], 0, stdout=manifest)):
             path = self.work / "modes" / build.build_sdist(self.work / "modes")
         with tarfile.open(path, "r:gz") as archive:
-            self.assertEqual(archive.getnames(), ["reverseai-0.6.0/" + name for name in sorted([*tracked, "PKG-INFO"])])
-            self.assertEqual(archive.getmember("reverseai-0.6.0/tools/reverseai_build.py").mode, 0o755)
-            self.assertEqual(archive.getmember("reverseai-0.6.0/README.md").mode, 0o644)
+            self.assertEqual(archive.getnames(), ["reverseai-0.6.1/" + name for name in sorted([*tracked, "PKG-INFO"])])
+            self.assertEqual(archive.getmember("reverseai-0.6.1/tools/reverseai_build.py").mode, 0o755)
+            self.assertEqual(archive.getmember("reverseai-0.6.1/README.md").mode, 0o644)
 
     def test_real_offline_install_and_pep517_build_from_sdist(self):
         environment = {key: value for key, value in os.environ.items() if key not in ("PYTHONPATH", "PYTHONHOME")}
@@ -241,7 +241,7 @@ class PackagingTests(unittest.TestCase):
         destination = self.work / "analysis"
         run([bindir / ("reverseai.exe" if os.name == "nt" else "reverseai"), "analyze", sample, "--out", destination])
         result = json.loads((destination / "report.json").read_text(encoding="utf-8"))
-        self.assertEqual(result["reverseai"], "0.6.0")
+        self.assertEqual(result["reverseai"], "0.6.1")
         self.assertGreater(result["summary"]["supported"], 0)
         self.assertTrue((destination / "report.md").is_file())
         script = '''

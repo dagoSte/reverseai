@@ -1066,7 +1066,7 @@ checkable without a download, a paid call or a hosted CI run. Hosted CI, amd64
 images and a Windows proof are M6b and wait for the owner. The analysis
 contract above is unchanged.
 
-- **Version**: `reverseai.__version__` is the single source, `0.6.0` for M6;
+- **Version**: `reverseai.__version__` is the single source, `0.6.0` for M6 and `0.6.1` for M6b;
   `pyproject.toml` declares the same static version and a test pins the two equal.
 - **pyproject.toml** (PEP 621): name `reverseai`, the version, a one-line
   description, `readme = "README.md"`, `requires-python = ">=3.12"`, no
@@ -1118,6 +1118,105 @@ contract above is unchanged.
   `m6-seams-builders`), the native verifier, `doctor`), `docs/SECURITY.md` (what is trusted,
   containment profile, verified versus derived, limits, how to report a
   problem), `CHANGELOG.md` (M1 to M6 with tags), and the README install section.
+
+## License, manual CI, Windows reports and offline builders (M6b, contract/3)
+
+Decisions `owner-license-mit`, `owner-ci-manual`, `m6b-contract`. M6b is version
+`0.6.1`. The analysis contract and the evidence shapes above are unchanged.
+
+- **License (lane P)**: the project is MIT. A top-level `LICENSE` holds the
+  standard MIT text, `Copyright (c) 2026 Stefano D'Agostino`. `pyproject.toml`
+  declares `license = "MIT"` and `license-files = ["LICENSE",
+  "THIRD_PARTY_NOTICES.md"]` (PEP 639). The wheel's `METADATA` becomes
+  Metadata-Version 2.4 with `License-Expression: MIT` and one `License-File`
+  line per file; both files are copied to `reverseai-0.6.1.dist-info/licenses/`
+  (no longer at the dist-info root) and listed in `RECORD`. The sdist adds
+  `LICENSE` at its root and the same headers in `PKG-INFO`. The REA attribution
+  in `THIRD_PARTY_NOTICES.md` stays unchanged. The backend refuses a pyproject
+  whose license or license files differ from these values.
+- **Editable install (lane P)**: the backend adds PEP 660 `build_editable` and
+  `get_requires_for_build_editable` (returning `[]`): a wheel whose only payload
+  is `reverseai_editable.pth` holding the absolute checkout root, with the same
+  dist-info (METADATA, WHEEL, entry points, licenses, RECORD) as the normal wheel.
+  `pip install --no-index --no-deps -e .` then needs no download; the checkout's
+  locks are used through `contained.default_lock` because no `_locks` copy exists.
+- **Manual CI (lane C)**: `.github/workflows/manual-proof.yml` is triggered only by
+  `workflow_dispatch` with one choice input `target` (`linux`, `windows`, `both`;
+  default `linux`). No `push`, `pull_request`, `pull_request_target`, `schedule`
+  or `workflow_run` trigger. Top-level `permissions: contents: read`; no
+  `secrets.` reference; no cache, artifact upload or deployment. Jobs:
+  `linux` on `ubuntu-24.04` and `windows` on `windows-2025`, each with
+  `timeout-minutes: 30`. The only actions are `actions/checkout` pinned to commit
+  `3d3c42e5aac5ba805825da76410c181273ba90b1` (v7.0.1) with
+  `persist-credentials: false`, and `actions/setup-python` pinned to commit
+  `6d4fd22b20465ccc0f7354476588e8df7c9ca0e0` (v7.1.0) with Python `3.12`; the
+  pins are full SHAs with the version as a trailing comment. Each job then runs
+  only `python -B tools/host_proof.py --receipt <runner temp>/receipt.json`.
+  A test pins all of the above by reading the workflow text, so the YAML stays
+  in one plain block style without anchors or flow mappings. Running it is the
+  owner's call each time (decision `owner-ci-manual`); a workflow on GitHub can be
+  dispatched only once it is on the default branch.
+- **Host proof (lane C)**: `tools/host_proof.py` runs on the current host, from a
+  checkout, the steps of the Linux proof's `inside()` (refactored so both share
+  one implementation): suite, wheel (`pip wheel --no-index --no-deps`), venv,
+  offline install, `--version`, imported_from, `doctor --json`, the code-built
+  fixture, `analyze --out`, plus a `query <fixture> --query list_segments --arg
+  limit=16 --out` step. The venv layout follows the host (`bin/` or `Scripts\`).
+  It writes the receipt JSON and prints it on one line after the marker
+  `REVERSEAI-HOST-PROOF `, also appending it to `$GITHUB_STEP_SUMMARY` when set.
+  Pass on POSIX: every step exit 0, the whole suite run with zero failures and
+  errors, the counts parsed, version and imported_from inside the venv, both
+  reports present. Pass on Windows (`os.name == "nt"`): the same install,
+  version, doctor, fixture, analyze and query checks plus a `windows_tests` step
+  running `python -B -m unittest tests.test_windows_output -v` with zero
+  failures and errors and at least one test run; the whole suite still runs and
+  its counts are recorded, but it does not gate the Windows result. The receipt
+  names the commit (`git rev-parse HEAD`), Python version, platform, machine and
+  each step's exit and output tail. Receipts kept in the repository are
+  `.coordination/m6b/platform-<os>-<arch>.json`.
+- **Offline LIEF and YARA-X builders (lane C)**: `tools/build_lief_image.py` and
+  `tools/build_yarax_image.py` no longer pull: like the JADX builder they inspect
+  the pinned base and refuse when it is absent (`this tool never pulls`). The build
+  keeps `--network none` and `--pull=false`; `--download` for the pinned wheel
+  stays an explicit opt-in. Proof: one rebuild each from the approved local
+  wheel to a scratch tag and a scratch lock path, then the native verifier with
+  that scratch lock; the committed locks and images stay unchanged and the scratch
+  images are removed. Docker only under the `docker-desktop` reservation. The
+  Ghidra builder still needs network (its natives stage runs `apt-get`); making it
+  offline needs approved Debian package downloads and is deferred.
+- **Windows reports (lane W)**: on Windows (`os.name == "nt"`) `analyze` and
+  `query` accept `--out` only for a directory that does not exist yet. It is
+  created with `os.mkdir(path, 0o700)`, which on CPython 3.12.4 or later
+  (gh-118486) gives the new directory a private ACL; older Windows Pythons refuse
+  `--out`. The new directory is opened with `CreateFileW` using
+  `FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT`, share mode without
+  `FILE_SHARE_DELETE` (so it cannot be renamed, deleted or replaced while bound),
+  and checked through the handle to be a directory, not a reparse point, and
+  empty. Each report is created relative to that handle with `NtCreateFile`
+  (`OBJECT_ATTRIBUTES.RootDirectory` set to the handle, a bare file name,
+  `FILE_CREATE`, `FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT |
+  FILE_SYNCHRONOUS_IO_NONALERT`), never by path, then written through
+  `msvcrt.open_osfhandle` with `\n` newlines. All Win32 and NT calls live in a
+  new `reverseai/winout.py` with explicit `argtypes`, `restype` and error
+  checks, loaded only on Windows. Existing POSIX behaviour and messages are
+  unchanged. Tests on POSIX drive `winout` through a fake API to pin the call
+  sequence and every refusal; `tests/test_windows_output.py` runs the real
+  calls only on Windows (an existing directory, a junction and a symlink at
+  `--out` refused, new reports with exact bytes, the bound directory not
+  renameable while bound) and skips elsewhere. Input intake already refuses a
+  link or a swapped file through its `lstat` and handle identity check; the
+  Windows tests also pin that for a symlinked input.
+- **Docs (lane P)**: README (license section, platforms, manual CI and how it
+  is started, Windows reports), `docs/INSTALL.md` (Windows analysis with a new
+  `--out` and Python 3.12.4 or later; editable install; offline LIEF and YARA-X
+  builders; Ghidra still online), `docs/SECURITY.md` (Windows report binding,
+  the CI's permissions and pinned actions, what a manual CI receipt proves),
+  `CHANGELOG.md` under "Unreleased: M6b", and `media/how-it-works.svg`. Release
+  status lines are written by coord at the gate from the receipts.
+- **Platforms (M6b)**: the whole suite on macOS arm64 and in the Linux arm64
+  container as in M6a, natives on rc1, and the manual CI receipts for Linux
+  x86-64 (host suite and wheel, not containers) and Windows x86-64 once the owner
+  starts a run. No AMD64 container image is built: that needs approved downloads.
 
 ## Known-answer fixtures
 

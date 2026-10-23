@@ -5,7 +5,7 @@ backend-path = ["tools"]
 
 [project]
 name = "reverseai"
-version = "0.6.0"
+version = "0.6.1"
 description = "Contained static analysis with verifiable evidence."
 readme = "README.md"
 requires-python = ">=3.12"
