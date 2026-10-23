@@ -103,7 +103,7 @@ class Fake:
             return 0
         if self.status and self.fail != "late-nt":
             return self.status
-        descriptor = os.open(self.folder / text, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        descriptor = os.open(self.folder / text, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o600)
         native = 2000 + descriptor
         self.handles[native] = descriptor
         C.cast(output, C.POINTER(W.HANDLE)).contents.value = native
