@@ -115,6 +115,17 @@ class CacheTests(unittest.TestCase):
             self.assertIsNone(self.store.lookup(identity()))
             self.assertFalse(any(p.name.startswith(".tmp-") for p in self.root.iterdir()))
 
+    def test_contained_timeout_keeps_its_type_and_identity(self):
+        from reverseai.contained import ContainedTimeout
+        failure = ContainedTimeout("WorkerTimeout")
+        def fail(sink):
+            sink.write(b"partial")
+            raise failure
+        with self.assertRaises(ContainedTimeout) as caught:
+            self.store.prepare(identity(), fail)
+        self.assertIs(caught.exception, failure)
+        self.assertIsNone(self.store.lookup(identity()))
+
     def test_cap_plus_one_is_refused_before_writing_the_extra_bytes(self):
         with patch.object(cache, "MAX_ARTIFACT_BYTES", 16):
             with self.assertRaises(cache.CacheError):
@@ -168,6 +179,17 @@ class CacheTests(unittest.TestCase):
             facts = self.store.facts()
             self.assertEqual(facts["entries"], 2)
             self.assertEqual(facts["bytes"], sum(p.stat().st_size for p in self.root.iterdir()))
+
+    def test_repairing_a_corrupt_full_store_entry_does_not_evict_an_unrelated_project(self):
+        with patch.object(cache, "MAX_ENTRIES", 2):
+            self.prepare(0)
+            self.prepare(1)
+            body = self.root / (cache.cache_key(identity(1)) + ".tar")
+            body.write_bytes(b"x" * len(self.blob))
+            self.assertEqual(self.prepare(1)[2], "created")
+            for number in (0, 1):
+                with self.store.lookup(identity(number)) as handle:
+                    self.assertIsNotNone(handle)
 
     def test_doctor_does_not_read_the_tar_body_or_change_files(self):
         self.prepare()

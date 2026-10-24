@@ -423,7 +423,7 @@ class DockerExecutor:
     The lock is frozen at construction so the reported identity matches every run.
     """
 
-    def __init__(self, lock, runner=None, *, prepare_runner=run_prepare_bounded, adapter_version="1.0.0-r2", extra_keys=(),
+    def __init__(self, lock, runner=None, *, prepare_runner=None, adapter_version="1.0.0-r2", extra_keys=(),
                  inspect=inspect_image, staging_root=STAGING_ROOT):
         self.lock = MappingProxyType(load_lock(lock, adapter_version=adapter_version, extra_keys=extra_keys))
         profile = {GHIDRA_VERSION: "ghidra", JADX_VERSION: "jadx", JSPARSER_VERSION: "jsparser"}.get(adapter_version, "default")
@@ -431,7 +431,7 @@ class DockerExecutor:
                                                         partial(run_bounded, profile=profile))
         self.inspect = inspect
         self.staging_root = Path(staging_root)
-        self.prepare_runner = prepare_runner
+        self.prepare_runner = run_prepare_bounded if prepare_runner is None else prepare_runner
 
     def available(self):
         try:

@@ -162,6 +162,44 @@ class AdmissionTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ContractError):
                 self.admit(items, args, "ghidra.pseudocode")
 
+    def test_function_parts_are_independent_bounded_pages(self):
+        for part in ("callees", "callers", "references", "strings", "assembly"):
+            target = self.layout["functions"][1 if part == "callers" else 2 if part == "callees" else -1]
+            if part == "assembly":
+                rows = [record({"kind": "instruction_export", "index": i, "from": target["entry"], "from_size": target["size"],
+                                "at": target["entry"] + delta, "length": length, "text": "derived instruction"},
+                               target["offset"] + delta, length) for i, (delta, length) in enumerate(target["instructions"])]
+            else:
+                source = program(self.data, self.layout, "calls" if part in ("callees", "callers") else part)[1:]
+                rows = [copy.deepcopy(row) for row in source if row.value["to" if part == "callers" else "from"] == target["entry"]]
+                for i, row in enumerate(rows):
+                    row.value["index"] = i
+            items = (header(self.data, part, scope="function", entry=target["entry"], total=len(rows), count=len(rows)), *rows)
+            with self.subTest(part=part):
+                admitted = self.admit(items, {"part": part, "entry": target["entry"]}, "ghidra.export_function")
+                self.assertEqual(admitted[:len(items)], items)
+
+    def test_export_argument_limits_and_unused_arguments_fail_closed(self):
+        from reverseai import queries
+        allowed = (("export_program", {"start": 1048575, "limit": 128}),
+                   ("export_function", {"part": "assembly", "entry": 2**64 - 1, "start": 1048575, "limit": 128}),
+                   ("procedure_pseudo_code", {"mode": "paged", "text_start": 1048576, "max_chars": 2048}))
+        for name, args in allowed:
+            queries.resolve(name, args)
+            for key, value in args.items():
+                if type(value) is int:
+                    for invalid in (True, -1, str(value), value + 1):
+                        with self.subTest(name=name, key=key, invalid=invalid), self.assertRaises(ContractError):
+                            queries.resolve(name, dict(args, **{key: invalid}))
+        for name, args in (("export_function", {"part": "info", "limit": 1}),
+                           ("export_function", {"part": "pseudocode", "start": 1}),
+                           ("export_function", {"part": "assembly", "text_start": 1}),
+                           ("export_function", {"select": "entry", "name": "ignored"}),
+                           ("procedure_pseudo_code", {"text_start": 1}),
+                           ("export_program", {"part": "all"}), ("export_program", {"cache": "path"})):
+            with self.subTest(name=name, args=args), self.assertRaises(ContractError):
+                queries.resolve(name, args)
+
 
 @unittest.skipIf(ghidra_cache.fcntl is None, "prepared tool requires POSIX cache")
 class PreparedToolTests(unittest.TestCase):
@@ -282,6 +320,44 @@ class PreparedToolTests(unittest.TestCase):
                 mcp_tools.command("prepare_file", {"file": sample.name, **extra}, root=self.temp.name, out="unused", enabled=enabled)
         full = mcp_tools.command("export_program", {"file": sample.name, "view": "full"}, root=self.temp.name, out="unused", enabled=enabled)
         self.assertNotIn("view=full", full)
+
+    def test_a_malformed_final_row_leaves_no_partial_gateway_evidence(self):
+        from reverseai.contract import InputRef
+        ghidra_tool.prepare(self.data, executor=self.executor, store=self.store)
+        self.reply_items = copy.deepcopy(program(self.data, self.layout))
+        self.reply_items[-1].value["entry"] = 0
+        tool = ghidra_tool.make_tool(self.executor, store=self.store)
+        analysis = pipeline.query_bytes(self.data, InputRef(sha256_hex(self.data), len(self.data), "inert"),
+                                        "export_program", {}, tools=(tool,))
+        self.assertEqual(analysis.results[0].status, "error")
+        self.assertEqual(analysis.results[0].evidence, ())
+        self.assertEqual(analysis.results[0].findings, ())
+
+    def test_128_string_rows_synthesize_257_observations_and_chunk_citations(self):
+        from tests.fixtures_structure import elf
+        from reverseai.contract import InputRef
+        data, layout = elf(entry=0x1000, sections=((b".text", 1, 6, 8192),))
+        import struct
+        data = bytearray(data)
+        struct.pack_into("<Q", data, layout["shoff"] + 64 + 16, 0x1000)
+        raw = layout["offsets"][0]
+        data[raw + 512:raw + 515] = b"ok\0"
+        self.data = bytes(data)
+        rows = [record({"kind": "string_export", "index": i, "from": 0x1000, "from_size": 8192,
+                        "at": 0x1000 + i, "instruction_length": 1, "address": 0x1200, "encoding": "ascii",
+                        "text": "ok", "truncated": False}, raw + 512, 2) for i in range(128)]
+        self.reply_items = (header(self.data, "strings", total=128, count=128), *rows)
+        ghidra_tool.prepare(self.data, executor=self.executor, store=self.store)
+        tool = ghidra_tool.make_tool(self.executor, store=self.store)
+        ref = InputRef(sha256_hex(self.data), len(self.data), "inert")
+        analysis = pipeline.query_bytes(self.data, ref, "export_program", {"part": "strings", "limit": 128}, tools=(tool,))
+        result = analysis.results[0]
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(len(result.evidence), 257)
+        self.assertEqual({v.status for v in analysis.verdicts}, {"derived"})
+        pages = [f for f in result.findings if f.claim_key == "code.export_strings"]
+        self.assertEqual([len(f.value["rows"]) for f in pages], [31, 31, 31, 31, 4])
+        self.assertTrue(all(len(f.evidence_ids) <= 64 for f in pages))
 
 
 if __name__ == "__main__":

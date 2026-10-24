@@ -174,7 +174,10 @@ def _atomic_json(directory, name, value):
 
 @contextmanager
 def _locked(directory, name, timeout=LOCK_SECONDS):
-    fd = _open_file(directory, name, create=True)
+    try:
+        fd = _open_file(directory, name, create=True)
+    except OSError:
+        raise CacheError(UNSAFE) from None
     try:
         deadline = time.monotonic() + timeout
         while True:
@@ -273,6 +276,7 @@ class CacheStore:
         if fcntl is None or os.name == "nt" or not self.root.is_absolute():
             raise CacheError(UNSAFE)
         fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        yielded = False
         try:
             parts = self.root.parts[1:]
             if not parts or any(part in (".", "..") for part in parts):
@@ -302,10 +306,13 @@ class CacheStore:
                     raise CacheError(UNSAFE)
                 os.close(fd)
                 fd = child
+            yielded = True
             yield fd
         except FileNotFoundError:
             raise
         except OSError:
+            if yielded:
+                raise
             raise CacheError(UNSAFE) from None
         finally:
             os.close(fd)
@@ -387,6 +394,8 @@ class CacheStore:
                     raise
         except FileNotFoundError:
             return None
+        except OSError:
+            raise CacheError(UNSAFE) from None
         finally:
             if lease is not None:
                 lease.__exit__(None, None, None)
@@ -395,12 +404,14 @@ class CacheStore:
         started = time.monotonic()
         key = cache_key(expected)
         with self._directory(create=True) as directory, _locked(directory, "prepare.lock"):
+            corrupt = False
             try:
                 found = self.lookup(expected)
             except CacheError as error:
                 if str(error) != MISSING:
                     raise
                 found = None
+                corrupt = True
             if found is not None:
                 with found:
                     if time.monotonic() >= started + CONTROLLER_SECONDS:
@@ -409,6 +420,8 @@ class CacheStore:
             with _locked(directory, "index.lock"):
                 index = self._index(directory)
                 _, names = self._inventory(directory)
+                if corrupt:
+                    index["entries"].pop(key, None)
                 for existing in tuple(index["entries"]):
                     if existing + ".tar" not in names or existing + ".json" not in names:
                         del index["entries"][existing]
