@@ -10,13 +10,16 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 import importlib
 import io
 import math
 import os
 from pathlib import Path
 import re
+import selectors
+import subprocess
+import threading
 import sys
 import tarfile
 import tempfile
@@ -33,6 +36,7 @@ from tests.fixtures_scale import elf_scale
 
 ROOT = Path(__file__).resolve().parents[1]
 PREPARE_SECONDS, PREPARE_BYTES = 900, 64 * 1024**2
+MAX_DOCKER_STDERR_BYTES = 4096
 PROGRAM_ARGS = {"part": "functions", "start": 0, "limit": 128}
 RESTORE_CASES = ("traversal", "absolute", "symlink", "duplicate", "checksum", "truncated", "trailer", "base256")
 REQUIRED_CHECKS = ("revision", *old.GHIDRA_REQUIRED_CHECKS,
@@ -193,8 +197,57 @@ def semantic_report(report):
                           for row in result["evidence"]]} for result in report["results"]]
 
 
+@contextmanager
+def docker_stderr():
+    """Observe the real bounded runner without changing its stdout, deadlines or argv.
+
+    A separate drain discards bytes after the fixed diagnostic prefix; stderr can
+    neither fill a pipe nor grow a host file. Only verifier-owned create/start/run
+    commands are observed, and the production runner still owns each process.
+    """
+    original, captured, readers = subprocess.Popen, bytearray(), []
+    mutex = threading.Lock()
+    def popen(argv, *args, **kwargs):
+        if not isinstance(argv, list) or argv[:2] not in (["docker", "create"], ["docker", "run"], ["docker", "start"]):
+            return original(argv, *args, **kwargs)
+        process = original(argv, *args, **dict(kwargs, stderr=subprocess.PIPE))
+        stop = threading.Event()
+        def drain():
+            try:
+                os.set_blocking(process.stderr.fileno(), False)
+                with selectors.DefaultSelector() as selector:
+                    selector.register(process.stderr, selectors.EVENT_READ)
+                    while not stop.is_set():
+                        if not selector.select(.05):
+                            continue
+                        chunk = os.read(process.stderr.fileno(), 65536)
+                        if not chunk:
+                            break
+                        with mutex:
+                            captured.extend(chunk[:max(0, MAX_DOCKER_STDERR_BYTES - len(captured))])
+            except (OSError, ValueError):
+                pass
+        reader = threading.Thread(target=drain, daemon=True)
+        readers.append((process.stderr, stop, reader))
+        reader.start()
+        return process
+    try:
+        with patch.object(subprocess, "Popen", side_effect=popen):
+            yield captured
+    finally:
+        for stream, stop, reader in readers:
+            # A finished CLI closes its writer, so drain its remaining diagnostic first.
+            reader.join(.2)
+            stop.set()
+            reader.join(1)
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
 class R1Verifier(old.NativeVerifier):
-    def __init__(self, boundary, lock, receipt, folder):
+    def __init__(self, boundary, lock, receipt, folder, *, reply_dir=None):
         verify_lock(lock)
         verify_profiles(boundary)
         super().__init__(boundary, lock, receipt, tool="ghidra")
@@ -204,6 +257,27 @@ class R1Verifier(old.NativeVerifier):
         self.true_executor = boundary.DockerExecutor
         self.requests, self.allowed = [], set()
         self.stream, self.probe_result = None, None
+        self.failed_stderr = b""
+        self.reply_dir = None if reply_dir is None else Path(reply_dir)
+        if self.reply_dir is not None:
+            old.need(not self.reply_dir.exists() and not self.reply_dir.is_symlink(), "R1NewReplyDirectory")
+            self.reply_dir.mkdir(mode=0o700)
+            self.receipt["replies"] = []
+
+    def save_reply(self, data, operation, args, raw):
+        if self.reply_dir is None:
+            return
+        old.need(operation in ("ghidra.export_program", "ghidra.export_function", "ghidra.functions")
+                 and type(raw) is bytes and 0 < len(raw) <= 262144, "R1ReplyOutput")
+        name = "elf_code." + operation
+        request = {"fixture": "elf_code", "input_sha256": sha256_hex(data), "operation": operation, "args": args}
+        encoded = canonical_json(request).encode()
+        for suffix, content in (("request.json", encoded), ("reply.json", raw)):
+            with (self.reply_dir / (name + "." + suffix)).open("xb") as target:
+                os.fchmod(target.fileno(), 0o600)
+                target.write(content)
+        self.receipt["replies"].append({**request, "file": name + ".reply.json", "bytes": len(raw),
+                                       "sha256": sha256_hex(raw), "request_sha256": sha256_hex(encoded)})
 
     def ghidra_request_allowed(self, operation, args):
         return (operation == "ghidra.prepare" and args == {} or old.ghidra_request_allowed(operation, args)
@@ -214,7 +288,21 @@ class R1Verifier(old.NativeVerifier):
             at = argv.index(self.lock["image_id"])
             self.requests.append({"operation": argv[at + 1], "args": old.decode(argv[at + 2]),
                                   "probe": self.active, "timeout": timeout, "max_output": max_output})
-        return super().runner(argv, timeout=timeout, max_output=max_output)
+        diagnostic = None
+        try:
+            with docker_stderr() as diagnostic:
+                return super().runner(argv, timeout=timeout, max_output=max_output)
+        finally:
+            if diagnostic:
+                self.failed_stderr = diagnostic
+
+    def record(self, name, check):
+        self.failed_stderr = b""
+        passed = super().record(name, check)
+        if not passed and self.failed_stderr:
+            raw = bytes(self.failed_stderr).decode("utf-8", errors="replace").encode("utf-8")
+            self.receipt["checks"][-1]["docker_stderr"] = raw[:MAX_DOCKER_STDERR_BYTES].decode("utf-8", errors="ignore")
+        return passed
 
     def run_bounded(self, argv, *, timeout, max_output):
         try:
@@ -582,6 +670,7 @@ class R1Verifier(old.NativeVerifier):
         def invoke(operation, args):
             self.allowed.add((operation, canonical_json(args)))
             raw = self.invoke(data, operation, args, project=project)
+            self.save_reply(data, operation, args, raw)
             return old.parse_worker_reply(raw, input_sha256=sha256_hex(data), max_observations=129)
         def metadata(rows, scope, part, entry, count):
             old.need(len(rows) == count + 1 and rows[0].value == {
@@ -779,6 +868,16 @@ def smoke_passes(receipt):
                     ("ghidra.export_function", {"select": "entry", "entry": layout["functions"][0]["entry"], "name": "",
                      "part": "info", "start": 0, "limit": 32, "text_start": 0, "max_chars": 1024}),
                     ("ghidra.functions", {"query": "", "start": 0, "limit": 1})]
+        if "replies" in receipt:
+            old.need(len(receipt["replies"]) == 3, "R1SmokeReplyFiles")
+            for saved, (operation, arguments) in zip(receipt["replies"], expected[1:]):
+                request = {"fixture": "elf_code", "input_sha256": sha256_hex(data),
+                           "operation": operation, "args": arguments}
+                old.need(all(saved[key] == value for key, value in request.items())
+                         and saved["file"] == "elf_code." + operation + ".reply.json"
+                         and type(saved["bytes"]) is int and 0 < saved["bytes"] <= 262144
+                         and re.fullmatch(r"[0-9a-f]{64}", saved["sha256"])
+                         and saved["request_sha256"] == sha256_hex(canonical_json(request).encode()), "R1SmokeReplyFiles")
         old.need([(row["operation"], row["args"]) for row in requests] == expected
                  and all(row["probe"] is None and type(row["timeout"]) is int and type(row["max_output"]) is int
                          and row["timeout"] == (900 if index == 0 else 240)
@@ -802,8 +901,9 @@ def smoke_main(args):
         verify_lock(lock)
         receipt.update(lock=lock, lock_sha256=sha256_hex(raw), sources=source_hashes(SMOKE_SOURCE_FILES))
         from reverseai import contained
-        with tempfile.TemporaryDirectory(prefix="reverseai-r1-smoke-") as folder:
-            native = R1Verifier(contained, lock, receipt, folder)
+        with tempfile.TemporaryDirectory(prefix="reverseai-r1-smoke-", dir=contained.STAGING_ROOT) as folder:
+            options = {"reply_dir": args.reply_dir} if args.reply_dir is not None else {}
+            native = R1Verifier(contained, lock, receipt, folder, **options)
             native.smoke()
             receipt["requests"] = native.requests
         old.need(receipt["sources"] == source_hashes(SMOKE_SOURCE_FILES), "R1SourcesChanged")
@@ -831,11 +931,14 @@ def main(argv=None):
     parser.add_argument("--offline", required=True, action="store_true")
     parser.add_argument("--route", choices=("A", "B"))
     parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--reply-dir", type=Path, help="New private directory for bounded raw smoke replies")
     parser.add_argument("--lock", required=True, type=Path)
     parser.add_argument("--receipt", required=True, type=Path)
     args = parser.parse_args(argv)
     if args.smoke:
         return smoke_main(args)
+    if args.reply_dir is not None:
+        parser.error("--reply-dir requires --smoke")
     if args.route is None:
         parser.error("full verification requires --route A|B")
     receipt = {"schema": "reverseai.r1-runtime/1", "platform": old.PLATFORM, "offline": True,
@@ -859,7 +962,7 @@ def main(argv=None):
         receipt.update(lock=lock, lock_sha256=sha256_hex(raw))
         receipt["checks"].append({"id": "revision", "status": "passed", "evidence": {
             "route": args.route, "parent_image_id": lock["parent_image_id"], "bundle_sha256": lock["bundle_sha256"]}})
-        with tempfile.TemporaryDirectory(prefix="reverseai-r1-proof-") as folder:
+        with tempfile.TemporaryDirectory(prefix="reverseai-r1-proof-", dir=contained.STAGING_ROOT) as folder:
             native = R1Verifier(contained, lock, receipt, folder)
             native.run_r1()
             receipt["requests"] = native.requests
