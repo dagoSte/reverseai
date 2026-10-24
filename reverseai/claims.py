@@ -105,7 +105,7 @@ def _symbol(value):
 
 
 def _rows(rows, maximum=64):
-    """1..maximum [delta, length, text] instruction rows in address order, non-overlapping (contracts M3c, M3d)."""
+    """1..maximum [delta, length, text] instruction rows in address order, non-overlapping."""
     if not isinstance(rows, list) or not 1 <= len(rows) <= maximum:
         return False
     end = 0
@@ -135,7 +135,7 @@ def _index(value):
 
 
 # The reviewer's own checks of each code and query shape: a malformed reading yields nothing, even when a finding
-# repeats it (M3c R1; M3a kinds and M3d rows since decision m3d-contract).
+# repeats it.
 SHAPES = {
     "function": lambda o: (_index(o.get("index")) and _symbol(o.get("name")) and _uint(o.get("entry"))
                            and _uint(o.get("size")) and o["size"] > 0),
@@ -156,7 +156,7 @@ SHAPES = {
                            and _rows(o.get("instructions")) and type(o.get("truncated")) is bool),
     "ref": lambda o: (_uint(o.get("from")) and _uint(o.get("to")) and o.get("type") in REFERENCE_TYPES
                       and _symbol(o.get("to_name"))),
-    # M4b: decompiled Java of one DEX method; printable ASCII, newline and tab only (the worker escapes the rest)
+    # Decompiled Java of one DEX method; printable ASCII, newline and tab only (the worker escapes the rest)
     "java": lambda o: (all(_ascii(o.get(key), 1, 255) for key in ("dex", "class", "name", "prototype"))
                        and o.get("form") in JAVA_FORMS and _index(o.get("start")) and _index(o.get("total"))
                        and isinstance(o.get("text"), str) and len(o["text"]) <= 2048
@@ -186,7 +186,7 @@ REFERENCE_TYPES = ("read", "write", "read_write", "data", "jump")
 
 
 def _shaped(name):
-    """Observations of one M3c kind, each with exactly its contract fields and shape, or None."""
+    """Observations of one code kind, each with exactly its contract fields and shape, or None."""
     def select(observations):
         chosen = _kind(name)(observations)
         if not chosen or not all(set(o) == FIELDS[name] and SHAPES[name](o) for o in chosen):
@@ -250,7 +250,7 @@ def _manifest_value(o):
     return isinstance(value, str) and len(value) <= 256 and value.isprintable()
 
 
-# List pages (M3d, M4a): kind -> (row fields in claim order, shape of one row besides kind, index and total).
+# List pages: kind -> (row fields in claim order, shape of one row besides kind, index and total).
 PAGES = {
     "segment": (("name", "offset", "filesz", "address", "memsz", "readable", "writable", "executable"),
                 lambda o: (_symbol(o["name"]) and all(_uint(o[key]) for key in ("offset", "filesz", "address", "memsz"))
@@ -260,12 +260,12 @@ PAGES = {
                           and o["binding"] in BINDINGS and _bool(o["defined"]))),
     "string": (("offset", "encoding", "text", "truncated"),
                lambda o: (_uint(o["offset"]) and o["encoding"] in ("ascii", "utf-16le") and _ascii(o["text"], 1, 256)
-                          and _bool(o["truncated"]))),  # the host scanners admit printable ASCII only (RD-M3D-CODEX-C M1)
+                          and _bool(o["truncated"]))),  # the host scanners admit printable ASCII only
     "function_row": (("name", "entry", "size"),
                      lambda o: _symbol(o["name"]) and _uint(o["entry"]) and _uint(o["size"]) and o["size"] > 0),
     "xref": (("at", "from", "type"),
              lambda o: _uint(o["at"]) and _maybe_uint(o["from"]) and o["type"] in XREF_TYPES and _uint(o["to"])),
-    # contract/3, M4a: Android package pages
+    # Android package pages
     "member": (("name", "method", "compressed_size", "size", "crc32", "sha256", "flags"),
                lambda o: ((_text(o["name"]) or (o["name"] == "" and isinstance(o["flags"], list)
                                                  and "traversing_name" in o["flags"]))
@@ -296,7 +296,7 @@ PAGES = {
                            and isinstance(o["target"], str) and len(o["target"]) <= 512 and o["target"].isprintable()
                            and _bool(o["target_truncated"])
                            and (not o["target_truncated"] or (o["ref_kind"] == "string" and len(o["target"]) == 256)))),
-    # M5a: JavaScript applications on the host; "" names a single-file input
+    # JavaScript applications on the host; "" names a single-file input
     "js_file": (("file", "size", "sha256", "lines", "max_line", "flags"),
                 lambda o: (_js_file(o["file"]) and _uint(o["size"])
                            and isinstance(o["flags"], list) and all(isinstance(flag, str) for flag in o["flags"])
@@ -308,7 +308,7 @@ PAGES = {
     "package_field": (("file", "path", "value", "truncated"),
                       lambda o: (_js_file(o["file"]) and _text(o["path"]) and o["path"].startswith("/")
                                  and _cut_text(o["value"], o["truncated"]))),
-    # M5b: the parser's syntactic readings, anchored at bytes the host verified
+    # The parser's syntactic readings, anchored at bytes the host verified
     "js_module": (("file", "form", "source", "truncated"),
                   lambda o: _js_file(o["file"]) and o["form"] in JS_FORMS and _cut_text(o["source"], o["truncated"])),
     "js_call": (("file", "callee"),
@@ -346,7 +346,7 @@ def _cut_text(value, truncated):
 PAGE_EXTRA = {"xref": {"to"}, "class": {"interfaces", "interfaces_total", "source_file"}}
 
 
-# Page claims (contract M3d): their findings are pages of one list, so the reviewer compares them row by row,
+# Page claims: their findings are pages of one list, so the reviewer compares them row by row,
 # within the task (one query with its arguments) that produced them.
 PAGE_CLAIMS = frozenset({"segments.list", "symbols.list", "strings.listed", "strings.matches",
                          "code.function_list", "code.xrefs", "android.members", "android.manifest",
@@ -355,12 +355,12 @@ PAGE_CLAIMS = frozenset({"segments.list", "symbols.list", "strings.listed", "str
                          "javascript.modules", "javascript.calls", "javascript.parse"})
 # Verified claims the reviewer checks against the cited bytes themselves: two of them never contradict each other.
 SELF_CHECKED_CLAIMS = frozenset({"bytes.read"})
-# Claims whose findings each name a subset of one set (M4a): several of them never contradict each other.
+# Claims whose findings each name a subset of one set: several of them never contradict each other.
 SUBSET_CLAIMS = frozenset({"android.permissions"})
 
 
 def _page(kind):
-    """{"start", "total", "rows"}: indexes contiguous from start, one total, rows in index order (contract M3d)."""
+    """{"start", "total", "rows"}: indexes contiguous from start, one total, rows in index order."""
     fields, shape = PAGES[kind]
     expected = {"kind", "index", "total", *fields} | PAGE_EXTRA.get(kind, set())
 
@@ -397,7 +397,7 @@ def _permissions(observations):
     if not all(o["element"] in ("uses-permission", "uses-permission-sdk-23") and o["attribute"] == "android:name"
                and o["type"] == "string" and o["value"] for o in rows):
         return None
-    # The page metadata the cited attributes carry must be coherent too (m4a-deferred 5): one total, distinct indexes.
+    # The page metadata the cited attributes carry must be coherent too: one total, distinct indexes.
     if not (all(_index(o["index"]) and _index(o["total"]) and o["index"] < o["total"] for o in rows)
             and len({o["total"] for o in rows}) == 1 and len({o["index"] for o in rows}) == len(rows)):
         return None
@@ -411,7 +411,7 @@ def _callers(observations):
     return {"to": calls[0]["to"], "rows": [[o["at"], o["from"]] for o in sorted(calls, key=lambda o: o["at"])]}
 
 
-MAX_IMPORT_NAMES = 32  # decision m3b-deferred-to-m3c (R3-P): the host tool's own bounds, now also the reviewer's
+MAX_IMPORT_NAMES = 32  # the host tool's own bounds, also the reviewer's
 
 
 def _import_name(name):
@@ -445,14 +445,14 @@ RULES = {
     "signatures.rule_matches": ("observed", {"yarax.matches": _signature_rules}),
     "imports.libraries": ("observed", {"structure.imports": _import_names("library")}),
     "imports.symbols": ("observed", {"structure.imports": _import_names("symbols")}),
-    # contract/2 derived claims: the tool's reading, always inferred, reviewed as "derived"
+    # Derived claims: the tool's reading, always inferred, reviewed as "derived"
     "code.functions": ("inferred", {"ghidra.analyze": _function_names}),
     "code.pseudocode": ("inferred", {"ghidra.analyze": _pseudocode, "ghidra.function": _pseudocode}),
     "code.calls": ("inferred", {"ghidra.analyze": _calls, "ghidra.function": _calls}),
     "code.assembly": ("inferred", {"ghidra.analyze": _assembly}),
     "code.references": ("inferred", {"ghidra.analyze": _references, "ghidra.function": _references}),
     "code.strings": ("inferred", {"ghidra.analyze": _strings}),
-    # M3d targeted queries: verified host pages and readings, then derived Ghidra ones
+    # Targeted queries: verified host pages and readings, then derived Ghidra ones
     "segments.list": ("observed", {"structure.segments": _page("segment")}),
     "load.entry": ("observed", {"structure.entry": _single("entry", ("address", "offset"))}),
     "symbols.list": ("observed", {"structure.symbols": _page("symbol")}),
@@ -467,7 +467,7 @@ RULES = {
         "instructions", ("entry", "start", "total", "rows", "truncated"))}),
     "code.callers": ("inferred", {"ghidra.function": _callers}),
     "code.xrefs": ("inferred", {"ghidra.xrefs": _page("xref")}),
-    # contract/3, M4a: Android packages, verified on the host (declarations in the bytes, not behaviour)
+    # Android packages, verified on the host (declarations in the bytes, not behaviour)
     "android.members": ("observed", {"apk.inventory": _page("member")}),
     "android.manifest": ("observed", {"apk.manifest": _page("manifest_attribute")}),
     "android.permissions": ("observed", {"apk.manifest": _permissions}),
@@ -477,7 +477,7 @@ RULES = {
     "javascript.files": ("observed", {"js.files": _page("js_file")}),
     "javascript.package": ("observed", {"js.package": _page("package_field")}),
     "javascript.hints": ("observed", {"js.hints": _page("js_hint")}),
-    # M5b: derived, the parser's reading at verified bytes
+    # Derived: the parser's reading at verified bytes
     "javascript.modules": ("inferred", {"jsparser.syntax": _page("js_module")}),
     "javascript.calls": ("inferred", {"jsparser.syntax": _page("js_call")}),
     "javascript.parse": ("inferred", {"jsparser.syntax": _page("js_parse")}),
@@ -485,7 +485,7 @@ RULES = {
 }
 
 
-# contract/2: claims that are always a tool's reading; the reviewer reports them as derived whatever a ToolSpec says.
+# Claims that are always a tool's reading; the reviewer reports them as derived whatever a ToolSpec says.
 DERIVED_CLAIMS = frozenset(key for key, (_, derivations) in RULES.items()
                            if all(operation.startswith(("ghidra.", "jadx.", "jsparser.")) for operation in derivations))
 
@@ -560,7 +560,7 @@ def _texts_match(cited):
 
 
 def _rows_inside(cited):
-    """code.assembly: rows end inside the cited anchor, which starts at the entry (decision m3c-deferred)."""
+    """code.assembly: rows end inside the cited anchor, which starts at the entry."""
     return all(max(delta + length for delta, length, _ in item.observation["instructions"]) <= item.location.length
                for item in cited)
 

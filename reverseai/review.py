@@ -13,7 +13,7 @@ from reverseai.contract import (
     check_artifact, evidence_intact, finding_intact, inflate_stream, materialize, sha256_hex,
 )
 
-MAX_REVIEW_CHILD_BYTES = 128 * 1024 * 1024  # contract/3: distinct child artifacts one review re-materializes
+MAX_REVIEW_CHILD_BYTES = 128 * 1024 * 1024  # distinct child artifacts one review re-materializes
 
 
 class _Children:
@@ -21,7 +21,7 @@ class _Children:
 
     def __init__(self, data):
         self.data, self.cache, self.spent = data, {}, 0
-        self.streams, self.stream_spent = {}, 0  # M5c: each gzip stream inflated once, its bound charged first
+        self.streams, self.stream_spent = {}, 0  # each gzip stream inflated once, its bound charged first
 
     def get(self, artifact):
         key = canonical_json(artifact)
@@ -31,7 +31,7 @@ class _Children:
             except ContractError:
                 self.cache[key] = None
             else:
-                # Charged before inflating, so failed attempts spend the budget too (RD-M4A-CODEX-C R2).
+                # Charged before inflating, so failed attempts spend the budget too.
                 if self.spent + artifact["size"] > MAX_REVIEW_CHILD_BYTES:
                     return None, "child artifacts exceed the review budget"
                 self.spent += artifact["size"]
@@ -122,12 +122,12 @@ def review(data: bytes, input: InputRef, results: Iterable[AnalysisResult], tool
             # Provenance first; then the claim must follow from what it cites.
             reasons.extend(local or claims.check(finding, cited))
     # Only verified findings contradict each other: neither an unsupported nor a derived claim can cancel a verified one.
-    # Pages of one list (contract M3d) contradict only by a different total or a different row at the same index, within
+    # Pages of one list contradict only by a different total or a different row at the same index, within
     # the task (one query and its arguments) that produced them; different filters give different lists. A claim the
     # reviewer checks against its own cited bytes (bytes.read) cannot contradict another one.
     values, pages = {}, {}
     def families_of(finding_id, finding):
-        # A finding produced by several tasks joins each task's list (decision m3d-deferred, RR-M3D-CODEX-C R1).
+        # A finding produced by several tasks joins each task's list.
         return [(finding.claim_key, canonical_json(finding.value.get("to")), task) for task in sorted(tasks[finding_id])]
     for finding_id, finding in findings.items():
         if (problems[finding_id] or finding_id in derived or finding.claim_key in claims.SELF_CHECKED_CLAIMS

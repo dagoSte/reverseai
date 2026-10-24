@@ -3,15 +3,14 @@
 Usage (from the repository root):
     python3 -B tools/build_jadx_image.py --download-dir DIR [--tag TAG] [--lock PATH]
 
-Nothing is downloaded here. --download-dir must already hold jadx-1.5.6.zip (the one download of decision
-owner-next-m4b, checked against the publisher's release metadata when it was fetched) and the Temurin JDK 21.0.12.1+1
-(aarch64) tarball approved for Ghidra (owner-m3-downloads); both are checked by size cap and SHA-256 before use. The
-digest-pinned python:3.12-slim base must already be present locally: the tool never pulls (decision owner-next-m4b
-reuses it). The image is built with the network off: one internal "build" stage takes the jar and its licence from the
+Nothing is downloaded here. --download-dir must already hold jadx-1.5.6.zip (pinned, checked against the
+publisher's release metadata when it was fetched) and the Temurin JDK 21.0.12.1+1
+(aarch64) tarball also used for Ghidra; both are checked by size cap and SHA-256 before use. The
+digest-pinned python:3.12-slim base must already be present locally: the tool never pulls. The image is built with the network off: one internal "build" stage takes the jar and its licence from the
 zip, unpacks the JDK and compiles the fixed driver against the jar, and the final stage copies only /opt/jdk,
 /opt/jadx and /opt/reverseai/driver from it. The Dockerfile check allows exactly that shape and runs again on the copied
 build context; the lock's driver and worker hashes are those of the copied context, the bytes Docker builds, and the tool
-refuses to write a lock when the repository files differ from them after the build (RD-M4B-CODEX-W M1). Every docker
+refuses to write a lock when the repository files differ from them after the build. Every docker
 call is an argv list; nothing goes through a shell.
 """
 

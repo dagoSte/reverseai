@@ -21,7 +21,7 @@ from reverseai.contract import (
     sha256_hex,
 )
 
-MAX_RUN_CHILD_BYTES = 128 * 1024 * 1024  # contract/3: distinct child artifacts one operation may materialize
+MAX_RUN_CHILD_BYTES = 128 * 1024 * 1024  # distinct child artifacts one operation may materialize
 
 
 @dataclass
@@ -89,14 +89,14 @@ class Gateway:
                 # Freeze nested JSON too: frozen dataclasses alone do not freeze dicts.
                 observation = Observation(observation.location, deepcopy(observation.value), deepcopy(observation.artifact))
                 child = None
-                if observation.artifact is not None:  # contract/3: materialize each child once per run, within a budget
+                if observation.artifact is not None:  # materialize each child once per run, within a budget
                     key = canonical_json(observation.artifact)
                     if key not in children:
                         check_artifact(observation.artifact)
                         if sum(len(c) for c in children.values()) + observation.artifact["size"] > MAX_RUN_CHILD_BYTES:
                             self._finish(execution, "budget_exceeded")
                             return
-                        if observation.artifact["method"] == 1:  # M5c: a new gzip stream's bound is charged before it inflates
+                        if observation.artifact["method"] == 1:  # a new gzip stream's bound is charged before it inflates
                             stream = (observation.artifact["data_offset"], observation.artifact["compressed_size"])
                             if stream not in charged:
                                 charged[stream] = min(MAX_STREAM_BYTES, MAX_CHILD_RATIO * stream[1])
@@ -104,7 +104,7 @@ class Gateway:
                                     self._finish(execution, "budget_exceeded")
                                     return
                         children[key] = materialize(data, observation.artifact, streams=streams)
-                        if sum(len(s) for s in streams.values()) > MAX_STREAM_BYTES:  # M5c: gzip streams per run
+                        if sum(len(s) for s in streams.values()) > MAX_STREAM_BYTES:  # gzip streams per run
                             self._finish(execution, "budget_exceeded")
                             return
                     child = children[key]

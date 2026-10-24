@@ -11,8 +11,8 @@ query --out of one code-built ELF; on Windows also tests.test_windows_output. Th
 (git rev-parse HEAD), Python, platform, machine and every step's exit and output tail; it is written to a new file,
 printed on one line after the marker REVERSEAI-HOST-PROOF and appended to $GITHUB_STEP_SUMMARY when that is set.
 POSIX passes when every step exits 0 and the whole suite runs clean; Windows when the install, version, doctor,
-fixture, analyze, query and Windows report tests pass, the whole suite's counts being recorded without gating
-(decision m6b-contract). Every command is an argv list; nothing goes through a shell.
+fixture, analyze, query and Windows report tests pass, the whole suite's counts being recorded without gating.
+Every command is an argv list; nothing goes through a shell.
 """
 
 from __future__ import annotations

@@ -1,5 +1,4 @@
-"""Closed query names, typed arguments and fixed operation requests (contract M3d; Android names M4a; JavaScript
-M5a/M5b)."""
+"""Closed query names, typed arguments and fixed operation requests for native, Android and JavaScript inputs."""
 
 from dataclasses import dataclass
 import re
@@ -29,7 +28,7 @@ class QuerySpec:
     fixed: object = None
     routes: object = None  # operation -> ({operation argument: query argument}, {operation argument: fixed value})
     optional: tuple = ()  # included only when the tool's operation is registered
-    details: object = None  # M5a: the "detail" argument's value -> routes of the operations it selects
+    details: object = None  # the "detail" argument's value -> routes of the operations it selects
     check: object = None  # (validated arguments) -> None, raising ContractError when they do not fit together
 
     def validate(self, raw):
@@ -73,14 +72,14 @@ def _detailed(args, details, check):
         {detail: _routes(routes) for detail, routes in details.items()}), check=check)
 
 
-# Android (contract/3): one DEX member by name, or "" for every classes*.dex member (decision m4a-seams-x4);
+# Android: one DEX member by name, or "" for every classes*.dex member;
 # exact descriptors and names, in the escaped form displayed in the rows.
 ANY_DEX = ArgSpec("identity", 0, 255, default="")
 CLASS = ArgSpec("identity", 1, 255)
 METHOD_ARGS = {"class": CLASS, "method": ArgSpec("identity", 1, 255), "prototype": ArgSpec("identity", 0, 255, default="")}
 ANDROID_LIMIT = _integer(1, 256, 128)
 
-# JavaScript applications (M5a, contract/3): the clean members of a ZIP, or the input itself as file "".
+# JavaScript applications: the clean members of a ZIP, or the input itself as file "".
 JS_CATEGORIES = ("all", "endpoint", "dynamic_code", "shell", "filesystem", "network", "credential", "encoding")
 JS_PAGES = {"files": ("js.files", ("start", "limit")), "package": ("js.package", ("file", "start", "limit")),
             "hints": ("js.hints", ("file", "category", "start", "limit"))}
@@ -90,7 +89,7 @@ JS_DEFAULTS = {"file": "", "category": "all", "start": 0}  # what summary reads:
 
 def _javascript(args):
     """An argument the detail does not pass on must keep its default, so no part of a question is silently dropped;
-    js.files and js.package page up to 65535 (contract M5a)."""
+    js.files and js.package page up to 65535."""
     if args["detail"] in JS_SYNTAX_DETAILS:
         if not args["file"].isascii():
             raise ContractError("Syntax query file must be printable ASCII")

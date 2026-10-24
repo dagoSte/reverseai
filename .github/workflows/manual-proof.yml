@@ -1,4 +1,4 @@
-# Manual host proof (decision owner-ci-manual): started by the owner from the Actions tab, never by a push.
+# Manual host proof: started by hand from the Actions tab, never by a push.
 # Each job checks out the repository read-only and runs only tools/host_proof.py; no secret, cache or upload.
 name: manual-proof
 

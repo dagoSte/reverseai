@@ -12,7 +12,7 @@ from reverseai.report import Analysis
 from reverseai.tools import apk, dex, js, strings, structure
 
 ANALYSTS = (structural, capability, code)
-TOOLS = (structure.TOOL, strings.TOOL, apk.TOOL, dex.TOOL, js.TOOL)  # apk and dex: contract/3, M4a; js: M5a
+TOOLS = (structure.TOOL, strings.TOOL, apk.TOOL, dex.TOOL, js.TOOL)  # apk and dex read packages; js reads JavaScript applications
 # LIEF and YARA-X start a container per operation (45 s limit each), so a run that includes one gets more time.
 CONTAINED_BUDGET = Budget(max_wall_seconds=150)
 # Ghidra's single import-and-analyse run may take its full 240 s profile; the code task allows 300 s.
@@ -20,7 +20,7 @@ GHIDRA_BUDGET = Budget(max_wall_seconds=330)
 # JADX's fixed 120 s worker profile plus host work; the query task allows 150 s.
 JADX_BUDGET = Budget(max_wall_seconds=180)
 ANDROID_QUERY_BUDGET = Budget(max_wall_seconds=120)
-# Every jshints pattern over up to 128 MiB of JavaScript (decision m5a-js-budget: measured 68 to 94 s)
+# Every jshints pattern over up to 128 MiB of JavaScript (measured at 68 to 94 s)
 JAVASCRIPT_QUERY_BUDGET = Budget(max_wall_seconds=150)
 
 
@@ -31,7 +31,7 @@ def _budget(tools):
 
 
 def _plan(analyst, ref, tools):
-    """Analysts that can use optional tools say so with a tools parameter; M1 analysts are called as before.
+    """Analysts that can use optional tools say so with a tools parameter; the others are called without it.
 
     An optional analyst returns None when its tool is absent and then takes no part in the run.
     """
