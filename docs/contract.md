@@ -1358,7 +1358,8 @@ bytes; the cached project is always untrusted (a matching digest proves storage 
   refusals keep "reverseai: input refused: " with the error class only. A timeout, the 64 MiB artifact limit and a
   row cap all fail prepare with the preparation line; nothing is published.
 - **Capacity.** The 64 MiB artifact holds the Ghidra database and the export tables together, so it binds before the
-  row caps on real programs: a program whose prepared analysis exceeds it cannot be prepared.
+  row caps on real programs: a program whose prepared analysis exceeds it cannot be prepared. A function whose raw
+  name exceeds about 3,900 characters also makes prepare fail (rows are at most 4,096 bytes).
 - **Wire shapes (worker/1).** Every reply starts with a derived metadata value
   `{kind: "export_page", scope: function|program, part, entry: uint64|null, status: ok|not_found|decompile_failed,
   start, total, count, next_start: int|null}` anchored at the original `Location(0, min(64, size))`; `start =
@@ -1406,7 +1407,8 @@ bytes; the cached project is always untrusted (a matching digest proves storage 
 - **MCP prepare.** `prepare_file` runs the fixed argv `prepare FILE --with-ghidra --json` and writes no report files. The
   bounded captured stdout (<= 8,192 bytes) must be exactly one strict `reverseai.prepare/1` receipt with the contract's
   keys and no path; it is returned as `structuredContent` and as text after the notice. Failures return only the fixed
-  failure lines above.
+  failure lines above. Because it writes the private cache and may evict entries, its annotations are
+  `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`.
 - **Proof.** Unit and hostile tests (archive grammar, store races and crashes, lying workers, cursor and Unicode
   edges, compact/full equality). Native: the revision route on Docker, prepare once per ELF/PE/Mach-O
   fixture and cached answers equal to fresh ones, restore negatives inside the container, flood +1 controls, and one
