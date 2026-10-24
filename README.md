@@ -141,6 +141,10 @@ Each tool keeps its own license; see [third-party notices](THIRD_PARTY_NOTICES.m
 
 ## The secure container infrastructure
 
+<p align="center">
+  <img src="media/infrastructure.svg" width="100%" alt="ReverseAI infrastructure: on the trusted host, an AI agent over MCP stdio or the command line drives the ReverseAI engine (intake, gateway, built-in parsers, re-derivation, evidence, independent reviewer), reading an approved inputs folder and writing private reports; Ghidra, JADX, LIEF, YARA-X and the Babel parser run in a Docker Desktop Linux VM, one fresh locked container per request, receiving a read-only snapshot and a fixed request and returning a bounded reply that the host re-checks.">
+</p>
+
 Every contained tool runs under the same locked profile, enforced on each run and
 verified against the real Docker engine:
 
