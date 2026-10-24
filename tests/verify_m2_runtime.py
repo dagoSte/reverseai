@@ -59,6 +59,11 @@ GHIDRA_ADAPTER_VERSION = "12.1.4-r6"
 GHIDRA_BASE_DIGEST = "sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e"
 GHIDRA_SHA256 = "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db"
 GHIDRA_JDK_SHA256 = "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223"
+GHIDRA_R7_VERSION = "12.1.4-r7"
+GHIDRA_PARENT_IMAGE_ID = "sha256:ac77fda75da8580e0479087580f83b6e5495fb16df97b9696a2bdf3ae100f452"
+GHIDRA_BUNDLE_FILES = ("worker.py", "project_cache.py", "ghidra_scripts/ReverseAIOptions.java",
+                       "ghidra_scripts/ReverseAIQuery.java", "ghidra_scripts/ReverseAIPrepare.java")
+GHIDRA_SOURCE = Path(__file__).resolve().parents[1] / "containers/ghidra"
 GHIDRA_FIXTURE_NAMES = ("elf_code", "pe_code", "elf_data_only", "macho_code", "elf_refs", "pe_refs", "macho_refs")
 GHIDRA_QUERY_FIXTURES = ("elf_refs", "pe_refs", "macho_refs")
 GHIDRA_QUERY_CASES = ("functions_page", "function_add", "function_constant", "xrefs_counter")
@@ -472,13 +477,15 @@ def native_runs(tool):
     return len(required_checks(tool)) - 3
 
 
-def lock_options(tool):
+def lock_options(tool, lock=None):
     if tool == "jsparser":
         return {"adapter_version": JSPARSER_ADAPTER_VERSION}
     if tool == "jadx":
         return {"adapter_version": JADX_ADAPTER_VERSION}
     if tool == "ghidra":
-        return {"adapter_version": GHIDRA_ADAPTER_VERSION}
+        if lock is not None:
+            verify_ghidra_lock(lock)
+        return {"adapter_version": GHIDRA_ADAPTER_VERSION if lock is None else lock["adapter_version"]}
     return {} if tool == "lief" else {"adapter_version": YARAX_ADAPTER_VERSION,
                                        "extra_keys": ("ruleset_sha256",)}
 
@@ -653,13 +660,29 @@ def verify_yarax_lock(lock):
 
 
 def verify_ghidra_lock(lock):
-    need(isinstance(lock, dict) and set(lock) == {
-        "adapter_version", "base_digest", "image_id", "platform", "ghidra_sha256", "jdk_sha256"}, "GhidraLockPins")
-    need(lock["adapter_version"] == GHIDRA_ADAPTER_VERSION and lock["platform"] == PLATFORM and
+    keys = {"adapter_version", "base_digest", "image_id", "platform", "ghidra_sha256", "jdk_sha256"}
+    need(isinstance(lock, dict), "GhidraLockPins")
+    revision = lock.get("adapter_version") == GHIDRA_R7_VERSION
+    need(set(lock) == (keys | {"parent_image_id", "bundle_sha256", "cache_format"} if revision else keys),
+         "GhidraLockPins")
+    need(lock["adapter_version"] in (GHIDRA_ADAPTER_VERSION, GHIDRA_R7_VERSION) and lock["platform"] == PLATFORM and
          lock["base_digest"] == GHIDRA_BASE_DIGEST and lock["ghidra_sha256"] == GHIDRA_SHA256 and
          lock["jdk_sha256"] == GHIDRA_JDK_SHA256 and
          isinstance(lock["image_id"], str) and re.fullmatch(r"sha256:[0-9a-f]{64}", lock["image_id"]),
          "GhidraLockPins")
+    if revision:
+        need((lock["parent_image_id"] is None or isinstance(lock["parent_image_id"], str)
+              and re.fullmatch(r"sha256:[0-9a-f]{64}", lock["parent_image_id"])) and type(lock["cache_format"]) is int
+             and lock["cache_format"] == 1 and lock["bundle_sha256"] == ghidra_bundle_hash(), "GhidraRevisionPins")
+
+
+def ghidra_bundle_hash():
+    try:
+        paths = {name: GHIDRA_SOURCE / name for name in GHIDRA_BUNDLE_FILES}
+        need(all(path.is_file() and not path.is_symlink() for path in paths.values()), "GhidraSourcePins")
+        return sha256_hex(canonical_json({name: sha256_hex(path.read_bytes()) for name, path in paths.items()}).encode())
+    except OSError:
+        raise VerificationError("GhidraSourcePins") from None
 
 
 def verify_jadx_lock(lock):
@@ -1448,7 +1471,7 @@ class NativeVerifier:
     def runner(self, argv, *, timeout, max_output):
         if argv[:2] != ["docker", "run"]:
             return self.run_bounded(argv, timeout=timeout, max_output=max_output)
-        need(type(timeout) is int and timeout == self.wall and max_output == MAX_WORKER_REPLY_BYTES,
+        need(type(timeout) is int and timeout == self.wall,
              "ExecutorLimitsChanged")
         name = argv[argv.index("--name") + 1]
         need(bool(re.fullmatch(r"reverseai-[a-z0-9-]{1,64}", name)), "BuilderContainerName")
@@ -1459,13 +1482,15 @@ class NativeVerifier:
         at = argv.index(self.lock["image_id"])
         operation, args = argv[at + 1], decode(argv[at + 2])
         if self.tool == "ghidra":
-            need(ghidra_request_allowed(operation, args), "GhidraRequestChanged")
+            need(self.ghidra_request_allowed(operation, args), "GhidraRequestChanged")
+        need(type(max_output) is int and max_output == (64 * 1024**2 if operation == "ghidra.prepare"
+                                                       else MAX_WORKER_REPLY_BYTES), "ExecutorLimitsChanged")
         if self.tool == "jadx":
             need(jadx_request_allowed(operation, args), "JadxRequestChanged")
         if self.tool == "jsparser":
             need(jsparser_request_allowed(operation, args), "JsparserRequestChanged")
         need(argv == self.boundary.build_argv(self.lock["image_id"], name, snapshot, operation, args), "BuilderMismatch")
-        code = probe_code(self.active, tool=self.tool) if self.active is not None else None
+        code = self.control_code() if self.active is not None else None
         created = derive_control_argv(argv, self.lock["image_id"], code)
         try:
             raw = self.boundary.run_bounded(created, timeout=5, max_output=128)
@@ -1527,7 +1552,7 @@ class NativeVerifier:
 
     def invoke(self, data, operation, args, *, probe=None):
         self.active, self.last = probe, None
-        executor = self.boundary.DockerExecutor(self.lock, runner=self.runner, **lock_options(self.tool))
+        executor = self.boundary.DockerExecutor(self.lock, runner=self.runner, **lock_options(self.tool, self.lock))
         try:
             return executor.run(operation, args, data, sha256_hex(data))
         finally:
@@ -1536,6 +1561,12 @@ class NativeVerifier:
                 row["staging_removed"] = not snapshot.exists()
                 need(row["staging_removed"], "SnapshotCleanupUnverified")
             self.active = None
+
+    def ghidra_request_allowed(self, operation, args):
+        return ghidra_request_allowed(operation, args)
+
+    def control_code(self):
+        return probe_code(self.active, tool=self.tool)
 
     def record(self, name, check):
         try:
@@ -1715,7 +1746,7 @@ def main(argv=None):
         if args.tool == "jsparser":
             verify_jsparser_lock(candidate_lock)
             verify_jsparser_executor_profile(contained)
-        receipt["lock"] = contained.load_lock(candidate_lock, **lock_options(args.tool))
+        receipt["lock"] = contained.load_lock(candidate_lock, **lock_options(args.tool, candidate_lock))
         ruleset = None
         if args.tool == "yarax":
             ruleset = load_yarax_ruleset(receipt["lock"])
