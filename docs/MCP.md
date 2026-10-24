@@ -16,9 +16,11 @@ over its standard input and output; you do not run it by hand.
 
 - **Local only.** The server speaks over stdin and stdout and opens no network port.
 - **Only files under `DIR`.** Every tool takes a `file` argument: a relative path inside `DIR` (no absolute paths,
-  no `..`, no empty parts). Its real path must stay inside `DIR`, so a link that points elsewhere is refused, and
+  no `..`, no empty parts). A link anywhere along that path is refused, even one that points inside `DIR`, and
   the usual intake checks still apply (one regular file, not a link, at most 64 MiB, unchanged while it is read).
-  `list_files` lists regular files under `DIR` with their sizes and never follows links.
+  `list_files` lists regular files under `DIR` with their sizes and never follows links. The check and the read
+  are separate steps: another process of the same user could swap a directory in between. As in
+  [SECURITY](SECURITY.md), the host account itself is trusted; keep `DIR` writable only by you.
 - **Your flags, not the client's.** The contained tools (LIEF, YARA-X, Ghidra, JADX, the JavaScript parser) run only
   when you start the server with their flags and their pinned images are present. No request can enable a tool,
   pass a Docker option, choose an output path or reach a shell.
@@ -39,8 +41,8 @@ All tools are read-only and idempotent. They are listed in one page, in this ord
 
 | Tool | What it does | Needs |
 | --- | --- | --- |
-| `list_files` | Names and sizes of the regular files under `DIR` (at most 1,000, depth 8) | - |
-| `analyze_file` | The whole-file analysis of one file | the enabled tools join the run |
+| `list_files` | Names and sizes of the regular files under `DIR` | - |
+| `analyze_file` | The whole-file analysis of one file | LIEF, YARA-X and Ghidra join the run when enabled |
 | `binary_overview`, `list_segments`, `inspect_native_load_image`, `list_names`, `read_bytes`, `list_strings`, `search_strings` | Native file structure, names, bytes and strings, verified on the host | - |
 | `list_procedures`, `search_procedures`, `procedure_info`, `procedure_pseudo_code`, `procedure_assembly`, `procedure_callees`, `procedure_callers`, `analyze_function`, `xrefs` | Functions, code and references as Ghidra reads them | `--with-ghidra` |
 | `inspect_android_package`, `search_android_classes`, `inspect_android_class`, `inspect_android_method`, `trace_android_references` | APK and DEX structure verified on the host | `--with-jadx` adds Java to `inspect_android_method` |
@@ -48,7 +50,16 @@ All tools are read-only and idempotent. They are listed in one page, in this ord
 
 Each query tool takes `file` plus that query's own arguments, with the types, limits and defaults the command line
 uses; the client sees them in the tool's input schema, and unknown arguments are refused. Large lists are paged
-with `start` and `limit`, as on the command line.
+with `start` and `limit`, as on the command line. For `analyze_javascript_application` the archive is `file`, and
+one file inside it is chosen with `member_file` (the command line's `--arg file=`). A query uses only its own
+contained tool: Ghidra for the code queries, JADX for `inspect_android_method`, the parser for the JavaScript
+syntax details.
+
+`list_files` returns `structuredContent` `{"files": [{"name": ..., "size": ...}], "truncated": ...}` and a readable
+listing. It visits at most 10,000 entries to a depth of 8 and returns at most 1,000 files; names that are not plain
+portable relative names (not UTF-8, or with a backslash, a colon or a control character) are skipped. `truncated`
+is true whenever a limit was reached or a name was skipped. The other tools return the report as
+`structuredContent` `{"report": ...}`.
 
 ## Configuring a client
 
@@ -137,7 +148,7 @@ from tests.mcp_client import Client
 
 with Client.reverseai("/path/to/approved-inputs") as client:
     print(client.discover()["result"]["supportedVersions"])
-    print(client.call_tool("list_files")["result"])
+    print(client.call_tool("list_files")["result"]["structuredContent"]["files"])
     reply = client.call_tool("binary_overview", {"file": "sample.bin"})
 ```
 
