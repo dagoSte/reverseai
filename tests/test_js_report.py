@@ -16,7 +16,7 @@ from tests.test_js_queries import run
 
 SECTION = "## JavaScript application"
 LEXICAL = ("Hints are lexical: occurrences of fixed patterns in the bytes, comments and strings included, not evidence "
-           "that the code runs. M5a reads no JavaScript syntax and runs nothing.")
+           "that the code runs. This reading uses no JavaScript syntax and runs nothing.")
 
 
 def section(markdown):

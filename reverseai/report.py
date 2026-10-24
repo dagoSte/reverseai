@@ -296,7 +296,7 @@ def _javascript_details(rows, args=None, *, syntax=False):
               "The sample was not executed."] if syntax else
              ["", "## JavaScript application", "",
               "Hints are lexical: occurrences of fixed patterns in the bytes, comments and strings included, not evidence "
-              "that the code runs. M5a reads no JavaScript syntax and runs nothing."])
+              "that the code runs. This reading uses no JavaScript syntax and runs nothing."])
     pages = {key: ({}, set()) for key in columns_by_key}
     for _, finding in rows:
         found, totals = pages.get(finding["claim_key"], (None, None))

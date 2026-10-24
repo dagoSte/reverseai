@@ -62,7 +62,7 @@ def write_new(directory, name, text):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="reverseai", description="Static analysis with verifiable evidence (M1 prototype).")
+    parser = argparse.ArgumentParser(prog="reverseai", description="Static reverse engineering of untrusted files, with verifiable evidence.")
     parser.add_argument("--version", action="version", version="reverseai " + reverseai.__version__)
     commands = parser.add_subparsers(dest="command", required=True)
     check = commands.add_parser("doctor", help="Report Python, Docker and the contained tools' locks and images, read-only")
@@ -70,11 +70,11 @@ def main(argv=None):
     analyze = commands.add_parser("analyze", help="Analyse one approved file without executing it")
     analyze.add_argument("file", type=Path)
     analyze.add_argument("--out", type=Path, required=True, help="New or empty directory for report.json and report.md")
-    analyze.add_argument("--with-lief", action="store_true", help="Also run the pinned LIEF worker in its container (M2a)")
+    analyze.add_argument("--with-lief", action="store_true", help="Also run the pinned LIEF worker in its locked container")
     analyze.add_argument("--with-yarax", action="store_true",
-                         help="Also run the pinned YARA-X worker with the reviewed ruleset in its container (M2b)")
+                         help="Also run the pinned YARA-X worker with the reviewed ruleset in its locked container")
     analyze.add_argument("--with-ghidra", action="store_true",
-                         help="Also run pinned Ghidra headless in its container; its findings are derived, not verified (M3)")
+                         help="Also run pinned Ghidra headless in its locked container; its findings are derived, not verified")
     query = commands.add_parser("query", help="Ask one targeted static-analysis question")
     query.add_argument("file", type=Path)
     query.add_argument("--query", required=True, metavar="NAME", help="One of: " + ", ".join(queries.TABLE))
