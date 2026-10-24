@@ -232,8 +232,10 @@ claude mcp add --transport stdio reverseai -- /path/to/.venv/bin/reverseai mcp -
 
 The server talks only over standard input and output, reads only files inside that
 folder, runs a contained tool only when you add its flag (for example `--with-ghidra`),
-and marks every quoted text from the files as untrusted. Setup for Claude Code, Codex
-and Cursor, and the full security model, are in the [MCP guide](docs/MCP.md).
+and marks every quoted text from the files as untrusted. Results go to your agent and,
+through it, to the agent's model provider, including text quoted from the files: use a
+provider and plan you trust with that content. Setup for Claude Code, Codex and Cursor,
+and the full security model, are in the [MCP guide](docs/MCP.md).
 
 ## Use cases
 
@@ -306,6 +308,7 @@ function calls. Mark which findings are verified and which are Ghidra's reading.
 ### Keep an evidence record for an audit or an incident
 
 ```sh
+mkdir -p evidence
 reverseai analyze vendor-agent.exe --with-lief --with-yarax --out evidence/vendor-agent
 ```
 
