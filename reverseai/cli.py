@@ -61,7 +61,7 @@ def write_new(directory, name, text):
         handle.write(text)
 
 
-def main(argv=None):
+def main(argv=None, *, _on_status=None):
     parser = argparse.ArgumentParser(prog="reverseai", description="Static reverse engineering of untrusted files, with verifiable evidence.")
     parser.add_argument("--version", action="version", version="reverseai " + reverseai.__version__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -85,8 +85,20 @@ def main(argv=None):
                        help="Include derived Java for Android method queries using the pinned contained JADX worker")
     query.add_argument("--with-jsparser", action="store_true",
                        help="Enable derived JavaScript syntax queries using the pinned contained parser")
+    mcp = commands.add_parser("mcp", help="Serve the analysis tools over MCP stdio")
+    mcp.add_argument("--inputs", type=Path, required=True, help="Existing directory of operator-approved inputs")
+    for tool in ("lief", "yarax", "ghidra", "jadx", "jsparser"):
+        mcp.add_argument("--with-" + tool, action="store_true", help="Enable the contained " + tool + " tool")
     args = parser.parse_args(argv)
 
+    if args.command == "mcp":
+        root = os.path.realpath(args.inputs)
+        if not os.path.isdir(root):
+            parser.exit(1, "reverseai: MCP --inputs must be an existing directory\n")
+        from reverseai.mcp import serve
+        enabled = frozenset(tool for tool in ("lief", "yarax", "ghidra", "jadx", "jsparser")
+                            if getattr(args, "with_" + tool))
+        return serve(sys.stdin.buffer, sys.stdout.buffer, sys.stderr, root=root, enabled=enabled)
     if args.command == "doctor":
         return doctor.main(as_json=args.json)
     if args.command == "query":
@@ -138,6 +150,8 @@ def main(argv=None):
         try:
             analysis = (pipeline.query_bytes(data, ref, args.query, checked, tools=tools) if args.command == "query"
                         else pipeline.analyze_bytes(data, ref, tools=tools))
+            if _on_status is not None:
+                _on_status(tuple(result.status for result in analysis.results))
             if args.command == "query" and any(result.status == "error" for result in analysis.results):
                 raise ValueError("Query operation failed")
         except ValueError as error:
