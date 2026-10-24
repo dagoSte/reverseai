@@ -15,7 +15,7 @@ over its standard input and output; you do not run it by hand.
 ## What the client can and cannot do
 
 - **Local only.** The server speaks over stdin and stdout and opens no network port.
-- **Only files under `DIR`.** Every tool takes a `file` argument: a relative path inside `DIR` (no absolute paths,
+- **Only files under `DIR`.** Every tool except `list_files` takes a `file` argument: a relative path inside `DIR` (no absolute paths,
   no `..`, no empty parts). A link anywhere along that path is refused, even one that points inside `DIR`, and
   the usual intake checks still apply (one regular file, not a link, at most 64 MiB, unchanged while it is read).
   `list_files` lists regular files under `DIR` with their sizes and never follows links. The check and the read
