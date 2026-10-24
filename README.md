@@ -210,6 +210,84 @@ folder, runs a contained tool only when you add its flag (for example `--with-gh
 and marks every quoted text from the files as untrusted. Setup for Claude Code, Codex
 and Cursor, and the full security model, are in the [MCP guide](docs/MCP.md).
 
+## Use cases
+
+The commands below assume the virtual environment from the quick start is active and
+that each file has been copied into a folder of approved inputs. Every command writes
+its JSON and Markdown report into a new folder; nothing is executed. Prompts for an
+agent work once the MCP server is connected as shown above.
+
+### Check an Electron app before installing it
+
+The app's code is in `app.asar` (on macOS inside `Contents/Resources/`). List what it
+contains, look for process spawning, then let the parser show the real calls:
+
+```sh
+reverseai query app.asar --query analyze_javascript_application --arg detail=summary --out check-app
+reverseai query app.asar --query analyze_javascript_application --arg detail=hints --arg category=shell --out check-app-shell
+reverseai query app.asar --query analyze_javascript_application --arg detail=calls --with-jsparser --out check-app-calls
+```
+
+Agent prompt: *"Does the Electron app in the folder start other processes, read credentials or
+contact hard-coded endpoints? Cite the file and byte range for every claim."*
+
+### Review an Android app before it reaches your devices
+
+```sh
+reverseai query app.apk --query inspect_android_package --out review-apk
+reverseai query app.apk --query search_android_classes --arg query=Activity --out review-classes
+reverseai query app.apk --query inspect_android_method --arg class='Lcom/example/MainActivity;' --arg method=onCreate --with-jadx --out review-oncreate
+```
+
+The first report lists the package's files and its manifest (package name, version,
+permissions); copy a class name exactly as the second report shows it.
+
+Agent prompt: *"Which permissions does this app declare, and which of its methods call the
+network or read contacts? Separate verified facts from decompiled code."*
+
+### Vet an npm package before adding the dependency
+
+Download the package tarball without running anything, then read it:
+
+```sh
+npm pack some-package@1.2.3 --ignore-scripts
+reverseai query some-package-1.2.3.tgz --query analyze_javascript_application --arg detail=package --out vet-package
+reverseai query some-package-1.2.3.tgz --query analyze_javascript_application --arg detail=hints --out vet-hints
+reverseai query some-package-1.2.3.tgz --query analyze_javascript_application --arg detail=modules --with-jsparser --out vet-modules
+```
+
+The package report shows its `package.json` declarations, install scripts included; they
+are read, never run.
+
+Agent prompt: *"Compare version 1.2.3 and 1.2.4 of this package: which install scripts,
+imports or sensitive calls are new?"*
+
+### Triage a suspicious program
+
+```sh
+reverseai query sample.exe --query binary_overview --out triage-overview
+reverseai query sample.exe --query search_strings --arg query=http --out triage-urls
+reverseai query sample.exe --query list_procedures --with-ghidra --out triage-functions
+reverseai analyze sample.exe --with-lief --with-yarax --with-ghidra --out triage-full
+```
+
+The same works for Linux (ELF) and macOS (Mach-O) programs. A universal macOS binary is
+recognised but not yet split into its architectures, and a packed program shows little
+of its real code; recognising packers is on the roadmap.
+
+Agent prompt: *"Profile sample.exe: format, imports, notable strings, and what its entry
+function calls. Mark which findings are verified and which are Ghidra's reading."*
+
+### Keep an evidence record for an audit or an incident
+
+```sh
+reverseai analyze vendor-agent.exe --with-lief --with-yarax --out evidence/vendor-agent
+```
+
+`report.json` records the file's SHA-256, every tool and image used, and for each
+finding the exact byte range it rests on, so a colleague or auditor can check the same
+facts against the same file later.
+
 ## Platforms
 
 | Platform | Status |
