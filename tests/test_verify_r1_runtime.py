@@ -192,6 +192,7 @@ class HarnessTests(SourcePins):
         self.assertEqual(result["uid"], 65534)
         self.assertEqual(self.native.requests, [{"operation": "ghidra.prepare", "args": {}, "probe": "runtime_identity",
                                                "timeout": 900, "max_output": 64 * 1024**2,
+                                               "cache_files": {"project.tar": False, "cache.json": False},
                                                "elapsed_seconds": self.native.requests[0].get("elapsed_seconds"),
                                                "probe_evidence": result}])
         self.assertGreaterEqual(self.native.requests[0]["elapsed_seconds"], 0)
@@ -277,6 +278,67 @@ class HarnessTests(SourcePins):
         self.assertGreaterEqual(row["elapsed_seconds"], 0)
         self.assertNotIn("probe_evidence", row)
 
+    def test_request_records_cache_files_observed_in_the_actual_snapshot(self):
+        data = b"fixture"
+        self.native.invoke(data, "ghidra.analyze", old.ghidra_args())
+        self.assertEqual(self.native.requests[-1].get("cache_files"), {"project.tar": False, "cache.json": False})
+        project = verifier.MemoryProject(verifier.empty_project(data), data, self.native.lock)
+        self.native.invoke(data, "ghidra.analyze", old.ghidra_args(), project=project)
+        self.assertEqual(self.native.requests[-1].get("cache_files"), {"project.tar": True, "cache.json": True})
+
+    def test_public_query_refuses_a_code_role_error_even_when_cli_exits_zero(self):
+        sample = Path(self.work.name, "fixture.bin")
+        sample.write_bytes(b"fixture")
+        def public(argv, cache):
+            self.native.requests.append({"operation": "ghidra.analyze", "args": old.ghidra_args()})
+            output = Path(argv[argv.index("--out") + 1])
+            output.mkdir()
+            report = {"results": [{"role": "code", "status": "error", "errors": ["WorkerProcessError"],
+                                   "findings": [], "evidence": []}]}
+            (output / "report.json").write_text(canonical_json(report))
+        with patch.object(self.native, "public_call", side_effect=public), self.assertRaises(old.VerificationError):
+            self.native.public_query(sample, sample.parent / "cache")
+
+    def test_cached_equality_requires_fresh_absence_and_cached_presence(self):
+        data, layout = old.elf_code()
+        for fault in (None, "fresh", "cached", "partial", "total"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory(dir=self.work.name) as folder:
+                self.native.folder = Path(folder)
+                self.native.requests.clear()
+                prepared = False
+                def prepare(sample, cache, *, state):
+                    nonlocal prepared
+                    if state == "created":
+                        self.native.requests.append({"operation": "ghidra.prepare"})
+                    prepared = True
+                    return {"analysis_id": "f" * 64}
+                def query(sample, cache, name=None, args=None):
+                    present = prepared
+                    if name is None and fault in ("fresh", "cached"):
+                        present = fault == "fresh"
+                    files = {"project.tar": present, "cache.json": present}
+                    if prepared and name is None and fault == "partial":
+                        files["cache.json"] = False
+                    self.native.requests.append({"operation": "ghidra.analyze" if name is None else "ghidra.export_program",
+                                                 "cache_files": files})
+                    report = page_report(data, layout["functions"] if name is None or args["part"] in ("functions", "calls") else [], 0)
+                    if name is not None:
+                        report["results"][0]["evidence"][0]["observation"]["part"] = args["part"]
+                        if fault == "total" and args["part"] == "functions":
+                            page = report["results"][0]["evidence"][0]["observation"]
+                            report["results"][0]["evidence"].pop()
+                            page.update(total=3, count=3, next_start=None)
+                    return report
+                with patch.object(self.native, "public_prepare", side_effect=prepare), \
+                        patch.object(self.native, "public_query", side_effect=query):
+                    if fault is None:
+                        value = self.native.cached_fixture("elf_code", data)
+                        self.assertEqual(value.get("cache_requests"), {"fresh": 1, "cached": 1, "program": 4})
+                        self.assertEqual(value.get("program_totals"), {"functions": 4, "calls": 4, "references": 0, "strings": 0})
+                    else:
+                        with self.assertRaises(old.VerificationError):
+                            self.native.cached_fixture("elf_code", data)
+
     def test_cleanup_error_cannot_replace_the_attached_worker_failure(self):
         self.boundary.prepare_error = self.boundary.ContainedError("WorkerOutputLimit")
         evidence = self.native.prepare_control("stdout", b"fixture")
@@ -307,10 +369,119 @@ class HarnessTests(SourcePins):
             compile(source, "trusted-r1-" + name, "exec")
             if name == "program_no_jvm":
                 self.assertIn("subprocess.Popen=deny", source)
-                self.assertIn("export_rows", source)
+                self.assertIn("w.reply(", source)
+                self.assertNotIn("w.export_rows(", source)
         self.native.active = "arbitrary;import os"
         with self.assertRaises(old.VerificationError):
             self.native.control_code()
+
+    def test_program_no_jvm_control_executes_reply_with_process_launches_denied(self):
+        self.native.active = "program_no_jvm"
+        source = self.native.control_code()
+        data = b"trusted inert fixture"
+        reply = {"protocol": "reverseai.worker/1", "status": "ok",
+                 "snapshot_sha256": sha256_hex(data), "observations": []}
+        worker = types.SimpleNamespace(reply=Mock(return_value=reply),
+                                       export_rows=Mock(side_effect=AssertionError("ReplyBypassed")))
+        spec = types.SimpleNamespace(loader=types.SimpleNamespace(exec_module=Mock()))
+        output, namespace = io.StringIO(), {}
+        with patch.object(verifier.importlib.util, "spec_from_file_location", return_value=spec), \
+                patch.object(verifier.importlib.util, "module_from_spec", return_value=worker), \
+                patch.object(Path, "read_bytes", return_value=data), \
+                patch.object(verifier.subprocess, "Popen"), verifier.redirect_stdout(output):
+            exec(compile(source, "trusted-r1-program-no-jvm", "exec"), namespace)
+            with self.assertRaisesRegex(AssertionError, "UnexpectedProcess"):
+                verifier.subprocess.Popen(["java"])
+        worker.reply.assert_called_once()
+        argv, received = worker.reply.call_args.args
+        self.assertEqual(argv[0], "ghidra.export_program")
+        self.assertEqual(json.loads(argv[1]), verifier.PROGRAM_ARGS)
+        self.assertEqual(received, data)
+        worker.export_rows.assert_not_called()
+        spec.loader.exec_module.assert_called_once_with(worker)
+        self.assertEqual(json.loads(output.getvalue()), {"launches": 0, "reply": reply})
+
+    def test_program_no_jvm_validates_standard_reply_and_functions_metadata(self):
+        from reverseai import ghidra_cache
+
+        data, layout = old.elf_code()
+        report = page_report(data, layout["functions"], 0)
+        observations = [{"location": row["location"], "value": {
+            key: value for key, value in row["observation"].items() if key != "analysis_id"}}
+            for row in report["results"][0]["evidence"]]
+        observations[0]["location"] = {"offset": 0, "length": min(64, len(data))}
+        reply = {"protocol": "reverseai.worker/1", "status": "ok",
+                 "snapshot_sha256": sha256_hex(data), "observations": observations}
+        value = {"launches": 0, "reply": reply}
+        with patch.object(ghidra_cache, "CacheStore"), \
+                patch.object(self.native, "invoke", return_value=canonical_json(value).encode()) as invoke:
+            try:
+                result = self.native.program_no_jvm()
+            except old.VerificationError as error:
+                self.fail("A valid ordinary worker reply was refused: " + str(error))
+        self.assertEqual(result, {"process_launches": 0, "rows": 5, "functions": 4,
+                                 "input_sha256": sha256_hex(data),
+                                 "reply_protocol": "reverseai.worker/1", "reply_status": "ok"})
+        self.assertEqual(invoke.call_args.args, (data, "ghidra.export_program", verifier.PROGRAM_ARGS))
+        self.assertEqual(invoke.call_args.kwargs["probe"], "program_no_jvm")
+        mutations = [(("launches",), True), (("launches",), 1),
+                     (("reply", "protocol"), "other/1"), (("reply", "status"), "error"),
+                     (("reply", "snapshot_sha256"), "0" * 64), (("reply", "observations"), [])]
+        mutations += [(("reply", "observations", 0, "value", key), changed) for key, changed in (
+            ("scope", "function"), ("part", "strings"), ("entry", 1), ("status", "error"),
+            ("start", True), ("start", 1), ("total", True), ("total", 3),
+            ("count", True), ("count", 3), ("next_start", 4))]
+        mutations += [(("reply", "observations", 1, "value", "kind"), "function"),
+                      (("reply", "observations", 1, "value", "index"), True)]
+        for path, changed in mutations:
+            invalid = copy.deepcopy(value)
+            target = invalid
+            for part in path[:-1]:
+                target = target[part]
+            target[path[-1]] = changed
+            with self.subTest(path=path, changed=changed), patch.object(ghidra_cache, "CacheStore"), \
+                    patch.object(self.native, "invoke", return_value=canonical_json(invalid).encode()), \
+                    self.assertRaises((old.VerificationError, old.ContractError)):
+                self.native.program_no_jvm()
+
+    def test_restore_checksum_control_changes_only_checksum_and_worker_rejects_it(self):
+        from tests.test_ghidra_worker_logic import worker
+
+        data = b"trusted inert fixture"
+        valid = verifier.empty_project(data)
+        broken = verifier.empty_project(data, "checksum")
+        changes = [index for index, pair in enumerate(zip(valid, broken)) if pair[0] != pair[1]]
+        self.assertEqual(len(valid), len(broken))
+        self.assertEqual(len(changes), 1)
+        self.assertIn(changes[0], range(148, 156))
+        self.assertIn(valid[changes[0]], b"01234567")
+        self.assertIn(broken[changes[0]], b"01234567")
+        repaired = broken[:148] + valid[148:156] + broken[156:]
+        self.assertEqual(repaired, valid)
+        module = worker.cache_module()
+        lock = r7_lock()
+        for label, body in (("valid", valid), ("checksum", broken), ("repaired", repaired)):
+            snapshot = Path(self.work.name, "checksum-" + label)
+            snapshot.mkdir()
+            verifier.MemoryProject(body, data, lock).stage(snapshot)
+            work = Path(self.work.name, "restore-" + label)
+            with self.subTest(label=label), patch.object(worker, "SNAPSHOT", snapshot / "input"), \
+                    patch.object(worker, "WORK", work), patch.object(worker, "cache_module", return_value=module), \
+                    patch.object(worker, "bundle_hash", return_value=lock["bundle_sha256"]), \
+                    patch.object(module, "_name", wraps=module._name) as names, \
+                    patch.object(module, "_octal", wraps=module._octal) as octal:
+                if label == "checksum":
+                    with self.assertRaises(worker.InvalidCachedProject):
+                        worker.restore_project(data)
+                    octal.assert_called_once_with(broken[148:156])
+                    names.assert_not_called()
+                    self.assertFalse((work / "restored").exists())
+                else:
+                    restored = worker.restore_project(data)
+                    self.assertEqual(restored, work / "restored/cache")
+                    self.assertEqual((restored / "project/reverseai.gpr").read_bytes(),
+                                     b"not opened by table queries")
+                    self.assertGreater(names.call_count, 0)
 
     def test_public_cli_injection_uses_same_real_executor_and_isolates_cache_root(self):
         import reverseai
@@ -404,7 +575,9 @@ class HarnessTests(SourcePins):
                     for index, (delta, length) in enumerate(function["instructions"])]
             elif part != "callees":
                 kind = {"info": "function_info", "callers": "call_export", "references": "reference_export", "strings": "string_export"}[part]
-                records = [(anchor, {"kind": kind}) for _ in range(2 if part == "strings" else 1)]
+                records = [(anchor, {"kind": kind}) for _ in range({"strings": 2, "references": 6}.get(part, 1))]
+                if part == "info":
+                    records[0][1]["totals"] = {"assembly": 6, "callees": 0, "callers": 1, "references": 6, "strings": 2}
             return function_report(data, function["entry"], part, 0, len(records), records)
         with patch.object(self.native, "public_query", side_effect=query) as public:
             parts = self.native.function_parts()
@@ -423,6 +596,21 @@ class HarnessTests(SourcePins):
             return report
         with patch.object(self.native, "public_query", side_effect=dishonest), self.assertRaises(old.VerificationError):
             self.native.pseudocode()
+        for bad_part in ("info", "callers", "references"):
+            def clipped(sample, cache, name, args):
+                report = query(sample, cache, name, args)
+                if args["part"] == bad_part:
+                    rows = report["results"][0]["evidence"]
+                    if bad_part == "info":
+                        rows[1]["observation"]["totals"]["references"] -= 1
+                    else:
+                        rows.pop()
+                        rows[0]["observation"]["total"] -= 1
+                        rows[0]["observation"]["count"] -= 1
+                return report
+            with self.subTest(bad_part=bad_part), patch.object(self.native, "public_query", side_effect=clipped), \
+                    self.assertRaises(old.VerificationError):
+                self.native.function_parts()
 
 
 class OracleTests(unittest.TestCase):
@@ -581,9 +769,14 @@ class ReceiptTests(SourcePins):
         evidence["revision"] = {"route": "B", "parent_image_id": old.GHIDRA_PARENT_IMAGE_ID,
                                 "bundle_sha256": lock["bundle_sha256"]}
         for name, data in old.ghidra_fixtures().items():
+            _, layout = getattr(old, name)()
+            query_cases = 4 if name in old.GHIDRA_QUERY_FIXTURES else 0
             evidence[name + ".cached_equal"] = {"input_sha256": sha256_hex(data), "input_bytes": len(data),
                 "prepare": prepared(data), "fresh_equal_cached": True, "prepare_operations": 1,
-                "query_cases": 4 if name in old.GHIDRA_QUERY_FIXTURES else 0,
+                "query_cases": query_cases,
+                "cache_requests": {"fresh": 1 + query_cases, "cached": 1 + query_cases, "program": 4},
+                "program_totals": {part: len(layout.get(key, [])) for part, key in
+                                   (("functions", "functions"), ("calls", "calls"), ("references", "refs"), ("strings", "strings"))},
                 "fresh_semantics_sha256": "a" * 64, "cached_semantics_sha256": "a" * 64, "elapsed_seconds": .2}
         data, _ = elf_scale()
         evidence["scale.10000"] = {"input_sha256": sha256_hex(data), "input_bytes": len(data), "functions": 10_000,
@@ -596,14 +789,25 @@ class ReceiptTests(SourcePins):
         evidence["function.pseudocode"] = {"input_sha256": sha256_hex(refs), "entry": entry, "analysis_id": "f" * 64,
             "characters": 130, "text_sha256": "b" * 64, "export_pages": 3, "procedure_pages": 3, "requests": 6}
         evidence["function.not_found"] = {"input_sha256": sha256_hex(refs), "analysis_id": "f" * 64, "rows": 0}
+        evidence["program.no_jvm"] = {"process_launches": 0, "rows": 5, "functions": 4,
+            "input_sha256": sha256_hex(old.elf_code()[0]), "reply_protocol": "reverseai.worker/1", "reply_status": "ok"}
         counts = {("ghidra.prepare", None): 8, ("ghidra.analyze", None): 21, ("ghidra.functions", None): 9,
                   ("ghidra.function", None): 18, ("ghidra.xrefs", None): 9, ("ghidra.export_program", None): 116,
                   ("ghidra.export_function", None): 11, ("ghidra.pseudocode", None): 3,
                   ("ghidra.export_program", "program_no_jvm"): 1, ("ghidra.export_program", "cache_write"): 1,
                   **{(operation, name): 1 for operation in ("ghidra.prepare", "ghidra.analyze") for name in old.CONTROL_NAMES}}
-        requests = [{"operation": operation, "probe": probe, "args": {}, "timeout": 900 if operation == "ghidra.prepare" else 240,
-                     "max_output": 64 * 1024**2 if operation == "ghidra.prepare" else 262144}
-                    for (operation, probe), count in counts.items() for _ in range(count)]
+        requests = []
+        for (operation, probe), count in counts.items():
+            for index in range(count):
+                if operation == "ghidra.prepare" or probe is not None and operation == "ghidra.analyze":
+                    present = False
+                else:
+                    present = index >= {"ghidra.analyze": 14, "ghidra.functions": 6,
+                                        "ghidra.function": 12, "ghidra.xrefs": 6}.get(operation, 0)
+                requests.append({"operation": operation, "probe": probe, "args": {},
+                                 "timeout": 900 if operation == "ghidra.prepare" else 240,
+                                 "max_output": 64 * 1024**2 if operation == "ghidra.prepare" else 262144,
+                                 "cache_files": {"project.tar": present, "cache.json": present}})
         return {"schema": "reverseai.r1-runtime/1", "offline": True, "platform": old.PLATFORM, "lock": lock,
                 "lock_sha256": "c" * 64, "image_id": lock["image_id"], "sources": {"trusted": "d" * 64},
                 "checks": [{"id": name, "status": "passed", "evidence": evidence[name]} for name in verifier.REQUIRED_CHECKS],
@@ -638,6 +842,36 @@ class ReceiptTests(SourcePins):
         proof["lock"]["parent_image_id"] = None
         old.verify_ghidra_lock(proof["lock"])
         self.assertFalse(verifier.receipt_passes(proof))
+
+    def test_receipt_refuses_failed_workers_missing_cache_evidence_and_clipped_totals(self):
+        with patch.object(verifier, "source_hashes", return_value={"trusted": "d" * 64}):
+            proof = self.receipt()
+            self.assertTrue(verifier.receipt_passes(proof))
+            for operation in {row["operation"] for row in proof["requests"] if row["probe"] is None}:
+                changed = copy.deepcopy(proof)
+                row = next(row for row in changed["requests"] if row["probe"] is None and row["operation"] == operation)
+                row["failure"] = "WorkerProcessError"
+                with self.subTest(operation=operation):
+                    self.assertFalse(verifier.receipt_passes(changed))
+            for files in (None, {}, {"project.tar": False, "cache.json": True},
+                          {"project.tar": 0, "cache.json": 0}, {"project.tar": True, "cache.json": True}):
+                changed = copy.deepcopy(proof)
+                if files is None:
+                    del changed["requests"][0]["cache_files"]
+                else:
+                    changed["requests"][0]["cache_files"] = files
+                with self.subTest(files=files):
+                    self.assertFalse(verifier.receipt_passes(changed))
+            for check, field in (("function.parts", "totals"), ("elf_refs.cached_equal", "program_totals"),
+                                 ("elf_refs.cached_equal", "cache_requests")):
+                changed = copy.deepcopy(proof)
+                item = next(row["evidence"] for row in changed["checks"] if row["id"] == check)[field]
+                for key in item:
+                    if type(item[key]) is int and item[key] > 0:
+                        item[key] -= 1
+                        break
+                with self.subTest(check=check, field=field):
+                    self.assertFalse(verifier.receipt_passes(changed))
 
 
 class MainTests(SourcePins):

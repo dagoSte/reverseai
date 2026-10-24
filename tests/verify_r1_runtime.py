@@ -124,7 +124,7 @@ def empty_project(data, variant=None):
             archive.addfile(item, io.BytesIO(body))
     raw = bytearray(target.getvalue())
     if variant == "checksum":
-        raw[0] ^= 1
+        raw[148] = 48 + (raw[148] - 48 + 1) % 8
     elif variant == "truncated":
         del raw[-513:]
     elif variant == "trailer":
@@ -195,6 +195,30 @@ def semantic_report(report):
                           for finding in result["findings"]],
              "evidence": [{"location": row["location"], "observation": without_id(row["observation"])}
                           for row in result["evidence"]]} for result in report["results"]]
+
+
+def fixture_program_totals(name, data):
+    old.need(name in old.GHIDRA_FIXTURE_NAMES, "R1UnknownFixture")
+    expected, layout = getattr(old, name)()
+    old.need(data == expected, "R1FixtureBytes")
+    return {part: len(layout.get(key, [])) for part, key in
+            (("functions", "functions"), ("calls", "calls"), ("references", "refs"), ("strings", "strings"))}
+
+
+def fixture_function_totals(layout, function):
+    entry = function["entry"]
+    return {"assembly": len(function["instructions"]),
+            "callees": sum(row["from"] == entry for row in layout["calls"]),
+            "callers": sum(row["to"] == entry for row in layout["calls"]),
+            "references": sum(row["from"] == entry for row in layout["refs"]),
+            "strings": sum(entry in row["from"] for row in layout["strings"])}
+
+
+def require_cache_files(requests, present):
+    old.need(requests and all(set(row.get("cache_files", {})) == {"project.tar", "cache.json"}
+             and all(type(value) is bool and value is present for value in row["cache_files"].values())
+             for row in requests), "R1CacheUseNotObserved")
+    return len(requests)
 
 
 @contextmanager
@@ -287,8 +311,14 @@ class R1Verifier(old.NativeVerifier):
         row, started = None, None
         if argv[:2] == ["docker", "run"]:
             at = argv.index(self.lock["image_id"])
+            mount = next(old.csv.reader(io.StringIO(argv[argv.index("--mount") + 1])))
+            sources = [item.removeprefix("source=") for item in mount if item.startswith("source=")]
+            old.need(len(sources) == 1, "BuilderSnapshot")
+            snapshot = Path(sources[0])
             row = {"operation": argv[at + 1], "args": old.decode(argv[at + 2]),
-                   "probe": self.active, "timeout": timeout, "max_output": max_output}
+                   "probe": self.active, "timeout": timeout, "max_output": max_output,
+                   "cache_files": {name: (snapshot / name).is_file() and not (snapshot / name).is_symlink()
+                                   for name in ("project.tar", "cache.json")}}
             if self.active is not None:
                 row["probe_evidence"] = None
             self.requests.append(row)
@@ -374,8 +404,8 @@ class R1Verifier(old.NativeVerifier):
                     "w=importlib.util.module_from_spec(s);s.loader.exec_module(w)\n"
                     "calls=[]\ndef deny(*a,**k):\n calls.append(1);raise AssertionError('UnexpectedProcess')\n"
                     "subprocess.Popen=deny\ndata=pathlib.Path('/snapshot/input').read_bytes()\n"
-                    "rows=w.export_rows('ghidra.export_program',{'part':'functions','start':0,'limit':128},data)\n"
-                    "print(json.dumps({'launches':len(calls),'rows':rows},separators=(',',':')))\n")
+                    "reply=w.reply(['ghidra.export_program',json.dumps({'part':'functions','start':0,'limit':128})],data)\n"
+                    "print(json.dumps({'launches':len(calls),'reply':reply},separators=(',',':')))\n")
         if self.stream is not None and self.active in ("wall", "stdout"):
             return ("import time;time.sleep(915)" if self.active == "wall" else
                     f"import sys;sys.stdout.buffer.write(b'x'*{PREPARE_BYTES + 1});sys.stdout.buffer.flush()")
@@ -483,7 +513,10 @@ class R1Verifier(old.NativeVerifier):
         old.need([(row["operation"], row["args"]) for row in actual] == expected, "R1PublicInvocationCount")
         raw = (output / "report.json").read_bytes()
         old.need(len(raw) <= 1024**2, "R1PublicReportLimit")
-        return old.decode(raw)
+        report = old.decode(raw)
+        code = [row for row in report["results"] if row["role"] == "code"]
+        old.need(len(code) == 1 and code[0]["status"] == "ok" and not code[0]["errors"], "R1CodeRoleFailed")
+        return report
 
     def public_prepare(self, sample, cache_root, *, state):
         before = len(self.requests)
@@ -513,6 +546,7 @@ class R1Verifier(old.NativeVerifier):
         folder.mkdir(mode=0o700)
         sample, cache = folder / "fixture.bin", folder / "cache"
         sample.write_bytes(data)
+        fresh_start = len(self.requests)
         fresh = self.public_query(sample, cache)
         cases = []
         if name in old.GHIDRA_QUERY_FIXTURES:
@@ -522,36 +556,60 @@ class R1Verifier(old.NativeVerifier):
                      ("procedure_callers", {"entry": requests["function_constant"][1]["entry"]}),
                      ("xrefs", {"address": requests["xrefs_counter"][1]["address"]})]
         fresh_queries = [self.public_query(sample, cache, query, args) for query, args in cases]
+        fresh_count = require_cache_files(self.requests[fresh_start:], False)
         prepared = self.public_prepare(sample, cache, state="created")
         reused = self.public_prepare(sample, cache, state="reused")
         old.need(reused["analysis_id"] == prepared["analysis_id"], "R1PrepareReusedIdentity")
+        cached_start = len(self.requests)
         cached = self.public_query(sample, cache)
         old.need(semantic_report(fresh) == semantic_report(cached), "R1CachedAnswerChanged")
         for (query, args), original in zip(cases, fresh_queries):
             report = self.public_query(sample, cache, query, args)
             old.need(semantic_report(report) == semantic_report(original), "R1CachedQueryChanged")
+        cached_count = require_cache_files(self.requests[cached_start:], True)
+        program_start, totals = len(self.requests), {}
+        expected_totals = fixture_program_totals(name, data)
         for part in ("functions", "calls", "references", "strings"):
             report = self.public_query(sample, cache, "export_program", {"part": part, "start": 0, "limit": 128})
             page, _ = validate_page(report, data, part, 0)
             old.need(page["analysis_id"] == prepared["analysis_id"], "R1PreparedPageIdentity")
+            totals[part] = page["total"]
+            old.need(type(totals[part]) is int and totals[part] == expected_totals[part], "R1ProgramTotal")
             if name == "elf_data_only":
                 old.need(page["total"] == 0 and page["count"] == 0, "R1DataOnlyNotEmpty")
         return {"input_sha256": sha256_hex(data), "input_bytes": len(data), "prepare": prepared,
                 "fresh_equal_cached": True, "prepare_operations": 1, "query_cases": len(cases),
+                "cache_requests": {"fresh": fresh_count, "cached": cached_count,
+                                   "program": require_cache_files(self.requests[program_start:], True)},
+                "program_totals": totals,
                 "fresh_semantics_sha256": sha256_hex(canonical_json(semantic_report(fresh)).encode()),
                 "cached_semantics_sha256": sha256_hex(canonical_json(semantic_report(cached)).encode()),
                 "elapsed_seconds": time.monotonic() - started}
 
     def program_no_jvm(self):
         from reverseai import ghidra_cache
-        data = old.ghidra_fixtures()["elf_code"]
+        data, layout = old.elf_code()
         cache = ghidra_cache.CacheStore(self.folder / "elf_code/cache")
         with cache.lookup(ghidra_cache.identity(sha256_hex(data), self.lock)) as project:
             value = old.decode(self.invoke(data, "ghidra.export_program", PROGRAM_ARGS,
                                            project=project, probe="program_no_jvm"))
-        old.need(value.get("launches") == 0 and isinstance(value.get("rows"), list) and len(value["rows"]) > 1,
+        old.need(isinstance(value, dict) and set(value) == {"launches", "reply"}
+                 and type(value["launches"]) is int and value["launches"] == 0,
                  "R1ProgramLaunchedProcess")
-        return {"process_launches": 0, "rows": len(value["rows"])}
+        rows = old.parse_worker_reply(canonical_json(value["reply"]).encode(),
+                                      input_sha256=sha256_hex(data), max_observations=129)
+        count = len(layout["functions"])
+        old.need(len(rows) == count + 1 and rows[0].value == {
+            "kind": "export_page", "scope": "program", "part": "functions", "entry": None,
+            "status": "ok", "start": 0, "total": count, "count": count, "next_start": None}
+            and all(type(rows[0].value[key]) is int for key in ("start", "total", "count"))
+            and rows[0].location == old.Location(0, min(64, len(data))), "R1ProgramFunctionsMetadata")
+        old.need(all(row.value.get("kind") == "function_export"
+                     and type(row.value.get("index")) is int and row.value["index"] == index
+                     for index, row in enumerate(rows[1:])), "R1ProgramFunctionRows")
+        return {"process_launches": 0, "rows": len(rows), "functions": count,
+                "input_sha256": sha256_hex(data), "reply_protocol": value["reply"]["protocol"],
+                "reply_status": value["reply"]["status"]}
 
     def function_parts(self):
         data, layout = old.elf_refs()
@@ -559,6 +617,7 @@ class R1Verifier(old.NativeVerifier):
         sample, cache = self.folder / "elf_refs/fixture.bin", self.folder / "elf_refs/cache"
         before = len(self.requests)
         totals, identity = {}, None
+        expected_totals = fixture_function_totals(layout, function)
         for part in ("info", "pseudocode", "assembly", "callees", "callers", "references", "strings"):
             args = {"entry": function["entry"], "part": part}
             if part == "pseudocode":
@@ -569,6 +628,13 @@ class R1Verifier(old.NativeVerifier):
             page, rows = validate_page(report, data, part, 0, scope="function", entry=function["entry"])
             old.need(identity is None or identity == page["analysis_id"], "R1FunctionMixedAnalysis")
             identity, totals[part] = page["analysis_id"], page["total"]
+            if part == "info":
+                old.need(page["total"] == 1 and len(rows) == 1
+                         and rows[0]["observation"].get("totals") == expected_totals
+                         and all(type(value) is int for value in rows[0]["observation"]["totals"].values()),
+                         "R1InfoTotals")
+            elif part in expected_totals:
+                old.need(page["total"] == expected_totals[part], "R1FunctionTotal")
             if part == "assembly":
                 expected = function["instructions"]
                 old.need(len(rows) == page["total"] == len(expected), "R1InstructionCompleteness")
@@ -814,12 +880,35 @@ def receipt_passes(receipt):
                     **{(operation, name): 1 for operation in ("ghidra.prepare", "ghidra.analyze")
                        for name in old.CONTROL_NAMES}}
         old.need(counted == expected, "R1ReceiptOperations")
+        old.need(all("failure" not in row for row in requests if row["probe"] is None), "R1ReceiptWorkerFailed")
+        for row in requests:
+            files = row.get("cache_files", {})
+            old.need(set(files) == {"project.tar", "cache.json"}
+                     and all(type(value) is bool for value in files.values())
+                     and files["project.tar"] is files["cache.json"], "R1ReceiptCacheFiles")
+        cache_counted = Counter((row["operation"], row["probe"], row["cache_files"]["project.tar"]) for row in requests)
+        fresh_legacy = {"ghidra.analyze": 14, "ghidra.functions": 6, "ghidra.function": 12, "ghidra.xrefs": 6}
+        cache_expected = Counter()
+        for (operation, probe), count in expected.items():
+            fresh = (count if operation == "ghidra.prepare" or probe is not None and operation == "ghidra.analyze"
+                     else fresh_legacy.get(operation, 0) if probe is None else 0)
+            if fresh:
+                cache_expected[operation, probe, False] = fresh
+            if count > fresh:
+                cache_expected[operation, probe, True] = count - fresh
+        old.need(cache_counted == cache_expected, "R1ReceiptCacheUse")
         revision = evidence["revision"]
         old.need(revision == {"route": revision["route"], "parent_image_id": old.GHIDRA_PARENT_IMAGE_ID,
                               "bundle_sha256": receipt["lock"]["bundle_sha256"]}
                  and revision["route"] in ("A", "B"), "R1ReceiptRevision")
         fixtures = old.ghidra_fixtures()
         refs_hash = sha256_hex(fixtures["elf_refs"])
+        _, layout = old.elf_refs()
+        target = next(row for row in layout["functions"] if row["name"] == "describe")
+        expected_totals = {"info": 1, **fixture_function_totals(layout, target)}
+        old.need(all(type(function["totals"][key]) is int and function["totals"][key] == value
+                     for key, value in expected_totals.items()) and function["entry"] == target["entry"],
+                 "R1ReceiptFunctionTotals")
         old.need(function["input_sha256"] == text["input_sha256"] == refs_hash
                  and function["entry"] == text["entry"]
                  and function["analysis_id"] == text["analysis_id"] == evidence["function.not_found"]["analysis_id"]
@@ -830,8 +919,18 @@ def receipt_passes(receipt):
             old.need(item["input_sha256"] == sha256_hex(data) and item["input_bytes"] == len(data)
                      and item["fresh_equal_cached"] is True and item["prepare_operations"] == 1
                      and item["query_cases"] == (4 if name in old.GHIDRA_QUERY_FIXTURES else 0)
+                     and item["cache_requests"] == {"fresh": 1 + item["query_cases"],
+                                                    "cached": 1 + item["query_cases"], "program": 4}
+                     and all(type(value) is int for value in item["cache_requests"].values())
+                     and item["program_totals"] == fixture_program_totals(name, data)
+                     and all(type(value) is int for value in item["program_totals"].values())
                      and re.fullmatch(r"[0-9a-f]{64}", item["fresh_semantics_sha256"])
                      and item["fresh_semantics_sha256"] == item["cached_semantics_sha256"], "R1ReceiptCachedAnswer")
+        no_jvm = evidence["program.no_jvm"]
+        old.need(no_jvm == {"process_launches": 0, "rows": 5, "input_sha256": sha256_hex(fixtures["elf_code"]),
+                           "reply_protocol": "reverseai.worker/1", "reply_status": "ok", "functions": 4}
+                 and type(no_jvm["process_launches"]) is int and type(no_jvm["rows"]) is int
+                 and type(no_jvm["functions"]) is int, "R1ReceiptProgramDispatch")
         scale = evidence["scale.10000"]
         scale_data, _ = elf_scale()
         old.need(scale["input_sha256"] == sha256_hex(scale_data) and scale["input_bytes"] == len(scale_data)

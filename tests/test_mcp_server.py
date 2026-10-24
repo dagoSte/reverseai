@@ -508,6 +508,48 @@ class ServerTests(unittest.TestCase):
         _, replies, _, _ = self.serve(request("tools/call", {"name": "list_files", "arguments": {"view": "compact"}}))
         self.assertTrue(replies[0]["result"]["isError"])
 
+    def test_compact_text_contains_every_export_value_in_structured_content(self):
+        report = self.compact_fixture(count=3)
+        values = [
+            {"scope": "function", "part": "pseudocode", "entry": 4194560,
+             "start": 12, "total": 9000, "count": 30, "next_start": 42, "analysis_id": "d" * 64},
+            {"entry": 4194560, "text": "return value + 1; /* α😀 <tag> `code` */\n", "start": 12,
+             "total": 9000, "next_start": 42, "text_sha256": "e" * 64, "analysis_id": "d" * 64},
+            {"rows": [["entry", 4194560, 20], ["add_numbers", 4194592, 10]], "start": 0,
+             "total": 10000, "next_start": 2, "analysis_id": "d" * 64},
+        ]
+        keys = ("code.export_page", "code.pseudocode_page", "code.export_functions")
+        for finding, value, key in zip(report["results"][0]["findings"], values, keys):
+            finding.update(claim_key=key, claim="Query result.", value=value)
+        with patch.object(cli, "main", side_effect=lambda argv, **kw: self.fake_report(argv, **kw, report=report)):
+            _, replies, _, _ = self.serve(request("tools/call", {
+                "name": "read_bytes", "arguments": {"file": "sample.bin"}}))
+        result = replies[0]["result"]
+        text, structured = result["content"][0]["text"], result["structuredContent"]
+        self.assertEqual(text, mcp.NOTICE + "\n\n" + canonical_json(structured))
+        self.assertEqual(json.loads(text[len(mcp.NOTICE) + 2:]), structured)
+        for finding in structured["report"]["results"][0]["findings"]:
+            self.assertIn(canonical_json(finding["value"]), text)
+
+    def test_compact_json_stays_whole_with_incomplete_and_failure_preambles(self):
+        report = self.compact_fixture(count=128, value_chars=600)
+        def render(argv, *, _on_status=None):
+            _on_status(("error",), usable=True, incomplete=(("ghidra.analyze", "error"),))
+            return self.fake_report(argv, report=report)
+        for name, failed in (("analyze_file", False), ("read_bytes", True)):
+            with self.subTest(name=name), patch.object(cli, "main", side_effect=render):
+                _, replies, _, _ = self.serve(request("tools/call", {
+                    "name": name, "arguments": {"file": "sample.bin"}}))
+            result = replies[0]["result"]
+            text, structured = result["content"][0]["text"], result["structuredContent"]
+            preamble = (mcp.FAILURE_MESSAGE + "\n\n" if failed else "")
+            preamble += "Incomplete operations: ghidra.analyze (error).\n\n"
+            self.assertEqual(result["isError"], failed)
+            self.assertLessEqual(len(text.encode("utf-8")), 64 * 1024)
+            self.assertEqual(text, mcp.NOTICE + "\n\n" + preamble + canonical_json(structured))
+            self.assertEqual(json.loads(text[len(mcp.NOTICE) + 2 + len(preamble):]), structured)
+            self.assertGreater(structured["omitted"]["findings"], 0)
+
     def test_compact_utf8_bounds_omit_whole_rows_and_count_every_omission(self):
         report = self.compact_fixture(count=128, value_chars=600)
         def render(argv, **kwargs):
@@ -521,10 +563,10 @@ class ServerTests(unittest.TestCase):
         structured = result["structuredContent"]
         self.assertLessEqual(len(canonical_json(structured).encode("utf-8")), 64 * 1024)
         text = result["content"][0]["text"]
-        self.assertLessEqual(len(text.encode("utf-8")), 4 * 1024)
+        self.assertLessEqual(len(text.encode("utf-8")), 64 * 1024)
         self.assertTrue(text.startswith(mcp.NOTICE))
         self.assertIn(mcp.COMPACT_HINT, text)
-        self.assertIn("Text finding rows omitted:", text)
+        self.assertEqual(text, mcp.NOTICE + "\n\n" + canonical_json(structured))
         self.assertNotIn("�", text)
         self.assertNotIn(b"EVIDENCE-BODY-ONLY", wire)
         row = structured["report"]["results"][0]
@@ -553,6 +595,8 @@ class ServerTests(unittest.TestCase):
             _, replies, _, _ = self.serve(request("tools/call", {"name": "read_bytes", "arguments": {"file": "sample.bin"}}))
         self.assertIsNone(replies[0]["result"]["structuredContent"]["report"])
         self.assertIn(mcp.COMPACT_HINT, replies[0]["result"]["content"][0]["text"])
+        self.assertEqual(replies[0]["result"]["content"][0]["text"],
+                         mcp.NOTICE + "\n\n" + canonical_json(replies[0]["result"]["structuredContent"]))
 
     def receipt_fixture(self):
         return {"schema": "reverseai.prepare/1", "input": {"sha256": "a" * 64, "size": 8},
@@ -599,6 +643,50 @@ class ServerTests(unittest.TestCase):
             expected = message if message in messages else mcp.FAILURE_MESSAGE
             self.assertEqual(replies[0]["result"]["content"][0]["text"], mcp.NOTICE + "\n\n" + expected)
             self.assertNotIn(b"/private/secret", wire)
+
+    def test_real_prepare_cli_failure_lines_are_pinned_to_mcp_allowlist(self):
+        from reverseai import ghidra_cache
+        from reverseai.tools import ghidra_tool
+
+        lock = {"image_id": "sha256:" + "c" * 64, "bundle_sha256": "d" * 64, "cache_format": 1}
+        failures = (TimeoutError("private diagnostic /private/secret"),
+                    *(ghidra_cache.CacheError(message) for message in
+                      (ghidra_cache.MISSING, ghidra_cache.UNSAFE, ghidra_cache.BUSY)))
+        lines = set()
+        with tempfile.TemporaryDirectory() as root:
+            sample = Path(root, "sample.bin")
+            sample.write_bytes(b"abcdefgh")
+            for failure in failures:
+                with self.subTest(failure=repr(failure)), \
+                        patch.object(ghidra_tool, "DockerExecutor") as executor, \
+                        patch.object(ghidra_tool, "load_lock", return_value=lock), \
+                        patch.object(ghidra_cache.CacheStore, "prepare", side_effect=failure) as prepare:
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+                            self.assertRaises(SystemExit) as raised:
+                        cli.main(["prepare", str(sample), "--with-ghidra", "--json"])
+                    self.assertEqual(raised.exception.code, 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+                    line = stderr.getvalue().strip()
+                    self.assertIn(line, mcp.CLI_FIXED_FAILURES)
+                    if isinstance(failure, ghidra_cache.CacheError):
+                        self.assertEqual(line, "reverseai: analysis failed: " + str(failure))
+                    lines.add(line)
+                    prepare.assert_called_once()
+                    prepare.reset_mock()
+
+                    _, replies, wire, errors = self.serve(request("tools/call", {
+                        "name": "prepare_file", "arguments": {"file": "sample.bin"}}),
+                        root=root, enabled=frozenset({"ghidra"}))
+                    result = replies[0]["result"]
+                    self.assertTrue(result["isError"])
+                    self.assertEqual(result["content"][0]["text"], mcp.NOTICE + "\n\n" + line)
+                    self.assertEqual(errors, "")
+                    self.assertNotIn(b"/private/secret", wire)
+                    prepare.assert_called_once()
+                    executor.return_value.prepare.assert_not_called()
+        self.assertEqual(len(lines), 4)
 
     def test_prepare_rejects_wrong_keys_types_paths_duplicate_keys_and_capture_overflow(self):
         receipt = self.receipt_fixture()
