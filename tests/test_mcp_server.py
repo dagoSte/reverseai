@@ -1,6 +1,7 @@
 """MCP lifecycle, bounded framing and isolated calls with a small catalog stand-in."""
 
 import contextlib
+import copy
 from dataclasses import replace
 import io
 import json
@@ -31,15 +32,18 @@ def catalog_standin():
     module.ToolInputError = type("ToolInputError", (Exception,), {})
     module.calls = []
     module.catalog = lambda enabled: [{"name": name, "inputSchema": {"type": "object"}}
-                                      for name in ("list_files", "analyze_file", "read_bytes")]
+                                      for name in ("list_files", "analyze_file", "read_bytes",
+                                                   *(("prepare_file",) if "ghidra" in enabled else ()))]
     module.list_files = lambda root: {"files": [{"name": "sample.bin", "size": 8}], "truncated": False}
 
     def command(name, args, *, root, out, enabled):
-        if name not in ("analyze_file", "read_bytes"):
+        if name not in ("analyze_file", "read_bytes", "prepare_file"):
             raise module.UnknownTool()
         if not isinstance(args, dict) or set(args) != {"file"} or args["file"] != "sample.bin":
             raise module.ToolInputError("Choose sample.bin from list_files.")
         module.calls.append((name, args, root, out, enabled))
+        if name == "prepare_file":
+            return ["prepare", str(Path(root, args["file"])), "--with-ghidra", "--json"]
         if name == "analyze_file":
             return ["analyze", str(Path(root, args["file"])), "--out", out]
         return ["query", str(Path(root, args["file"])), "--query", "read_bytes",
@@ -305,7 +309,9 @@ class ServerTests(unittest.TestCase):
     def test_real_cli_byte_query_preserves_the_report_and_cleans_the_private_directory(self):
         with tempfile.TemporaryDirectory() as root:
             Path(root, "sample.bin").write_bytes(b"abcdefgh")
-            _, replies, raw, errors = self.serve(request("tools/call", {"name": "read_bytes", "arguments": {"file": "sample.bin"}}),
+            _, replies, raw, errors = self.serve(request("tools/call", {
+                "name": "read_bytes", "arguments": {"file": "sample.bin", "view": "full"}}),
+                request("tools/call", {"name": "read_bytes", "arguments": {"file": "sample.bin"}}, identifier=2),
                                                root=root, enabled=frozenset({"ghidra"}))
             self.assertEqual(errors, "")
             result = replies[0]["result"]
@@ -314,6 +320,10 @@ class ServerTests(unittest.TestCase):
             finding = report["results"][0]["findings"][0]
             self.assertEqual(finding["value"]["hex"], "61626364")
             self.assertEqual(finding["verdict"], "supported")
+            compact = replies[1]["result"]
+            self.assertEqual(compact["isError"], result["isError"])
+            self.assertEqual(compact["structuredContent"]["report"]["results"][0]["findings"],
+                             report["results"][0]["findings"])
             self.assertEqual(self.tools.calls[0][-1], frozenset({"ghidra"}))
             out = Path(self.tools.calls[0][3])
             self.assertFalse(out.parent.exists())
@@ -387,7 +397,7 @@ class ServerTests(unittest.TestCase):
                     patch.object(mcp, "MAX_STRUCTURED_BYTES", json_limit):
                 Path(root, "sample.bin").write_bytes(elf_code()[0])
                 _, replies, _, _ = self.serve(request("tools/call", {
-                    "name": "analyze_file", "arguments": {"file": "sample.bin"}}), root=root)
+                    "name": "analyze_file", "arguments": {"file": "sample.bin", "view": "full"}}), root=root)
             result = replies[0]["result"]
             self.assertFalse(result["isError"])
             if json_limit == 128:
@@ -438,6 +448,192 @@ class ServerTests(unittest.TestCase):
         print("private diagnostic /private/secret", file=sys.stderr)
         return code
 
+    def compact_fixture(self, count=2, value_chars=30):
+        evidence, findings = [], []
+        for index in range(count):
+            identity = f"{index:016x}"
+            evidence.append({"id": "ev-" + identity, "location": {"offset": index * 4, "length": 4},
+                             "observation": {"body": "EVIDENCE-BODY-ONLY"}, "excerpt_sha256": "a" * 64,
+                             "input_sha256": "b" * 64, "tool": {"name": "ghidra", "version": "test"}})
+            findings.append({"id": "fi-" + identity, "claim": "Derived row " + str(index),
+                             "statement": "The reviewed claim", "claim_key": "code.export_functions",
+                             "value": {"text": "α😀" * value_chars, "index": index}, "confidence": "inferred",
+                             "evidence_ids": ["ev-" + identity], "verdict": "derived", "reasons": ["Derived reading"]})
+        return {"contract": "reverseai.contract/3", "input": {"sha256": "b" * 64, "size": count * 4, "name": "sample.bin"},
+                "results": [{"task_id": "tk-" + "0" * 16, "role": "code", "status": "ok", "errors": [],
+                             "findings": findings, "evidence": evidence}], "summary": {"derived": count}}
+
+    def test_default_and_explicit_compact_strip_view_before_validation_and_keep_findings(self):
+        report = self.compact_fixture()
+        report["results"][0]["evidence"][0]["artifact"] = {"member": "classes.dex", "sha256": "c" * 64,
+                                                          "size": 10, "data_offset": 5}
+        messages = [request("tools/call", {"name": name, "arguments": {"file": "sample.bin", **extra}})
+                    for name, extra in (("read_bytes", {}), ("read_bytes", {"view": "compact"}),
+                                        ("analyze_file", {"view": "compact"}), ("read_bytes", {"view": "full"}))]
+        def render(argv, **kwargs):
+            return self.fake_report(argv, **kwargs, report=report, markdown="Full report evidence body")
+        with patch.object(cli, "main", side_effect=render):
+            _, replies, _, errors = self.serve(*messages)
+        self.assertEqual(errors, "")
+        full = replies[-1]["result"]
+        self.assertEqual(full["structuredContent"], {"report": report})
+        self.assertIn("Full report evidence body", full["content"][0]["text"])
+        for reply in replies[:-1]:
+            result = reply["result"]
+            compact = result["structuredContent"]
+            self.assertEqual(compact["view"], "compact")
+            row = compact["report"]["results"][0]
+            self.assertEqual(row["findings"], report["results"][0]["findings"])
+            self.assertEqual(row["evidence"][0], {"id": "ev-" + "0" * 16,
+                "location": {"offset": 0, "length": 4}, "artifact": {"member": "classes.dex", "sha256": "c" * 64}})
+            self.assertNotIn("EVIDENCE-BODY-ONLY", canonical_json(compact))
+            self.assertNotIn("excerpt_sha256", canonical_json(compact))
+            self.assertEqual(compact["omitted"]["findings"], 0)
+            self.assertEqual(compact["omitted"]["citations"], 0)
+            self.assertEqual(compact["omitted"]["evidence_bodies"], 2)
+        self.assertTrue(all(call[1] == {"file": "sample.bin"} for call in self.tools.calls))
+        self.assertEqual(messages[1]["params"]["arguments"]["view"], "compact")
+
+    def test_invalid_view_is_a_fixed_refusal_before_cli_or_command(self):
+        for value in (None, True, 1, [], {}, "FULL", "compact\n/private/secret", "/private/secret"):
+            with self.subTest(value=value), patch.object(cli, "main") as run, \
+                    patch.object(self.tools, "command") as command:
+                _, replies, wire, _ = self.serve(request("tools/call", {
+                    "name": "read_bytes", "arguments": {"file": "sample.bin", "view": value}}))
+                self.assertTrue(replies[0]["result"]["isError"])
+                self.assertEqual(replies[0]["result"]["content"][0]["text"], mcp.NOTICE + "\n\n" + mcp.BAD_VIEW)
+                self.assertNotIn(b"/private/secret", wire)
+                run.assert_not_called()
+                command.assert_not_called()
+        _, replies, _, _ = self.serve(request("tools/call", {"name": "list_files", "arguments": {"view": "compact"}}))
+        self.assertTrue(replies[0]["result"]["isError"])
+
+    def test_compact_utf8_bounds_omit_whole_rows_and_count_every_omission(self):
+        report = self.compact_fixture(count=128, value_chars=600)
+        def render(argv, **kwargs):
+            return self.fake_report(argv, **kwargs, report=report, markdown="EVIDENCE-BODY-ONLY" * 20000)
+        self.assertLess(len(canonical_json(report).encode("utf-8")), mcp.MAX_STRUCTURED_BYTES)
+        with patch.object(cli, "main", side_effect=render):
+            _, replies, wire, errors = self.serve(request("tools/call", {
+                "name": "read_bytes", "arguments": {"file": "sample.bin"}}))
+        self.assertEqual(errors, "")
+        result = replies[0]["result"]
+        structured = result["structuredContent"]
+        self.assertLessEqual(len(canonical_json(structured).encode("utf-8")), 64 * 1024)
+        text = result["content"][0]["text"]
+        self.assertLessEqual(len(text.encode("utf-8")), 4 * 1024)
+        self.assertTrue(text.startswith(mcp.NOTICE))
+        self.assertIn(mcp.COMPACT_HINT, text)
+        self.assertIn("Text finding rows omitted:", text)
+        self.assertNotIn("�", text)
+        self.assertNotIn(b"EVIDENCE-BODY-ONLY", wire)
+        row = structured["report"]["results"][0]
+        self.assertGreater(len(row["findings"]), 0)
+        self.assertGreater(structured["omitted"]["findings"], 0)
+        self.assertEqual(len(row["findings"]) + structured["omitted"]["findings"], 128)
+        self.assertEqual(len(row["evidence"]) + structured["omitted"]["citations"], 128)
+        originals = {finding["id"]: finding for finding in report["results"][0]["findings"]}
+        citations = {citation["id"] for citation in row["evidence"]}
+        for finding in row["findings"]:
+            self.assertEqual(finding, originals[finding["id"]])
+            self.assertTrue(set(finding["evidence_ids"]).issubset(citations))
+
+    def test_compact_covers_large_metadata_oversized_individual_rows_and_report_input_limit(self):
+        report = self.compact_fixture()
+        report["tools"] = [{"name": "x" * 70000}]
+        report["results"][0]["findings"][0]["value"] = "α" * 40000
+        compact = mcp._compact({"report": report})
+        self.assertLessEqual(len(canonical_json(compact).encode()), 64 * 1024)
+        self.assertEqual(compact["omitted"]["metadata_fields"], 1)
+        self.assertEqual(compact["omitted"]["findings"], 1)
+        self.assertEqual(compact["report"]["results"][0]["findings"], report["results"][0]["findings"][1:])
+        def render(argv, **kwargs):
+            return self.fake_report(argv, **kwargs, report={"large": "x" * (mcp.MAX_STRUCTURED_BYTES + 1)})
+        with patch.object(cli, "main", side_effect=render):
+            _, replies, _, _ = self.serve(request("tools/call", {"name": "read_bytes", "arguments": {"file": "sample.bin"}}))
+        self.assertIsNone(replies[0]["result"]["structuredContent"]["report"])
+        self.assertIn(mcp.COMPACT_HINT, replies[0]["result"]["content"][0]["text"])
+
+    def receipt_fixture(self):
+        return {"schema": "reverseai.prepare/1", "input": {"sha256": "a" * 64, "size": 8},
+                "analysis_id": "b" * 64, "state": "created", "runtime": {"image": "sha256:" + "c" * 64,
+                "platform": "linux/arm64", "bundle_sha256": "d" * 64}, "cache_format": 1,
+                "artifact_size": 10240, "elapsed_seconds": 0.25}
+
+    def test_prepare_returns_only_strict_receipt_and_does_not_read_reports(self):
+        for state in ("created", "reused"):
+            receipt = self.receipt_fixture()
+            receipt["state"] = state
+            def prepare(argv, *, _on_status):
+                self.assertEqual(argv, ["prepare", "/operator-inputs/sample.bin", "--with-ghidra", "--json"])
+                print(canonical_json(receipt))
+                print("private diagnostic /private/secret", file=sys.stderr)
+                return 0
+            with self.subTest(state=state), patch.object(cli, "main", side_effect=prepare), \
+                    patch.object(mcp, "_reports") as reports, patch.object(mcp, "_read_report") as read_report:
+                _, replies, wire, errors = self.serve(request("tools/call", {
+                    "name": "prepare_file", "arguments": {"file": "sample.bin"}}), enabled=frozenset({"ghidra"}))
+            result = replies[0]["result"]
+            self.assertFalse(result["isError"])
+            self.assertEqual(result["structuredContent"], receipt)
+            self.assertEqual(result["content"][0]["text"], mcp.NOTICE + "\n\n" + canonical_json(receipt))
+            self.assertEqual(errors, "")
+            self.assertNotIn(b"/private/secret", wire)
+            self.assertFalse(Path(self.tools.calls[-1][3]).parent.exists())
+            reports.assert_not_called()
+            read_report.assert_not_called()
+
+    def test_prepare_rejects_wrong_keys_types_paths_duplicate_keys_and_capture_overflow(self):
+        receipt = self.receipt_fixture()
+        invalid = ["", "not JSON", "[]", canonical_json(receipt) + "\n/private/secret",
+                   canonical_json(receipt)[:-1] + ',"state":"reused"}',
+                   canonical_json(receipt) + " " * (mcp.MAX_DIAGNOSTIC_CHARS + 1)]
+        mutations = [((), "schema", "reverseai.prepare/2"), ((), "analysis_id", "/private/secret"),
+                     ((), "cache_path", "/private/secret"), ((), "state", "/private/secret"),
+                     ((), "cache_format", True), ((), "artifact_size", True), ((), "artifact_size", 0),
+                     ((), "artifact_size", 64 * 1024 * 1024 + 1), ((), "elapsed_seconds", -1),
+                     ((), "elapsed_seconds", True), ((), "elapsed_seconds", float("nan")),
+                     (("input",), "size", True), (("input",), "size", 64 * 1024 * 1024 + 1),
+                     (("input",), "sha256", "A" * 64), (("input",), "path", "/private/secret"),
+                     (("runtime",), "image", "/private/secret"), (("runtime",), "platform", "/private/secret"),
+                     (("runtime",), "bundle_sha256", "/private/secret"), (("runtime",), "cache_path", "/private/secret")]
+        for parents, key, value in mutations:
+            changed = copy.deepcopy(receipt)
+            target = changed
+            for parent in parents:
+                target = target[parent]
+            target[key] = value
+            invalid.append(json.dumps(changed))
+        for output in invalid:
+            def prepare(argv, **kwargs):
+                print(output)
+                return 0
+            with self.subTest(output=output[:100]), patch.object(cli, "main", side_effect=prepare):
+                _, replies, wire, errors = self.serve(request("tools/call", {
+                    "name": "prepare_file", "arguments": {"file": "sample.bin"}}), enabled=frozenset({"ghidra"}))
+            self.assertTrue(replies[0]["result"]["isError"])
+            self.assertNotIn("structuredContent", replies[0]["result"])
+            self.assertNotIn(b"/private/secret", wire)
+            self.assertNotIn("/private/secret", errors)
+
+    def test_prepare_only_forwards_existing_fixed_cli_refusals(self):
+        for line, expected in (("reverseai: input refused: IntakeError", True),
+                               ("reverseai: analysis failed: ValueError", True),
+                               ("reverseai: the Ghidra worker is unavailable (image lock, image or Docker missing)", True),
+                               ("reverseai: input refused: /private/secret", False),
+                               ("reverseai: analysis failed: ValueError /private/secret", False),
+                               ("private diagnostic /private/secret", False)):
+            def prepare(argv, **kwargs):
+                print(line, file=sys.stderr)
+                raise SystemExit(1)
+            with self.subTest(line=line), patch.object(cli, "main", side_effect=prepare):
+                _, replies, wire, _ = self.serve(request("tools/call", {
+                    "name": "prepare_file", "arguments": {"file": "sample.bin"}}), enabled=frozenset({"ghidra"}))
+            result = replies[0]["result"]
+            self.assertTrue(result["isError"])
+            self.assertEqual(result["content"][0]["text"], mcp.NOTICE + "\n\n" + (line if expected else mcp.FAILURE_MESSAGE))
+            self.assertNotIn(b"/private/secret", wire)
+
     def test_output_capture_and_cleanup_survive_return_exit_exception_and_missing_reports(self):
         def exit_now(argv, **kwargs):
             print("private summary /private/secret")
@@ -458,7 +654,8 @@ class ServerTests(unittest.TestCase):
         def large(argv, **kwargs):
             return self.fake_report(argv, **kwargs, markdown="α😀" * 500)
         with patch.object(cli, "main", side_effect=large), patch.object(mcp, "MAX_TEXT_BYTES", 256):
-            _, replies, _, _ = self.serve(request("tools/call", {"name": "read_bytes", "arguments": {"file": "sample.bin"}}))
+            _, replies, _, _ = self.serve(request("tools/call", {
+                "name": "read_bytes", "arguments": {"file": "sample.bin", "view": "full"}}))
             text = replies[0]["result"]["content"][0]["text"]
             self.assertTrue(text.startswith(mcp.NOTICE))
             self.assertTrue(text.endswith(mcp.TEXT_CUT))
@@ -472,7 +669,8 @@ class ServerTests(unittest.TestCase):
                 return self.fake_report(argv, **kwargs, report=report)
             with self.subTest(count=count), patch.object(cli, "main", side_effect=render), \
                     patch.object(mcp, "MAX_STRUCTURED_BYTES", 128):
-                _, replies, _, _ = self.serve(request("tools/call", {"name": "read_bytes", "arguments": {"file": "sample.bin"}}))
+                _, replies, _, _ = self.serve(request("tools/call", {
+                    "name": "read_bytes", "arguments": {"file": "sample.bin", "view": "full"}}))
                 structured = replies[0]["result"]["structuredContent"]
                 if len(canonical_json({"report": report}).encode()) <= 128:
                     self.assertEqual(structured, {"report": report})
