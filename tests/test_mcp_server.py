@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 import reverseai
-from reverseai import cli, mcp, pipeline
+from reverseai import cli, intake, mcp, pipeline
 from reverseai.contract import canonical_json
 
 
@@ -318,6 +318,51 @@ class ServerTests(unittest.TestCase):
             self.assertFalse(out.parent.exists())
             self.assertNotIn(root.encode(), raw)
             self.assertNotIn(str(out).encode(), raw)
+
+    def test_cli_intake_refusals_keep_the_fixed_line_and_clean_the_temporary_directory(self):
+        for problem in ("hard_link", "too_large", "changed_during_read"):
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory() as root:
+                sample = Path(root, "sample.bin"); sample.write_bytes(b"abcdefgh")
+                if problem == "hard_link":
+                    os.link(sample, Path(root, "second.bin"))
+                elif problem == "too_large":
+                    with sample.open("r+b") as handle:
+                        handle.truncate(intake.MAX_INPUT_BYTES + 1)
+                def snapshot(*args, **kwargs):
+                    raise intake.IntakeError("Input changed while reading")
+                changed = (patch.object(intake, "snapshot", side_effect=snapshot) if problem == "changed_during_read"
+                           else contextlib.nullcontext())
+                with changed:
+                    _, replies, raw, _ = self.serve(request("tools/call", {
+                        "name": "read_bytes", "arguments": {"file": "sample.bin"}}), root=root)
+                result = replies[0]["result"]
+                self.assertTrue(result["isError"])
+                self.assertEqual(result["content"][0]["text"], mcp.NOTICE + "\n\nreverseai: input refused: IntakeError")
+                self.assertNotIn(root.encode(), raw)
+                self.assertNotIn(b"Traceback", raw)
+                self.assertFalse(Path(self.tools.calls[-1][3]).parent.exists())
+
+    def test_first_fixed_intake_line_is_selected_without_returning_other_diagnostics(self):
+        def refuse(argv, **kwargs):
+            print("private diagnostic /private/secret", file=sys.stderr)
+            print("reverseai: input refused: IntakeError", file=sys.stderr)
+            print("reverseai: input refused: OSError", file=sys.stderr)
+            raise SystemExit(1)
+        with patch.object(cli, "main", side_effect=refuse):
+            _, replies, raw, _ = self.serve(request("tools/call", {"name": "read_bytes", "arguments": {"file": "sample.bin"}}))
+        self.assertEqual(replies[0]["result"]["content"][0]["text"],
+                         mcp.NOTICE + "\n\nreverseai: input refused: IntakeError")
+        self.assertNotIn(b"/private/secret", raw)
+        self.assertNotIn(b"OSError", raw)
+
+    def test_other_cli_failures_keep_the_generic_message(self):
+        for line in ("reverseai: output failed: OSError", "reverseai: analysis failed: ValueError", "/private/secret"):
+            def fail(argv, **kwargs):
+                print(line, file=sys.stderr)
+                raise SystemExit(1)
+            with self.subTest(line=line), patch.object(cli, "main", side_effect=fail):
+                _, replies, _, _ = self.serve(request("tools/call", {"name": "read_bytes", "arguments": {"file": "sample.bin"}}))
+            self.assertEqual(replies[0]["result"]["content"][0]["text"], mcp.NOTICE + "\n\n" + mcp.FAILURE_MESSAGE)
 
     def fake_report(self, argv, *, _on_status=None, markdown="Static report", report=None, code=0):
         report = report if report is not None else {"results": []}

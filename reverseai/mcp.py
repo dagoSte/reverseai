@@ -176,6 +176,9 @@ class _Session:
                     except SystemExit as error:
                         code = error.code
                 if code is not None and (type(code) is not int or code != 0):
+                    for line in captured_err.getvalue().splitlines():
+                        if line.startswith("reverseai: input refused: "):
+                            return _failed(line)
                     return _failed()
                 markdown, structured = _reports(out)
                 if failed:
