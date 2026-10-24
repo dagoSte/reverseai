@@ -1065,7 +1065,7 @@ checkable without a download, a paid call or a hosted CI run. Hosted CI, amd64
 images and a Windows proof are M6b and wait for the owner. The analysis
 contract above is unchanged.
 
-- **Version**: `reverseai.__version__` is the single source, `0.6.0` for M6 and `0.6.1` for M6b;
+- **Version**: `reverseai.__version__` is the single source, `0.6.0` for M6, `0.6.1` for M6b and `0.6.2` for the presentation release;
   `pyproject.toml` declares the same static version and a test pins the two equal.
 - **pyproject.toml** (PEP 621): name `reverseai`, the version, a one-line
   description, `readme = "README.md"`, `requires-python = ">=3.12"`, no

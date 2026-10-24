@@ -4,7 +4,7 @@
 
 <p align="center">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square">
-  <img alt="Version 0.6.1" src="https://img.shields.io/badge/version-0.6.1-38bdf8?style=flat-square">
+  <img alt="Version 0.6.2" src="https://img.shields.io/badge/version-0.6.2-38bdf8?style=flat-square">
   <img alt="Python 3.12 or later" src="https://img.shields.io/badge/python-3.12%2B-3776ab?style=flat-square&logo=python&logoColor=white">
   <img alt="No Python dependencies" src="https://img.shields.io/badge/dependencies-none-22c55e?style=flat-square">
   <img alt="Platforms: macOS, Linux, Windows (experimental)" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows%20(experimental)-64748b?style=flat-square">
