@@ -339,5 +339,13 @@ print(json.dumps(checks))
         self.assertEqual((output / self.wheel.name).read_bytes(), self.wheel.read_bytes())
 
 
+    def test_sdist_includes_the_closed_prepared_worker_source_bundle(self):
+        with tarfile.open(self.sdist, "r:gz") as archive:
+            names = set(archive.getnames())
+        for name in ("containers/ghidra/project_cache.py", "containers/ghidra/Dockerfile.revise",
+                     "containers/ghidra/ghidra_scripts/ReverseAIPrepare.java"):
+            self.assertIn(f"reverseai-{__version__}/" + name, names)
+
+
 if __name__ == "__main__":
     unittest.main()
