@@ -1,6 +1,6 @@
 # Install and check ReverseAI
 
-M6 (version 0.6.0) is released for macOS ARM64 and Linux ARM64. Installing the
+M6b (version 0.6.1) is released for macOS ARM64 and Linux ARM64. Installing the
 Python package enables host-only
 analysis on supported POSIX systems. Contained tools additionally require their
 exact local images and a separately verified Docker environment. Installation
@@ -215,7 +215,7 @@ Controls exercise network/write/privilege refusal, PID, memory, wall and output
 limits, known answers and cleanup. They parse synthetic fixtures without
 executing sample code. See the [security model](SECURITY.md) for the trust limits.
 
-M6a's host validation scope is macOS ARM64 plus a Linux ARM64 container. On the
+The proven host scope is macOS ARM64 plus a Linux ARM64 container. On the
 Mac, run the committed candidate's whole suite:
 
 ```sh

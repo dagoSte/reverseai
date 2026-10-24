@@ -1,19 +1,5 @@
 # Changelog
 
-## Unreleased: M6b
-
-- MIT license with Metadata-Version 2.4, license expression and preserved license
-  files in wheels/source distributions; offline PEP 660 editable installation.
-- Owner-started manual host proof workflow for Linux and Windows x86-64, with
-  read-only permissions and SHA-pinned actions. A workflow is not a completed run.
-- Experimental Windows report output bound to a directory handle; requires
-  CPython 3.12.4 or later and a new output directory for every call.
-- Offline LIEF and YARA-X builders using approved local wheels and a cached
-  pinned base. Ghidra's online build and AMD64 container images remain deferred.
-
-Platform receipts and release status are recorded separately at the gate;
-these entries describe the unreleased checkout, not a completed hosted proof.
-
 ## Released milestones
 
 Dates below are the release tags' creator dates: tagger date for annotated tags,
@@ -22,6 +8,7 @@ commit date for lightweight tags. Scope follows the repository's
 
 | Date | Tag | Change |
 | --- | --- | --- |
+| 2026-10-24 | `m6b` | Version 0.6.1: MIT license with Metadata-Version 2.4 and preserved license files, offline editable install, an owner-started manual host-proof workflow for Linux and Windows x86-64 with SHA-pinned actions, experimental Windows report output bound to a directory handle, and offline LIEF and YARA-X builders; the whole suite and the same installed wheel proven on macOS ARM64 (Python 3.15) and in a Linux ARM64 container (Python 3.12). Windows and Linux x86-64 receipts await an owner-started run; an offline Ghidra build and AMD64 images remain deferred. |
 | 2026-10-22 | `m6` | Version 0.6.0: Python packaging with a dependency-free in-tree build backend, reproducible wheel and sdist, offline installation, `reverseai --version` and a read-only `doctor`; the whole suite and the installed wheel proven on macOS ARM64 (Python 3.15) and in a Linux ARM64 container (Python 3.12). |
 | 2026-10-22 | `m5c` | npm tarballs: bounded gzip/tar reading, file and header provenance, and existing JavaScript queries without extraction or installation. |
 | 2026-10-22 | `m5b` | JavaScript syntax through a pinned parser in a locked container; module sources and sensitive calls remain derived, with verified byte anchors. |
