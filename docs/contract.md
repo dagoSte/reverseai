@@ -370,8 +370,8 @@ wall limit) reports three more derived kinds. Adapter `12.1.4-r5`. Decision
 ## Targeted queries (M3d)
 
 M3d answers one question at a time, by name, address or text, with paging, next
-to the whole-file `analyze` run. The query names are REA Safe Agent's 16 native
-query names, so M7 can compare them one by one. Decision `m3d-contract`.
+to the whole-file `analyze` run. The query names follow the common vocabulary of
+native reverse-engineering queries, so a benchmark can compare them one by one. Decision `m3d-contract`.
 
 - **Command**: `python3 -m reverseai query FILE --query NAME [--arg KEY=VALUE ...]
   --out DIR [--with-ghidra]`. NAME is one of the closed table below
@@ -679,7 +679,7 @@ and needs an owner-approved download. Decision `m4a-contract`.
   ref_kind, target, target_truncated]`.
 - These are declarations in the bytes: a reference in code is not evidence that
   it runs, and a permission declared is not evidence that it is used.
-- **Queries** (`reverseai/queries.py`), REA's Android names: `inspect_android_package`
+- **Queries** (`reverseai/queries.py`), the Android names: `inspect_android_package`
   (`apk.inventory`, `apk.manifest`), `search_android_classes` (`dex.classes`),
   `inspect_android_class` (`dex.classes` with the exact `class`, `dex.methods`), `inspect_android_method` (`dex.methods`, `dex.references`
   `from`; decompiled Java comes with M4b), `trace_android_references`
@@ -773,7 +773,7 @@ Java is the decompiler's reading, kept **derived** like Ghidra's pseudocode.
 
 ## JavaScript applications on the host (M5a, contract/3)
 
-Decision `owner-next-m5a`: stdlib only, no download. M5a covers REA's
+Decision `owner-next-m5a`: stdlib only, no download. M5a covers
 `analyze_javascript_application` with what the host can verify from the bytes:
 the files of an application, its `package.json` declarations and lexical hints
 anchored at exact bytes. Abstract syntax, module graphs and deobfuscation need a
@@ -858,7 +858,7 @@ evaluates the sample.
   `m5a-fix-round`).
   `jshints.scan(data)` yields `(offset, length, category, hint)` for one file's
   bytes, in offset order, overlapping matches of different patterns allowed.
-- **Query** `analyze_javascript_application` (REA's name): args `detail` enum
+- **Query** `analyze_javascript_application`: args `detail` enum
   `summary`, `files`, `package`, `hints` default `summary`, `file`, `category`,
   `start`, `limit` as above; `summary` routes `js.files`, `js.package` and
   `js.hints` (first page each), the others one operation.
@@ -877,8 +877,7 @@ parser's reading and stays **derived**; the bytes at each anchor are verified.
   `python:3.12-slim` base with the five approved downloads: Node.js 24.22.1
   (`node-v24.22.1-linux-arm64.tar.xz`, `dbabf7a1...336e`) and the npm tarballs
   `@babel/parser` 8.0.4, `@babel/types` 8.0.4, `@babel/helper-string-parser`
-  8.0.6, `@babel/helper-validator-identifier` 8.0.6 (registry sha512 integrities,
-  REA's lock). No npm client and no install scripts: the build tool checks each
+  8.0.6, `@babel/helper-validator-identifier` 8.0.6 (registry sha512 integrities). No npm client and no install scripts: the build tool checks each
   tarball and unpacks it. A fixed driver imports `@babel/parser` only. Lock keys:
   `adapter_version` `8.0.4-r1` (`8.0.4-r2` since M5c, whose worker also reads gzip-stream children), `platform`, `base_digest`, `node_sha256`,
   `babel_parser_integrity`, `babel_types_integrity`,
@@ -1131,8 +1130,8 @@ Decisions `owner-license-mit`, `owner-ci-manual`, `m6b-contract`. M6b is version
   Metadata-Version 2.4 with `License-Expression: MIT` and one `License-File`
   line per file; both files are copied to `reverseai-0.6.1.dist-info/licenses/`
   (no longer at the dist-info root) and listed in `RECORD`. The sdist adds
-  `LICENSE` at its root and the same headers in `PKG-INFO`. The REA attribution
-  in `THIRD_PARTY_NOTICES.md` stays unchanged. The backend refuses a pyproject
+  `LICENSE` at its root and the same headers in `PKG-INFO`. `THIRD_PARTY_NOTICES.md`
+  lists the external tools and their licenses. The backend refuses a pyproject
   whose license or license files differ from these values.
 - **Editable install (lane P)**: the backend adds PEP 660 `build_editable` and
   `get_requires_for_build_editable` (returning `[]`): a wheel whose only payload

@@ -1,6 +1,6 @@
 # Install and check ReverseAI
 
-M6b (version 0.6.1) is released for macOS ARM64 and Linux ARM64. Installing the
+Version 0.6.1 is released for macOS ARM64 and Linux ARM64. Installing the
 Python package enables host-only
 analysis on supported POSIX systems. Contained tools additionally require their
 exact local images and a separately verified Docker environment. Installation

@@ -2,7 +2,7 @@
 # linux/arm64 manifest digest; Ghidra 12.1.4 and the Temurin JDK come from the build context, checked by SHA-256
 # (owner-m3-downloads). Only the natives stage uses the network, once, for Debian's g++ and make at their exact
 # trixie versions (owner-m3-apt-trixie) to build the arm64 decompiler and GNU demangler from the release's sources,
-# as REA c6f45cd does; the image copies /opt/jdk and /opt/ghidra from it and nothing else.
+# following Ghidra's own build instructions; the image copies /opt/jdk and /opt/ghidra from it and nothing else.
 FROM python:3.12-slim@sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e124c3dba340f15e AS natives
 RUN apt-get update \
     && apt-get install -y --no-install-recommends g++=4:14.2.0-1 make=4.4.1-2 \

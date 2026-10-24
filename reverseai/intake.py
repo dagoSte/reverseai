@@ -1,9 +1,6 @@
 """Freeze the bytes of one approved regular file (reverseai.contract/1 intake).
 
-The safeguards are ported from REA Safe Agent, file
-skills/rea-isolated/scripts/input_snapshot.py at committed revision
-c6f45cd27f1ed8ca774d5438d86d4b4f81c484fe.
-Copyright (c) 2026 Stefano D'Agostino. MIT License; see THIRD_PARTY_NOTICES.md.
+Copyright (c) 2026 Stefano D'Agostino. MIT License; see LICENSE.
 
 Only the final path component is checked: the owner approves the path, and
 parent directories may legitimately be links (for example /tmp on macOS).

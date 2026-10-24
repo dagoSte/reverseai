@@ -154,7 +154,7 @@ TABLE = MappingProxyType({
     "trace_android_references": _query("dex.references", {
         "member": ANY_DEX, **METHOD_ARGS, "direction": ArgSpec("enum", choices=("from", "to"), default="from"),
         "start": START, "limit": ANDROID_LIMIT}),
-    # REA's JavaScript name: summary reads the first page of files, package.json declarations and hints
+    # The JavaScript name: summary reads the first page of files, package.json declarations and hints
     "analyze_javascript_application": _detailed(
         {"detail": ArgSpec("enum", choices=("summary", *JS_PAGES, *JS_SYNTAX_DETAILS), default="summary"),
          "file": ArgSpec("literal", 0, 255, default=""), "category": ArgSpec("enum", choices=JS_CATEGORIES, default="all"),

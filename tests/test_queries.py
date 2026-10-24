@@ -138,12 +138,12 @@ class QueryTests(unittest.TestCase):
                                                      "procedure_callees", "procedure_callers", "analyze_function")},
             "xrefs": ("ghidra.xrefs",),
         }
-        expected.update({  # decision m4a-contract: REA's five Android names
+        expected.update({  # decision m4a-contract: the five Android names
             "inspect_android_package": ("apk.inventory", "apk.manifest"), "search_android_classes": ("dex.classes",),
             "inspect_android_class": ("dex.classes", "dex.methods"),
             "inspect_android_method": ("dex.methods", "dex.references"), "trace_android_references": ("dex.references",),
         })
-        # decision m5a-contract: REA's JavaScript name; its default summary detail reads all three js operations
+        # decision m5a-contract: the JavaScript name; its default summary detail reads all three js operations
         expected["analyze_javascript_application"] = ("js.files", "js.package", "js.hints")
         self.assertEqual(set(queries.TABLE), set(expected))
         for name, operations in expected.items():

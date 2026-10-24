@@ -15,7 +15,7 @@ commit date for lightweight tags. Scope follows the repository's
 | 2026-10-22 | `m5a` | Host-verified JavaScript file inventory, package.json declarations and lexical hints without sample execution. |
 | 2026-10-22 | `m4b` | Contained JADX decompilation to derived Java, bound to host-verified DEX methods. |
 | 2026-10-21 | `m4a` | APK inventory, binary manifest and DEX classes, methods and references, with compressed-member evidence under contract/3. |
-| 2026-10-21 | `m3d` | Targeted native queries by name, address or text with paging, covering REA's 16 native query names. |
+| 2026-10-21 | `m3d` | Targeted native queries by name, address or text with paging. |
 | 2026-10-21 | `m3c` | Ghidra assembly, references from code and referenced strings reported as derived evidence. |
 | 2026-10-20 | `m3b` | Mach-O host decoding, verified imports for ELF/PE/Mach-O and Ghidra analysis of Mach-O. |
 | 2026-10-20 | `m3a` | Contained Ghidra analysis of ELF/PE functions, pseudocode and calls as derived evidence under contract/2. |

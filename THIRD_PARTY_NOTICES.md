@@ -1,47 +1,5 @@
 # Third-party notices
 
-## REA Safe Agent
-
-`reverseai/intake.py` ports the input-snapshot safeguards of REA Safe Agent
-(https://github.com/dagoSte/rea-safe-agents), file
-`skills/rea-isolated/scripts/input_snapshot.py` at committed revision
-`c6f45cd27f1ed8ca774d5438d86d4b4f81c484fe`. That code is distributed under the
-following license:
-
-```text
-MIT License
-
-Copyright (c) 2026 Stefano D'Agostino
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-## REA Safe Agent: Ghidra build approach
-
-`containers/ghidra/Dockerfile` follows the Ghidra build of REA Safe Agent's
-`skills/rea-isolated/assets/Dockerfile` at committed revision
-`c6f45cd27f1ed8ca774d5438d86d4b4f81c484fe`: the same pinned Ghidra 12.1.4 and Temurin
-JDK 21.0.12.1+1 inputs, and the commands that build the arm64 decompiler (`make
-ghidra_opt ARCH_TYPE= OSDIR=linux_arm_64`) and the GNU demangler from the release's
-own sources. That file is distributed under the MIT License reproduced above
-(Copyright (c) 2026 Stefano D'Agostino).
-
 ## Ghidra and the Temurin JDK (Ghidra worker image only)
 
 The locally built image `reverseai-ghidra` (`tools/build_ghidra_image.py`, decision
