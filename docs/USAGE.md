@@ -65,7 +65,8 @@ Copy a real entry from the function listing in place of `0x401000`. `export_func
 `select=name` with an exact `name`; duplicate names select the lowest entry and metadata gives the match count.
 Choose one `part`: `info` (default), `pseudocode`, `assembly`, `callees`, `callers`, `references` or `strings`.
 Program parts are `functions` (default), `calls`, `references` and `strings`; they never decompile all functions.
-Each call writes normal report.json/report.md into a fresh output folder; it does not write compilable source files.
+Each export query writes normal report.json/report.md into a fresh output folder; it does not write compilable source
+files. The prepare command prints a receipt and maintains the private cache.
 
 Follow the displayed `next_start` for row pages and use it as `text_start` for pseudocode. Row limits are 1..128
 (default 32); text pages request 64..2048 characters (default 1024) but may be smaller to fit the byte limit.
@@ -80,13 +81,21 @@ requires a bounded decompilation in a fresh container. Names, signatures, spans 
 `library_hint` is currently null. Data references identify addresses, not verified global types: use `read_bytes`
 for bounded byte ranges. Preparation and queries never execute the file or rebuilt code.
 
-Projects are opaque on the host and keyed by input hash, exact image, reviewed worker bundle and format. On macOS
-they live under `~/Library/Caches/ReverseAI/ghidra/v1`; on Linux under the safe absolute XDG cache location or
-`~/.cache/reverseai/ghidra/v1`. The private cache retains up to 32 projects / 2 GiB, including temporary data;
-least-recently-used entries are evicted. These files can contain sensitive input-derived content and outlive a CLI
-or MCP session. `doctor` reports cache metadata read-only; ready describes the store, not a promise that a particular
-file is prepared. Windows contained Ghidra/cache is unsupported. On a missing/invalid entry, run prepare again;
-queries do not silently warm up or use an old-image project. No client can choose a cache path or project ID.
+Projects are opaque on the host and keyed by input hash, exact image, reviewed worker bundle and format. Each
+prepared analysis includes a copy of the file's bytes and outlives CLI and MCP sessions until least-recently-used
+eviction or manual deletion. The private cache retains up to 32 projects / 2 GiB, including temporary data. Once an
+input is prepared, its ordinary Ghidra queries also use that prepared analysis.
+
+On macOS the private folder is `~/Library/Caches/ReverseAI/ghidra/v1`; on Linux it is
+`$XDG_CACHE_HOME/reverseai/ghidra/v1` when that base is absolute and safe, otherwise `~/.cache/reverseai/ghidra/v1`.
+To erase the retained analyses, stop ReverseAI instances using the cache and delete that entire `ghidra/v1` folder.
+This is also the recovery for a stray file such as `.DS_Store` or a damaged entry that triggers
+`Private Ghidra cache is unsafe or unavailable.` Run prepare again to create a fresh private cache and analysis.
+An unsafe parent directory still needs its ownership or permissions corrected.
+
+`doctor` reports cache metadata read-only; ready describes the store, not a promise that a particular file is prepared.
+Windows contained Ghidra/cache is unsupported. On a missing/invalid entry, run prepare again; queries do not silently
+warm up or use an old-image project. No client can choose a cache path or project ID.
 
 ## Examples
 

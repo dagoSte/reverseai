@@ -403,6 +403,17 @@ class CacheStore:
     def prepare(self, expected, producer):
         started = time.monotonic()
         key = cache_key(expected)
+        try:
+            found = self.lookup(expected)
+        except CacheError as error:
+            if str(error) != MISSING:
+                raise
+            found = None
+        if found is not None:
+            with found:
+                if time.monotonic() >= started + CONTROLLER_SECONDS:
+                    raise TimeoutError("Ghidra preparation exceeded its limits")
+                return dict(found.manifest), found.analysis_id, "reused", time.monotonic() - started
         with self._directory(create=True) as directory, _locked(directory, "prepare.lock"):
             corrupt = False
             try:
@@ -449,7 +460,9 @@ class CacheStore:
             try:
                 sink = _Sink(fd, started + CONTROLLER_SECONDS)
                 producer(sink)
-                if not sink.size or time.monotonic() >= sink.deadline:
+                if time.monotonic() >= sink.deadline:
+                    raise TimeoutError("Ghidra preparation exceeded its limits")
+                if not sink.size:
                     raise CacheError(UNSAFE)
                 os.fsync(fd)
                 manifest = {"format": 1, "input_sha256": expected["input_sha256"], "image_id": expected["image_id"],
@@ -457,27 +470,30 @@ class CacheStore:
                             "artifact_sha256": sink.digest.hexdigest()}
                 with _locked(directory, "index.lock"):
                     index = self._index(directory)
-                    if time.monotonic() >= sink.deadline:
-                        raise TimeoutError("Ghidra preparation exceeded its limits")
-                    os.replace(temporary, key + ".tar", src_dir_fd=directory, dst_dir_fd=directory)
-                    published = True
-                    _atomic_json(directory, key + ".json", manifest)
-                    index["sequence"] += 1
-                    index["entries"][key] = index["sequence"]
-                    _atomic_json(directory, "index.json", index)
-                    os.fsync(directory)
-                    if time.monotonic() >= sink.deadline:
-                        raise TimeoutError("Ghidra preparation exceeded its limits")
-                return manifest, analysis_id(key, manifest["artifact_sha256"]), "created", time.monotonic() - started
-            except BaseException:
-                if published:
-                    # Even if index/directory fsync failed, no new entry can be replayed.
-                    for suffix in (".tar", ".json"):
-                        try:
-                            os.unlink(key + suffix, dir_fd=directory)
-                        except FileNotFoundError:
-                            pass
-                raise
+                    try:
+                        if time.monotonic() >= sink.deadline:
+                            raise TimeoutError("Ghidra preparation exceeded its limits")
+                        os.replace(temporary, key + ".tar", src_dir_fd=directory, dst_dir_fd=directory)
+                        published = True
+                        _atomic_json(directory, key + ".json", manifest)
+                        index["sequence"] += 1
+                        index["entries"][key] = index["sequence"]
+                        _atomic_json(directory, "index.json", index)
+                        os.fsync(directory)
+                        if time.monotonic() >= sink.deadline:
+                            raise TimeoutError("Ghidra preparation exceeded its limits")
+                        return manifest, analysis_id(key, manifest["artifact_sha256"]), "created", time.monotonic() - started
+                    except BaseException:
+                        if published:
+                            for suffix in (".tar", ".json"):
+                                try:
+                                    os.unlink(key + suffix, dir_fd=directory)
+                                except FileNotFoundError:
+                                    pass
+                            index["entries"].pop(key, None)
+                            _atomic_json(directory, "index.json", index)
+                            os.fsync(directory)
+                        raise
             finally:
                 os.close(fd)
                 try:

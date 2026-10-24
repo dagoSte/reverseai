@@ -60,7 +60,7 @@ class ArgumentSchemaTests(unittest.TestCase):
                                                 "additionalProperties": False})
         for tool in full:
             self.assertTrue(tool["title"] and tool["description"])
-            self.assertEqual(tool["annotations"], {"readOnlyHint": True, "destructiveHint": False,
+            self.assertEqual(tool["annotations"], {"readOnlyHint": tool["name"] != "prepare_file", "destructiveHint": False,
                                                    "idempotentHint": True, "openWorldHint": False})
         for enabled in (frozenset(), frozenset({"jadx"}), frozenset({"jsparser"}), frozenset({"ghidra"})):
             with self.subTest(enabled=enabled):
@@ -69,6 +69,14 @@ class ArgumentSchemaTests(unittest.TestCase):
                 details = tools["analyze_javascript_application"]["inputSchema"]["properties"]["detail"]["enum"]
                 self.assertEqual(details, ["summary", "files", "package", "hints", "modules", "calls", "parse"]
                                  if "jsparser" in enabled else ["summary", "files", "package", "hints"])
+
+    def test_prepare_annotations_disclose_the_private_cache_write(self):
+        tools = {tool["name"]: tool for tool in mcp_tools.catalog(frozenset({"ghidra"}))}
+        self.assertEqual(tools["prepare_file"]["annotations"],
+                         {"readOnlyHint": False, "destructiveHint": False,
+                          "idempotentHint": True, "openWorldHint": False})
+        self.assertTrue(all(tool["annotations"]["readOnlyHint"] for name, tool in tools.items()
+                            if name != "prepare_file"))
 
     def test_catalog_calls_are_independent_and_do_not_probe_workers(self):
         with patch("subprocess.run", side_effect=AssertionError("no process")), \

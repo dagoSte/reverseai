@@ -104,6 +104,7 @@ def admit(data, observations, raw_args, operation):
         _check(item.location == _function_anchor(_SectionIndex(_sections(data)[0]), value["entry"], value["size"]))
         _check(value["status"] == "ok" and all(value[k] == meta[k] for k in ("start", "total", "next_start")))
         _check(all(_integer(value[k], 1048576) for k in ("start", "total")))
+        _check(value["next_start"] is None or type(value["next_start"]) is int)
         text = value["text"]
         _check(isinstance(text, str) and len(text) <= args["max_chars"] and len(text) == meta["count"]
                and all(c.isprintable() or c in "\n\t" for c in text)
