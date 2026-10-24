@@ -644,6 +644,50 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(replies[0]["result"]["content"][0]["text"], mcp.NOTICE + "\n\n" + expected)
             self.assertNotIn(b"/private/secret", wire)
 
+    def test_real_prepare_cli_failure_lines_are_pinned_to_mcp_allowlist(self):
+        from reverseai import ghidra_cache
+        from reverseai.tools import ghidra_tool
+
+        lock = {"image_id": "sha256:" + "c" * 64, "bundle_sha256": "d" * 64, "cache_format": 1}
+        failures = (TimeoutError("private diagnostic /private/secret"),
+                    *(ghidra_cache.CacheError(message) for message in
+                      (ghidra_cache.MISSING, ghidra_cache.UNSAFE, ghidra_cache.BUSY)))
+        lines = set()
+        with tempfile.TemporaryDirectory() as root:
+            sample = Path(root, "sample.bin")
+            sample.write_bytes(b"abcdefgh")
+            for failure in failures:
+                with self.subTest(failure=repr(failure)), \
+                        patch.object(ghidra_tool, "DockerExecutor") as executor, \
+                        patch.object(ghidra_tool, "load_lock", return_value=lock), \
+                        patch.object(ghidra_cache.CacheStore, "prepare", side_effect=failure) as prepare:
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr), \
+                            self.assertRaises(SystemExit) as raised:
+                        cli.main(["prepare", str(sample), "--with-ghidra", "--json"])
+                    self.assertEqual(raised.exception.code, 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(len(stderr.getvalue().splitlines()), 1)
+                    line = stderr.getvalue().strip()
+                    self.assertIn(line, mcp.CLI_FIXED_FAILURES)
+                    if isinstance(failure, ghidra_cache.CacheError):
+                        self.assertEqual(line, "reverseai: analysis failed: " + str(failure))
+                    lines.add(line)
+                    prepare.assert_called_once()
+                    prepare.reset_mock()
+
+                    _, replies, wire, errors = self.serve(request("tools/call", {
+                        "name": "prepare_file", "arguments": {"file": "sample.bin"}}),
+                        root=root, enabled=frozenset({"ghidra"}))
+                    result = replies[0]["result"]
+                    self.assertTrue(result["isError"])
+                    self.assertEqual(result["content"][0]["text"], mcp.NOTICE + "\n\n" + line)
+                    self.assertEqual(errors, "")
+                    self.assertNotIn(b"/private/secret", wire)
+                    prepare.assert_called_once()
+                    executor.return_value.prepare.assert_not_called()
+        self.assertEqual(len(lines), 4)
+
     def test_prepare_rejects_wrong_keys_types_paths_duplicate_keys_and_capture_overflow(self):
         receipt = self.receipt_fixture()
         invalid = ["", "not JSON", "[]", canonical_json(receipt) + "\n/private/secret",
