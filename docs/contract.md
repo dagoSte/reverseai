@@ -1065,7 +1065,7 @@ checkable without a download, a paid call or a hosted CI run. Hosted CI, amd64
 images and a Windows proof are M6b and wait for the owner. The analysis
 contract above is unchanged.
 
-- **Version**: `reverseai.__version__` is the single source, `0.6.0` for M6, `0.6.1` for M6b and `0.6.2` for the presentation release;
+- **Version**: `reverseai.__version__` is the single source, `0.6.0` for M6, `0.6.1` for M6b, `0.6.2` for the presentation release and `0.7.0` for the MCP server;
   `pyproject.toml` declares the same static version and a test pins the two equal.
 - **pyproject.toml** (PEP 621): name `reverseai`, the version, a one-line
   description, `readme = "README.md"`, `requires-python = ">=3.12"`, no
@@ -1265,6 +1265,16 @@ same validation, budgets, gateway, reviewer and reports.
 - **Inputs:** `file` is a relative POSIX path of at most 1,024 bytes, without NUL, empty, `.` or `..` segments and
   not absolute; joined to `DIR`, its `realpath` must stay inside `DIR`. Intake then applies its own checks (one
   regular file, no link, stable while read, at most 64 MiB). Errors name only the relative path the client gave.
+- **Seam rulings (decision mcp-seams):** `analyze_javascript_application`'s archive-member selector is exposed as
+  `member_file` and passed as the query's `file` argument. `analyze_file` passes the enabled flags among LIEF, YARA-X
+  and Ghidra; a query passes only its own relevant enabled worker. A link or reparse point in any relative component
+  of `file` is refused, even when its target stays inside `DIR` (a narrowing of intake for MCP); the check and the
+  read are separate steps, so another process of the same (trusted) user could swap a directory in between.
+  `list_files` visits at most 10,000 entries, returns at most 1,000 files and skips names that are not portable
+  relative POSIX names (non-UTF-8, backslash, colon, control characters), setting `truncated` true at any limit; its
+  `structuredContent` is `{"files": [...], "truncated": bool}`. The 1 MiB line limit includes the line feed; the
+  whole text item is at most 256 KiB; the structured size is the canonical JSON byte length. The server learns an
+  exceeded budget or a failed analysis through a private keyword-only status callback of `reverseai.cli.main`.
 - **Calls:** each call writes its reports into a new directory inside a fresh private temporary directory, reads
   them back and removes the temporary directory whatever the outcome. The command's own stdout and stderr are
   captured, never written to the protocol stream.

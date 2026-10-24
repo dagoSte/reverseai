@@ -4,7 +4,7 @@
 
 <p align="center">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square">
-  <img alt="Version 0.6.2" src="https://img.shields.io/badge/version-0.6.2-38bdf8?style=flat-square">
+  <img alt="Version 0.7.0" src="https://img.shields.io/badge/version-0.7.0-38bdf8?style=flat-square">
   <img alt="Python 3.12 or later" src="https://img.shields.io/badge/python-3.12%2B-3776ab?style=flat-square&logo=python&logoColor=white">
   <img alt="No Python dependencies" src="https://img.shields.io/badge/dependencies-none-22c55e?style=flat-square">
   <img alt="Platforms: macOS, Linux, Windows (experimental)" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows%20(experimental)-64748b?style=flat-square">
@@ -13,7 +13,7 @@
   <img alt="Containers: offline, read-only, non-root" src="https://img.shields.io/badge/containers-offline%20%C2%B7%20read--only%20%C2%B7%20non--root-0ea5e9?style=flat-square&logo=docker&logoColor=white">
   <img alt="Evidence: byte-anchored" src="https://img.shields.io/badge/evidence-byte--anchored-14b8a6?style=flat-square">
   <img alt="Tools: Ghidra, JADX, LIEF, YARA-X, Babel" src="https://img.shields.io/badge/tools-Ghidra%20%C2%B7%20JADX%20%C2%B7%20LIEF%20%C2%B7%20YARA--X%20%C2%B7%20Babel-6366f1?style=flat-square">
-  <img alt="MCP server: planned" src="https://img.shields.io/badge/MCP%20server-planned-a855f7?style=flat-square">
+  <img alt="MCP server: protocol 2026-07-28" src="https://img.shields.io/badge/MCP%20server-2026--07--28-a855f7?style=flat-square">
 </p>
 
 <p align="center">
@@ -33,9 +33,9 @@ verified only what it can prove from the file's own bytes. Every answer says whe
 the file it comes from, which tool produced it and whether ReverseAI verified it
 or it is a tool's interpretation.
 
-It is designed to be driven by an analyst today and by AI agents next, through
-the Model Context Protocol (MCP), so that an agent can investigate a file while
-every answer it receives stays checkable.
+It works from the command line and from AI agents: its MCP server lets Claude Code,
+Codex, Cursor or any other Model Context Protocol client investigate a file, while
+every answer it receives stays checkable and the file never leaves its locked setup.
 
 ## Why ReverseAI
 
@@ -196,6 +196,20 @@ Add `--with-ghidra`, `--with-jadx`, `--with-lief`, `--with-yarax` or
 except Ghidra's build, which still needs network) and running the native proof; the [usage guide](docs/USAGE.md) lists every question,
 option and known limit.
 
+### Use it from an AI agent
+
+Start ReverseAI as a local MCP server over a folder of files you approved; the agent
+sees one tool per question plus `list_files` and `analyze_file`:
+
+```sh
+claude mcp add --transport stdio reverseai -- /path/to/.venv/bin/reverseai mcp --inputs /path/to/approved-files
+```
+
+The server talks only over standard input and output, reads only files inside that
+folder, runs a contained tool only when you add its flag (for example `--with-ghidra`),
+and marks every quoted text from the files as untrusted. Setup for Claude Code, Codex
+and Cursor, and the full security model, are in the [MCP guide](docs/MCP.md).
+
 ## Platforms
 
 | Platform | Status |
@@ -215,13 +229,13 @@ option and known limit.
 - JavaScript applications in ZIP, Electron ASAR, npm package or bundle form:
   inventory, declarations, hints, and syntax with the Babel parser.
 - Offline installation, a setup check, reproducible packages and the MIT license.
+- An MCP server (protocol revision 2026-07-28, with older clients supported) that
+  gives AI agents the same verified questions, confined to a folder you choose.
 
 **Next**
 
 - **Benchmark**: measured accuracy on a public corpus of files with known
   answers, with the method and raw results published.
-- **MCP server**: the same verified questions exposed to AI agents through the
-  Model Context Protocol, so any MCP client can investigate a file safely.
 - **AI analyst team**: agents that plan and ask questions in parallel, with the
   independent reviewer keeping the final word.
 
