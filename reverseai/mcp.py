@@ -35,6 +35,10 @@ COMPACT_CUT = "\n\n[Compact text omitted; " + COMPACT_HINT + ".]"
 CLI_FAILURE_PREFIXES = ("reverseai: input refused: ", "reverseai: query refused: ", "reverseai: analysis failed: ")
 CLI_FIXED_FAILURES = frozenset(("reverseai: this query requires --with-ghidra",
                                 "reverseai: this detail requires --with-jsparser",
+                                "reverseai: analysis failed: Ghidra preparation failed or exceeded its limits",
+                                "reverseai: analysis failed: Ghidra cache busy; retry prepare.",
+                                "reverseai: analysis failed: Private Ghidra cache is unsafe or unavailable.",
+                                "reverseai: analysis failed: Prepared Ghidra analysis is missing or invalid; run reverseai prepare FILE --with-ghidra.",
                                 *(f"reverseai: the {label} worker is unavailable (image lock, image or Docker missing)"
                                   for label in ("LIEF", "YARA-X", "Ghidra", "JADX", "JavaScript parser"))))
 

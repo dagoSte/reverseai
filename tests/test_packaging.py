@@ -344,7 +344,7 @@ print(json.dumps(checks))
             names = set(archive.getnames())
         for name in ("containers/ghidra/project_cache.py", "containers/ghidra/Dockerfile.revise",
                      "containers/ghidra/ghidra_scripts/ReverseAIPrepare.java"):
-            self.assertIn("reverseai-0.7.0/" + name, names)
+            self.assertIn(f"reverseai-{__version__}/" + name, names)
 
 
 if __name__ == "__main__":

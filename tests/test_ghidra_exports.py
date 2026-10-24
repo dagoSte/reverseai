@@ -141,6 +141,48 @@ class TablesAndPagesTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_page()
 
+    def test_function_export_assembly_and_pseudocode_use_the_selected_cached_function(self):
+        function = self.layout["functions"][-1]
+        item = self.query["functions"][-1]
+        def java(format_, args, script):
+            self.assertEqual(script[:5], ["export", "entry", str(function["offset"]), "x", args.get("part", "pseudocode")])
+            start = min(args.get("start", 0), len(function["instructions"]))
+            listing = [{"index": i, "address": function["entry"] + delta, "length": size,
+                        "file_offset": function["offset"] + delta,
+                        "bytes": self.data[function["offset"] + delta:function["offset"] + delta + size].hex(), "text": "INSN"}
+                       for i, (delta, size) in enumerate(function["instructions"])]
+            return {"format": "x", "mode": "export", "options_off": {}, "blocks": self.query["blocks"],
+                    "function": item, "pseudocode": "text 😀\n" * 10000,
+                    "instructions": {"start": start, "total": len(listing), "overflow": False,
+                                     "rows": listing[start:start + args.get("limit", 32)]}}
+        args = arguments("ghidra.export_function", entry=function["entry"], part="assembly", start=1, limit=2)
+        rows = worker.export_rows("ghidra.export_function", args, self.data, root=self.cache, query_of=java)
+        self.assertEqual((rows[0]["value"]["start"], rows[0]["value"]["count"]), (1, 2))
+        for index, row in enumerate(rows[1:], 1):
+            delta, length = function["instructions"][index]
+            self.assertEqual(row["location"], {"offset": function["offset"] + delta, "length": length})
+            self.assertEqual((row["value"]["from"], row["value"]["from_size"]), (function["entry"], function["size"]))
+        args = arguments("ghidra.pseudocode", entry=function["entry"], text_start=65536, max_chars=128)
+        rows = worker.export_rows("ghidra.pseudocode", args, self.data, root=self.cache, query_of=java)
+        self.assertEqual(len(rows), 2)
+        meta, value = [row["value"] for row in rows]
+        self.assertEqual((meta["count"], meta["start"], meta["total"], meta["next_start"]),
+                         (len(value["text"]), value["start"], value["total"], value["next_start"]))
+        self.assertEqual(value["size"], function["size"])
+        self.assertEqual(value["text"], ("text 😀\n" * 10000)[65536:65664])
+
+    def test_decompile_failure_is_metadata_alone_and_wrong_function_anchor_is_refused(self):
+        item = self.query["functions"][0]
+        q = {"format": "x", "mode": "export", "options_off": {}, "blocks": self.query["blocks"],
+             "function": item, "pseudocode": None, "instructions": None}
+        args = arguments("ghidra.pseudocode", entry=self.layout["functions"][0]["entry"])
+        rows = worker.export_rows("ghidra.pseudocode", args, self.data, root=self.cache, query_of=lambda *a: q)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["value"]["status"], rows[0]["value"]["count"]), ("decompile_failed", 0))
+        q["function"] = dict(item, size=item["size"] + 1)
+        with self.assertRaises(worker.InconsistentAnchor):
+            worker.export_rows("ghidra.pseudocode", args, self.data, root=self.cache, query_of=lambda *a: q)
+
     def test_prepared_tables_work_for_each_original_format(self):
         for builder in (pe_refs, macho_refs):
             with self.subTest(format=builder.__name__):

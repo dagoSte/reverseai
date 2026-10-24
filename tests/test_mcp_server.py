@@ -583,6 +583,23 @@ class ServerTests(unittest.TestCase):
             reports.assert_not_called()
             read_report.assert_not_called()
 
+    def test_prepare_forwards_only_exact_fixed_cache_failure_messages(self):
+        messages = ("reverseai: analysis failed: Ghidra preparation failed or exceeded its limits",
+                    "reverseai: analysis failed: Ghidra cache busy; retry prepare.",
+                    "reverseai: analysis failed: Private Ghidra cache is unsafe or unavailable.",
+                    "reverseai: analysis failed: Prepared Ghidra analysis is missing or invalid; run reverseai prepare FILE --with-ghidra.")
+        for message in (*messages, "reverseai: analysis failed: /private/secret", messages[1] + " /private/secret"):
+            def refuse(argv, **kwargs):
+                print(message, file=sys.stderr)
+                return 1
+            with self.subTest(message=message), patch.object(cli, "main", side_effect=refuse):
+                _, replies, wire, _ = self.serve(request("tools/call", {
+                    "name": "prepare_file", "arguments": {"file": "sample.bin"}}), enabled=frozenset({"ghidra"}))
+            self.assertTrue(replies[0]["result"]["isError"])
+            expected = message if message in messages else mcp.FAILURE_MESSAGE
+            self.assertEqual(replies[0]["result"]["content"][0]["text"], mcp.NOTICE + "\n\n" + expected)
+            self.assertNotIn(b"/private/secret", wire)
+
     def test_prepare_rejects_wrong_keys_types_paths_duplicate_keys_and_capture_overflow(self):
         receipt = self.receipt_fixture()
         invalid = ["", "not JSON", "[]", canonical_json(receipt) + "\n/private/secret",
