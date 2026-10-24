@@ -361,6 +361,10 @@ facts against the same file later.
 ReverseAI is a tool for examining files you are entitled to examine. How you use it is
 your responsibility.
 
+- **Intended purpose.** ReverseAI is built for defensive security work: examining
+  suspicious or potentially dangerous software, such as malware, untrusted packages and
+  third-party components, to understand its risks without running it, for incident
+  response, threat analysis and pre-adoption review.
 - **Analyse only what you may analyse.** Use ReverseAI on files you own or are authorised
   to examine. Licence agreements of third-party software may restrict reverse
   engineering, decompilation or disassembly, and the law of your country may allow such
