@@ -1,4 +1,4 @@
-"""Host re-derivation of contained LIEF values (FIX-M2-G1): honest worker replies pass, every forged value is refused.
+"""Host re-derivation of contained LIEF values: honest worker replies pass, every forged value is refused.
 
 The honest replies come from the worker's own logic with faithful LIEF facts (tests/test_lief_worker_logic.py),
 so the host must confirm everything a correct worker can send; no Docker and no LIEF.
@@ -65,7 +65,7 @@ def decoded_at(data, at, index):
 
 
 def g1_forge(operation, reply):
-    """The REL-M2-CLAUDE G1 probe: section 1 (.text, flags 0x6) reported as writable and executable."""
+    """Section 1 (.text, flags 0x6) reported as writable and executable."""
     if operation == "lief.sections":
         reply["observations"][1]["value"].update(flags=0x7, writable=True, executable=True)
 
@@ -297,7 +297,7 @@ class HandlerTests(unittest.TestCase):
                     handler(data, {"max_sections": count})
 
     def test_the_old_unconfirmed_dummy_observations_are_refused(self):
-        """Before FIX-M2-G1, tests/test_lief_tool.py fed the handler these values and the host accepted them."""
+        """Forged worker values must be refused by the host."""
         from tests.test_lief_tool import FakeExecutor, item, reply
         for data in (b"\x7fELF" + bytes(128), elf()[0]):
             for operation, value in (("lief.headers", {"format": "elf", "machine_name": "aarch64", "shnum": 4}),

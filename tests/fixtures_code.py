@@ -1,4 +1,4 @@
-"""Deterministic ELF64 and PE32+ x86-64 fixtures with real instructions, for the M3 Ghidra lanes; no binary files.
+"""Deterministic ELF64 and PE32+ x86-64 fixtures with real instructions, for Ghidra tests; no binary files.
 
 The same four hand-assembled functions are placed in each container:
 
@@ -13,7 +13,7 @@ names them in its LC_SYMTAB and enters at `_start` through LC_MAIN. elf_data_onl
 control with no executable section and no entry point. Each builder returns (data, layout): the
 bytes and the declared addresses, file offsets and sizes, so tests can state exact expectations.
 
-elf_refs(), pe_refs() and macho_refs() (M3c) add a data section and a fifth function, called by
+elf_refs(), pe_refs() and macho_refs() add a data section and a fifth function, called by
 _start after compute:
 
     describe     lea rax, [rip+greeting]; lea rdx, [rip+wide_greeting]; mov ecx, [rip+counter];
@@ -199,7 +199,7 @@ def macho_code():
     return bytes(data), layout
 
 
-# M3c: the same four functions plus describe, with references into a data section.
+# The same four functions plus describe, with references into a data section.
 REFS_FUNCTIONS = (("_start", 0x00), ("add_numbers", 0x20), ("compute", 0x30), ("constant", 0x50), ("describe", 0x60))
 REFS_TEXT_SIZE = 0x86
 DATA_SIZE = 0x50

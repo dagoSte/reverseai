@@ -1,4 +1,4 @@
-"""Deterministic APK, binary Android manifest and DEX fixtures for the M4a lanes; no binary files.
+"""Deterministic APK, binary Android manifest and DEX fixtures; no binary files.
 
 apk_basic() builds a small Android package from declared values only, members in this order:
 

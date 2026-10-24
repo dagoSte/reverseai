@@ -187,7 +187,7 @@ class HostTests(unittest.TestCase):
         self.assertEqual(rows[0].location, Location(layout["code_items"][0]["offset"] + 16, 4096))
 
     def test_escaping_heavy_pages_fit_the_longest_prefix_and_keep_paging(self):
-        # Decision m4b-fix-round replaces oversized-page refusal with clipping.
+        # Oversized pages are clipped.
         for char in ('"', '\\'):
             for maximum in (1024, 2048):
                 for status in ('ok', 'fallback'):
@@ -240,7 +240,7 @@ class HostTests(unittest.TestCase):
                         {**r, 'status': status, 'total': 0, 'text': ''} for r in rows])
 
     def test_success_pages_have_exact_worker_length_before_byte_clipping(self):
-        # Decision next-carries requires a full worker page before host clipping.
+        # Require a full worker page before host clipping.
         for status in ('ok', 'fallback'):
             for start, total, maximum in ((0, 1, 64), (0, 200, 64), (7, 200, 64),
                                           (7, 20, 64), (7, 2055, 2048),
@@ -272,7 +272,7 @@ class HostTests(unittest.TestCase):
         for member in ('assets/x.dex', 'missing.dex', 'classes3.dex'):
             with self.subTest(member=member):
                 executor = Executor(self.layout)
-                # Decision next-carries gives member selection its own fixed message.
+                # Member selection has its own fixed error message.
                 with self.assertRaises(ContractError) as caught:
                     self.invoke({'member': member}, executor=executor, data=data)
                 self.assertEqual(str(caught.exception), 'JADX member is not a classes*.dex member of the input')

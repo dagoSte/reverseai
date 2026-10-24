@@ -75,7 +75,7 @@ class OperationTests(unittest.TestCase):
                 ArgSpec("str").check(bad)
 
     def test_literal_search_text_is_bounded_printable_and_never_contained(self):
-        # Decision m3d-contract: search text may hold "/" or start with "-", but only in-process tools take it.
+        # Search text may hold "/" or start with "-", but only in-process tools take it.
         literal = ArgSpec("literal", 1, 128)
         for good in ("http://example.test/a", "-flag", "a b", "x" * 128, "café"):
             self.assertEqual(literal.check(good), good)

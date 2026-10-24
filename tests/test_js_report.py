@@ -1,5 +1,5 @@
-"""The JavaScript section of query reports (M5a): files, package.json declarations with install-time scripts marked,
-hints grouped by category, a plain statement of what M5a reads, and sample text kept inert."""
+"""The JavaScript section of query reports: files, package.json declarations with install-time scripts marked,
+hints grouped by category, a plain statement of what the lexical tools read, and sample text kept inert."""
 
 from dataclasses import replace
 import hashlib
@@ -92,7 +92,7 @@ class JavaScriptReportTests(unittest.TestCase):
         self.assertNotIn("Next start", "\n".join(section(report.to_markdown(run(J.app_zip(), {"detail": "files"})))))
 
     def test_a_page_missing_a_finding_shows_each_run_and_continues_at_the_first_missing_row(self):
-        # RD-M5A-CODEX-F R1: one hint page of 192 rows in three findings of 64; drop findings and review again
+        # One hint page of 192 rows in three findings of 64; drop findings and review again
         data, _ = J.source(*(("fetch(", ("url_https", f"https://e{i}.example.com/"), ");") for i in range(192)))
         heading = f"### {claims.statement('javascript.hints')}"
 
@@ -127,7 +127,7 @@ class JavaScriptReportTests(unittest.TestCase):
         self.assertNotIn(SECTION, report.to_markdown(analysis).replace(SECTION, "", 1))  # one section only
 
     def test_sample_names_values_and_texts_stay_inert(self):
-        # L0001: HTML, links and backticks from the sample never render. RD-M5A-CODEX-F I1: the JavaScript member's
+        # HTML, links and backticks from the sample never render. The JavaScript member's
         # name has no slash or colon, so it is admitted, and its hint text is the matched hostile literal.
         hostile = "<img src=x onerror=alert(1)>[x](https://evil.example/)`b`"
         name = "<img src=x onerror=alert(1)>[x](y)`b`.js"

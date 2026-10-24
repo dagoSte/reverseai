@@ -224,7 +224,7 @@ class SectionTests(unittest.TestCase):
 
 
 class RefusalTests(unittest.TestCase):
-    # Expected (headers, sections) outcome per M1 malformed input. The worker differs from M1 by design where names
+    # Expected (headers, sections) outcome per malformed host input. The worker differs from the host by design where names
     # are deferred (a bad name table does not matter) and where the PE optional header is read only inside its
     # declared size, the section table then starting where the COFF header says, as the Windows loader does.
     MALFORMED = {

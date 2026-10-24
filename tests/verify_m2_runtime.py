@@ -93,8 +93,8 @@ JSPARSER_PINS = {
 }
 JSPARSER_DRIVER_PATH = Path(__file__).resolve().parents[1] / "containers/jsparser/driver.mjs"
 JSPARSER_WORKER_PATH = Path(__file__).resolve().parents[1] / "containers/jsparser/worker.py"
-# The host's catalog, the only list reverseai.contained admits (validate_jsparser_request); a change to
-# jshints.CALLEES changes these known answers, which must then be renewed (FIX-M5B-V).
+# The host's catalog is the only list reverseai.contained admits (validate_jsparser_request).
+# Changes to jshints.CALLEES require renewing these known answers.
 JSPARSER_CALLEES = tuple(sorted(_JSHINTS_CALLEES))
 JSPARSER_CASE_NAMES = ("app_modules", "app_calls", "app_page", "app_parse", "bundle_modules", "bundle_calls",
                        "dialects_modules", "dialects_calls", "dialects_parse", "boundary_parse", "input_mismatch",
@@ -103,7 +103,7 @@ JSPARSER_REQUIRED_CHECKS = ("local_daemon", "image", "container", *CONTROL_NAMES
                             *(f"jsparser.{name}" for name in JSPARSER_CASE_NAMES))
 JSPARSER_NATIVE_RUNS = len(JSPARSER_REQUIRED_CHECKS) - 3
 # Measured on r6 image sha256:d4c9076d0f6b0e4123704851f4300f08ab5d2f96ae6e4f37faadbcdf7d96492a.
-# Source: coordinator-forwarded m3d-w-native-oracle.json, SHA-256 d8baabf89e32d3147ec08ea231415e9fd68dadf21fdfb3438e888d75f471674d.
+# Native Ghidra query oracle, SHA-256 d8baabf89e32d3147ec08ea231415e9fd68dadf21fdfb3438e888d75f471674d.
 GHIDRA_QUERY_EXPECTED = {'84a2fe7a4e67702df1bfa4434c1c57aa6fee8d21df4717ed47a1f3688d162e4f': {'function_add': [{'location': {'length': 10,
                                                                                                      'offset': 800},
                                                                                         'value': {'callees_total': 0,
@@ -454,7 +454,7 @@ def need(condition, reason):
 def limits(tool):
     """Independent fixed expectations: pids, memory, nanocpus, tmpfs, wall."""
     need(tool in ("lief", "yarax", "ghidra", "jadx", "jsparser"), "VerifierTool")
-    if tool == "jsparser":  # decision m5b-w-plan
+    if tool == "jsparser":
         return (64, 2 * 1024**3, 2_000_000_000, "rw,noexec,nosuid,nodev,size=64m", 120)
     if tool in ("ghidra", "jadx"):
         return (256, 2 * 1024**3, 2_000_000_000, "rw,noexec,nosuid,nodev,size=512m",
@@ -678,7 +678,7 @@ def verify_jadx_lock(lock):
         raise VerificationError("JadxSourcePins") from None
 
 
-# Native forms relayed by coord in m4bv-forms; the Java spelling remains derived.
+# Native method forms; the Java spelling remains derived.
 JADX_FORMS = {"main_init": "omitted", "helper_int": "java", "helper_string": "java",
               "on_create": "java", "marker_init": "java", "compute": "java",
               "worker_init": "omitted", "run": "java", "helper_overloads": "java", "past_end": "java"}
@@ -806,7 +806,7 @@ def verify_jsparser_lock(lock):
         raise VerificationError("JsparserSourcePins") from None
 
 
-# Code-built sources of the dialect archive (M5B-W probe): every status, dialect, module form and callee rule.
+# Code-built sources of the dialect archive: every status, dialect, module form and callee rule.
 JSPARSER_DIALECT_SOURCES = (
     ("view.tsx", b'import React from "react";\nexport const C = (p: {n: string}) => '
                  b'<div onClick={() => fetch("/x")}>{p.n}</div>;\n'),
@@ -836,7 +836,7 @@ def _jsparser_dialects():
     return fixtures_apk.zip_archive([fixtures_apk.member(name, data) for name, data in JSPARSER_DIALECT_SOURCES])
 
 
-# M5c (decision m5c-contract): an npm tarball built in code, its files read through method 1 artifacts.
+# An npm tarball built in code, its files read through method 1 artifacts.
 JSPARSER_TARBALL_SOURCES = (
     ("package/package.json", b'{"name": "fixture", "main": "index.js"}\n'),
     ("package/index.js", b"const cp = require('child_process');\ncp.exec(cmd);\nfetch(url);\n"),
@@ -867,8 +867,8 @@ def _jsparser_tarball():
 
 
 def jsparser_fixtures():
-    # js_boundary is exactly the 4 MiB a single file may have: the host refuses one byte more before any worker
-    # (RD-M5B-CODEX-W R2), so the worker's too_large row is covered by its unit tests, not by a native case.
+    # js_boundary is exactly the 4 MiB a single file may have: the host refuses one byte more before any worker,
+    # so the worker's too_large row is covered by its unit tests, not by a native case.
     tarball = _jsparser_tarball()[0]
     # js_tarball_bad flips one bit of the gzip trailer's CRC-32: the worker must refuse the stream ("input")
     return {"js_app": fixtures_js.app_zip()[0], "js_bundle": fixtures_js.bundle_js()[0],
@@ -913,7 +913,7 @@ def _jsparser_rows(*rows):
             for index, (status, errors, count, items) in enumerate(rows)]
 
 
-# Known answers (M5B-W probe, checked natively): one tuple per file, (status, errors, count, page items).
+# Known answers, checked natively: one tuple per file, (status, errors, count, page items).
 JSPARSER_EXPECTED = {
     "app_modules": _jsparser_rows(("ok", 0, 0, ()), ("ok", 0, 2, (("require", 119, 134), ("require", 156, 160))),
         ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ()), ("ok", 0, 0, ())),

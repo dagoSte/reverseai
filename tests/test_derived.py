@@ -1,4 +1,4 @@
-"""contract/2 derived evidence: anchored in the input, reviewed as "derived", never verified or contradicting."""
+"""Derived evidence: anchored in the input, reviewed as "derived", never verified or contradicting."""
 
 import unittest
 
@@ -41,13 +41,12 @@ class DerivedTests(unittest.TestCase):
         self.assertIn("not verified against the bytes", verdict.reasons[0])
 
     def test_code_claims_stay_derived_even_under_a_misregistered_spec(self):
-        # Decision m3a-derived-claims-by-key: the claim key, not only the spec flag, makes a finding derived.
-        # Decision m3c-contract adds assembly, references and referenced strings; m3d-contract the targeted queries.
+        # The claim key, not only the spec flag, makes a finding derived.
         self.assertEqual(claims.DERIVED_CLAIMS, {"code.functions", "code.pseudocode", "code.calls",
                                                  "code.assembly", "code.references", "code.strings",
                                                  "code.function_list", "code.function_info", "code.instructions",
                                                  "code.callers", "code.xrefs", "android.java",
-                                             "javascript.modules", "javascript.calls", "javascript.parse"})  # M4b, decision m4b-contract
+                                             "javascript.modules", "javascript.calls", "javascript.parse"})
         finding = make_finding("code", "Functions.", "code.functions", ["entry", "helper"], [e.id for e in FUNCTIONS], "inferred")
         self.assertEqual(verdicts([finding], FUNCTIONS, tool(derived=False))[finding.id].status, "derived")
 
@@ -146,7 +145,7 @@ class DerivedTests(unittest.TestCase):
             self.assertEqual(verdicts([finding], [item])[finding.id].status, "unsupported")
 
     def test_a_finding_that_repeats_a_malformed_reading_is_still_refused(self):
-        # RD-M3C-CODEX-C R1: the rule checks each M3c shape itself; echoing a malformed projection is not enough.
+        # The rule checks each code shape itself; echoing a malformed projection is not enough.
         rows = [[0, 1, "PUSH RBP"]]
         good = {"assembly": dict(index=0, entry=0x1000, instructions=rows, truncated=False),
                 "ref": {"from": 0x1000, "to": 0x2000, "type": "read", "to_name": "counter"},
@@ -180,7 +179,7 @@ class DerivedTests(unittest.TestCase):
                 self.assertEqual(verdicts([finding], [item])[finding.id].status, "unsupported", (kind, change))
 
     def test_single_listing_and_single_reading_guards_are_pinned(self):
-        # RD-M3C-CODEX-C I1: equal listings at two locations, and both orders of a conflicting string reading.
+        # Equal listings at two locations, and both orders of a conflicting string reading.
         rows = [[0, 1, "RET"]]
         one = observed(0, kind="assembly", index=0, entry=0x1000, instructions=rows, truncated=False)
         two = observed(64, kind="assembly", index=0, entry=0x1000, instructions=rows, truncated=False)

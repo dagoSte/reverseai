@@ -1,4 +1,4 @@
-"""M5b contract: derived JavaScript syntax pages from the contained parser (decision m5b-contract)."""
+"""Derived JavaScript syntax pages from the contained parser."""
 
 import unittest
 
