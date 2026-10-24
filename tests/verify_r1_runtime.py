@@ -284,15 +284,32 @@ class R1Verifier(old.NativeVerifier):
                 or (operation, canonical_json(args)) in self.allowed)
 
     def runner(self, argv, *, timeout, max_output):
+        row, started = None, None
         if argv[:2] == ["docker", "run"]:
             at = argv.index(self.lock["image_id"])
-            self.requests.append({"operation": argv[at + 1], "args": old.decode(argv[at + 2]),
-                                  "probe": self.active, "timeout": timeout, "max_output": max_output})
+            row = {"operation": argv[at + 1], "args": old.decode(argv[at + 2]),
+                   "probe": self.active, "timeout": timeout, "max_output": max_output}
+            if self.active is not None:
+                row["probe_evidence"] = None
+            self.requests.append(row)
+            started = time.monotonic()
         diagnostic = None
         try:
             with docker_stderr() as diagnostic:
-                return super().runner(argv, timeout=timeout, max_output=max_output)
+                result = super().runner(argv, timeout=timeout, max_output=max_output)
+            if row is not None and row["probe"] is not None and result is not None:
+                try:
+                    evidence = old.decode(result)
+                except old.VerificationError:
+                    pass  # Keep missing evidence explicit; the control still validates the reply.
+                else:
+                    if isinstance(evidence, dict):
+                        row["probe_evidence"] = evidence
+            return result
         finally:
+            if row is not None:
+                # This includes stopped inspection and cleanup; wall evidence times the attached process separately.
+                row["elapsed_seconds"] = time.monotonic() - started
             if diagnostic:
                 self.failed_stderr = diagnostic
 
@@ -311,7 +328,8 @@ class R1Verifier(old.NativeVerifier):
                 return self.boundary.run_prepare_bounded(argv, self.stream, timeout=PREPARE_SECONDS)
             return super().run_bounded(argv, timeout=timeout, max_output=max_output)
         except self.boundary.ContainedError as error:
-            if self.requests and str(error) in ("WorkerTimeout", "WorkerOutputLimit", "WorkerProcessError"):
+            if (argv[:3] == ["docker", "start", "--attach"] and self.requests
+                    and str(error) in ("WorkerTimeout", "WorkerOutputLimit", "WorkerProcessError")):
                 self.requests[-1]["failure"] = str(error)
             raise
 
@@ -365,6 +383,7 @@ class R1Verifier(old.NativeVerifier):
 
     def prepare_control(self, name, data):
         self.active, self.last, self.probe_result = name, None, None
+        request_start, value = len(self.requests), None
         try:
             with tempfile.TemporaryFile() as sink:
                 try:
@@ -386,6 +405,8 @@ class R1Verifier(old.NativeVerifier):
                 old.validate_probe(name, value, tool="ghidra")
             return value
         finally:
+            if len(self.requests) > request_start:
+                self.requests[request_start]["probe_evidence"] = value if isinstance(value, dict) else self.probe_result
             self.finish_call()
 
     def restore(self, data, variant=None):

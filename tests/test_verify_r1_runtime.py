@@ -29,6 +29,9 @@ class FakeBoundary(GhidraFakeBoundary):
     GHIDRA_PREPARE_WALL_SECONDS, GHIDRA_PREPARE_MAX_BYTES = 900, 64 * 1024**2
     default_lock = staticmethod(lambda tool: None)
 
+    class ContainedTimeout(GhidraFakeBoundary.ContainedError, TimeoutError):
+        pass
+
     @staticmethod
     def resource_profile(operation):
         return {"pids": 256, "memory": "2g", "cpus": 2, "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=512m",
@@ -188,7 +191,10 @@ class HarnessTests(SourcePins):
         result = self.native.prepare_control("runtime_identity", b"fixture")
         self.assertEqual(result["uid"], 65534)
         self.assertEqual(self.native.requests, [{"operation": "ghidra.prepare", "args": {}, "probe": "runtime_identity",
-                                               "timeout": 900, "max_output": 64 * 1024**2}])
+                                               "timeout": 900, "max_output": 64 * 1024**2,
+                                               "elapsed_seconds": self.native.requests[0].get("elapsed_seconds"),
+                                               "probe_evidence": result}])
+        self.assertGreaterEqual(self.native.requests[0]["elapsed_seconds"], 0)
         self.assertEqual(self.boundary.prepare_calls[0][1], 900)
         self.assertEqual(self.boundary.prepare_calls[0][0][:3], ["docker", "start", "--attach"])
         created = next(argv for argv, _, _ in self.boundary.calls if argv[:2] == ["docker", "create"])
@@ -198,6 +204,87 @@ class HarnessTests(SourcePins):
         self.assertEqual(self.native.inspected, 1)
         self.assertTrue(self.receipt["cleanup"][0]["verified"])
         self.assertTrue(self.receipt["cleanup"][0]["staging_removed"])
+
+    def test_fake_timeout_preserves_the_real_oserror_inheritance(self):
+        self.assertIsInstance(self.boundary.ContainedTimeout("WorkerTimeout"), self.boundary.ContainedError)
+        self.assertIsInstance(self.boundary.ContainedTimeout("WorkerTimeout"), TimeoutError)
+        self.assertIsInstance(self.boundary.ContainedTimeout("WorkerTimeout"), OSError)
+
+    def wall_control(self, elapsed):
+        clock = Mock(return_value=100.0)
+        def expire(argv, sink, *, timeout):
+            self.assertTrue(self.boundary.running_observed.wait(timeout=1))
+            clock.return_value += elapsed
+            raise self.boundary.ContainedTimeout("WorkerTimeout")
+        with patch.object(verifier.time, "monotonic", clock), \
+                patch.object(self.boundary, "run_prepare_bounded", side_effect=expire):
+            return self.native.record("prepare.wall", lambda: self.native.prepare_control("wall", b"fixture"))
+
+    def test_prepare_wall_records_elapsed_and_the_observed_probe(self):
+        self.assertTrue(self.wall_control(900.1))
+        row = self.native.requests[0]
+        self.assertAlmostEqual(row.get("elapsed_seconds", -1), 900.1)
+        self.assertEqual(row.get("probe_evidence"), self.receipt["checks"][0]["evidence"])
+        self.assertEqual(row["failure"], "WorkerTimeout")
+        self.assertTrue(row["probe_evidence"]["running_observed"])
+        self.assertTrue(self.receipt["cleanup"][0]["verified"])
+        self.assertTrue(self.receipt["cleanup"][0]["staging_removed"])
+
+    def test_failed_wall_keeps_its_short_elapsed_time_and_probe(self):
+        self.assertFalse(self.wall_control(240.1))
+        row = self.native.requests[0]
+        self.assertEqual(self.receipt["checks"][0]["reason"], "R1PrepareWallNotObserved")
+        self.assertAlmostEqual(row.get("elapsed_seconds", -1), 240.1)
+        self.assertAlmostEqual(row.get("probe_evidence", {}).get("elapsed", -1), 240.1)
+
+    def test_failed_prepare_keeps_elapsed_with_explicit_missing_probe(self):
+        clock = Mock(return_value=100.0)
+        def fail(argv, sink, *, timeout):
+            clock.return_value = 100.25
+            raise self.boundary.ContainedError("WorkerProcessError")
+        with patch.object(verifier.time, "monotonic", clock), \
+                patch.object(self.boundary, "run_prepare_bounded", side_effect=fail):
+            self.assertFalse(self.native.record("prepare.wall", lambda: self.native.prepare_control("wall", b"fixture")))
+        row = self.native.requests[0]
+        self.assertEqual(row.get("elapsed_seconds"), .25)
+        self.assertIn("probe_evidence", row)
+        self.assertIsNone(row["probe_evidence"])
+        self.assertEqual(row["failure"], "WorkerProcessError")
+
+    def test_failed_prepare_validation_keeps_the_received_probe(self):
+        evidence = {**ghidra_probe_fixture("runtime_identity"), "uid": 0}
+        self.boundary.output = canonical_json(evidence).encode()
+        self.assertFalse(self.native.record("prepare.runtime_identity",
+                                          lambda: self.native.prepare_control("runtime_identity", b"fixture")))
+        row = self.native.requests[0]
+        self.assertEqual(row.get("probe_evidence"), evidence)
+        self.assertIsInstance(row.get("elapsed_seconds"), float)
+
+    def test_query_control_records_its_probe_and_elapsed_time(self):
+        evidence = ghidra_probe_fixture("runtime_identity")
+        self.boundary.output = canonical_json(evidence).encode()
+        raw = self.native.invoke(b"fixture", "ghidra.analyze", old.ghidra_args(), probe="runtime_identity")
+        row = self.native.requests[0]
+        self.assertEqual(old.decode(raw), evidence)
+        self.assertEqual(row.get("probe_evidence"), evidence)
+        self.assertIsInstance(row.get("elapsed_seconds"), float)
+        self.assertGreaterEqual(row["elapsed_seconds"], 0)
+
+    def test_ordinary_query_records_elapsed_without_probe_evidence(self):
+        self.native.invoke(b"fixture", "ghidra.analyze", old.ghidra_args())
+        row = self.native.requests[0]
+        self.assertIsInstance(row.get("elapsed_seconds"), float)
+        self.assertGreaterEqual(row["elapsed_seconds"], 0)
+        self.assertNotIn("probe_evidence", row)
+
+    def test_cleanup_error_cannot_replace_the_attached_worker_failure(self):
+        self.boundary.prepare_error = self.boundary.ContainedError("WorkerOutputLimit")
+        evidence = self.native.prepare_control("stdout", b"fixture")
+        with patch.object(self.boundary, "run_bounded", side_effect=self.boundary.ContainedError("WorkerProcessError")):
+            with self.assertRaises(self.boundary.ContainedError):
+                self.native.runner(["docker", "kill", "reverseai-unit"], timeout=5, max_output=256)
+        self.assertEqual(self.native.requests[0]["failure"], "WorkerOutputLimit")
+        self.assertEqual(self.native.requests[0].get("probe_evidence"), evidence)
 
     def test_prepare_cap_plus_one_is_fixed_and_failure_is_observed_at_real_drain_seam(self):
         self.boundary.prepare_error = self.boundary.ContainedError("WorkerOutputLimit")
