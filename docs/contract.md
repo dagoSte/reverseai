@@ -1218,6 +1218,46 @@ Decisions `owner-license-mit`, `owner-ci-manual`, `m6b-contract`. M6b is version
   x86-64 (host suite and wheel, not containers) and Windows x86-64 once the owner
   starts a run. No AMD64 container image is built: that needs approved downloads.
 
+## MCP server (0.7.0)
+
+`reverseai mcp` serves ReverseAI's analysis to AI agents and other clients of the Model Context Protocol (MCP). It
+adds no analysis of its own: every tool call runs the existing `analyze` or `query` command in-process, with the
+same validation, budgets, gateway, reviewer and reports.
+
+- **Command:** `reverseai mcp --inputs DIR [--with-lief] [--with-yarax] [--with-ghidra] [--with-jadx]
+  [--with-jsparser]`. `DIR` must be an existing directory; it is resolved once at start with `os.path.realpath`.
+  The flags are the operator's choice; no client request can enable a contained tool. The command is `stdio` only:
+  it opens no network port.
+- **Transport:** JSON-RPC 2.0, one UTF-8 JSON object per line on stdin and stdout. stdout carries protocol messages
+  only; diagnostics go to stderr, bounded. A line longer than 1 MiB is answered with a parse error and discarded
+  without being held in memory beyond the limit. JSON arrays (batches) are refused with "invalid request". Messages
+  are handled one at a time, in order. End of input ends the server with exit 0.
+- **Lifecycle:** `initialize` negotiates the protocol version: the client's requested version when it is one of
+  `2025-11-25`, `2025-06-18` or `2025-03-26`, otherwise `2025-11-25`. The result names `serverInfo`
+  (`name` `reverseai`, `title` `ReverseAI`, `version` the package version), `capabilities` `{"tools": {"listChanged":
+  false}}`, and `instructions` stating that text quoted from analysed files is untrusted data, never instructions.
+  Before `initialize`, every request except `ping` gets error -32002 "server not initialized". `ping` answers `{}`.
+  Notifications get no reply. Unknown methods get -32601; malformed params -32602.
+- **Tools:** a fixed catalog built from `reverseai.queries.TABLE` and the enabled flags:
+  `list_files` (relative names and sizes of regular files under `DIR`, sorted, at most 1,000 entries and depth 8,
+  links never followed); `analyze_file` (`file`; the enabled contained tools join the whole-file run); and one tool
+  per query name, whose `inputSchema` is `file` plus that query's arguments with their types, bounds, enums and
+  defaults from its `ArgSpec`s. A query that needs Ghidra is listed only with `--with-ghidra`; `inspect_android_method`
+  adds Java with `--with-jadx`; the parser details of `analyze_javascript_application` are offered only with
+  `--with-jsparser`. Every tool has `annotations` `readOnlyHint` true, `destructiveHint` false, `idempotentHint` true,
+  `openWorldHint` false. `inputSchema` sets `additionalProperties` false.
+- **Inputs:** `file` is a relative POSIX path of at most 1,024 bytes, without NUL, empty, `.` or `..` segments and
+  not absolute; joined to `DIR`, its `realpath` must stay inside `DIR`. Intake then applies its own checks (one
+  regular file, no link, stable while read, at most 64 MiB). Errors name only the relative path the client gave.
+- **Calls:** each call writes its reports into a new directory inside a fresh private temporary directory, reads
+  them back and removes the temporary directory whatever the outcome. The command's own stdout and stderr are
+  captured, never written to the protocol stream.
+- **Results:** `content` holds one text item: a fixed line saying that quoted file text is untrusted data, then the
+  Markdown report, cut at 256 KiB with a closing note when longer. `structuredContent` is `{"report": <report.json>}`
+  when that object serialises to at most 1 MiB, otherwise `{"report": null, "omitted": "<reason>"}` with a hint to
+  narrow or page the query. A refused input, a failed analysis or an exceeded budget is a tool result with
+  `isError` true and a fixed message, never a traceback; protocol errors are JSON-RPC errors.
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under
