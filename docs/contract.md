@@ -1304,7 +1304,9 @@ bytes; the cached project is always untrusted (a matching digest proves storage 
   entrypoint, exact file set). Lock keys r7: adapter_version, base_digest, ghidra_sha256, jdk_sha256,
   parent_image_id, bundle_sha256, cache_format, image_id, platform; `bundle_sha256` is the SHA-256 of the canonical
   JSON map relative path -> SHA-256 of every worker, helper, Java script and options file. An r6 lock is never
-  admitted as r7. The full networked build stays as it is.
+  admitted as r7. The full networked build copies the same bundle file set and writes an r7 lock with
+  `parent_image_id: null` (revise writes the r6 ID); it is not run in 0.8.0. No frozen r6 copy is kept: the r6 bytes
+  are reproducible from tag v0.7.0. `parent_image_id` is informational and not part of the cache key.
 - **Prepare.** CLI `reverseai prepare FILE --with-ghidra [--json]` and the MCP tool `prepare_file(file)` (listed only
   with `--with-ghidra`) run the internal operation `ghidra.prepare` (args `{}`): import, fixed analysis, export tables,
   close, then write ONLY an uncompressed USTAR archive on stdout through a dedicated streaming sink (<= 64 MiB, never
@@ -1326,7 +1328,8 @@ bytes; the cached project is always untrusted (a matching digest proves storage 
   and manifest, atomic rename, index last, fsync directory. A lookup re-hashes the whole body. `doctor` reports
   `ghidra_cache {state: absent|unsafe|ready|unsupported, entries, bytes, max_entries, max_bytes, artifact_max_bytes}`
   read-only.
-- **Restore.** A cached call stages `input`, `project.tar` and a <= 4,096-byte host-built `cache.json` in the same
+- **Restore.** A cached call stages `input`, `project.tar` and a <= 4,096-byte host-built `cache.json` (exactly the manifest
+  keys `{format: 1, input_sha256, image_id, bundle_sha256, size, artifact_sha256}`; no analysis_id or store data) in the same
   disposable read-only `/snapshot` (no new mount or flag). The worker re-hashes and strictly unpacks into fresh tmpfs:
   USTAR only, valid checksums and octal sizes, <= 4,096 headers, <= 64 MiB tar, <= 128 MiB unpacked, depth <= 16, names
   relative ASCII <= 240 bytes with components `[A-Za-z0-9_.~+-]{1,64}` (not `.` or `..`), only `cache/project/...` and
@@ -1360,7 +1363,9 @@ bytes; the cached project is always untrusted (a matching digest proves storage 
     `type` from the existing `refs` enumeration;
   - `{kind: "string_export", index, from, from_size, at, instruction_length, address, encoding, text, truncated}` at
     the string bytes, with the instruction `[at, at + instruction_length)` mapped and cited separately, one row per
-    `(from, at, address, encoding)` and the existing decoding rules;
+    `(from, at, address, encoding)` and the existing decoding rules; after admission the host adds its own
+    `{kind: "string_reference_anchor", index, from, from_size, at, address, instruction_length}` at the instruction
+    bytes, so the finding cites both (the worker's 129-observation cap is unchanged);
   - `{kind: "function_info", name, entry, size, matches, signature, signature_truncated, library_hint, totals:
     {assembly, callees, callers, references, strings}, pseudocode_status: "not_requested"}` at the function's anchor;
   - `{kind: "pseudocode_page", entry, text_sha256, start, total, text, next_start, status}` at the function's anchor.
