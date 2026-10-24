@@ -18,3 +18,8 @@ runtime/
 worktrees/
 *.pem
 *.key
+
+# Local MCP client settings hold private absolute paths
+.mcp.json
+.cursor/
+.codex/

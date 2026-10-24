@@ -22,7 +22,9 @@ do not analyse a file during setup.
    directly. Wait for the answer before registering a server.
 5. Follow [MCP client configuration](MCP.md#configuring-a-client) for your own
    client. Register ReverseAI with the absolute installed executable path and
-   that approved directory as `--inputs`. Preserve unrelated configuration and
+   that approved directory as `--inputs`, in the user's own settings (Claude Code's
+   default local scope or `--scope user`, `~/.codex/config.toml`, `~/.cursor/mcp.json`),
+   never in a project file inside this checkout, whose paths could be committed. Preserve unrelated configuration and
    existing servers; ask before replacing a conflicting ReverseAI entry. Start
    with no `--with-*` worker flags. Do not register servers for other clients.
 6. Connect or reload the server using your client's normal MCP mechanism. Call

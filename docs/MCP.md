@@ -70,13 +70,15 @@ example `"--with-ghidra"`.
 
 ### Claude Code
 
-Add the server for this project (stored in `.mcp.json`, shared with the project):
+Add the server for yourself (the default `local` scope, or `--scope user` for every project):
 
 ```sh
-claude mcp add --transport stdio --scope project reverseai -- /path/to/.venv/bin/reverseai mcp --inputs /path/to/approved-inputs
+claude mcp add --transport stdio reverseai -- /path/to/.venv/bin/reverseai mcp --inputs /path/to/approved-inputs
 ```
 
-Or write the project's `.mcp.json` yourself:
+The configuration holds your absolute paths, so keep it in your own settings. A project scope (`--scope project`)
+writes `.mcp.json` into the project and shares it with everyone who uses it; use it only for paths that are meant to
+be shared, never inside the ReverseAI checkout, and keep it out of version control:
 
 ```json
 {
@@ -90,8 +92,7 @@ Or write the project's `.mcp.json` yourself:
 }
 ```
 
-Use `--scope local` (the default) to keep it to yourself, or `--scope user` for every project. Claude Code asks
-before it first uses a project's servers from `.mcp.json`. It warns when one tool result passes 10,000 tokens and
+Claude Code asks before it first uses a project's servers from `.mcp.json`. It warns when one tool result passes 10,000 tokens and
 stores results over its limit (25,000 tokens by default, or 50,000 characters of text) in a file instead of the
 conversation; prefer paged queries, or raise `MAX_MCP_OUTPUT_TOKENS` before starting Claude Code.
 
@@ -101,7 +102,8 @@ conversation; prefer paged queries, or raise `MAX_MCP_OUTPUT_TOKENS` before star
 codex mcp add reverseai -- /path/to/.venv/bin/reverseai mcp --inputs /path/to/approved-inputs
 ```
 
-Or add it to `~/.codex/config.toml` (or a trusted project's `.codex/config.toml`):
+Or add it to your own `~/.codex/config.toml` (a project's `.codex/config.toml` is shared with the project; keep
+private paths out of it):
 
 ```toml
 [mcp_servers.reverseai]
@@ -115,7 +117,8 @@ Codex stops a tool call after 60 seconds by default; Ghidra queries can take up 
 
 ### Cursor
 
-Put this in the project's `.cursor/mcp.json` (or `~/.cursor/mcp.json` for every project):
+Put this in `~/.cursor/mcp.json` (your own settings, for every project). A project's `.cursor/mcp.json` is shared
+with the project; keep private paths out of it:
 
 ```json
 {
