@@ -235,7 +235,7 @@ class CacheHandle:
                 os.close(fd)
         finally:
             os.close(target)
-            self._release()
+            self.close()
 
     def close(self):
         if self.fd is not None:

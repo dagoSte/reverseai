@@ -85,6 +85,7 @@ class CacheTests(unittest.TestCase):
             manifest = dict(handle.manifest)
             handle.stage(target)
             self.assertIsNone(handle._lease)
+            self.assertIsNone(handle.fd)
         self.assertEqual({p.name for p in target.iterdir()}, {"project.tar", "cache.json"})
         self.assertEqual((target / "project.tar").read_bytes(), self.blob)
         self.assertEqual(json.loads((target / "cache.json").read_text()), manifest)

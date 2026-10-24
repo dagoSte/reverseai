@@ -17,6 +17,7 @@ from types import MappingProxyType
 import uuid
 
 from reverseai.contract import ArgSpec, ContractError, MAX_WORKER_REPLY_BYTES, canonical_json, check_artifact, sha256_hex
+from reverseai.ghidra_cache import CacheError
 
 STAGING_ROOT = Path("/Users/Shared/rea-safe-staging-501")
 WALL_SECONDS = 45
@@ -496,7 +497,7 @@ class DockerExecutor:
             started = False  # --rm has removed the successfully completed container.
             succeeded = True
             return raw
-        except (ContainedError, KeyboardInterrupt, SystemExit):
+        except (ContainedError, CacheError, KeyboardInterrupt, SystemExit):
             raise
         except (TimeoutError, subprocess.TimeoutExpired):
             raise ContainedTimeout("WorkerTimeout") from None
