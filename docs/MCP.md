@@ -1,8 +1,8 @@
 # Using ReverseAI from an MCP client
 
 `reverseai mcp` lets an AI agent, or any other client of the Model Context Protocol (MCP), ask ReverseAI the same
-questions as the command line. It adds no analysis of its own: every tool call runs the existing `analyze` or
-`query` command, with the same checks, budgets, reviewer and reports. For the questions themselves see
+questions as the command line. Analysis calls run the existing `analyze` or `query` command, with the same checks,
+budgets, reviewer and reports. `prepare_file` runs the explicit `prepare` command for cached Ghidra analysis. For the questions themselves see
 [USAGE](USAGE.md); for installation see [INSTALL](INSTALL.md); for the trust model see [SECURITY](SECURITY.md).
 
 ```sh
@@ -29,26 +29,32 @@ over its standard input and output; you do not run it by hand.
   with a line saying so, and the server's instructions tell the agent to treat that text as data, never as
   instructions. A file can still contain text written to mislead an agent, so keep a person in the loop for any
   action an agent proposes after reading a report.
-- **Bounded results.** The Markdown report is cut at 256 KiB with a closing note; the JSON report is included as
-  `structuredContent` up to 1 MiB, otherwise it is omitted with a hint to narrow or page the query. Each call's
-  reports are written to a private temporary directory that is removed afterwards.
+- **Bounded results.** Analysis/query calls default to `view=compact`: reviewed findings and minimal citations,
+  without repeated evidence bodies, up to 4 KiB text and 64 KiB structured JSON. Use `view=full` to request the
+  bounded Markdown/JSON reports (256 KiB text, 1 MiB structured). An oversized report is explicitly omitted; reduce
+  the page limit or `max_chars`. Temporary report folders are removed after each call; prepared projects persist
+  in the private cache until eviction and can contain sensitive input-derived data.
 - **Errors are messages.** A wrong argument, a refused file, a failed analysis or an exceeded budget comes back as a
   tool result marked as an error with a short, fixed explanation.
 
 ## Tools
 
-All tools are read-only and idempotent. They are listed in one page, in this order:
+Tools do not modify approved inputs. Preparation maintains a private cache; it never executes the input. The fixed
+catalog is listed in one page:
 
 | Tool | What it does | Needs |
 | --- | --- | --- |
 | `list_files` | Names and sizes of the regular files under `DIR` | - |
 | `analyze_file` | The whole-file analysis of one file | LIEF, YARA-X and Ghidra join the run when enabled |
+| `prepare_file` | Prepare or reuse a private Ghidra project; returns a small receipt, never the project | `--with-ghidra` |
 | `binary_overview`, `list_segments`, `inspect_native_load_image`, `list_names`, `read_bytes`, `list_strings`, `search_strings` | Native file structure, names, bytes and strings, verified on the host | - |
 | `list_procedures`, `search_procedures`, `procedure_info`, `procedure_pseudo_code`, `procedure_assembly`, `procedure_callees`, `procedure_callers`, `analyze_function`, `xrefs` | Functions, code and references as Ghidra reads them | `--with-ghidra` |
+| `export_function`, `export_program` | One part/page of a prepared function or program | `--with-ghidra` and `prepare_file` first |
 | `inspect_android_package`, `search_android_classes`, `inspect_android_class`, `inspect_android_method`, `trace_android_references` | APK and DEX structure verified on the host | `--with-jadx` adds Java to `inspect_android_method` |
 | `analyze_javascript_application` | Files, package.json declarations and lexical hints of a JavaScript ZIP, ASAR, npm tarball or bundle | `--with-jsparser` adds the module, call and parse details |
 
-Each query tool takes `file` plus that query's own arguments, with the types, limits and defaults the command line
+Analysis and query tools also accept `view=compact|full` (default compact); this is an MCP display option, not a query
+argument. `prepare_file` accepts only `file`. Each query tool takes `file` plus that query's own arguments, with the types, limits and defaults the command line
 uses; the client sees them in the tool's input schema, and unknown arguments are refused. Large lists are paged
 with `start` and `limit`, as on the command line. For `analyze_javascript_application` the archive is `file`, and
 one file inside it is chosen with `member_file` (the command line's `--arg file=`). A query uses only its own
@@ -58,8 +64,31 @@ syntax details.
 `list_files` returns `structuredContent` `{"files": [{"name": ..., "size": ...}], "truncated": ...}` and a readable
 listing. It visits at most 10,000 entries to a depth of 8 and returns at most 1,000 files; names that are not plain
 portable relative names (not UTF-8, or with a backslash, a colon or a control character) are skipped. `truncated`
-is true whenever a limit was reached or a name was skipped. The other tools return the report as
-`structuredContent` `{"report": ...}`.
+is true whenever a limit was reached or a name was skipped. Analysis/query tools return `structuredContent`
+`{"report": ...}`; `prepare_file` returns `{"preparation": ...}` with its storage/runtime receipt.
+
+## Prepared native export workflow
+
+With Ghidra enabled by the operator, call `prepare_file({"file":"program"})` once. It can take up to 1,020 seconds,
+including lock wait and host work; if the client cannot wait that long, run `reverseai prepare FILE --with-ghidra`
+in the terminal first. No analysis call silently starts this warm-up. Existing preview queries still work without it.
+
+Then ask for bounded pages:
+
+```json
+{"file":"program","part":"functions","start":0,"limit":32}
+```
+
+Pass that object to `export_program`, then follow `next_start`. Use `part=calls`, `references` or `strings` for the
+other tables. `export_function` selects an entry or exact name and one part (`info` by default); pseudocode uses
+`text_start` and `max_chars`, while assembly/call/reference/string parts use `start` and `limit`.
+`procedure_pseudo_code` keeps its bounded `mode=preview` default; set `mode=paged` after preparation.
+
+Record the input hash and `analysis_id` with every page. Do not mix different analysis IDs; pseudocode pages must
+also share `text_sha256`. A missing/invalid cache entry gives the explicit prepare command. The cache checks every
+opaque project's size/hash, while observations still cite the original file bytes; signatures, functions and
+relationships remain Ghidra's interpretation. No program export decompiles all functions, compiles code or executes
+an input. See [the CLI workflow and limits](USAGE.md#prepared-native-exports).
 
 ## Configuring a client
 

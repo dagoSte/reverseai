@@ -127,7 +127,7 @@ class QueryTests(unittest.TestCase):
                         self.assertEqual(analysis.results[0].findings, ())
                     self.assertEqual(report.to_json(analysis), report.to_json(pipeline.query_bytes(data, ref, name, args)))
 
-    def test_the_table_has_exactly_the_sixteen_native_five_android_and_one_javascript_names_and_fixed_operations(self):
+    def test_the_closed_table_names_and_operations_include_paged_exports(self):
         expected = {
             "binary_overview": ("structure.identify", "structure.headers", "structure.sections", "structure.imports", "structure.entry"),
             "list_segments": ("structure.segments",), "inspect_native_load_image": ("structure.segments", "structure.entry"),
@@ -138,6 +138,8 @@ class QueryTests(unittest.TestCase):
                                                      "procedure_callees", "procedure_callers", "analyze_function")},
             "xrefs": ("ghidra.xrefs",),
         }
+        expected.update({"procedure_pseudo_code": ("ghidra.function",),
+                         "export_function": ("ghidra.export_function",), "export_program": ("ghidra.export_program",)})
         expected.update({  # The five Android names
             "inspect_android_package": ("apk.inventory", "apk.manifest"), "search_android_classes": ("dex.classes",),
             "inspect_android_class": ("dex.classes", "dex.methods"),
@@ -153,6 +155,8 @@ class QueryTests(unittest.TestCase):
             spec, checked = queries.resolve(name, args)
             self.assertEqual(tuple(request.operation for request in spec.requests(checked)), operations)
             self.assertEqual(spec.role, "code" if operations[0].startswith("ghidra.") else "structural")
+        spec, checked = queries.resolve("procedure_pseudo_code", {"mode": "paged", "text_start": 100})
+        self.assertEqual([(r.operation, r.args["text_start"]) for r in spec.requests(checked)], [("ghidra.pseudocode", 100)])
         for name, part in (("procedure_info", "info"), ("procedure_assembly", "assembly"), ("analyze_function", "all")):
             spec, checked = queries.resolve(name, {})
             self.assertEqual(spec.requests(checked)[0].args["parts"], part)

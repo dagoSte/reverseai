@@ -3,27 +3,53 @@
 from reverseai.contained import ContainedError, DockerExecutor, default_lock, inspect_image, load_lock
 from reverseai.contract import ArgSpec, ContractError, OperationSpec, ToolRef, ToolSpec, WorkerError, parse_worker_reply, sha256_hex
 from reverseai.tools import ghidra_verify
+from reverseai import ghidra_args, ghidra_cache
+from reverseai.contract import Observation
 
-REF = ToolRef("ghidra", "12.1.4-r6")
+REF = ToolRef("ghidra", "12.1.4-r7")
 DEFAULT_LOCK = default_lock("ghidra")
 
 
-def make_tool(executor=None):
+def make_tool(executor=None, *, store=None):
     if executor is None:
         executor = DockerExecutor(DEFAULT_LOCK, adapter_version=REF.version)
+        if store is None:
+            store = ghidra_cache.CacheStore()
     lock = load_lock(executor.lock, adapter_version=REF.version)
 
     def invoke(operation, data, args):
         spec = operations[operation]
         checked = spec.validate_args(args)
         digest = sha256_hex(data)
-        raw = executor.run(operation, checked, data, digest)
+        exported = operation in ghidra_args.OPERATIONS
+        if exported:
+            checked = ghidra_args.check(operation, checked)
+        project = None
+        if store is not None:
+            try:
+                project = store.lookup(ghidra_cache.identity(digest, lock))
+            except ghidra_cache.CacheError:
+                if exported:
+                    raise
+        if exported and project is None:
+            raise ghidra_cache.CacheError(ghidra_cache.MISSING)
         try:
-            observations = parse_worker_reply(raw, input_sha256=digest, max_observations=spec.max_observations)
+            raw = (executor.run(operation, checked, data, digest, project=project) if project is not None
+                   else executor.run(operation, checked, data, digest))
+            source_id = None if project is None else project.analysis_id
+        finally:
+            if project is not None:
+                project.close()
+        try:
+            observations = parse_worker_reply(raw, input_sha256=digest,
+                                              max_observations=129 if exported else spec.max_observations)
         except WorkerError:
             raise
         except (ContractError, UnicodeError):
             raise ContractError(ghidra_verify.REFUSED) from None
+        if exported:
+            admitted = ghidra_verify.verify(data, observations, checked, operation=operation)
+            return tuple(Observation(item.location, {**item.value, "analysis_id": source_id}) for item in admitted)
         if operation == "ghidra.analyze":
             ghidra_verify.verify(data, observations, checked)
         else:
@@ -67,8 +93,24 @@ def make_tool(executor=None):
             "limit": ArgSpec("int", 1, 256, default=64),
         }, 256),
     }
+    for name, args in ghidra_args.OPERATIONS.items():
+        operations[name] = operation(name, args, 257)
     return ToolSpec(REF, operations, contained=True,
                     runtime={"image": lock["image_id"], "platform": lock["platform"]})
+
+
+def prepare(data, *, executor=None, store=None):
+    """Explicit trusted controller operation; a project is storage, never evidence."""
+    executor = executor if executor is not None else DockerExecutor(DEFAULT_LOCK, adapter_version=REF.version)
+    store = store if store is not None else ghidra_cache.CacheStore()
+    lock = load_lock(executor.lock, adapter_version=REF.version)
+    digest = sha256_hex(data)
+    manifest, source_id, state, seconds = store.prepare(ghidra_cache.identity(digest, lock),
+                                                        lambda sink: executor.prepare(data, digest, sink))
+    return {"schema": "reverseai.prepare/1", "input": {"sha256": digest, "size": len(data)},
+            "analysis_id": source_id, "state": state,
+            "runtime": {"image": lock["image_id"], "platform": lock["platform"], "bundle_sha256": lock["bundle_sha256"]},
+            "cache_format": 1, "artifact_size": manifest["size"], "elapsed_seconds": seconds}
 
 
 def available(lock=None, *, inspect=None):

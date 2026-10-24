@@ -38,6 +38,8 @@ _QUERY_TEXT = {
     "search_procedures": ("Search functions", "Find functions by name in Ghidra's derived reading."),
     "procedure_info": ("Inspect a function", "Read Ghidra's derived metadata for a function by entry or exact name."),
     "procedure_pseudo_code": ("Decompile a function", "Read derived pseudocode for a function; it is not verified source."),
+    "export_function": ("Export a function page", "Read one part of a prepared Ghidra function; results are derived."),
+    "export_program": ("Export a program page", "Read a page of prepared functions, calls or references without decompiling all functions."),
     "procedure_assembly": ("Read assembly", "Page through a function's derived instruction listing."),
     "procedure_callees": ("List function callees", "Read Ghidra's derived calls from a selected function."),
     "procedure_callers": ("List function callers", "Read Ghidra's derived call sites targeting a selected function."),
@@ -102,9 +104,17 @@ def catalog(enabled: frozenset) -> list[dict]:
         _tool("analyze_file", "Analyze a file", "Run static whole-file analysis without executing the input.",
               {"file": dict(file_schema)}, ["file"]),
     ]
+    view = {"type": "string", "enum": ["compact", "full"], "default": "compact",
+            "description": "Compact reviewed findings, or full bounded reports including evidence bodies."}
+    tools[1]["inputSchema"]["properties"]["view"] = dict(view)
+    if "ghidra" in enabled:
+        tools.append(_tool("prepare_file", "Prepare a native file",
+                           "Create or reuse a private pinned Ghidra analysis without executing the input. This can take up to 17 minutes.",
+                           {"file": dict(file_schema)}, ["file"]))
     for name in _query_names(enabled):
         spec = queries.TABLE[name]
         properties = {"file": dict(file_schema),
+                      "view": dict(view),
                       **{_argument_name(key): _schema(value) for key, value in spec.args.items()}}
         if name == "analyze_javascript_application":
             properties["member_file"]["description"] = ("Printable archive member selector used with detail hints, "
@@ -211,9 +221,17 @@ def list_files(root: str) -> dict:
 
 def command(name, arguments, *, root: str, out: str, enabled: frozenset) -> list[str]:
     enabled = _enabled(enabled)
-    if not isinstance(name, str) or (name != "analyze_file" and name not in _query_names(enabled)):
+    if not isinstance(name, str) or (name != "analyze_file" and name not in _query_names(enabled)
+                                   and not (name == "prepare_file" and "ghidra" in enabled)):
         raise UnknownTool
     if not isinstance(arguments, dict) or "file" not in arguments:
+        raise ToolInputError(_BAD_ARGUMENTS)
+    if name == "prepare_file":
+        if set(arguments) != {"file"}:
+            raise ToolInputError(_BAD_ARGUMENTS)
+        return ["prepare", _input_path(root, arguments["file"]), "--with-ghidra", "--json"]
+    arguments = dict(arguments)
+    if arguments.pop("view", "compact") not in ("compact", "full"):
         raise ToolInputError(_BAD_ARGUMENTS)
     if name == "analyze_file":
         if set(arguments) != {"file"}:

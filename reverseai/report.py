@@ -195,6 +195,44 @@ def _query_details(rows):
     return lines
 
 
+def _export_details(rows):
+    """Render reviewed export values once as complete, bounded pages."""
+    lines = []
+    for _, finding in rows:
+        key, value = finding["claim_key"], finding["value"]
+        if key == "code.export_page":
+            lines += ["", "### Prepared analysis page (derived)", "",
+                      f"Analysis: {_cell(value['analysis_id'], limit=64)}",
+                      f"Part: {_cell(value['scope'])} / {_cell(value['part'])}; status: {_cell(value['status'])}"]
+            if value["count"] == 0:
+                lines += [f"No rows shown; cursor {value['start']} of {value['total']}."]
+            continue
+        if key == "code.pseudocode_page":
+            start, count = value["start"], len(value["text"])
+            shown = f"characters {start}..{start + count - 1} of {value['total']}" if count else f"No characters shown at {start} of {value['total']}"
+            lines += ["", "### Pseudocode character page (derived)", "", shown,
+                      f"Entry: {_cell(_address(value['entry']))}; text SHA-256: {_cell(value['text_sha256'], limit=64)}"]
+            if value["next_start"] is not None:
+                lines += [f"Next text_start: {value['next_start']}"]
+            lines += [""]
+            for line in value["text"].splitlines():
+                lines += [_cell(line.replace("\t", "    "), limit=16384), ""]
+            continue
+        if not key.startswith("code.export_") or not value.get("rows"):
+            continue
+        start, count = value["start"], len(value["rows"])
+        lines += ["", f"### Exported {value['part']} (derived)", "", f"rows {start}..{start + count - 1} of {value['total']}"]
+        if value["next_start"] is not None:
+            lines += [f"Next start: {value['next_start']}"]
+        fields = [name for name in value["rows"][0] if name != "index"]
+        lines += ["", "| Index | " + " | ".join(fields) + " |", "|---|" + "---|" * len(fields)]
+        for index, row in enumerate(value["rows"], start):
+            cells = [_cell(_address(row[name]) if name in ("entry", "from", "at", "to", "address") else row[name], limit=4096)
+                     for name in fields]
+            lines += [f"| {index} | " + " | ".join(cells) + " |"]
+    return lines
+
+
 def _code_details(rows):
     """Readable views of derived values; instruction bytes are not carried by Analysis."""
     lines = []
@@ -401,6 +439,7 @@ def to_markdown(analysis):
         lines += _java_details(derived, report["tools"])
         lines += _javascript_details(derived, analysis.query["args"] if analysis.query is not None else None, syntax=True)
     if analysis.query is not None:
+        lines += _export_details(derived)
         lines += _query_details(supported + derived)
         if analysis.query["name"] == "analyze_javascript_application" and analysis.query["args"].get("detail") in (
                 "summary", "files", "package", "hints"):

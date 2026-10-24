@@ -46,7 +46,10 @@ class DerivedTests(unittest.TestCase):
                                                  "code.assembly", "code.references", "code.strings",
                                                  "code.function_list", "code.function_info", "code.instructions",
                                                  "code.callers", "code.xrefs", "android.java",
-                                             "javascript.modules", "javascript.calls", "javascript.parse"})
+                                        "javascript.modules", "javascript.calls", "javascript.parse",
+                                        "code.export_page", "code.export_functions", "code.export_calls",
+                                        "code.export_references", "code.export_strings", "code.export_instructions",
+                                        "code.pseudocode_page"})
         finding = make_finding("code", "Functions.", "code.functions", ["entry", "helper"], [e.id for e in FUNCTIONS], "inferred")
         self.assertEqual(verdicts([finding], FUNCTIONS, tool(derived=False))[finding.id].status, "derived")
 

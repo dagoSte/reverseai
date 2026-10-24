@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 from reverseai.contained import ContainedTimeout
+from reverseai.ghidra_args import OPERATIONS as EXPORT_OPERATIONS
 from reverseai.contract import (
     AnalysisTask, Budget, ContractError, InputRef, MAX_WORKER_REPLY_BYTES, OperationRequest,
     WORKER_PROTOCOL, WorkerError, content_id, sha256_hex,
@@ -48,11 +49,11 @@ class ToolTests(unittest.TestCase):
         self.operation = self.tool.operations["ghidra.analyze"]
 
     def test_metadata_defaults_derived_declaration_and_snapshot_binding(self):
-        self.assertEqual((self.tool.ref.name, self.tool.ref.version), ("ghidra", "12.1.4-r6"))
+        self.assertEqual((self.tool.ref.name, self.tool.ref.version), ("ghidra", "12.1.4-r7"))
         self.assertTrue(self.tool.contained)
         self.assertTrue(self.operation.derived)
         self.assertEqual(self.operation.max_observations, 600)
-        self.assertEqual(set(self.tool.operations), {"ghidra.analyze", "ghidra.functions", "ghidra.function", "ghidra.xrefs"})
+        self.assertEqual(set(self.tool.operations), {"ghidra.analyze", "ghidra.functions", "ghidra.function", "ghidra.xrefs", *EXPORT_OPERATIONS})
         self.assertEqual(self.tool.runtime, {"image": ghidra_lock()["image_id"], "platform": "linux/arm64"})
         self.assertEqual(self.operation.handler(self.data, {}), observations(self.items))
         self.assertEqual(self.executor.calls, [("ghidra.analyze", ARGS, self.data, sha256_hex(self.data))])
@@ -154,7 +155,7 @@ class ToolTests(unittest.TestCase):
         importlib.reload(ghidra_tool)
         with patch.object(ghidra_tool, "DockerExecutor", return_value=self.executor) as factory:
             tool = ghidra_tool.make_tool()
-            factory.assert_called_once_with(ghidra_tool.DEFAULT_LOCK, adapter_version="12.1.4-r6")
+            factory.assert_called_once_with(ghidra_tool.DEFAULT_LOCK, adapter_version="12.1.4-r7")
             self.assertTrue(tool.operations["ghidra.analyze"].derived)
 
     def test_availability_requires_exact_lock_and_local_image_without_host_native_imports(self):
@@ -164,7 +165,7 @@ class ToolTests(unittest.TestCase):
             return image
         self.assertTrue(ghidra_tool.available(ghidra_lock(), inspect=inspect))
         self.assertEqual(inspected, [ghidra_lock()["image_id"]])
-        for version in ("12.1.4-r1", "12.1.4-r2", "12.1.4-r3", "12.1.4-r4", "12.1.4-r5"):
+        for version in ("12.1.4-r1", "12.1.4-r2", "12.1.4-r3", "12.1.4-r4", "12.1.4-r5", "12.1.4-r6"):
             with self.subTest(version=version):
                 self.assertFalse(ghidra_tool.available(dict(ghidra_lock(), adapter_version=version), inspect=inspect))
         self.assertFalse(ghidra_tool.available(dict(ghidra_lock(), ghidra_sha256="0" * 64), inspect=inspect))
@@ -230,7 +231,7 @@ class QueryToolTests(unittest.TestCase):
         data, _ = elf_code()
         executor = FakeExecutor(reply(data, []))
         tool = ghidra_tool.make_tool(executor)
-        self.assertEqual(set(tool.operations), {"ghidra.analyze", *self.DEFAULTS})
+        self.assertEqual(set(tool.operations), {"ghidra.analyze", *self.DEFAULTS, *EXPORT_OPERATIONS})
         for operation, expected in self.DEFAULTS.items():
             with self.subTest(operation=operation):
                 spec = tool.operations[operation]
@@ -249,7 +250,7 @@ class QueryToolTests(unittest.TestCase):
     def test_query_specs_pin_every_integer_bound_and_enum_choice(self):
         executor = FakeExecutor(reply(b"inert", []))
         tool = ghidra_tool.make_tool(executor)
-        self.assertEqual(set(tool.operations), {"ghidra.analyze", *self.DEFAULTS})
+        self.assertEqual(set(tool.operations), {"ghidra.analyze", *self.DEFAULTS, *EXPORT_OPERATIONS})
         ranges = {
             "ghidra.functions": {"start": (0, 65535), "limit": (1, 128)},
             "ghidra.function": {"entry": (0, 2 ** 64 - 1), "start": (0, 65535), "limit": (1, 256),
@@ -279,7 +280,7 @@ class QueryToolTests(unittest.TestCase):
         data, _ = elf_code()
         executor = FakeExecutor(reply(data, []))
         tool = ghidra_tool.make_tool(executor)
-        self.assertEqual(set(tool.operations), {"ghidra.analyze", *self.DEFAULTS})
+        self.assertEqual(set(tool.operations), {"ghidra.analyze", *self.DEFAULTS, *EXPORT_OPERATIONS})
         for operation, defaults in self.DEFAULTS.items():
             for args in ({"script": "run.py"}, {"profile": "ghidra"}, {"timeout": 999},
                          {"entrypoint": "other"}, {"limit": True}, {"start": -1}):

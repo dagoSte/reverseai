@@ -67,6 +67,10 @@ def main(argv=None, *, _on_status=None):
     commands = parser.add_subparsers(dest="command", required=True)
     check = commands.add_parser("doctor", help="Report Python, Docker and the contained tools' locks and images, read-only")
     check.add_argument("--json", action="store_true", help="Print the same facts as JSON")
+    prepare = commands.add_parser("prepare", help="Prepare a private Ghidra analysis for paged exports without executing the input")
+    prepare.add_argument("file", type=Path)
+    prepare.add_argument("--with-ghidra", action="store_true", required=True)
+    prepare.add_argument("--json", action="store_true", help="Print a bounded preparation receipt")
     analyze = commands.add_parser("analyze", help="Analyse one approved file without executing it")
     analyze.add_argument("file", type=Path)
     analyze.add_argument("--out", type=Path, required=True, help="New or empty directory for report.json and report.md")
@@ -101,6 +105,27 @@ def main(argv=None, *, _on_status=None):
         return serve(sys.stdin.buffer, sys.stdout.buffer, sys.stderr, root=root, enabled=enabled)
     if args.command == "doctor":
         return doctor.main(as_json=args.json)
+    if args.command == "prepare":
+        from reverseai.tools import ghidra_tool
+        from reverseai.ghidra_cache import CacheError, ERRORS, UNSAFE
+        from reverseai.contained import ContainedError
+        try:
+            data, _ = intake.snapshot(args.file)
+        except (OSError, ValueError) as error:
+            parser.exit(1, f"reverseai: input refused: {type(error).__name__}\n")
+        try:
+            receipt = ghidra_tool.prepare(data)
+        except CacheError as error:
+            message = str(error) if str(error) in ERRORS else UNSAFE
+            parser.exit(1, f"reverseai: analysis failed: {message}\n")
+        except (ContainedError, OSError, ValueError, TimeoutError):
+            parser.exit(1, "reverseai: analysis failed: Ghidra preparation failed or exceeded its limits\n")
+        if args.json:
+            from reverseai.contract import canonical_json
+            print(canonical_json(receipt))
+        else:
+            print(f"Ghidra analysis {receipt['state']}: {receipt['analysis_id']}")
+        return 0
     if args.command == "query":
         try:
             checked = queries.parse_args(args.query, args.arg)
@@ -159,6 +184,12 @@ def main(argv=None, *, _on_status=None):
                            usable=any(verdict.status in ("supported", "derived") for verdict in analysis.verdicts),
                            incomplete=incomplete)
             if args.command == "query" and any(result.status == "error" for result in analysis.results):
+                from reverseai.ghidra_cache import ERRORS
+                for result in analysis.results:
+                    for error in result.errors:
+                        message = error.partition(": ")[2]
+                        if message in ERRORS:
+                            parser.exit(1, "reverseai: query refused: " + message + "\n")
                 raise ValueError("Query operation failed")
         except ValueError as error:
             parser.exit(1, f"reverseai: analysis failed: {type(error).__name__}\n")

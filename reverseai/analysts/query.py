@@ -2,9 +2,10 @@
 
 from reverseai.analysts import structural
 from reverseai.contract import MAX_EVIDENCE_PER_FINDING, ToolRef, evidence_intact, make_finding
+from reverseai import export_claims
 
 REFS = {"structure": ToolRef("structure", "0.1.0"), "strings": ToolRef("strings", "0.1.0"),
-        "ghidra": ToolRef("ghidra", "12.1.4-r6"), "apk": ToolRef("apk", "0.1.0"), "dex": ToolRef("dex", "0.1.0"),
+        "ghidra": ToolRef("ghidra", "12.1.4-r7"), "apk": ToolRef("apk", "0.1.0"), "dex": ToolRef("dex", "0.1.0"),
         "jadx": ToolRef("jadx", "1.5.6-r1"), "js": ToolRef("js", "0.1.0"),
         "jsparser": ToolRef("jsparser", "8.0.4-r2")}
 JAVA_FIELDS = ("dex", "class", "name", "prototype", "form", "start", "total", "text")
@@ -70,6 +71,37 @@ def conclude(task, evidence):
         findings.extend(structural.conclude(task, tuple(own.values())))
     for operation in sorted(allowed):
         items = [item for item in own.values() if item.operation == operation]
+        if operation in export_claims.OPERATIONS:
+            headers = [item for item in items if item.observation.get("kind") == "export_page"]
+            if len(headers) != 1:
+                continue
+            header = headers[0]
+            value = export_claims.page([header.observation])
+            if value is not None:
+                emit("code.export_page", value, [header])
+            for key, derive in export_claims.DERIVATIONS.items():
+                if key == "code.export_page":
+                    continue
+                if key == "code.pseudocode_page":
+                    rows = [i for i in items if i.observation.get("kind") == "pseudocode_page"]
+                    chunks = [rows] if rows else []
+                else:
+                    kind = {"code.export_functions": ("function_export", "function_info"), "code.export_calls": ("call_export",),
+                            "code.export_references": ("reference_export",), "code.export_strings": ("string_export",),
+                            "code.export_instructions": ("instruction_export",)}[key]
+                    rows = [i for i in items if i.observation.get("kind") in kind]
+                    size = 31 if key == "code.export_strings" else 63
+                    chunks = [rows[start:start + size] for start in range(0, len(rows), size)]
+                for chunk in chunks:
+                    cited = [header, *chunk]
+                    if key == "code.export_strings":
+                        indexes = {i.observation["index"] for i in chunk}
+                        cited += [i for i in items if i.observation.get("kind") == "string_reference_anchor"
+                                  and i.observation.get("index") in indexes]
+                    value = derive([i.observation for i in cited])
+                    if value is not None:
+                        emit(key, value, cited)
+            continue
         if operation == "jadx.method":
             for item in items:
                 if item.observation.get("kind") == "java" and set(JAVA_FIELDS) <= set(item.observation):

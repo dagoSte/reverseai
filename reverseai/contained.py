@@ -17,14 +17,19 @@ from types import MappingProxyType
 import uuid
 
 from reverseai.contract import ArgSpec, ContractError, MAX_WORKER_REPLY_BYTES, canonical_json, check_artifact, sha256_hex
+from reverseai.ghidra_cache import CacheError
 
 STAGING_ROOT = Path("/Users/Shared/rea-safe-staging-501")
 WALL_SECONDS = 45
 GHIDRA_WALL_SECONDS = 240
 PLATFORM = "linux/arm64"
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
-GHIDRA_VERSION = "12.1.4-r6"
-GHIDRA_OPERATIONS = frozenset(("ghidra.analyze", "ghidra.functions", "ghidra.function", "ghidra.xrefs"))
+GHIDRA_VERSION = "12.1.4-r7"
+GHIDRA_PREPARE_WALL_SECONDS = 900
+GHIDRA_PREPARE_MAX_BYTES = 64 * 1024 * 1024
+GHIDRA_CACHE_FORMAT = 1
+GHIDRA_OPERATIONS = frozenset(("ghidra.analyze", "ghidra.functions", "ghidra.function", "ghidra.xrefs",
+                               "ghidra.prepare", "ghidra.pseudocode", "ghidra.export_function", "ghidra.export_program"))
 JADX_VERSION = "1.5.6-r1"
 JADX_WALL_SECONDS = 120
 JSPARSER_VERSION = "8.0.4-r2"
@@ -52,6 +57,7 @@ _LEGACY_PROFILE = MappingProxyType({"pids": 64, "memory": "512m", "cpus": 1,
     "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=64m", "wall_seconds": WALL_SECONDS})
 _GHIDRA_PROFILE = MappingProxyType({"pids": 256, "memory": "2g", "cpus": 2,
     "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=512m", "wall_seconds": GHIDRA_WALL_SECONDS})
+_GHIDRA_PREPARE_PROFILE = MappingProxyType({**_GHIDRA_PROFILE, "wall_seconds": GHIDRA_PREPARE_WALL_SECONDS})
 _JADX_PROFILE = MappingProxyType({"pids": 256, "memory": "2g", "cpus": 2,
     "tmpfs": "/tmp:rw,noexec,nosuid,nodev,size=512m", "wall_seconds": JADX_WALL_SECONDS})
 _JSPARSER_PROFILE = MappingProxyType({"pids": 64, "memory": "2g", "cpus": 2,
@@ -69,6 +75,8 @@ def default_lock(tool):
 
 def resource_profile(operation):
     """Only the validated operation selects resources; requests cannot override them."""
+    if operation == "ghidra.prepare":
+        return _GHIDRA_PREPARE_PROFILE
     if operation in GHIDRA_OPERATIONS:
         return _GHIDRA_PROFILE
     if operation == "jadx.method":
@@ -113,8 +121,13 @@ def load_lock(lock, *, adapter_version="1.0.0-r2", extra_keys=()):
                            for key in ("driver_sha256", "worker_sha256"))):
                 raise ValueError
         elif adapter_version == GHIDRA_VERSION:
-            keys = ("image_id", "platform", "adapter_version", *GHIDRA_PINS)
-            if extra_keys or set(value) != set(keys) or any(value[key] != pin for key, pin in GHIDRA_PINS.items()):
+            keys = ("image_id", "platform", "adapter_version", *GHIDRA_PINS,
+                    "parent_image_id", "bundle_sha256", "cache_format")
+            if (extra_keys or set(value) != set(keys) or any(value[key] != pin for key, pin in GHIDRA_PINS.items())
+                    or type(value["cache_format"]) is not int or value["cache_format"] != GHIDRA_CACHE_FORMAT
+                    or not isinstance(value["bundle_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", value["bundle_sha256"])
+                    or value["parent_image_id"] is not None and (not isinstance(value["parent_image_id"], str)
+                    or not _DIGEST.fullmatch(value["parent_image_id"]))):
                 raise ValueError
         else:
             if not re.fullmatch(r"[0-9a-f]{64}", value.get("wheel_sha256", "")):
@@ -236,6 +249,16 @@ def _validated_args(operation, args):
     # Validate here as well as at the gateway: this is the last boundary before argv.
     if not isinstance(args, Mapping):
         raise ContainedError("InvalidWorkerArguments")
+    if operation == "ghidra.prepare":
+        if args:
+            raise ContainedError("InvalidWorkerArguments")
+        return {}
+    from reverseai.ghidra_args import OPERATIONS, check
+    if operation in OPERATIONS:
+        try:
+            return check(operation, args)
+        except ContractError:
+            raise ContainedError("InvalidWorkerArguments") from None
     if operation == "jadx.method":
         return validate_jadx_request(args)
     if operation == "jsparser.syntax":
@@ -335,6 +358,57 @@ def run_bounded(argv, *, timeout=WALL_SECONDS, max_output=MAX_WORKER_REPLY_BYTES
             process.stdout.close()
 
 
+class _PrepareSink:
+    def __init__(self, sink):
+        self.sink, self.count = sink, 0
+
+    def write(self, chunk):
+        if not isinstance(chunk, bytes) or self.count + len(chunk) > GHIDRA_PREPARE_MAX_BYTES:
+            raise ContainedError("WorkerOutputLimit")
+        if self.sink.write(chunk) != len(chunk):
+            raise ContainedError("WorkerProcessError")
+        self.count += len(chunk)
+        return len(chunk)
+
+
+def run_prepare_bounded(argv, sink, *, timeout=GHIDRA_PREPARE_WALL_SECONDS):
+    """Only prepare streams opaque stdout; ordinary JSON runners retain their cap."""
+    process = None
+    try:
+        deadline = time.monotonic() + min(timeout, GHIDRA_PREPARE_WALL_SECONDS)
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, shell=False)
+        bounded = _PrepareSink(sink)
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not selector.select(remaining):
+                    raise ContainedTimeout("WorkerTimeout")
+                chunk = os.read(process.stdout.fileno(), min(65536, GHIDRA_PREPARE_MAX_BYTES + 1 - bounded.count))
+                if not chunk:
+                    selector.unregister(process.stdout)
+                    break
+                bounded.write(chunk)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ContainedTimeout("WorkerTimeout")
+        if process.wait(timeout=remaining) != 0:
+            raise ContainedError("WorkerProcessError")
+        if not bounded.count:
+            raise ContainedError("WorkerProcessError")
+    except subprocess.TimeoutExpired:
+        raise ContainedTimeout("WorkerTimeout") from None
+    except OSError:
+        raise ContainedError("WorkerProcessError") from None
+    finally:
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            process.stdout.close()
+
+
 def inspect_image(image_id):
     raw = run_bounded(["docker", "image", "inspect", "--format", "{{.Id}}", image_id], timeout=5, max_output=128)
     try:
@@ -350,7 +424,7 @@ class DockerExecutor:
     The lock is frozen at construction so the reported identity matches every run.
     """
 
-    def __init__(self, lock, runner=None, *, adapter_version="1.0.0-r2", extra_keys=(),
+    def __init__(self, lock, runner=None, *, prepare_runner=None, adapter_version="1.0.0-r2", extra_keys=(),
                  inspect=inspect_image, staging_root=STAGING_ROOT):
         self.lock = MappingProxyType(load_lock(lock, adapter_version=adapter_version, extra_keys=extra_keys))
         profile = {GHIDRA_VERSION: "ghidra", JADX_VERSION: "jadx", JSPARSER_VERSION: "jsparser"}.get(adapter_version, "default")
@@ -358,6 +432,7 @@ class DockerExecutor:
                                                         partial(run_bounded, profile=profile))
         self.inspect = inspect
         self.staging_root = Path(staging_root)
+        self.prepare_runner = run_prepare_bounded if prepare_runner is None else prepare_runner
 
     def available(self):
         try:
@@ -365,7 +440,15 @@ class DockerExecutor:
         except Exception:
             return False
 
-    def run(self, operation, args, data, input_sha256):
+    def prepare(self, data, input_sha256, sink):
+        self._execute("ghidra.prepare", {}, data, input_sha256, sink=_PrepareSink(sink))
+
+    def run(self, operation, args, data, input_sha256, *, project=None):
+        if operation == "ghidra.prepare":
+            raise ContainedError("InvalidWorkerArguments")
+        return self._execute(operation, args, data, input_sha256, project=project)
+
+    def _execute(self, operation, args, data, input_sha256, *, project=None, sink=None):
         args = _validated_args(operation, args)
         if ((operation in GHIDRA_OPERATIONS) != (self.lock["adapter_version"] == GHIDRA_VERSION)
                 or (operation == "jadx.method") != (self.lock["adapter_version"] == JADX_VERSION)
@@ -373,6 +456,13 @@ class DockerExecutor:
             raise ContainedError("InvalidWorkerArguments")
         if not isinstance(data, bytes) or sha256_hex(data) != input_sha256:
             raise ContainedError("SnapshotMismatch")
+        if project is not None:
+            if operation not in GHIDRA_OPERATIONS or operation == "ghidra.prepare":
+                raise ContainedError("InvalidWorkerArguments")
+            manifest = project.manifest
+            if (manifest["input_sha256"] != input_sha256 or manifest["image_id"] != self.lock["image_id"]
+                    or manifest["bundle_sha256"] != self.lock["bundle_sha256"]):
+                raise ContainedError("SnapshotMismatch")
         if (operation == "jsparser.syntax" and args["files"][0]["artifact"] is None
                 and not 0 < len(data) <= 4 * 1024 * 1024):
             raise ContainedError("InvalidWorkerArguments")
@@ -390,16 +480,24 @@ class DockerExecutor:
             with (folder / "input").open("xb") as stream:
                 stream.write(data)
                 os.fchmod(stream.fileno(), 0o444)
+            if project is not None:
+                project.stage(folder)
             os.chmod(folder, 0o555)
             argv = build_argv(self.lock["image_id"], name, folder, operation, args)
             started = True
-            raw = self.runner(argv, timeout=resource_profile(operation)["wall_seconds"], max_output=MAX_WORKER_REPLY_BYTES)
-            if not isinstance(raw, bytes) or len(raw) > MAX_WORKER_REPLY_BYTES:
-                raise ContainedError("WorkerOutputLimit")
+            if sink is not None:
+                self.prepare_runner(argv, sink, timeout=GHIDRA_PREPARE_WALL_SECONDS)
+                if not sink.count:
+                    raise ContainedError("WorkerProcessError")
+                raw = None
+            else:
+                raw = self.runner(argv, timeout=resource_profile(operation)["wall_seconds"], max_output=MAX_WORKER_REPLY_BYTES)
+                if not isinstance(raw, bytes) or len(raw) > MAX_WORKER_REPLY_BYTES:
+                    raise ContainedError("WorkerOutputLimit")
             started = False  # --rm has removed the successfully completed container.
             succeeded = True
             return raw
-        except (ContainedError, KeyboardInterrupt, SystemExit):
+        except (ContainedError, CacheError, KeyboardInterrupt, SystemExit):
             raise
         except (TimeoutError, subprocess.TimeoutExpired):
             raise ContainedTimeout("WorkerTimeout") from None
