@@ -6,7 +6,7 @@ https://github.com/user-attachments/assets/884cff5d-e37e-49c3-9bb7-8fbcf118e2ee
 
 <p align="center">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square">
-  <img alt="Version 0.7.0" src="https://img.shields.io/badge/version-0.7.0-38bdf8?style=flat-square">
+  <img alt="Version 0.8.0" src="https://img.shields.io/badge/version-0.8.0-38bdf8?style=flat-square">
   <img alt="Python 3.12 or later" src="https://img.shields.io/badge/python-3.12%2B-3776ab?style=flat-square&logo=python&logoColor=white">
   <img alt="No Python dependencies" src="https://img.shields.io/badge/dependencies-none-22c55e?style=flat-square">
   <img alt="Platforms: macOS, Linux, Windows (experimental)" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows%20(experimental)-64748b?style=flat-square">
@@ -91,7 +91,7 @@ malicious or behaves in a certain way.
 ## How it works
 
 <p align="center">
-  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and fingerprinted; a gateway runs only allowlisted operations within time and output budgets; built-in parsers read native, Android and JavaScript formats in-process, while LIEF, YARA-X, Ghidra, JADX and a JavaScript parser each run in a locked container per request; the host re-derives every byte-level value and anchor from the original bytes; evidence records the file fingerprint, tool, operation and exact byte range; analysts cite evidence, an independent reviewer re-checks every citation, and the report separates supported, derived, unsupported and contradicted findings.">
+  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and fingerprinted; a gateway runs only allowlisted operations within time and output budgets; built-in parsers read native, Android and JavaScript formats in-process, while LIEF, YARA-X, Ghidra, JADX and a JavaScript parser each run in a locked container per request, and a Ghidra analysis can be prepared once per file and exported in pages; the host re-derives every byte-level value and anchor from the original bytes; evidence records the file fingerprint, tool, operation and exact byte range; analysts cite evidence, an independent reviewer re-checks every citation, and the report separates supported, derived, unsupported and contradicted findings.">
 </p>
 
 1. **Freeze the file.** You approve one regular file. ReverseAI copies it into a
@@ -133,7 +133,7 @@ image; at analysis time nothing is downloaded, pulled or installed.
 | Tool | What it does in ReverseAI | How its answer is checked |
 | --- | --- | --- |
 | **Built-in parsers** (Python standard library) | Structure, imports, strings and bytes of ELF, PE and Mach-O files; APK members, the binary manifest and DEX classes, methods and references; JavaScript archives, packages and hints | They are the verified reference that every other tool is checked against. |
-| [**Ghidra**](https://github.com/NationalSecurityAgency/ghidra) 12.1.4 | Functions, decompiled pseudocode, assembly, calls and cross-references of native programs | Every address and byte anchor is re-read from the file; its interpretations are labelled derived. |
+| [**Ghidra**](https://github.com/NationalSecurityAgency/ghidra) 12.1.4 | Functions, decompiled pseudocode, assembly, calls and cross-references of native programs; a prepared analysis, kept once per file, exports whole functions and the whole program in pages | Every address and byte anchor is re-read from the file; its interpretations are labelled derived. The kept analysis is opened only inside a locked container and is bound to the file, the image and the worker code. |
 | [**JADX**](https://github.com/skylot/jadx) 1.5.6 | Decompiled Java for a chosen Android method | Accepted only for the method ReverseAI's own DEX decoder verified, with the same code position and instruction count. |
 | [**LIEF**](https://github.com/lief-project/LIEF) 1.0.0 | A second reading of executable headers and sections | Every reported value is recomputed from the bytes; any difference rejects the reply. |
 | [**YARA-X**](https://github.com/VirusTotal/yara-x) 1.21.0 | Signature matching with a reviewed set of literal rules | Every match is found again at its exact offset. |
@@ -202,7 +202,7 @@ Other local installation paths:
 | Path | Command |
 | --- | --- |
 | uv, if already installed | `uv tool install --offline --no-python-downloads --python python3 /path/to/reverseai` |
-| An approved wheel, inside the dedicated venv | `python -m pip install --no-index --no-deps /approved/reverseai-0.7.0-py3-none-any.whl` |
+| An approved wheel, inside the dedicated venv | `python -m pip install --no-index --no-deps /approved/reverseai-0.8.0-py3-none-any.whl` |
 | Editable development install, inside the dedicated venv and trusted checkout | `python -m pip install --no-index --no-deps -e .` |
 
 The uv path creates a tool environment; use the executable location it prints.
@@ -234,7 +234,11 @@ claude mcp add --transport stdio reverseai -- /path/to/.venv/bin/reverseai mcp -
 
 The server talks only over standard input and output, reads only files inside that
 folder, runs a contained tool only when you add its flag (for example `--with-ghidra`),
-and marks every quoted text from the files as untrusted. Results go to your agent and,
+and marks every quoted text from the files as untrusted. Answers are compact by default
+(findings and verdicts without evidence bodies); an agent asks for `view=full` when it
+needs everything. With `--with-ghidra`, `prepare_file` analyses a program once and the
+export tools then page through all of its functions, calls, references, strings and
+complete pseudocode. Results go to your agent and,
 through it, to the agent's model provider, including text quoted from the files: use a
 provider and plan you trust with that content. Setup for Claude Code, Codex and Cursor,
 and the full security model, are in the [MCP guide](docs/MCP.md).
@@ -307,6 +311,30 @@ of its real code; recognising packers is on the roadmap.
 Agent prompt: *"Profile sample.exe: format, imports, notable strings, and what its entry
 function calls. Mark which findings are verified and which are Ghidra's reading."*
 
+### Rebuild a program you are allowed to rebuild
+
+For software whose licence permits it, your own program whose source was lost, or a
+malicious sample you need to understand in depth, prepare the analysis once and export
+it page by page; an agent can then rebuild the program function by function from the
+cited evidence:
+
+```sh
+reverseai prepare tool.bin --with-ghidra --json
+reverseai query tool.bin --with-ghidra --query export_program --arg part=functions --arg limit=32 --out rebuild-functions
+reverseai query tool.bin --with-ghidra --query export_function --arg entry=0x401000 --arg part=info --out rebuild-info
+reverseai query tool.bin --with-ghidra --query procedure_pseudo_code --arg mode=paged --arg entry=0x401000 --arg text_start=0 --out rebuild-code
+```
+
+Copy a real entry from the function page in place of `0x401000`, and follow each
+page's next cursor. Everything Ghidra reconstructs stays labelled derived; checking the
+rebuilt program against the original is your responsibility (see the
+[legal notice](#responsible-use-and-legal-notice)). Details are in the
+[usage guide](docs/USAGE.md#prepared-native-exports).
+
+Agent prompt: *"Prepare tool.bin, list its functions page by page, and rebuild it in C
+starting from the functions that call nothing else. Cite the export page for each
+function you write."*
+
 ### Keep an evidence record for an audit or an incident
 
 ```sh
@@ -339,6 +367,10 @@ facts against the same file later.
 - Offline installation, a setup check, reproducible packages and the MIT license.
 - An MCP server (protocol revision 2026-07-28, with older clients supported) that
   gives AI agents the same verified questions, confined to a folder you choose.
+- Reconstruction export: a Ghidra analysis prepared once per file and kept in a
+  private cache, then whole functions, complete pseudocode and the whole program
+  (functions, calls, references, strings) exported in pages, over the command line
+  and MCP; compact answers for agents by default.
 
 **Next**
 
@@ -346,6 +378,9 @@ facts against the same file later.
   PCs, Intel Macs), with the same offline, unprivileged containment proven natively
   on each. Today the containers run on ARM64 (Apple silicon and Linux ARM64);
   x86-64 programs can already be analysed there.
+- **Reconstruction, next steps**: types, structures, signatures and global data;
+  recognising known libraries; then an agent team that plans, rebuilds and checks
+  each function against the original.
 - **Benchmark**: measured accuracy on a public corpus of files with known
   answers, with the method and raw results published.
 - **AI analyst team**: agents that plan and ask questions in parallel, with the

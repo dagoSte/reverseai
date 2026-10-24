@@ -1,6 +1,6 @@
 # Install and check ReverseAI
 
-Version 0.7.0 is released for macOS ARM64 and Linux ARM64. Installing the
+Version 0.8.0 is released for macOS ARM64 and Linux ARM64. Installing the
 Python package enables host-only
 analysis on supported POSIX systems. Contained tools additionally require their
 exact local images and a separately verified Docker environment. Installation
@@ -36,7 +36,7 @@ On macOS or Linux:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install --no-index --no-deps /approved/reverseai-0.7.0-py3-none-any.whl
+.venv/bin/python -m pip install --no-index --no-deps /approved/reverseai-0.8.0-py3-none-any.whl
 .venv/bin/reverseai --version
 .venv/bin/reverseai doctor
 .venv/bin/reverseai doctor --json
@@ -68,7 +68,7 @@ On Windows, with CPython 3.12.4 or later installed:
 
 ```powershell
 py -3.12 -m venv .venv
-.venv\Scripts\python.exe -m pip install --no-index --no-deps C:\approved\reverseai-0.7.0-py3-none-any.whl
+.venv\Scripts\python.exe -m pip install --no-index --no-deps C:\approved\reverseai-0.8.0-py3-none-any.whl
 .venv\Scripts\reverseai.exe --version
 .venv\Scripts\reverseai.exe doctor --json
 .venv\Scripts\reverseai.exe analyze C:\approved\file.exe --out C:\reports\new-analysis
@@ -82,7 +82,7 @@ new directory for every call. Windows handling remains experimental: consult
 the receipt for the exact tested host and commit. Use your installed Python
 launcher when a different supported version is selected.
 
-The version command prints `reverseai 0.7.0`. `doctor` reports Python, OS and
+The version command prints `reverseai 0.8.0`. `doctor` reports Python, OS and
 architecture, lock validity, whether Docker answers its version probe within
 10 seconds, and whether each locked image is present. It reads no sample and
 never pulls, builds or runs a container. Exit 0 means the host Python requirement
@@ -109,13 +109,13 @@ python3 -B tools/reverseai_build.py wheel --out dist
 python3 -B tools/reverseai_build.py sdist --out dist
 ```
 
-This writes `reverseai-0.7.0-py3-none-any.whl` and `reverseai-0.7.0.tar.gz`.
+This writes `reverseai-0.8.0-py3-none-any.whl` and `reverseai-0.8.0.tar.gz`.
 The backend fixes archive ordering, timestamps and modes for reproducible output
 from the same tree. Source distributions select tracked files; commit new files
 before building a release sdist. Wheels contain application modules, locks,
 ruleset and metadata, not image build contexts or tests. The project uses MIT;
 the wheel's Metadata-Version 2.4 declares `License-Expression: MIT` and the two
-license files, copied under `reverseai-0.7.0.dist-info/licenses/`. The sdist
+license files, copied under `reverseai-0.8.0.dist-info/licenses/`. The sdist
 includes `LICENSE`, `THIRD_PARTY_NOTICES.md` and the same license headers in
 `PKG-INFO`. Third-party notices and licenses remain applicable.
 

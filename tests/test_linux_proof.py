@@ -15,10 +15,10 @@ SPEC.loader.exec_module(P)
 
 COMMIT = "c" * 40
 IMAGE = "sha256:" + "e" * 64
-WHEEL = "reverseai-0.7.0-py3-none-any.whl"
+WHEEL = "reverseai-0.8.0-py3-none-any.whl"
 
 
-def doctor_facts(version="0.7.0"):
+def doctor_facts(version="0.8.0"):
     return {"reverseai": version, "host_ok": True, "docker": {"answered": False},
             "tools": [{"tool": name, "lock_loads": True,
                        "lock": f"/tmp/venv/lib/python3.12/site-packages/reverseai/_locks/{name}.json"}
@@ -29,7 +29,7 @@ def inside_facts(**changes):
     facts = {"python": "3.12.9", "platform": "Linux-6.10-aarch64-with-glibc2.36", "machine": "aarch64", "uid": 65534,
              "suite": {"ran": 1750, "skipped": 1, "failures": 0, "errors": 0, "expected_failures": 0,
                        "unexpected_successes": 0, "ok": True},
-             "wheel": {"name": WHEEL, "size": 1, "sha256": "0" * 64}, "version": "reverseai 0.7.0",
+             "wheel": {"name": WHEEL, "size": 1, "sha256": "0" * 64}, "version": "reverseai 0.8.0",
              "imported_from": "/tmp/venv/lib/python3.12/site-packages/reverseai/__init__.py",
              "doctor": doctor_facts(), "analyze": {"reports": ["report.json", "report.md"]},
              "query": {"reports": ["report.json", "report.md"]}, "venv": "/tmp/venv",
@@ -61,7 +61,7 @@ class HostDocker:
             Path(argv[argv.index("-o") + 1]).write_bytes(b"tar")
             return 0, "", ""
         if argv[:4] == ["git", "-C", str(P.ROOT), "show"]:
-            return 0, '"""ReverseAI."""\n\n__version__ = "0.7.0"\n', ""
+            return 0, '"""ReverseAI."""\n\n__version__ = "0.8.0"\n', ""
         if self.silent and argv[:2] == ["docker", "image"] and argv[2] in ("rm", "inspect") and argv[-1] == IMAGE:
             return None, "", ""
         if argv[:5] == ["docker", "image", "inspect", "--format", "{{.Id}}"]:
@@ -224,7 +224,7 @@ class ProveTests(unittest.TestCase):
 
 class PassedTests(unittest.TestCase):
     def test_every_required_fact_is_needed(self):
-        self.assertTrue(P.passed(inside_facts(), "0.7.0"))
+        self.assertTrue(P.passed(inside_facts(), "0.8.0"))
         empty = {"ran": 0, "skipped": 0, "failures": 0, "errors": 0, "expected_failures": 0,
                  "unexpected_successes": 0, "ok": True}
         changes = {"zero tests": {"suite": empty}, "suite exit 17": {"steps": {
@@ -234,7 +234,7 @@ class PassedTests(unittest.TestCase):
                    "root": {"uid": 0}, "Python 3.13": {"python": "3.13.1"}, "no wheel": {"wheel": None}}
         for label, change in changes.items():
             with self.subTest(label=label):
-                self.assertFalse(P.passed(inside_facts(**change), "0.7.0"))
+                self.assertFalse(P.passed(inside_facts(**change), "0.8.0"))
 
 
 class InsideTests(unittest.TestCase):
@@ -255,7 +255,7 @@ class InsideTests(unittest.TestCase):
             if argv[1:3] == ["-m", "venv"] or argv[1:4] == ["-m", "pip", "install"]:
                 return 0, "", ""
             if argv[1:] == ["--version"]:
-                return 0, "reverseai 0.7.0\n", ""
+                return 0, "reverseai 0.8.0\n", ""
             if argv[1:3] == ["-I", "-c"]:
                 return 0, "/tmp/venv/lib/python3.12/site-packages/reverseai/__init__.py\n", ""
             if argv[1:] == ["doctor", "--json"]:
@@ -298,7 +298,7 @@ class InsideTests(unittest.TestCase):
         self.assertEqual(facts["analyze"]["reports"], ["report.json", "report.md"])
         container = {"machine": "aarch64", "platform": "Linux-7.0-aarch64-with-glibc2.41", "python": "3.12.15",
                      "uid": 65534, "venv": "/tmp/venv"}  # this test runs on the host; the container reports these
-        self.assertTrue(P.passed({**facts, **container}, "0.7.0"))
+        self.assertTrue(P.passed({**facts, **container}, "0.8.0"))
         self.assertFalse(P.passed({**facts, **container}, "0.7.1"))
 
     def test_a_failed_wheel_build_stops_before_any_install(self):
@@ -310,7 +310,7 @@ class InsideTests(unittest.TestCase):
             facts = P.inside(runner=run, work=work, source=source)
         self.assertEqual(list(facts["steps"]), ["suite", "wheel"])
         self.assertIsNone(facts["wheel"])
-        self.assertFalse(P.passed(facts, "0.7.0"))
+        self.assertFalse(P.passed(facts, "0.8.0"))
 
     def test_a_suite_timeout_with_bytes_output_keeps_structured_timeout_facts(self):
         def timed_out(argv, *, timeout, cwd=None, env=None):
