@@ -2,6 +2,7 @@
 and hash rules, the build context and the exact docker calls."""
 
 import contextlib
+import copy
 import hashlib
 import importlib.util
 import io
@@ -9,6 +10,7 @@ import json
 from pathlib import Path
 import shutil
 import tempfile
+import subprocess
 import unittest
 import urllib.request
 import zipfile
@@ -32,14 +34,81 @@ PREFIX = ("FROM " + build.BASE + " AS natives\nRUN apt-get update\nFROM " + buil
 class FakeDocker:
     def __init__(self, image_id="sha256:" + "a" * 64):
         self.calls, self.context, self.image_id = [], None, image_id
+        self.containers, self.bundle, self.legacy_calls = {}, {}, []
+        self.info_changes, self.result_changes = {}, {}
+        self.failure = None
+        self.server = {"ServerVersion": "28.5.1", "OSType": "linux", "Architecture": "aarch64", "Driver": "overlay2",
+                       "DriverStatus": [["Backing Filesystem", "extfs"]]}
+        self.endpoint = "unix:///var/run/docker.sock"
 
-    def __call__(self, *args, capture=False):
+    def image(self, image_id):
+        value = {"Id": image_id, "Os": "linux", "Architecture": "arm64",
+                 "RootFS": {"Type": "layers", "Layers": ["sha256:" + "1" * 64] +
+                            ([] if image_id == build.PARENT_IMAGE_ID else ["sha256:" + "2" * 64])},
+                 "Config": {"User": "65534:65534", "Entrypoint": ["python3", "-I", "-B", "/opt/reverseai/worker.py"],
+                            "Env": ["PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8"], "Cmd": ["python3"],
+                            "WorkingDir": "", "Volumes": None, "OnBuild": None}}
+        value.update(copy.deepcopy(self.info_changes.get(image_id, {})))
+        return value
+
+    def runtime(self, image_id):
+        files = {("jdk", "bin/java"): (b"fixed JDK java bytes", 0o755),
+                 ("ghidra", "support/analyzeHeadless"): (b"fixed headless bytes", 0o755),
+                 ("ghidra", "Ghidra/Features/Decompiler/os/linux_arm_64/decompile"): (b"fixed decompiler bytes", 0o755),
+                 ("ghidra", "GPL/DemanglerGnu/os/linux_arm_64/demangler_gnu_v2_41"): (b"fixed demangler bytes", 0o755)}
+        bundle = self.bundle if image_id != build.PARENT_IMAGE_ID else {"worker.py": b"old worker",
+                  "ghidra_scripts/ReverseAIOptions.java": b"old options", "ghidra_scripts/ReverseAIQuery.java": b"old query"}
+        files.update({("reverseai", name): (body, 0o644) for name, body in bundle.items()})
+        if image_id != build.PARENT_IMAGE_ID:
+            files.update(self.result_changes)
+        return files
+
+    def __call__(self, *args, capture=False, legacy=False):
         self.calls.append(args)
+        if legacy:
+            self.legacy_calls.append(args)
+        if self.failure is not None and self.failure(args):
+            raise subprocess.CalledProcessError(1, ["docker", *args])
         if args[0] == "build":
             context = Path(args[-1])
             self.context = sorted(str(path.relative_to(context)) for path in context.rglob("*"))
-            self.downloads = {path.name: path.read_bytes() for path in (context / "downloads").iterdir()}
+            self.downloads = {path.name: path.read_bytes() for path in (context / "downloads").iterdir()} if (context / "downloads").is_dir() else {}
+            self.bundle = {name: (context / name).read_bytes() for name in (
+                "worker.py", "project_cache.py", "ghidra_scripts/ReverseAIOptions.java",
+                "ghidra_scripts/ReverseAIPrepare.java", "ghidra_scripts/ReverseAIQuery.java")}
             Path(args[args.index("--iidfile") + 1]).write_text(self.image_id + "\n")
+        elif args[:2] == ("image", "inspect"):
+            return json.dumps([self.image(args[2])])
+        elif args[:2] == ("context", "inspect"):
+            return json.dumps([{"Endpoints": {"docker": {"Host": self.endpoint}}}])
+        elif args[0] == "info":
+            return json.dumps(self.server)
+        elif args[0] == "create":
+            name = args[args.index("--name") + 1]
+            self.containers[name] = (args[-1], self.runtime(args[-1]))
+            return "c" * 64
+        elif args[:2] == ("container", "inspect"):
+            return json.dumps([{"Image": self.containers[args[2]][0], "State": {"Running": False, "Status": "created"},
+                                "Mounts": [], "HostConfig": {"NetworkMode": "none", "Binds": None}}])
+        elif args[0] == "cp":
+            if ":/opt/" in args[1]:
+                name, root = args[1].split(":/opt/", 1)
+                root = root.removesuffix("/.")
+                for (tree, relative), (body, mode) in self.containers[name][1].items():
+                    if root == tree:
+                        path = Path(args[2]) / relative
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_bytes(body)
+                        path.chmod(mode)
+            else:
+                name, relative = args[2].split(":/opt/reverseai/", 1)
+                self.containers[name][1][("reverseai", relative)] = (Path(args[1]).read_bytes(), 0o644)
+        elif args[0] == "commit":
+            self.bundle = {relative: body for (tree, relative), (body, _) in self.containers[args[1]][1].items()
+                           if tree == "reverseai"}
+            return self.image_id
+        elif args[0] == "rm":
+            self.containers.pop(args[2], None)
 
 
 class BuildTests(unittest.TestCase):
@@ -53,19 +122,25 @@ class BuildTests(unittest.TestCase):
             (self.downloads / asset["name"]).write_bytes(FAKE[key])
         self.lock = self.root / "image.lock.json"
         self.docker = FakeDocker()
+        self.source = self.root / "source"
+        shutil.copytree(build.SOURCE, self.source)
+        # The other R1 source owner can still be writing these files while this
+        # isolated builder suite runs. Fake builds require only inert bytes.
+        for name in ("project_cache.py", "ghidra_scripts/ReverseAIPrepare.java"):
+            if not (self.source / name).exists():
+                (self.source / name).write_bytes(b"fake reviewed bundle member\n")
 
     def build(self, *extra, source=None):
         with contextlib.ExitStack() as stack:
             stack.enter_context(patch.object(build, "docker", self.docker))
             stack.enter_context(patch.object(build, "ASSETS", assets()))
-            if source:
-                stack.enter_context(patch.object(build, "SOURCE", source))
+            stack.enter_context(patch.object(build, "SOURCE", source or self.source))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             return build.main(["--download-dir", str(self.downloads), "--lock", str(self.lock), *extra])
 
     def copy(self, label):
         source = self.root / label.replace(" ", "-")
-        shutil.copytree(build.SOURCE, source, ignore=shutil.ignore_patterns("image.lock.json"))
+        shutil.copytree(self.source, source, ignore=shutil.ignore_patterns("image.lock.json"))
         return source
 
     def dockerfile(self, label, lines):
@@ -73,21 +148,27 @@ class BuildTests(unittest.TestCase):
         (source / "Dockerfile").write_text("\n".join(lines) + "\n")
         return source
 
-    def test_the_base_is_pulled_by_digest_and_the_lock_has_exactly_the_six_keys(self):
+    def test_full_build_keeps_networked_assets_and_writes_the_nine_r7_lock_keys(self):
         self.assertEqual(self.build(), 0)
-        pull, built = self.docker.calls
+        pull, built = self.docker.calls[:2]
         self.assertEqual(pull, ("pull", "--platform", "linux/arm64", build.BASE))
         self.assertEqual(built[:4], ("build", "--platform", "linux/arm64", "--pull=false"))
-        self.assertEqual(built[4:8], ("--iidfile", built[5], "--tag", "reverseai-ghidra:12.1.4-r6"))
+        self.assertEqual(built[4:8], ("--iidfile", built[5], "--tag", "reverseai-ghidra:12.1.4-r7"))
         self.assertEqual(len(built), 9)  # network is restricted by the Dockerfile itself (one natives RUN)
         self.assertEqual(self.docker.context, [
             "Dockerfile", "downloads", "downloads/" + build.ASSETS["jdk"]["name"], "downloads/" + build.ASSETS["ghidra"]["name"],
-            "ghidra_scripts", "ghidra_scripts/ReverseAIOptions.java", "ghidra_scripts/ReverseAIQuery.java", "unpack.py", "worker.py"])
+            "ghidra_scripts", "ghidra_scripts/ReverseAIOptions.java", "ghidra_scripts/ReverseAIPrepare.java",
+            "ghidra_scripts/ReverseAIQuery.java", "project_cache.py", "unpack.py", "worker.py"])
         self.assertEqual(self.docker.downloads, {build.ASSETS[key]["name"]: FAKE[key] for key in FAKE})
         self.assertEqual(json.loads(self.lock.read_text()), {
-            "adapter_version": "12.1.4-r6", "base_digest": build.BASE_DIGEST, "image_id": "sha256:" + "a" * 64,
+            "adapter_version": "12.1.4-r7", "base_digest": build.BASE_DIGEST, "image_id": "sha256:" + "a" * 64,
             "ghidra_sha256": hashlib.sha256(FAKE["ghidra"]).hexdigest(), "jdk_sha256": hashlib.sha256(FAKE["jdk"]).hexdigest(),
-            "platform": "linux/arm64"})
+            "platform": "linux/arm64", "parent_image_id": None, "cache_format": 1,
+            "bundle_sha256": hashlib.sha256(json.dumps({name: hashlib.sha256((self.source / name).read_bytes()).hexdigest()
+                for name in ("worker.py", "project_cache.py", "ghidra_scripts/ReverseAIOptions.java",
+                             "ghidra_scripts/ReverseAIQuery.java", "ghidra_scripts/ReverseAIPrepare.java")},
+                sort_keys=True, separators=(",", ":")).encode()).hexdigest()})
+        self.assertEqual(self.docker.containers, {})
 
     def test_the_pinned_assets_are_the_owner_approved_files(self):
         self.assertEqual(build.ASSETS["ghidra"]["sha256"], "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db")
@@ -137,8 +218,8 @@ class BuildTests(unittest.TestCase):
                     source = self.copy(f"run-{run}{'-spaces' if tail else ''}")
                     (source / "Dockerfile").write_bytes(PREFIX + ("RUN --network=none true " + "\\" * run + tail + "\n").encode()
                                                         + b"ADD https://example.invalid/x /x\nUSER 65534:65534\n")
-                    if joined:  # BuildKit reads ADD as words of the RUN command, and so does the guard
-                        self.assertEqual(self.build(source=source), 0)
+                    if joined:  # Parser check only: this is intentionally not the closed full Dockerfile.
+                        build.check_dockerfile(source / "Dockerfile")
                     else:
                         with self.assertRaisesRegex(SystemExit, "ADD is refused"):
                             self.build(source=source)
@@ -166,7 +247,7 @@ class BuildTests(unittest.TestCase):
                 self.assertEqual(self.docker.calls, [])
         crlf = self.copy("CRLF line ends")
         (crlf / "Dockerfile").write_bytes((body + b"RUN --network=none true \\\n    && true\n" + user).replace(b"\n", b"\r\n"))
-        self.assertEqual(self.build(source=crlf), 0)
+        build.check_dockerfile(crlf / "Dockerfile")
 
     def test_the_real_dockerfile_is_accepted(self):
         build.check_dockerfile(build.SOURCE / "Dockerfile")
@@ -174,15 +255,19 @@ class BuildTests(unittest.TestCase):
     def test_the_dockerfile_content_is_pinned(self):
         instructions = [" ".join(words) for words in build.logical_instructions((build.SOURCE / "Dockerfile").read_text())]
         final = instructions[instructions.index("FROM " + build.BASE):]
-        self.assertEqual(final[:6], [
+        self.assertEqual(final[:9], [
             "FROM " + build.BASE, "COPY --from=natives /opt/jdk /opt/jdk", "COPY --from=natives /opt/ghidra /opt/ghidra",
-            "COPY worker.py /opt/reverseai/worker.py", "COPY ghidra_scripts/ /opt/reverseai/ghidra_scripts/", "USER 65534:65534"])
-        self.assertEqual(len(final), 8)
-        self.assertTrue(final[6].startswith('RUN --network=none ["python3", "-I", "-B", "-c", "import os, importlib.util as u;'))
+            "COPY worker.py /opt/reverseai/worker.py", "COPY project_cache.py /opt/reverseai/project_cache.py",
+            "COPY ghidra_scripts/ReverseAIOptions.java /opt/reverseai/ghidra_scripts/ReverseAIOptions.java",
+            "COPY ghidra_scripts/ReverseAIQuery.java /opt/reverseai/ghidra_scripts/ReverseAIQuery.java",
+            "COPY ghidra_scripts/ReverseAIPrepare.java /opt/reverseai/ghidra_scripts/ReverseAIPrepare.java", "USER 65534:65534"])
+        self.assertEqual(len(final), 11)
+        self.assertTrue(final[9].startswith('RUN --network=none ["python3", "-I", "-B", "-c", "import os, importlib.util as u;'))
         for piece in ("'/opt/jdk/bin/java'", "'/opt/ghidra/support/analyzeHeadless'", "os/linux_arm_64/decompile'",
-                      "os/linux_arm_64/demangler_gnu_v2_41'", "['ReverseAIOptions.java', 'ReverseAIQuery.java']"):
-            self.assertIn(piece, final[6])
-        self.assertEqual(final[7], 'ENTRYPOINT ["python3", "-I", "-B", "/opt/reverseai/worker.py"]')
+                      "os/linux_arm_64/demangler_gnu_v2_41'", "['ReverseAIOptions.java', 'ReverseAIPrepare.java', 'ReverseAIQuery.java']",
+                      "['ghidra_scripts', 'project_cache.py', 'worker.py']"):
+            self.assertIn(piece, final[9])
+        self.assertEqual(final[10], 'ENTRYPOINT ["python3", "-I", "-B", "/opt/reverseai/worker.py"]')
         self.assertFalse([line for line in instructions if line.split()[0].upper() in ("ENV", "VOLUME", "ARG", "ONBUILD", "SHELL")])
         natives = instructions[:instructions.index("FROM " + build.BASE)]
         self.assertEqual(natives[1], "RUN apt-get update && apt-get install -y --no-install-recommends g++=4:14.2.0-1 make=4.4.1-2 "
@@ -243,7 +328,7 @@ class BuildTests(unittest.TestCase):
                     self.build(source=self.dockerfile(label, lines))
                 self.assertEqual(self.docker.calls, [])
         allowed = self.dockerfile("smallest accepted", [natives, apt, offline, final, *copy, offline, user])
-        self.assertEqual(self.build(source=allowed), 0)
+        build.check_dockerfile(allowed / "Dockerfile")
 
 
 UNPACK_SPEC = importlib.util.spec_from_file_location("ghidra_unpack", ROOT / "containers" / "ghidra" / "unpack.py")

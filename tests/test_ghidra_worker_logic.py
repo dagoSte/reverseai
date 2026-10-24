@@ -1073,13 +1073,22 @@ class ReplyTests(unittest.TestCase):
 class BuildInputTests(unittest.TestCase):
     def test_scripts_lock_and_dockerfile_are_pinned_consistently(self):
         lock = json.loads((SOURCE / "image.lock.json").read_text(encoding="utf-8"))
-        self.assertEqual(set(lock), {"adapter_version", "base_digest", "ghidra_sha256", "image_id", "jdk_sha256", "platform"})
-        self.assertEqual((lock["adapter_version"], lock["platform"], worker.ADAPTER_VERSION), ("12.1.4-r6", "linux/arm64", "12.1.4-r6"))
+        base_keys = {"adapter_version", "base_digest", "ghidra_sha256", "image_id", "jdk_sha256", "platform"}
+        if lock["adapter_version"] == "12.1.4-r6":
+            self.assertEqual(set(lock), base_keys)
+            self.assertEqual(lock["image_id"], "sha256:ac77fda75da8580e0479087580f83b6e5495fb16df97b9696a2bdf3ae100f452")
+        else:
+            self.assertEqual(lock["adapter_version"], "12.1.4-r7")
+            self.assertEqual(set(lock), base_keys | {"parent_image_id", "bundle_sha256", "cache_format"})
+            from tools.build_ghidra_image import bundle_digest, bundle_hashes
+            self.assertEqual(lock["bundle_sha256"], bundle_digest(bundle_hashes(SOURCE)))
+            self.assertEqual(lock["cache_format"], 1)
+        self.assertEqual((lock["platform"], worker.ADAPTER_VERSION), ("linux/arm64", "12.1.4-r7"))
         self.assertEqual(lock["ghidra_sha256"], "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db")
         self.assertEqual(lock["jdk_sha256"], "23e37e026f12f3e706f18938ff611db3032d075b09d0879a25d06718c773e223")
         self.assertEqual(lock["base_digest"], json.loads((ROOT / "containers" / "lief" / "image.lock.json").read_text())["base_digest"])
         self.assertRegex(lock["image_id"], r"^sha256:[0-9a-f]{64}$")
-        self.assertEqual(sorted(p.name for p in (SOURCE / "ghidra_scripts").iterdir()), ["ReverseAIOptions.java", "ReverseAIQuery.java"])
+        self.assertEqual(sorted(p.name for p in (SOURCE / "ghidra_scripts").iterdir()), ["ReverseAIOptions.java", "ReverseAIPrepare.java", "ReverseAIQuery.java"])
         query_source = (SOURCE / "ghidra_scripts" / "ReverseAIQuery.java").read_text()
         # Size is the span; reverting to the body's address count must fail here.
         self.assertIn("long size = span(function);", query_source)
@@ -1094,7 +1103,8 @@ class BuildInputTests(unittest.TestCase):
         # Each mode takes a fixed number of arguments after the output path and the mode itself.
         self.assertIn('int expected = mode.equals("analyze") ? 8 : mode.equals("functions") ? 5 : mode.equals("function") ? 9',
                       query_source)
-        self.assertIn('\t\t\t: mode.equals("xrefs") ? 6 : -1;\n\t\tif (args.length != expected) {', query_source)
+        self.assertIn('mode.equals("export") ? 8', query_source)
+        self.assertIn('if (args.length != expected) {', query_source)
         # References leave calls (their own kind) and non-memory targets out; listings start at the entry and count
         # the whole body, so the worker can tell a cut listing; the listed functions follow the pseudocode order.
         for pin in ("if (refs == MAX_REFS_PER_FUNCTION || !target.isMemoryAddress() || type.isCall()) {",

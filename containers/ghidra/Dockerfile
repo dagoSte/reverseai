@@ -31,8 +31,11 @@ FROM python:3.12-slim@sha256:16bf2b5c59a08523519d3c8589deca849285dee1d62a3653e12
 COPY --from=natives /opt/jdk /opt/jdk
 COPY --from=natives /opt/ghidra /opt/ghidra
 COPY worker.py /opt/reverseai/worker.py
-COPY ghidra_scripts/ /opt/reverseai/ghidra_scripts/
+COPY project_cache.py /opt/reverseai/project_cache.py
+COPY ghidra_scripts/ReverseAIOptions.java /opt/reverseai/ghidra_scripts/ReverseAIOptions.java
+COPY ghidra_scripts/ReverseAIQuery.java /opt/reverseai/ghidra_scripts/ReverseAIQuery.java
+COPY ghidra_scripts/ReverseAIPrepare.java /opt/reverseai/ghidra_scripts/ReverseAIPrepare.java
 USER 65534:65534
 # The worker, its fixed scripts, the JDK and both arm64 natives must be in place: a missing piece fails the build.
-RUN --network=none ["python3", "-I", "-B", "-c", "import os, importlib.util as u; s = u.spec_from_file_location('worker', '/opt/reverseai/worker.py'); w = u.module_from_spec(s); s.loader.exec_module(w); assert all(os.access(p, os.X_OK) for p in ('/opt/jdk/bin/java', '/opt/ghidra/support/analyzeHeadless', '/opt/ghidra/Ghidra/Features/Decompiler/os/linux_arm_64/decompile', '/opt/ghidra/GPL/DemanglerGnu/os/linux_arm_64/demangler_gnu_v2_41')); assert sorted(os.listdir(w.SCRIPTS)) == ['ReverseAIOptions.java', 'ReverseAIQuery.java']"]
+RUN --network=none ["python3", "-I", "-B", "-c", "import os, importlib.util as u; s = u.spec_from_file_location('worker', '/opt/reverseai/worker.py'); w = u.module_from_spec(s); s.loader.exec_module(w); assert all(os.access(p, os.X_OK) for p in ('/opt/jdk/bin/java', '/opt/ghidra/support/analyzeHeadless', '/opt/ghidra/Ghidra/Features/Decompiler/os/linux_arm_64/decompile', '/opt/ghidra/GPL/DemanglerGnu/os/linux_arm_64/demangler_gnu_v2_41')); assert sorted(os.listdir(w.SCRIPTS)) == ['ReverseAIOptions.java', 'ReverseAIPrepare.java', 'ReverseAIQuery.java']; assert sorted(os.listdir('/opt/reverseai')) == ['ghidra_scripts', 'project_cache.py', 'worker.py']"]
 ENTRYPOINT ["python3", "-I", "-B", "/opt/reverseai/worker.py"]

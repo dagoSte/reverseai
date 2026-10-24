@@ -1,4 +1,4 @@
-"""ReverseAI Ghidra worker: one operation on /snapshot/input, one reverseai.worker/1 JSON object on stdout.
+"""ReverseAI Ghidra worker: bounded query JSON, or one raw USTAR prepared artifact, on stdout.
 
 Entrypoint (docs/contract.md, "Contained Ghidra worker (M3a)"):
     python3 -I -B /opt/reverseai/worker.py ghidra.analyze <canonical JSON of validated args>
@@ -34,6 +34,8 @@ one JSON object is written, to stdout only.
 """
 
 import hashlib
+import importlib.util
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -45,7 +47,7 @@ import subprocess
 import sys
 
 PROTOCOL = "reverseai.worker/1"
-ADAPTER_VERSION = "12.1.4-r6"
+ADAPTER_VERSION = "12.1.4-r7"
 SNAPSHOT = "/snapshot/input"
 MAX_INPUT_BYTES = 64 * 1024 * 1024
 MAX_REPLY_BYTES = 262_144
@@ -70,6 +72,19 @@ OPERATIONS = {
                         "max_calls": ("int", 0, 256, 64), "max_refs": ("int", 0, 128, 64)},
     "ghidra.xrefs": {"address": ("int", 0, MAX_ADDRESS, None), "start": ("int", 0, 65535, 0), "limit": ("int", 1, 256, 64)},
 }
+OPERATIONS.update({
+    "ghidra.prepare": {},
+    "ghidra.pseudocode": {"select": ("enum", ("entry", "name"), "entry"),
+                          "entry": ("int", 0, MAX_ADDRESS, 0), "name": ("str", ""),
+                          "text_start": ("int", 0, 1048576, 0), "max_chars": ("int", 64, 2048, 1024)},
+    "ghidra.export_function": {"select": ("enum", ("entry", "name"), "entry"),
+        "entry": ("int", 0, MAX_ADDRESS, 0), "name": ("str", ""),
+        "part": ("enum", ("info", "pseudocode", "assembly", "callees", "callers", "references", "strings"), "info"),
+        "start": ("int", 0, 1048575, 0), "limit": ("int", 1, 128, 32),
+        "text_start": ("int", 0, 1048576, 0), "max_chars": ("int", 64, 2048, 1024)},
+    "ghidra.export_program": {"part": ("enum", ("functions", "calls", "references", "strings"), "functions"),
+                               "start": ("int", 0, 1048575, 0), "limit": ("int", 1, 128, 32)},
+})
 MAX_OBSERVATIONS = {"ghidra.analyze": 600, "ghidra.functions": 128, "ghidra.function": 643, "ghidra.xrefs": 256}
 MAX_ROWS = 65536  # functions, callers, callees or references to an address one query run may count (m3d-seams-w, m3d-fix-round)
 MAX_FUNCTION_INSTRUCTIONS = 1_000_000  # instructions one function may count (m3d-fix-round)
@@ -320,6 +335,15 @@ def parse_request(argv):
         if value is None or not _allowed(spec, value):
             raise InvalidRequest()
         checked[name] = value
+    if operation in ("ghidra.pseudocode", "ghidra.export_function"):
+        if checked["select"] == "entry" and checked["name"] or checked["select"] == "name" and checked["entry"]:
+            raise InvalidRequest()
+    if operation == "ghidra.export_function":
+        part = checked["part"]
+        if (part == "info" and (checked["start"] or checked["limit"] != 32)
+                or part == "pseudocode" and (checked["start"] or checked["limit"] != 32)
+                or part not in ("pseudocode",) and (checked["text_start"] or checked["max_chars"] != 1024)):
+            raise InvalidRequest()
     return operation, checked
 
 
@@ -914,8 +938,418 @@ HANDLERS = {"ghidra.analyze": observations, "ghidra.functions": function_rows, "
 
 def run(operation, args, data, query_of=None):
     """Observations for one operation; query_of(format, args, script arguments) defaults to the headless Ghidra run."""
-    query = (query_of or run_ghidra)(kind(data), args, script_args(operation, args, data))
+    if operation in ("ghidra.pseudocode", "ghidra.export_function", "ghidra.export_program"):
+        return export_rows(operation, args, data, query_of=query_of)
+    if query_of is None and (Path(SNAPSHOT).parent / "cache.json").exists():
+        cache_root = restore_project(data)
+        query = run_cached(kind(data), args, script_args(operation, args, data), cache_root)
+    else:
+        query = (query_of or run_ghidra)(kind(data), args, script_args(operation, args, data))
     return HANDLERS[operation](data, query, args)
+
+
+# ---- Prepared projects and paged exports ---------------------------------------------------------
+
+PREPARE_SECONDS = 840
+PREPARE_ANALYSIS_SECONDS = 720
+MAX_PSEUDOCODE = 1048576
+MAX_INSTRUCTION_VISITS = 8388608
+HOST_ID_BYTES = 81
+BUNDLE_FILES = ("worker.py", "project_cache.py", "ghidra_scripts/ReverseAIOptions.java",
+                "ghidra_scripts/ReverseAIQuery.java", "ghidra_scripts/ReverseAIPrepare.java")
+
+
+class InvalidCachedProject(WorkerFailure):
+    pass
+
+
+class IncompleteAnalysis(WorkerFailure):
+    pass
+
+
+class PseudocodeTooLarge(WorkerFailure):
+    pass
+
+
+def cache_module():
+    # The entrypoint uses -I, which intentionally excludes its directory from sys.path.
+    spec = importlib.util.spec_from_file_location("reverseai_project_cache", Path(__file__).with_name("project_cache.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def bundle_hash():
+    root = Path(__file__).resolve().parent
+    hashes = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in BUNDLE_FILES}
+    return hashlib.sha256(encode(hashes).rstrip(b"\n")).hexdigest()
+
+
+def _headless(argv, timeout):
+    with open(WORK / "headless.out", "wb") as log:
+        process = subprocess.Popen(argv, env=ghidra_env(), cwd=WORK, stdin=subprocess.DEVNULL,
+                                   stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            raise GhidraTimeout() from None
+        if process.returncode != 0:
+            raise GhidraFailed()
+
+
+def _query_file(path):
+    try:
+        with open(path, "rb") as source:
+            raw = source.read(MAX_QUERY_BYTES + 1)
+        if len(raw) > MAX_QUERY_BYTES:
+            raise InvalidQueryOutput()
+        return cache_module()._json(raw)
+    except (OSError, ValueError, RecursionError):
+        raise InvalidQueryOutput() from None
+
+
+def restore_project(data):
+    module, folder = cache_module(), Path(SNAPSHOT).parent
+    try:
+        with open(folder / "cache.json", "rb") as source:
+            raw = source.read(module.MAX_METADATA_BYTES + 1)
+        if len(raw) > module.MAX_METADATA_BYTES:
+            raise InvalidCachedProject()
+        manifest = module._json(raw)
+        fields = {"format", "input_sha256", "image_id", "bundle_sha256", "size", "artifact_sha256"}
+        if (not isinstance(manifest, dict) or set(manifest) != fields or type(manifest["format"]) is not int
+                or manifest["format"] != 1 or manifest["input_sha256"] != hashlib.sha256(data).hexdigest()
+                or manifest["bundle_sha256"] != bundle_hash()
+                or not isinstance(manifest["image_id"], str)
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", manifest["image_id"])
+                or type(manifest["size"]) is not int or not 0 < manifest["size"] <= module.MAX_TAR_BYTES):
+            raise InvalidCachedProject()
+        shutil.rmtree(WORK, ignore_errors=True)
+        WORK.mkdir(mode=0o700)
+        (WORK / "home").mkdir(mode=0o700)
+        with open(folder / "project.tar", "rb") as source:
+            if os.fstat(source.fileno()).st_size != manifest["size"]:
+                raise InvalidCachedProject()
+            root = module.unpack_project(source, manifest["artifact_sha256"], WORK / "restored")
+        metadata = load_metadata(root, data)
+        # Validate index sizes even for a query that does not read one of the tables.
+        for name, count in metadata["counts"].items():
+            reader = module.TableReader(root / "tables", name, count)
+            reader.close()
+        return root
+    except (OSError, ValueError, KeyError, TypeError, struct.error):
+        raise InvalidCachedProject() from None
+
+
+def load_metadata(root, data):
+    module = cache_module()
+    with open(Path(root) / "tables" / "meta.json", "rb") as source:
+        raw = source.read(module.MAX_METADATA_BYTES + 1)
+    if len(raw) > module.MAX_METADATA_BYTES:
+        raise InvalidCachedProject()
+    metadata = module._json(raw)
+    if (not isinstance(metadata, dict) or set(metadata) != {"format", "input_sha256", "counts", "complete"}
+            or type(metadata["format"]) is not int or metadata["format"] != 1
+            or metadata["input_sha256"] != hashlib.sha256(data).hexdigest() or metadata["complete"] is not True
+            or not isinstance(metadata["counts"], dict) or set(metadata["counts"]) != set(module.TABLES)
+            or any(type(n) is not int or not 0 <= n <= module.CAPS[name] for name, n in metadata["counts"].items())):
+        raise InvalidCachedProject()
+    return metadata
+
+
+def run_cached(format_, args, script, root):
+    out = WORK / "query.json"
+    argv = ["/bin/bash", str(GHIDRA / "support" / "analyzeHeadless"), str(Path(root) / "project"), "reverseai",
+            "-process", "input", "-noanalysis", "-readOnly", "-max-cpu", "2", "-scriptPath", str(SCRIPTS),
+            "-postScript", "ReverseAIQuery.java", str(out), *script,
+            "-log", str(WORK / "ghidra.log"), "-scriptlog", str(WORK / "script.log")]
+    _headless(argv, GHIDRA_SECONDS)
+    return _query_file(out)
+
+
+def prepare_argv(format_, raw_folder):
+    return ["/bin/bash", str(GHIDRA / "support" / "analyzeHeadless"), str(WORK / "cache" / "project"), "reverseai",
+            "-import", SNAPSHOT, "-max-cpu", "2", "-analysisTimeoutPerFile", str(PREPARE_ANALYSIS_SECONDS),
+            "-loader", LOADERS[format_], "-loader-loadLibraries", "false", "-loader-linkExistingProjectLibraries", "false",
+            "-scriptPath", str(SCRIPTS), "-preScript", "ReverseAIOptions.java",
+            "-postScript", "ReverseAIPrepare.java", str(raw_folder),
+            "-log", str(WORK / "ghidra.log"), "-scriptlog", str(WORK / "script.log")]
+
+
+def _raw_rows(path, cap):
+    module = cache_module()
+    with open(path, "rb") as source:
+        count = 0
+        while raw := source.readline(16385):
+            if len(raw) > 16384 or not raw.endswith(b"\n") or count == cap:
+                raise TooManyRows()
+            value = module._json(raw)
+            if not isinstance(value, dict):
+                raise InvalidQueryOutput()
+            count += 1
+            yield value
+
+
+def _export_item(location, value):
+    # Reserve the host-added analysis_id in every value, including metadata and pseudocode.
+    if _size(value) + HOST_ID_BYTES > MAX_OBSERVATION_BYTES:
+        raise ReplyTooLarge()
+    return {"location": location, "value": value}
+
+
+def _signature(raw):
+    if raw is None:
+        return None, False
+    if not isinstance(raw, str):
+        raise InvalidQueryOutput()
+    text = "".join(c if c.isprintable() else "?" for c in raw)
+    return text[:512], len(text) > 512
+
+
+def build_tables(data, raw_folder, tables):
+    """Stream the fixed prepare output into bounded indexed tables; no full-program JSON blob."""
+    module = cache_module()
+    header = _query_file(Path(raw_folder) / "header.json")
+    if header.get("complete") is not True:
+        raise IncompleteAnalysis()
+    _, sections, anchors = _prelude(data, header)
+    functions, instruction_visits = {}, 0
+    counts = {}
+    with contextlib.ExitStack() as stack:
+        writers, budget = {}, {"bytes": 0}
+        for name in module.TABLES:
+            writers[name] = module.TableWriter(tables, name, budget=budget)
+            stack.callback(writers[name].close)
+        previous = -1
+        for item in _raw_rows(Path(raw_folder) / "functions.jsonl", module.CAPS["functions"]):
+            function = _function(anchors, sections, item)
+            if function is None or function["va"] <= previous or function["size"] > MAX_ADDRESS - function["va"]:
+                raise InconsistentAnchor()
+            previous = function["va"]
+            signature, cut = _signature(item.get("signature"))
+            assembly_total = _int(item.get("assembly_total"))
+            if assembly_total > MAX_FUNCTION_INSTRUCTIONS:
+                raise TooManyRows()
+            instruction_visits += assembly_total
+            if instruction_visits > MAX_INSTRUCTION_VISITS:
+                raise TooManyRows()
+            index = writers["functions"].count
+            value = {"kind": "function_export", "index": index, "name": function["name"],
+                     "entry": function["va"], "size": function["size"], "signature": signature,
+                     "signature_truncated": cut, "library_hint": None}
+            record = _export_item({"offset": function["offset"], "length": function["length"]}, value)
+            record["raw_name"] = function["raw_name"]
+            record["assembly_total"] = assembly_total
+            writers["functions"].add(record)
+            functions[function["address"]] = function
+        last_string = None
+        for name in ("calls", "references"):
+            previous_key = None
+            for item in _raw_rows(Path(raw_folder) / (name + ".jsonl"), module.CAPS[name]):
+                function = functions.get(item.get("from"))
+                if function is None:
+                    raise InconsistentAnchor()
+                mapped = _instruction(anchors, function, item)
+                to = _target(anchors, item) if mapped else None
+                if mapped is None or to is None or to > MAX_ADDRESS:
+                    raise InconsistentAnchor()
+                at, offset, length = mapped
+                value = {"kind": "call_export" if name == "calls" else "reference_export", "index": writers[name].count,
+                         "from": function["va"], "from_size": function["size"], "at": at, "to": to,
+                         "to_name": printable_name(item.get("to_name", ""))}
+                if name == "references":
+                    value["type"] = ref_type(item)
+                    if value["type"] is None:
+                        continue
+                key = (function["va"], at, to, value.get("type", ""))
+                if previous_key is not None and key <= previous_key:
+                    raise InvalidQueryOutput()
+                previous_key = key
+                writers[name].add(_export_item({"offset": offset, "length": length}, value))
+                if name == "references":
+                    decoded = decode_string(data, sections, to)
+                    if decoded is not None:
+                        start, size, encoding, text, truncated = decoded
+                        string = {"kind": "string_export", "index": writers["strings"].count,
+                                  "from": function["va"], "from_size": function["size"], "at": at,
+                                  "instruction_length": length, "address": to, "encoding": encoding,
+                                  "text": text, "truncated": truncated}
+                        # A repeated reference type does not repeat the same string relationship.
+                        string_key = (function["va"], at, to, encoding)
+                        if string_key != last_string:
+                            writers["strings"].add(_export_item({"offset": start, "length": size}, string))
+                            last_string = string_key
+        counts = {name: writer.count for name, writer in writers.items()}
+    metadata = {"format": 1, "input_sha256": hashlib.sha256(data).hexdigest(), "counts": counts, "complete": True}
+    (Path(tables) / "meta.json").write_bytes(module.canonical(metadata))
+    return metadata
+
+
+def _table_rows(folder, name, count, *, flush=None):
+    if flush is not None:
+        flush.body.flush()
+        flush.index.flush()
+    reader = cache_module().TableReader(folder, name, count)
+    try:
+        yield from reader.rows()
+    finally:
+        reader.close()
+
+
+def prepare(data, sink):
+    format_ = kind(data)
+    shutil.rmtree(WORK, ignore_errors=True)
+    for name in ("home", "raw", "cache/project", "cache/tables"):
+        (WORK / name).mkdir(mode=0o700, parents=True, exist_ok=True)
+    _headless(prepare_argv(format_, WORK / "raw"), PREPARE_SECONDS)
+    build_tables(data, WORK / "raw", WORK / "cache" / "tables")
+    # Headless has closed the project before it is packed. No query can write this artifact back.
+    return cache_module().pack_project(WORK, sink)
+
+
+def _page(data, scope, part, entry, total=0, start=0, rows=(), status="ok", count=None):
+    rows = list(rows)
+    start = min(start, total)
+    row_units = count is None
+    count = len(rows) if row_units else count
+    if status != "ok":
+        start = total = count = 0
+        rows = []
+    if count == 0 and start < total:
+        raise InvalidQueryOutput()
+    next_start = start + count if start + count < total else None
+    value = {"kind": "export_page", "scope": scope, "part": part, "entry": entry, "status": status,
+             "start": start, "total": total, "count": count, "next_start": next_start}
+    while True:
+        result = [_export_item({"offset": 0, "length": min(64, len(data))}, value), *rows]
+        envelope = {"protocol": PROTOCOL, "status": "ok", "snapshot_sha256": "0" * 64, "observations": result}
+        if len(result) <= 129 and len(encode(envelope)) + HOST_ID_BYTES * len(result) <= MAX_REPLY_BYTES:
+            return result
+        if not row_units or not rows:
+            raise ReplyTooLarge()
+        rows.pop()
+        if not rows and start < total:
+            raise ReplyTooLarge()
+        value.update(count=len(rows), next_start=start + len(rows) if start + len(rows) < total else None)
+
+
+def pseudocode_page(data, function, text, args):
+    normalized = printable_text(text)
+    # Python len/slicing counts Unicode scalar values after control/surrogate normalization.
+    if len(normalized) > MAX_PSEUDOCODE:
+        raise PseudocodeTooLarge()
+    total, start = len(normalized), min(args.get("text_start", 0), len(normalized))
+    whole = normalized[start:start + args["max_chars"]]
+    value = {"kind": "pseudocode_page", "entry": function["entry"], "size": function["size"],
+             "text_sha256": hashlib.sha256(normalized.encode("utf-8")).hexdigest(), "start": start,
+             "total": total, "text": whole, "next_start": None, "status": "ok"}
+    low, high = 0, len(whole)
+    while low < high:
+        middle = (low + high + 1) // 2
+        value.update(text=whole[:middle], next_start=start + middle if start + middle < total else None)
+        if _size(value) + HOST_ID_BYTES <= MAX_OBSERVATION_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+    value.update(text=whole[:low], next_start=start + low if start + low < total else None)
+    if not low and start < total:
+        raise ReplyTooLarge()
+    return _export_item(function["location"], value)
+
+
+def export_rows(operation, args, data, *, query_of=None, root=None):
+    root = root or restore_project(data)
+    metadata = load_metadata(root, data)
+    tables = Path(root) / "tables"
+    part = "pseudocode" if operation == "ghidra.pseudocode" else args["part"]
+    if operation == "ghidra.export_program":
+        reader = cache_module().TableReader(tables, part, metadata["counts"][part])
+        try:
+            start = min(args["start"], reader.count)
+            rows = [public_record(reader.row(i), i) for i in range(start, min(start + args["limit"], reader.count))]
+            return _page(data, "program", part, None, reader.count, start, rows)
+        finally:
+            reader.close()
+    matches, selected = 0, None
+    for record in _table_rows(tables, "functions", metadata["counts"]["functions"]):
+        value = record["value"]
+        if (args["select"] == "entry" and value["entry"] == args["entry"]
+                or args["select"] == "name" and record.get("raw_name") == args["name"]):
+            matches += 1
+            if selected is None:
+                selected = record
+    if selected is None:
+        return _page(data, "function", part, None, status="not_found")
+    function = dict(selected["value"], location=selected["location"])
+    entry = function["entry"]
+    if part == "info":
+        totals = {"assembly": selected["assembly_total"], "callees": 0, "callers": 0, "references": 0, "strings": 0}
+        for table in ("calls", "references", "strings"):
+            for record in _table_rows(tables, table, metadata["counts"][table]):
+                value = record["value"]
+                if value["from"] == entry:
+                    totals["callees" if table == "calls" else table] += 1
+                if table == "calls" and value["to"] == entry:
+                    totals["callers"] += 1
+        value = {"kind": "function_info", "name": function["name"], "entry": entry, "size": function["size"],
+                 "matches": matches, "signature": function["signature"], "signature_truncated": function["signature_truncated"],
+                 "library_hint": None, "totals": totals, "pseudocode_status": "not_requested"}
+        return _page(data, "function", part, entry, 1, 0, [_export_item(selected["location"], value)])
+    if part in ("pseudocode", "assembly"):
+        _, sections = FILE_MAPS[kind(data)](data)
+        offset = offset_of(sections, entry)
+        script = ["export", "entry", str(offset if offset is not None else -1), "x", part,
+                  str(args.get("start", 0)), str(args.get("limit", 32))]
+        query = ((query_of(kind(data), args, script)) if query_of else run_cached(kind(data), args, script, root))
+        _, sections, anchors = _prelude(data, query, "export")
+        found = _function(anchors, sections, query.get("function"))
+        if found is None or found["va"] != entry or found["size"] != function["size"]:
+            raise InconsistentAnchor()
+        if part == "pseudocode":
+            text = query.get("pseudocode")
+            if text is None:
+                return _page(data, "function", part, entry, status="decompile_failed")
+            observation = pseudocode_page(data, function, text, args)
+            value = observation["value"]
+            return _page(data, "function", part, entry, value["total"], value["start"], [observation], count=len(value["text"]))
+        listing = query.get("instructions")
+        if not isinstance(listing, dict) or listing.get("overflow") is not False:
+            raise TooManyRows()
+        total = _int(listing.get("total"))
+        start = min(args["start"], total)
+        if total != selected["assembly_total"] or listing.get("start") != start:
+            raise InvalidQueryOutput()
+        rows, after = [], -1
+        for index, row in enumerate(listing.get("rows", []), start):
+            mapped = _instruction(anchors, found, row)
+            if mapped is None or row.get("index") != index or index >= total or len(rows) >= args["limit"]:
+                raise InconsistentAnchor()
+            at, offset, length = mapped
+            if at < after:
+                raise InvalidQueryOutput()
+            after = at + length
+            value = {"kind": "instruction_export", "index": index, "from": entry, "from_size": function["size"],
+                     "at": at, "length": length, "text": printable_name(row.get("text"))[:64] or "?"}
+            rows.append(_export_item({"offset": offset, "length": length}, value))
+        return _page(data, "function", part, entry, total, start, rows)
+    table = "calls" if part in ("callees", "callers") else part
+    total, rows = 0, []
+    for record in _table_rows(tables, table, metadata["counts"][table]):
+        value = record["value"]
+        if value["to" if part == "callers" else "from"] == entry:
+            if args["start"] <= total < args["start"] + args["limit"]:
+                rows.append(public_record(record, total))
+            total += 1
+    return _page(data, "function", part, entry, total, args["start"], rows)
+
+
+def public_record(record, index):
+    if not isinstance(record, dict) or not isinstance(record.get("location"), dict) or not isinstance(record.get("value"), dict):
+        raise InvalidCachedProject()
+    value = dict(record["value"], index=index)
+    return _export_item(record["location"], value)
 
 
 # ---- Reply --------------------------------------------------------------------------------------
@@ -962,7 +1396,21 @@ def main(argv=None, snapshot=SNAPSHOT):
         data, digest = read_snapshot(snapshot)
     except OSError:
         data, digest = None, None
-    sys.stdout.buffer.write(encode(reply(sys.argv[1:] if argv is None else argv, data, digest=digest)))
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments and arguments[0] == "ghidra.prepare":
+        try:
+            operation, checked = parse_request(arguments)
+            if data is None:
+                raise SnapshotUnreadable()
+            if len(data) > MAX_INPUT_BYTES:
+                raise InputTooLarge()
+            prepare(data, sys.stdout.buffer)
+            sys.stdout.flush()
+            return 0
+        except Exception as exc:
+            sys.stderr.write(error_name(exc) + "\n")
+            return 1
+    sys.stdout.buffer.write(encode(reply(arguments, data, digest=digest)))
     sys.stdout.flush()
     return 0
 

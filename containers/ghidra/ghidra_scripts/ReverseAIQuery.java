@@ -44,6 +44,7 @@ public class ReverseAIQuery extends GhidraScript {
 	private static final int MAX_ROWS = 65536;  // functions, callers or xrefs counted by one run (decision m3d-seams-w)
 	private static final int MAX_LOCATION = 4096;
 	private static final int MAX_TEXT = 65536;
+	private static final int MAX_EXPORT_TEXT = 1048576;
 	// The same rule as ReverseAIOptions: the worker refuses the run if any of these is still on.
 	private static final Pattern OFF = Pattern.compile("(?i).*(pdb|dwarf|swift).*");
 
@@ -54,7 +55,7 @@ public class ReverseAIQuery extends GhidraScript {
 		String[] args = getScriptArgs();
 		String mode = args.length > 1 ? args[1] : "";
 		int expected = mode.equals("analyze") ? 8 : mode.equals("functions") ? 5 : mode.equals("function") ? 9
-			: mode.equals("xrefs") ? 6 : -1;
+			: mode.equals("xrefs") ? 6 : mode.equals("export") ? 8 : -1;
 		if (args.length != expected) {
 			throw new IllegalArgumentException("ReverseAIQuery arguments");
 		}
@@ -69,6 +70,9 @@ public class ReverseAIQuery extends GhidraScript {
 		}
 		else if (mode.equals("function")) {
 			function(out, args);
+		}
+		else if (mode.equals("export")) {
+			export(out, args);
 		}
 		else {
 			xrefs(out, args);
@@ -268,6 +272,126 @@ public class ReverseAIQuery extends GhidraScript {
 		}
 		else {
 			out.append("null");
+		}
+	}
+
+	/** export: <entry|name> <entry file offset> <name (x + hex)> <pseudocode|assembly> <start> <limit>.
+	 * Cached tables serve all other parts. A call here visits or decompiles only its selected function. */
+	private void export(StringBuilder out, String[] args) throws Exception {
+		if ((!args[2].equals("entry") && !args[2].equals("name"))
+				|| (!args[5].equals("pseudocode") && !args[5].equals("assembly"))) {
+			throw new IllegalArgumentException("ReverseAIQuery export arguments");
+		}
+		boolean byEntry = args[2].equals("entry");
+		long offset = Long.parseLong(args[3]);
+		String name = text(args[4]);
+		int start = Integer.parseInt(args[6]);
+		int limit = Integer.parseInt(args[7]);
+		if (start < 0 || start > 1048575 || limit < 1 || limit > 128) {
+			throw new IllegalArgumentException("ReverseAIQuery export page");
+		}
+		Function target = null;
+		for (Function function : currentProgram.getFunctionManager().getFunctions(true)) {
+			monitor.checkCancelled();
+			long entryOffset = uniqueExportFileOffset(function.getEntryPoint(), 1);
+			if (!function.isExternal() && entryOffset >= 0
+					&& (byEntry ? entryOffset == offset : function.getName().equals(name))) {
+				target = function;
+				break; // The iterator's address order selects the lowest exact match.
+			}
+		}
+		out.append(",\"function\":");
+		if (target == null) {
+			out.append("null,\"pseudocode\":null,\"instructions\":null");
+			return;
+		}
+		appendFunction(out, target, 0, false);
+		out.append(",\"pseudocode\":");
+		String pseudocode = args[5].equals("pseudocode") ? exportDecompiled(target) : null;
+		out.append(pseudocode == null ? "null" : quote(pseudocode)).append(",\"instructions\":");
+		if (args[5].equals("assembly")) {
+			appendExportPage(out, target, start, limit);
+		}
+		else {
+			out.append("null");
+		}
+	}
+
+	/** Match the prepare traversal's validity rule, so every cursor counts the same admitted instructions. */
+	private void appendExportPage(StringBuilder out, Function function, int start, int limit) throws Exception {
+		StringBuilder rows = new StringBuilder();
+		Address entry = function.getEntryPoint();
+		int visits = 0;
+		int total = 0;
+		boolean first = true;
+		for (Instruction instruction : currentProgram.getListing().getInstructions(function.getBody(), true)) {
+			monitor.checkCancelled();
+			if (++visits > MAX_BODY_INSTRUCTIONS) {
+				throw new IllegalStateException("TooManyRows");
+			}
+			Address at = instruction.getAddress();
+			int length = instruction.getLength();
+			if (at.compareTo(entry) < 0 || length < 1 || length > 16
+					|| length > span(function) - at.subtract(entry) || uniqueExportFileOffset(at, length) < 0) {
+				continue;
+			}
+			if (total >= start && total - start < limit) {
+				rows.append(first ? "" : ",").append("{\"index\":").append(total)
+					.append(",\"address\":").append(at.getOffset()).append(",\"length\":").append(length)
+					.append(",\"file_offset\":").append(fileOffset(at))
+					.append(",\"bytes\":").append(quote(toHex(instruction.getBytes())))
+					.append(",\"text\":").append(quote(instruction.toString())).append("}");
+				first = false;
+			}
+			total++;
+		}
+		out.append("{\"start\":").append(Math.min(start, total)).append(",\"rows\":[").append(rows)
+			.append("],\"total\":").append(total).append(",\"overflow\":false}");
+	}
+
+	/** Every byte must have exactly one executable, contiguous file mapping; identical to prepare's rule. */
+	private long uniqueExportFileOffset(Address at, int length) {
+		MemoryBlock block = memory.getBlock(at);
+		long offset = fileOffset(at);
+		if (block == null || !block.isLoaded() || !block.isExecute() || !block.isInitialized() || offset < 0
+				|| blockFileOffset(block) < 0 || blockFileOffset(block) + at.subtract(block.getStart()) != offset
+				|| block.getEnd().subtract(at) < length - 1L) {
+			return -1;
+		}
+		for (int index = 0; index < length; index++) {
+			Address address = at.add(index);
+			List<Address> mapped = memory.locateAddressesForFileOffset(offset + index);
+			if (fileOffset(address) != offset + index || mapped == null || mapped.size() != 1 || !address.equals(mapped.get(0))) {
+				return -1;
+			}
+		}
+		return offset;
+	}
+
+	/** One complete C result, at most 40 seconds and 1,048,576 Unicode scalars; never clipped.
+	 * Python's printable_text is authoritative for normalization, including its Unicode category version. */
+	private String exportDecompiled(Function function) throws Exception {
+		DecompInterface decompiler = new DecompInterface();
+		try {
+			decompiler.setOptions(new DecompileOptions());
+			if (!decompiler.openProgram(currentProgram)) {
+				return null;
+			}
+			DecompileResults result = decompiler.decompileFunction(function, 40, monitor);
+			if (result == null || !result.decompileCompleted() || result.getDecompiledFunction() == null) {
+				return null;
+			}
+			String raw = result.getDecompiledFunction().getC();
+			if (raw == null) {
+				return null;
+			}
+			if (raw.codePointCount(0, raw.length()) > MAX_EXPORT_TEXT) {
+				throw new IllegalStateException("PseudocodeTooLarge");
+			}
+			return raw;
+		}
+		finally {
+			decompiler.dispose();
 		}
 	}
 
