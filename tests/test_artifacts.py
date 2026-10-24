@@ -1,4 +1,4 @@
-"""contract/3 child artifacts: evidence inside a stored or deflated member, re-derived from the input (decision m4a-contract)."""
+"""Child artifacts: evidence inside a stored or deflated member, re-derived from the input."""
 
 import unittest
 import zlib
@@ -190,7 +190,7 @@ class AndroidClaimTests(unittest.TestCase):
 
 
 class AndroidReviewerFixTests(unittest.TestCase):
-    """Decision m4a-fix-round: valid empty source files, malformed member flags refused without failing, permission subsets."""
+    """Valid empty source files, malformed member flags refused without failing, permission subsets."""
 
     def setUp(self):
         self.dex, self.apk = ToolRef("dex", "0.1.0"), ToolRef("apk", "0.1.0")
@@ -230,7 +230,7 @@ class AndroidReviewerFixTests(unittest.TestCase):
         self.assertEqual(self.judge([a, b], [first, second]), ["supported", "supported"])
 
     def test_permission_page_metadata_must_be_coherent(self):
-        # m4a-deferred 5 (decision next-carries): one total, distinct indexes below it.
+        # One total, distinct indexes below it.
         def permission(offset, name, index, total):
             return make_evidence(DATA, self.apk, "apk.manifest", Observation(Location(offset, 20), {
                 "kind": "manifest_attribute", "index": index, "total": total, "element_index": index,
@@ -247,7 +247,7 @@ class AndroidReviewerFixTests(unittest.TestCase):
 
 class SharedFindingTests(unittest.TestCase):
     def test_a_finding_in_two_tasks_is_judged_the_same_whatever_the_order(self):
-        # Decision m3d-deferred (RR-M3D-CODEX-C R1): it joins every producing task's page family.
+        # It joins every producing task's page family.
         structure = ToolRef("structure", "0.1.0")
         tools = {"structure": ToolSpec(structure, {"structure.segments": OperationSpec("structure.segments", {},
                                                                                        lambda d, a: [])})}
@@ -273,7 +273,7 @@ class SharedFindingTests(unittest.TestCase):
 
 
 class ReviewerBudgetAndShapeTests(unittest.TestCase):
-    """Decision m4a-fix-round-2 (RD-M4A-CODEX-C R2, R5): failed children spend the budget; each guard pinned alone."""
+    """Failed children spend the budget; each guard pinned alone."""
 
     def test_the_child_size_cap_holds_on_its_own(self):
         cap = 32 * 1024 * 1024

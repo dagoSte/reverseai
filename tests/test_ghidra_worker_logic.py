@@ -1,4 +1,4 @@
-"""The Ghidra worker's pure logic, without Ghidra: requests, the file's own sections, anchor cross-checks, the M3a
+"""The Ghidra worker's pure logic, without Ghidra: requests, the file's own sections, anchor cross-checks, the function
 selection rules and the reply.
 
 Query outputs are built here from tests/fixtures_code.py's declared layout (addresses, offsets, sizes and calls fixed
@@ -67,7 +67,7 @@ def query(data, layout, *, delta=0, names=None, texts=None, options=None):
 
 
 def expected(layout, names=None, *, args=DEFAULTS, texts=None):
-    """The M3a observations for the declared layout and request."""
+    """The function, pseudocode and call observations for the declared layout and request."""
     names = names or [f["name"] for f in layout["functions"]]
     functions = [dict(f, name=n, index=i) for i, (f, n) in enumerate(zip(layout["functions"], names))][:args["max_functions"]]
     end = layout["text"]["offset"] + TEXT_SIZE
@@ -131,7 +131,7 @@ def macho_text_and_main(data):
             next(body for command, body in commands if command == 0x80000028))
 
 
-# M3c: what a correct ReverseAIQuery writes for the refs fixtures; Ghidra's reference-type flags per x86 access.
+# What a correct ReverseAIQuery writes for the refs fixtures; Ghidra's reference-type flags per x86 access.
 FLAGS = {"data": (False, False, False, False, True), "read": (False, False, True, False, True), "write": (False, False, False, True, True),
          "read_write": (False, False, True, True, True), "jump": (True, True, False, False, False)}
 
@@ -177,7 +177,7 @@ def refs_query(data, layout, *, delta=0, names=None, flags=None, listing=None):
 
 
 def expected_m3c(layout, names=None, *, args=DEFAULTS):
-    """The M3c observations for a refs fixture: listings in the ranked order, the six references, the two strings."""
+    """Expected listings, six references and two strings for a refs fixture, in ranked order."""
     names = names or [f["name"] or f"FUN_{f['entry']:x}" for f in layout["functions"]]
     index = {f["entry"]: i for i, f in enumerate(layout["functions"])}
     by_entry = {f["entry"]: name for f, name in zip(layout["functions"], names)}
@@ -357,7 +357,7 @@ class BoundTests(unittest.TestCase):
         self.assertEqual(lengths, [8, 8, 8, 6])
 
     def test_a_sparse_body_keeps_the_calls_in_its_span(self):
-        """Decision m3a-function-span: size is entry to last body byte, so a call after a gap is still inside."""
+        """Size is entry to last body byte, so a call after a gap is still inside."""
         data, layout = elf_code()
         q = query(data, layout)
         start = q["functions"][0]
@@ -494,7 +494,7 @@ class FileMapTests(unittest.TestCase):
         self.assertEqual(worker.elf_map(bytes(alloc))[1], [(0x100, 0x156, 0x400100, True), (0x158, 0x158 + 120, 0, False)])
 
     def test_pe_sections_count_their_raw_bytes_when_virtual_size_is_zero(self):
-        """Decision m3a-function-span: PE extent is min(SizeOfRawData, VirtualSize), SizeOfRawData when VirtualSize is 0."""
+        """PE extent is min(SizeOfRawData, VirtualSize), SizeOfRawData when VirtualSize is 0."""
         data, layout = pe_code()
         text_header = 0x40 + 4 + 20 + 240
         patched = bytearray(data)
@@ -558,7 +558,7 @@ class FileMapTests(unittest.TestCase):
         self.assertEqual(worker.macho_map(thin32), (vmaddr + 0x100, [(0x100, 0x110, vmaddr + 0x100, True)]))
 
     def test_the_macho_entry_follows_the_hosts_lc_main_and_lc_unixthread_rule(self):
-        """Decision m3b-macho-entry: the entry that leads the pseudocode is the one the host verifier checks."""
+        """The entry that leads the pseudocode is the one the host verifier checks."""
         data, layout = macho_code()
         text, main = macho_text_and_main(data)
         def text_with(field, value):  # __TEXT with one of vmaddr (24), vmsize (32), filesize (48) changed
@@ -593,7 +593,7 @@ class FileMapTests(unittest.TestCase):
                 self.assertEqual(worker.macho_map(sample)[0], structure.macho_entry(sample) or 0)
 
     def test_macho_sections_outside_their_segments_file_bytes_are_not_mapped(self):
-        """Decision m3b-macho-zerofill: the worker maps exactly the code sections the host's macho_sections keeps."""
+        """The worker maps exactly the code sections the host's macho_sections keeps."""
         data, _ = macho_code()
         text_segment = 32 + 72
         for label, at, value, mapped in (("declared", None, None, True), ("segment ends inside the section", text_segment + 48, 0x250, False),
@@ -644,7 +644,7 @@ class FileMapTests(unittest.TestCase):
 
 
 class M3cTests(unittest.TestCase):
-    """Decision m3c-contract: assembly, ref and string observations after the M3a kinds."""
+    """Assembly, reference and string observations alongside functions, pseudocode and calls."""
 
     def m3c(self, data, q, **args):
         return [o for o in observe(data, q, **args) if o["value"]["kind"] in ("assembly", "ref", "string")]
@@ -806,7 +806,7 @@ class M3cTests(unittest.TestCase):
         self.assertIsNone(worker.decode_string(data, [(0, 3, 0x1000, False)], 0x2000))
 
     def test_a_string_needs_one_mapping_for_its_whole_span_both_ways(self):
-        """FIX-M3C-W (RD-M3C-CODEX-W M1): another section that maps any of the string's addresses or file bytes, terminator
+        """Another section that maps any of the string's addresses or file bytes, terminator
         or next unit included, makes the string ambiguous; it is omitted and the rest of the reply stays admissible."""
         data, layout = elf_refs()
         symtab = layout["shoff"] + 3 * 64  # .symtab's header becomes an allocated PROGBITS section
@@ -834,7 +834,7 @@ class M3cTests(unittest.TestCase):
         self.assertEqual(worker.decode_string(b"ab\0" + bytes(13), sections, 0x1000), (0, 2, "ascii", "ab", False))
 
     def test_references_are_unique_by_the_contract_key(self):
-        """FIX-M3C-W (RD-M3C-CODEX-W I1): a repeated (offset, to, type) with another name gives one row, the lowest."""
+        """A repeated (offset, to, type) with another name gives one row, the lowest."""
         data, layout = elf_refs()
         q = refs_query(data, layout)
         describe = next(item for item in q["functions"] if item["name"] == "describe")
@@ -860,7 +860,7 @@ class M3cTests(unittest.TestCase):
         self.assertEqual(len(worker.strings(data, worker.elf_map(data)[1], many, dict(DEFAULTS, max_strings=1))), 1)
 
     def test_pseudocode_is_cut_to_fit_the_observation_limit(self):
-        """Decision m3c-pseudocode-fit: max_chars first, then the longest prefix whose value fits 4,096 bytes."""
+        """Bound by max_chars first, then the longest prefix whose value fits 4,096 bytes."""
         data, layout = elf_code()
         for max_chars in (2048, 1024):
             for label, char in (("quote", "\""), ("backslash", "\\"), ("newline", "\n"), ("cjk", "\u4e00"), ("astral", "\U0001f600"),
@@ -885,8 +885,8 @@ class M3cTests(unittest.TestCase):
 
     def test_the_reply_at_every_maximum_is_never_refused_for_its_size(self):
         """128 functions, 16 pseudocode texts, 256 calls, 8 listings of 64 rows, 128 references and 64 strings, with every
-        name and text at the size that costs most in JSON: the M3a kinds always fit, the M3c kinds are added only while the
-        reply does, none is cut, and the reply parses on the host."""
+        name and text at the size that costs most in JSON: functions, pseudocode and calls always fit;
+        listings, references and strings are added only while the reply fits, none is cut, and the reply parses on the host."""
         quote = "\"" * 128
         text = bytearray(0x90 for _ in range(128 * 32))
         strings = b"".join(b"\"" * 129 + b"\0" for _ in range(64))
@@ -1081,7 +1081,7 @@ class BuildInputTests(unittest.TestCase):
         self.assertRegex(lock["image_id"], r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(sorted(p.name for p in (SOURCE / "ghidra_scripts").iterdir()), ["ReverseAIOptions.java", "ReverseAIQuery.java"])
         query_source = (SOURCE / "ghidra_scripts" / "ReverseAIQuery.java").read_text()
-        # Decision m3a-function-span: size is the span; reverting to the body's address count must fail here.
+        # Size is the span; reverting to the body's address count must fail here.
         self.assertIn("long size = span(function);", query_source)
         self.assertIn("int bySize = Long.compare(span(b), span(a));", query_source)
         self.assertIn("Address last = function.getBody().getMaxAddress();", query_source)
@@ -1091,11 +1091,11 @@ class BuildInputTests(unittest.TestCase):
         rule = re.compile(r'Pattern\.compile\("\(\?i\)\.\*\(pdb\|dwarf\|swift\)\.\*"\)')
         for name in ("ReverseAIOptions.java", "ReverseAIQuery.java"):
             self.assertRegex((SOURCE / "ghidra_scripts" / name).read_text(), rule)
-        # M3d: each mode takes a fixed number of arguments after the output path and the mode itself.
+        # Each mode takes a fixed number of arguments after the output path and the mode itself.
         self.assertIn('int expected = mode.equals("analyze") ? 8 : mode.equals("functions") ? 5 : mode.equals("function") ? 9',
                       query_source)
         self.assertIn('\t\t\t: mode.equals("xrefs") ? 6 : -1;\n\t\tif (args.length != expected) {', query_source)
-        # M3c: references leave calls (their own kind) and non-memory targets out; listings start at the entry and count
+        # References leave calls (their own kind) and non-memory targets out; listings start at the entry and count
         # the whole body, so the worker can tell a cut listing; the listed functions follow the pseudocode order.
         for pin in ("if (refs == MAX_REFS_PER_FUNCTION || !target.isMemoryAddress() || type.isCall()) {",
                     '.append(",\\"inside\\":").append(function.getBody().contains(target))',

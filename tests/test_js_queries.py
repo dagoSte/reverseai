@@ -1,4 +1,4 @@
-"""analyze_javascript_application (M5a): arguments, routing by detail, page conclusions and review through the js tool
+"""analyze_javascript_application: arguments, routing by detail, page conclusions and review through the js tool
 on the fixtures, with exact answers from their layouts."""
 
 import contextlib
@@ -172,7 +172,7 @@ class QueryRunTests(unittest.TestCase):
         self.assertEqual(pages(analysis), {})
 
     def test_every_detail_runs_with_150_seconds_for_task_and_gateway(self):
-        # decision m5a-js-budget; the native 30 s and Android 120 s stay as test_queries pins them
+        # The native 30 s and Android 120 s stay as test_queries pins them.
         built = J.app_zip()
         real_run = Gateway.run
         for detail in ("summary", "files", "package", "hints"):

@@ -1,5 +1,5 @@
 """The APK, manifest and DEX fixtures checked against their own declared layouts with readers written here,
-zipfile and zlib, so the M4a parsers can trust the layouts as expectations."""
+zipfile and zlib, so the APK and DEX parsers can trust the layouts as expectations."""
 
 import hashlib
 import io
@@ -439,7 +439,7 @@ class DexTests(unittest.TestCase):
                          [("run", "Lorg/reverseai/fixture/Helper;->compute(II)I")])
 
     def test_a_dex_without_code_items_or_class_data(self):
-        # FIX-M4A-F: dex_file builds a valid DEX when no method has code (an interface with an abstract method, a class
+        # dex_file builds a valid DEX when no method has code (an interface with an abstract method, a class
         # with a static field only, and an empty class with no class_data).
         from reverseai.tools import dex as tool
         classes = ({"name": "La/Api;", "super": F.OBJECT, "access": 0x601,

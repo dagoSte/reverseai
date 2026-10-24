@@ -134,7 +134,7 @@ class JavaScriptFilesTests(unittest.TestCase):
                     'size': len(data), 'sha256': sha256_hex(data), 'lines': expected_lines,
                     'max_line': max(map(len, data.split(b'\n'))), 'flags': []})
                 self.assertIsNone(row.artifact)
-        self.assertEqual(run('files', b''), [])  # Decision m5a-seams-p: no bytes to cite.
+        self.assertEqual(run('files', b''), [])  # No bytes to cite.
         archive, _ = zip_bytes([])
         self.assertEqual(run('files', archive), [])
 
@@ -187,7 +187,7 @@ class JavaScriptFilesTests(unittest.TestCase):
             self.assertEqual(len(run('files', b'x' * 20)), 1)
 
     def test_each_operation_parses_the_directory_once_before_materializing_clean_members(self):
-        # Decision m5a-seams-f-p item 4: same-buffer clean descriptors may use
+        # Same-buffer clean descriptors may use
         # the materialization core; the public wrapper would reparse per file.
         data, _ = zip_bytes([('a.js', b'eval(a)'), ('b.ts', b'eval(b)'), ('package.json', b'{"name":"app"}')])
         with scanner():
@@ -246,7 +246,6 @@ class PackageTests(unittest.TestCase):
                          [('/exports/a', 'one'), ('/exports/b/c/d/e', 'four')])
 
     def test_collections_distinguish_direct_values_descendants_and_bundled_entries(self):
-        # Coordinator seam reply m5ap-interface-ok2 clarifies the field selection.
         data = json.dumps({'scripts': 'ignored', 'engines': 'ignored', 'dependencies': 'ignored',
             'devDependencies': {'group': ['yes']}, 'bundledDependencies': ['bundled', {'nested': 'ignored'}, ['ignored']],
             'bundleDependencies': 'ignored', 'bin': './bin.js', 'exports': './main.js'}).encode()
@@ -281,7 +280,7 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(len(run('package', data)[0].value['path']), 255)
 
     def test_single_bundle_has_no_package_and_object_inputs_remain_strict(self):
-        # Decision m5a-bundle-summary selects only object-like single-file JSON.
+        # Only object-like single-file JSON is selected.
         for data in (shared.bundle_js()[0], b'', b'[]', b'null', b'"value"', b' \t\r\nconst x = 1;',
                      b'\xef\xbb\xbf' + shared.bundle_js()[0], b'\xef\xbb\xbf \tconst x = 1;'):
             with self.subTest(data=data[:30]):
@@ -324,7 +323,7 @@ class PackageTests(unittest.TestCase):
                 run('package', data)
 
     def test_member_selectors_and_invalid_zip_mode_follow_the_contract(self):
-        # Decision m5a-seams-p2 closes selection and refuses a bad local ZIP header.
+        # Selection is closed and refuses a bad local ZIP header.
         data, _ = zip_bytes([('config.js', b'{"name":"wrong"}'), ('package.json', b'{"name":"right"}')])
         self.assertEqual(run('package', data, file='config.js'), [])
         self.assertEqual(run('package', data, file='missing.json'), [])

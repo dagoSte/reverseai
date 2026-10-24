@@ -1,4 +1,4 @@
-"""M5a contract: JavaScript page claims and their row shapes (decision owner-next-m5a)."""
+"""JavaScript page claims and their row shapes."""
 
 import unittest
 

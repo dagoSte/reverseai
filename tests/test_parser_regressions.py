@@ -81,7 +81,7 @@ class ParserRegressionTests(unittest.TestCase):
         for width in (32, 64):
             for order in ("<", ">"):
                 valid = macho_fat(width=width, order=order, machines=(7,) * 20)
-                # Decision m3c-seams-h: only big-endian fat wrappers are identified.
+                # Only big-endian fat wrappers are identified.
                 self.assertEqual(run("structure.identify", valid)[0].value["format"],
                                  "macho-universal" if order == ">" else "unknown")
                 for count in (0, 21, 52):

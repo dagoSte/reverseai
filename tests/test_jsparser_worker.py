@@ -111,7 +111,7 @@ class RequestTests(unittest.TestCase):
 
 
     def test_a_duplicate_key_alone_refuses_an_otherwise_valid_request(self):
-        # RD-M5B-CODEX-W I1: the same envelope without the repeated key is valid, so the refusal is the duplicate's
+        # The same envelope without the repeated key is valid, so the refusal is the duplicate's
         text = request(self.good)[1]
         self.assertEqual(worker.parse_request(["jsparser.syntax", text])[2], 0)
         repeated = text.replace('"start": 0', '"start": 0, "start": 0', 1)
@@ -194,7 +194,7 @@ TARBALL_FILES = (("index.js", b"const cp = require('child_process');\ncp.exec(cm
 
 
 class GzipStreamTests(unittest.TestCase):
-    """M5c method 1 children: the worker's own inflater, equal to contract.inflate_stream on the same inputs."""
+    """Method 1 children: the worker's own inflater, equal to contract.inflate_stream on the same inputs."""
 
     def test_the_inflater_accepts_and_refuses_exactly_as_the_contract_does(self):
         from reverseai import contract

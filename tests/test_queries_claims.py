@@ -1,4 +1,4 @@
-"""M3d claim rules: query pages and single readings, verified on the host or derived from Ghidra (decision m3d-contract)."""
+"""Query pages and single readings, verified on the host or derived from Ghidra."""
 
 import unittest
 
@@ -62,7 +62,7 @@ class QueryClaimTests(unittest.TestCase):
         gap = [segment(0), segment(2)]
         gap_rows = [[r.observation[k] for k in ("name", "offset", "filesz", "address", "memsz", "readable", "writable",
                                                 "executable")] for r in gap]
-        # RD-M3D-CODEX-C I1: the claimed rows are the cited ones, so only the missing index 1 can reject them.
+        # The claimed rows are the cited ones, so only the missing index 1 can reject them.
         self.assertEqual(judge("segments.list", {"start": 0, "total": 3, "rows": gap_rows}, gap), "unsupported")
         mixed = [segment(1), segment(2, total=4)]
         self.assertEqual(judge("segments.list", value, mixed), "unsupported")
@@ -164,7 +164,7 @@ class QueryClaimTests(unittest.TestCase):
         self.assertEqual(judge("code.instructions", {**value, "total": 2}, [over]), "unsupported")
 
     def test_assembly_rows_must_end_inside_the_cited_anchor(self):
-        # Decision m3c-deferred (RR-M3C-CODEX1): the reviewer itself checks rows against the cited location.
+        # The reviewer itself checks rows against the cited location.
         rows = [[0, 1, "PUSH RBP"], [1, 3, "MOV RBP,RSP"]]
         listing = dict(kind="assembly", index=0, entry=0x1000, instructions=rows, truncated=False)
         value = {"entry": 0x1000, "instructions": rows, "truncated": False}
@@ -200,7 +200,7 @@ if __name__ == "__main__":
 
 
 class ReviewerHardeningTests(unittest.TestCase):
-    """RD-M3D-CODEX-C M1, M2, M3: malformed rows refused without failing, offsets bound, queries kept apart."""
+    """Malformed rows refused without failing, offsets bound, queries kept apart."""
 
     def test_a_non_ascii_text_row_is_refused_not_raised(self):
         for operation, key in (("strings.list", "strings.listed"), ("strings.search", "strings.matches")):
@@ -245,7 +245,7 @@ class ReviewerHardeningTests(unittest.TestCase):
 
 
 class PageReviewTests(unittest.TestCase):
-    """Pages of one verified list are compatible; a different total or row at one index contradicts (m3d-seams-paging)."""
+    """Pages of one verified list are compatible; a different total or row at one index contradicts."""
 
     def verdicts(self, pages):
         findings, evidence = [], []

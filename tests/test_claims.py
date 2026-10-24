@@ -81,7 +81,7 @@ class ClaimRuleTests(unittest.TestCase):
         self.assertNotEqual(claims.check(finding("imports.libraries", ["libc.so.6"], [lief]), [lief]), ())
 
     def test_import_claims_keep_the_host_tools_name_bounds(self):
-        # Decision m3b-deferred-to-m3c (R3-P): at most 32 names per group, each 1..128 printable characters.
+        # At most 32 names per group, each 1..128 printable characters.
         names = [f"f{index}" for index in range(32)]
         full = evidence(STRUCTURE, "structure.imports", 0, kind="symbols", library=None, names=names)
         self.assertEqual(claims.check(finding("imports.symbols", sorted(names), [full]), [full]), ())

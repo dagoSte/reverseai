@@ -1,4 +1,4 @@
-"""Deterministic JavaScript application fixtures for the M5a lanes; bytes built in code, never real samples.
+"""Deterministic JavaScript application fixtures; bytes built in code, never real samples.
 
 app_zip() builds a small application archive from declared values, members in central directory order:
 
@@ -17,8 +17,7 @@ app_zip() builds a small application archive from declared values, members in ce
 
 bundle_js() is one file that is not a ZIP: a webpack-like bundle on one long line, then a source map comment.
 package_only() is the app's package.json alone, a single-file input for js.package (file "").
-js_edge(kind) builds the clean edge cases of EDGE_KINDS, js_hostile(kind) the problems of HOSTILE_KINDS (decisions
-m5a-seams-p and m5a-seams-p2 included);
+js_edge(kind) builds the clean edge cases of EDGE_KINDS, js_hostile(kind) the problems of HOSTILE_KINDS;
 INVALID_JSON names package.json texts a strict RFC 8259 reader refuses, and package_zip(text) puts any of them in an
 application ZIP; nested_json(depth) is an object nested to an exact depth for boundary tests.
 
@@ -34,12 +33,12 @@ Each builder returns (data, layout):
                         child, quotes included, at most 4,096), and every string value of the document with its JSON
                         pointer and token span ("strings")
     layout["marks"]     per file, named spans of hint-worthy text (labels of this module, not jshints pattern names),
-                        so the hint lanes can pin their own exact matches
+                        so hint tests can pin their own exact matches
     layout["expect"]    hostile and edge cases only: what each js operation must do ("ok", "refused" for a failed
                         operation, "no rows")
 
-Conventions this module states for the lanes (contract M5a): lines counts line feeds, plus one when the last byte is
-not a line feed (0 when empty); max_line is the longest run of bytes between line feeds, a carriage return counting as
+Conventions: `lines` counts line feeds, plus one when the last byte is not a line feed (0 when empty);
+max_line is the longest run of bytes between line feeds, a carriage return counting as
 a byte; JSON depth counts the containers on the path, the outermost included (a bare {} has depth 1); the exports depth
 counts the pointer segments after /exports (/exports/./import/node is 3); paths are JSON pointers of the decoded keys
 (~ as ~0, / as ~1); values and paths are escaped like import names (printable ASCII as is but the backslash, every
@@ -150,7 +149,7 @@ def json_text(value):
 
 
 def listed(pointer):
-    """Whether js.package lists the string at this pointer (contract M5a field list)."""
+    """Whether js.package lists the string at this pointer."""
     segments = pointer.split("/")[1:]
     if not segments or not segments[0]:
         return False
@@ -378,7 +377,7 @@ INVALID_JSON = {
     "two_values": b'{"name": "a"} {}',
     "empty": b"",
     "bare_word": b"package",
-    "byte_order_mark": b'\xef\xbb\xbf{"name": "a"}',  # decision m5a-seams-p: a UTF-8 BOM is refused
+    "byte_order_mark": b'\xef\xbb\xbf{"name": "a"}',  # A UTF-8 BOM is refused
     "top_level_array": b'["name"]',  # the file must hold one JSON object
     "top_level_string": b'"name"',
 }
@@ -413,12 +412,12 @@ def js_edge(kind):
         built[1]["expect"] = {"js.package": "ok", "default": "b/package.json"}
         return built
     if kind == "empty_file":
-        # decision m5a-seams-p: an empty member is anchored at its central directory entry, without an artifact
+        # An empty member is anchored at its central directory entry, without an artifact
         built = archive([F.member("lib/empty.js", b"", 0), F.member("lib/index.js", INDEX_JS)])
         built[1]["expect"] = {"js.files": "ok", "js.hints": "ok"}
         return built
     if kind == "empty_input":
-        # decision m5a-seams-p: an empty single-file input has no rows
+        # An empty single-file input has no rows
         built = single(b"")
         built[1]["expect"] = {"js.files": "no rows", "js.hints": "no rows"}
         return built
@@ -466,10 +465,10 @@ def js_hostile(kind):
         built[1]["expect"] = {"js.files": "ok", "js.package": "refused", "js.hints": "ok"}
         return built
     elif kind == "long_pointer":
-        # decision m5a-seams-p: a JSON pointer longer than 255 characters fails js.package
+        # A JSON pointer longer than 255 characters fails js.package
         built = package_zip(b'{"name": "a", "dependencies": {"' + b"k" * 300 + b'": "1.0.0"}}\n')
     elif kind == "flagged_members":
-        # Decision m5a-fix-round: all JS names are listed; flagged members are never read.
+        # All JS names are listed; flagged members are never read.
         package, strings = json_text({"name": "flagged"})
         specs = [F.member("package.json", package), F.member("ok.js", INDEX_JS),
                  F.member("../escape.js", INDEX_JS), F.member("../package.json", b'{"name": "outside"}'),
@@ -500,7 +499,7 @@ def js_hostile(kind):
                       expect={"js.files": "ok", "js.package": "no rows", "js.hints": "no rows"})
         return data, layout
     elif kind == "zip_refused":
-        # decision m5a-seams-p2: it starts with a ZIP local header but the parser refuses it (ZIP64), so every js
+        # It starts with a ZIP local header but the parser refuses it (ZIP64), so every js
         # operation fails; it is never read as one script
         data, zipped = F.zip_archive([F.member("lib/index.js", INDEX_JS)], zip64=True)
         return data, {"size": len(data), "sha256": hashlib.sha256(data).hexdigest(), "zip": zipped, "files": [],

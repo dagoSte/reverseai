@@ -4516,7 +4516,7 @@ def utf16_to_utf8(data):
 
 
 class JsparserNativeContractTests(unittest.TestCase):
-    """M5B-W: the jsparser profile, lock, receipt, fixed requests and known answers of the native verifier."""
+    """The jsparser profile, lock, receipt, fixed requests and known answers of the native verifier."""
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="jsparser-inert-sources-")
@@ -4601,7 +4601,7 @@ class JsparserNativeContractTests(unittest.TestCase):
         from reverseai.tools.jshints import CALLEES
         for case, (fixture, args) in cases.items():
             self.assertEqual(args["callees"], sorted(CALLEES))
-            # FIX-M5B-V: every fixed request passes the executor's own request check
+            # Every fixed request passes the executor's own request check
             contained._validated_args("jsparser.syntax", args)
             self.assertTrue(verifier.jsparser_request_allowed("jsparser.syntax", args), case)
             # A single-file request names no artifact, so bundle and large requests of one kind are the same request;
@@ -4615,7 +4615,7 @@ class JsparserNativeContractTests(unittest.TestCase):
         with self.assertRaisesRegex(verifier.VerificationError, "KnownAnswerFixture"):
             verifier.jsparser_cases(changed)
         self.assertEqual(cases["input_mismatch"][1]["files"][1]["artifact"]["sha256"], "0" * 64)
-        # M5c: the tarball cases read method 1 children of one gzip stream; the tampered one differs only in its trailer
+        # The tarball cases read method 1 children of one gzip stream; the tampered one differs only in its trailer
         good, bad = fixtures["js_tarball"], fixtures["js_tarball_bad"]
         self.assertEqual((len(good), good[:-8], good[-7:]), (len(bad), bad[:-8], bad[-7:]))
         self.assertNotEqual(good[-8], bad[-8])
@@ -4628,7 +4628,7 @@ class JsparserNativeContractTests(unittest.TestCase):
         import zipfile
         from reverseai.tools.jshints import CALLEES
         fixtures = verifier.jsparser_fixtures()
-        entries = set(CALLEES)  # FIX-M5B-V: the host's catalog, the only list the executor admits
+        entries = set(CALLEES)  # The host's catalog is the only list the executor admits.
         self.assertEqual(verifier.JSPARSER_CALLEES, tuple(sorted(CALLEES)))
         chain = re.compile(rb"[$A-Za-z_][$A-Za-z0-9_]*(?:\.[$A-Za-z_][$A-Za-z0-9_]*){0,3}")
         for case, (fixture, args) in verifier.jsparser_cases(fixtures).items():
@@ -4639,7 +4639,7 @@ class JsparserNativeContractTests(unittest.TestCase):
             data = fixtures[fixture]
             if args["files"][0]["artifact"] is None:
                 children = [data]
-            elif args["files"][0]["artifact"]["method"] == 1:  # M5c: ranges of the inflated gzip stream
+            elif args["files"][0]["artifact"]["method"] == 1:  # Ranges of the inflated gzip stream
                 import gzip
                 stream = gzip.decompress(data)
                 children = [stream[entry["artifact"]["inner_offset"]:entry["artifact"]["inner_offset"]
@@ -4713,7 +4713,7 @@ class JsparserNativeContractTests(unittest.TestCase):
         self.assertEqual(len(cases), len(verifier.JSPARSER_EXPECTED))
 
     def test_every_fixed_request_crosses_the_real_executor_and_oversize_input_is_refused_before_it(self):
-        # RD-M5B-CODEX-W R1/R2: the production DockerExecutor, with a fake runner and image inspection, admits each
+        # The production DockerExecutor, with a fake runner and image inspection, admits each
         # case's request and data; one byte past 4 MiB in a single file is refused before any runner call.
         from reverseai import contained
         lock = json.loads(Path(verifier.JSPARSER_DRIVER_PATH.parent, "image.lock.json").read_text())

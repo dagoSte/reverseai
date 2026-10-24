@@ -192,7 +192,7 @@ class BuildTests(unittest.TestCase):
                 self.assertEqual(self.docker.calls, [])
 
     def test_trailing_backslash_runs_match_a_native_buildkit_parse(self):
-        """Measured with buildx v0.37.2 (cache-only builds, M3B-W): only a single trailing backslash, with or without
+        """Measured with buildx v0.37.2 (cache-only builds): only a single trailing backslash, with or without
         spaces after it, joins the next line; runs of 2 to 5 end the instruction."""
         joins = {1: True, 2: False, 3: False, 4: False, 5: False}
         for run, joined in joins.items():

@@ -1,4 +1,4 @@
-"""Targeted command uses inert in-process stand-ins until the host lane is integrated."""
+"""Targeted command using inert in-process stand-ins."""
 import contextlib
 from dataclasses import replace
 import io

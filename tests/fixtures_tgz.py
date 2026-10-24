@@ -2,7 +2,7 @@
 
 npm_tgz() and tgz_hostile(kind) return (gzip bytes, layout). Offsets in members,
 files, package, hints, modules and calls refer to the decompressed tar or its
-declared child as named. Accepted files carry contract/3 method 1 artifacts;
+declared child as named. Accepted files carry method 1 artifacts;
 flagged and empty rows cite their own 512-byte header as a child of the gzip.
 """
 

@@ -1,4 +1,4 @@
-"""Known answers and hostile bounds for the verified M3d structure operations."""
+"""Known answers and hostile bounds for the verified structure operations."""
 
 import struct
 import unittest
@@ -107,7 +107,7 @@ class StructureQueryTests(unittest.TestCase):
         return bytes(header) + b''.join(commands)
 
     def test_macho_wrong_width_segment_never_returns_a_complete_prefix(self):
-        # Decision m4b-carry-s changes only this formerly silent prefix.
+        # An incomplete table is refused instead of returning a silent prefix.
         for width in (32, 64):
             honest = self.mixed_width_segments(width, wrong=False)
             self.assertEqual([o.value['name'] for o in run('segments', honest)], ['S0', 'S1', 'S2'])

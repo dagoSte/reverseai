@@ -62,7 +62,6 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(project["requires-python"], ">=3.12")
         self.assertEqual(project["readme"], "README.md")
         self.assertEqual(project["dependencies"], [])
-        # Decision m6b-contract replaces the M6a no-license pin.
         self.assertEqual(project["license"], "MIT")
         self.assertEqual(project["license-files"], ["LICENSE", "THIRD_PARTY_NOTICES.md"])
         self.assertEqual(project["scripts"], {"reverseai": "reverseai.cli:main"})
@@ -75,7 +74,7 @@ class PackagingTests(unittest.TestCase):
         expected = {path.relative_to(ROOT).as_posix() for path in (ROOT / "reverseai").rglob("*.py")
                     if "__pycache__" not in path.parts}
         expected.update(f"reverseai/_locks/{name}.json" for name in TOOLS)
-        expected.add("reverseai/_locks/m2_fixture_v1.json")  # decision m6-seams-p: required by the host verifier
+        expected.add("reverseai/_locks/m2_fixture_v1.json")  # Required by the host verifier
         expected.update(f"{INFO}/{name}" for name in ("METADATA", "WHEEL", "entry_points.txt", "RECORD",
                                                     "licenses/LICENSE", "licenses/THIRD_PARTY_NOTICES.md"))
         self.assertEqual(self.wheel.name, "reverseai-0.6.1-py3-none-any.whl")
@@ -187,7 +186,7 @@ class PackagingTests(unittest.TestCase):
         with mock.patch.object(build, "ROOT", source):
             self.assertEqual((self.work / "archive-wheel" / build.build_wheel(self.work / "archive-wheel")).read_bytes(),
                              self.wheel.read_bytes())
-            # Decision m6-seams-sdist: neither Git nor PKG-INFO is a fixed refusal, never a guessed file list.
+            # Neither Git nor PKG-INFO is a fixed refusal, never a guessed file list.
             with self.assertRaisesRegex(ValueError, "^Build the source distribution from a Git checkout or an unpacked sdist$"):
                 build.build_sdist(self.work / "refused-sdist")
 

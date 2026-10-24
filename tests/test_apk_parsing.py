@@ -190,7 +190,7 @@ class ZipParsingTests(unittest.TestCase):
         self.assertIn('header_mismatch', apk.members(invalid)[0].flags)
 
     def test_long_names_are_flagged_at_the_escaped_character_boundary(self):
-        # Decision m4b-start: disclose every cut member identity and never materialize it.
+        # Disclose every cut member identity and never materialize it.
         cases = [('a' * 255, 'a' * 255, False), ('a' * 256, 'a' * 255, True),
                  ('a' * 251 + '\u00e9', 'a' * 251 + '\\xe9', False),
                  ('a' * 252 + '\u00e9', 'a' * 252 + '\\xe', True),
@@ -240,7 +240,7 @@ class ZipParsingTests(unittest.TestCase):
         signature = 0x08074b50
         data = struct.pack('<4I', *([signature] * 4))
         # Both layouts require these three equal values, beyond the archive/child limits.
-        # Test the bounded descriptor decision directly without allocating that payload.
+        # Check the descriptor bound directly without allocating that payload.
         self.assertEqual(struct.unpack_from('<3I', data, 0), (signature,) * 3)
         self.assertEqual(struct.unpack_from('<3I', data, 4), (signature,) * 3)
         with self.assertRaises(apk.ApkError):
@@ -280,7 +280,7 @@ class ZipParsingTests(unittest.TestCase):
     def test_whole_archive_refusals_zip64_multidisk_sfx_ambiguity_and_limits(self):
         data, layout = zip_bytes([('x', b'value')])
         cd, end = layout['cd'], layout['end']
-        # Decision m4a-seams-z3: version-needed alone never establishes ZIP64.
+        # Version-needed alone never establishes ZIP64.
         classic = changed(changed(data, cd + 6, '<H', 46), 4, '<H', 46)
         self.assertEqual(apk.materialize(classic, apk.members(classic)[0])[0], b'value')
         bad = [changed(data, end + 10, '<H', 0xffff), changed(data, cd + 24, '<I', NONE),

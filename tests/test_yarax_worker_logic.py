@@ -30,7 +30,7 @@ PATTERNS = [(rule["id"], pattern["id"], bytes.fromhex(pattern["hex"])) for rule 
 
 
 def oracle(data, limit=32):
-    """The first 4 occurrences of every pattern (decision m2b-per-pattern-cap), as (offset, rule, pattern, length),
+    """The first 4 occurrences of every pattern, as (offset, rule, pattern, length),
     ascending and cut at limit."""
     found = set()
     for rule, pattern, needle in PATTERNS:
@@ -282,7 +282,7 @@ class MatchTests(unittest.TestCase):
                          upx_a + [(1200, "credential_dump_marker", "$a", 10)] + [(1210 + 4 * i, "upx_packed", "$b", 4) for i in range(4)])
 
     def test_a_flood_of_one_pattern_cannot_hide_a_later_rule(self):
-        """Decision m2b-per-pattern-cap: 64 early repeats used to fill max_matches and drop credential_dump_marker."""
+        """64 early repeats used to fill max_matches and drop credential_dump_marker."""
         reply = run(FIXTURES["flood then a later rule"], max_matches=64)
         self.assertEqual(rows(reply), [(4 * i, "upx_packed", "$a", 4) for i in range(4)] + [(256, "credential_dump_marker", "$a", 10)])
 

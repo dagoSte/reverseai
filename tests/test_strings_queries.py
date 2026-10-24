@@ -1,4 +1,4 @@
-"""M3d string pages: exact byte citations, full-run literal search and real reviewer checks."""
+"""String pages: exact byte citations, full-run literal search and real reviewer checks."""
 
 import unittest
 import tracemalloc
@@ -125,7 +125,7 @@ class StringsQueryTests(unittest.TestCase):
         self.assertEqual(run('search',data,query='hit',start=3),[])
 
     def test_dense_pages_count_all_runs_with_bounded_allocation(self):
-        # 64 MiB measurements are in CARRY-M4B-S; keep the routine check small.
+        # Keep this routine check smaller than the 64 MiB performance measurements.
         count = 70000
         data = b'abcd\0' * count
         for operation in ('list', 'search'):

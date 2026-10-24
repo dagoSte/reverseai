@@ -1,6 +1,6 @@
 """The JADX worker, its build helper and its build tool without Docker, Java or the internet: request bounds, the
 members re-materialized from the snapshot, the driver's answer checked row by row, the whole-run errors, the
-Dockerfile shape, the image lock and the exact docker calls. The native proof runs the built image (M4B-W)."""
+Dockerfile shape, the image lock and the exact docker calls. The native proof runs the built image."""
 
 import contextlib
 import hashlib
@@ -350,7 +350,7 @@ class BuildToolTests(unittest.TestCase):
         return source
 
     def test_the_lock_names_the_built_context_and_an_edit_during_the_build_writes_no_lock(self):
-        # RD-M4B-CODEX-W M1: the hashes are of the bytes Docker builds; a source changed meanwhile refuses the lock.
+        # The hashes are of the bytes Docker builds; a source changed meanwhile refuses the lock.
         source = self.private_source()
         docker = FakeDocker()
         self.assertEqual(self.main(docker), 0)
@@ -370,7 +370,7 @@ class BuildToolTests(unittest.TestCase):
             (source / name).write_bytes(original)
 
     def test_a_source_edited_right_after_its_copy_writes_no_lock(self):
-        # RR-M4B-CODEX-W RR-I1: the lock must name the copied bytes, not the repository's at hashing time. An edit that
+        # The lock must name the copied bytes, not the repository's at hashing time. An edit that
         # lands after a file is copied and before anything is hashed leaves the image with the old bytes: refused.
         source = self.private_source()
         real_copytree, real_copy = shutil.copytree, shutil.copy2

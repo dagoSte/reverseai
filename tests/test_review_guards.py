@@ -1,4 +1,4 @@
-"""Isolated reviewer guards the M5a Codex read found unpinned (RD-M5A-CODEX-C C2, decision m5a-fix-round)."""
+"""Isolated reviewer guards for package-pointer bounds and permission page metadata."""
 
 import unittest
 

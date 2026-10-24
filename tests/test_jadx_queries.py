@@ -1,4 +1,4 @@
-"""M4B-F: query/CLI wiring against real APK bytes and a contained JADX stand-in."""
+"""Query/CLI wiring against real APK bytes and a contained JADX stand-in."""
 
 import contextlib
 import copy

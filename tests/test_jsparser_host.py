@@ -259,7 +259,7 @@ class HostReplyTests(unittest.TestCase):
                 invoke(data, change=lambda _: [changed])
 
     def test_comment_roles_remain_derived_and_exact_bytes_are_still_required(self):
-        # Decision m5b-seams-h: the host checks bytes, not whether the parser chose code or comment text.
+        # The host checks bytes, not whether the parser chose code or comment text.
         data = b'// eval(x) and "a"\n'
         modules, _ = invoke(data, change=lambda _: [{'file': 0, 'status': 'ok', 'errors': 0, 'count': 1,
                                 'items': [item(data, 'import', '"a"')]}])
@@ -286,7 +286,7 @@ class HostReplyTests(unittest.TestCase):
                         invoke(data, {'kind': 'calls'}, change=changed)
 
     def test_qualified_callees_match_only_complete_trailing_parts(self):
-        # Decision m5b-callee-suffix: common method names need their catalog receiver.
+        # Common method names need their catalog receiver.
         for spelling, valid in (('get', False), ('map.get', False), ('http.get', True), ('my.http.get', True),
                                  ('myhttp.get', False), ('Buffer.from', True), ('Other.from', False),
                                  ('buffer.from', False), ('fs.write', True), ('log.write', False),

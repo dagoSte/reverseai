@@ -30,7 +30,7 @@ def _int(low, high, default=None):
     return ArgSpec("int", low, high, default=default)
 
 
-# The contract/3 argument schemas of the apk and dex operations (docs/contract.md, M4a).
+# Argument schemas for apk and dex operations (docs/contract.md).
 ANDROID_SCHEMAS = {
     "apk.inventory": {"start": _int(0, 65535, 0), "limit": _int(1, 256, 128)},
     "apk.manifest": {"start": _int(0, 65535, 0), "limit": _int(1, 256, 256)},
@@ -47,8 +47,8 @@ ANDROID_SCHEMAS = {
 
 
 def android_standins(layout):
-    """In-process apk and dex tools answering in the contract/3 shapes from a fixture layout, until the M4A-Z and
-    M4A-X tools land; the real gateway materializes every child and the real reviewer checks every row."""
+    """In-process apk and dex tools answering from a fixture layout with member provenance;
+    the real gateway materializes every child and the real reviewer checks every row."""
     members = {row["name"]: row for row in layout["members"]}
     dex_names = [row["name"] for row in layout["members"] if re.fullmatch(r"classes[0-9]*\.dex", row["name"])]
 
@@ -138,12 +138,12 @@ class QueryTests(unittest.TestCase):
                                                      "procedure_callees", "procedure_callers", "analyze_function")},
             "xrefs": ("ghidra.xrefs",),
         }
-        expected.update({  # decision m4a-contract: the five Android names
+        expected.update({  # The five Android names
             "inspect_android_package": ("apk.inventory", "apk.manifest"), "search_android_classes": ("dex.classes",),
             "inspect_android_class": ("dex.classes", "dex.methods"),
             "inspect_android_method": ("dex.methods", "dex.references"), "trace_android_references": ("dex.references",),
         })
-        # decision m5a-contract: the JavaScript name; its default summary detail reads all three js operations
+        # The JavaScript name; its default summary detail reads all three js operations
         expected["analyze_javascript_application"] = ("js.files", "js.package", "js.hints")
         self.assertEqual(set(queries.TABLE), set(expected))
         for name, operations in expected.items():
@@ -477,7 +477,7 @@ class AndroidQueryTests(unittest.TestCase):
                            item.excerpt_sha256, item.observation, artifact)
         self.assertEqual(query.conclude(task, [outside]), ())
 
-    def test_permissions_are_concluded_in_chunks_of_64_in_document_order(self):  # decision m4a-fix-round-2 (F3)
+    def test_permissions_are_concluded_in_chunks_of_64_in_document_order(self):
         artifact = self.layout["members"][0]["artifact"]
         rows = [("uses-permission", "android:name", "string", f"p.{i:02}") for i in range(70)]
         rows[3] = ("uses-permission", "android:name", "reference", "@0x7f0a0001")
@@ -557,7 +557,7 @@ class AndroidQueryTests(unittest.TestCase):
 
 class PermissionChunkTests(unittest.TestCase):
     def test_more_than_64_permissions_through_the_real_apk_tool_and_reviewer(self):
-        # FIX-M4A-F (RD-M4A-CODEX-F F3): no permission is omitted; every chunk is supported (claims.SUBSET_CLAIMS).
+        # No permission is omitted; every chunk is supported (claims.SUBSET_CLAIMS).
         names = [f"org.reverseai.permission.P{i:03d}" for i in range(70)]
         tag, line, end, attributes, children = fixtures_apk.MANIFEST
         permissions = tuple(("uses-permission", 3, 3, ((True, "name", name),), ()) for name in names)

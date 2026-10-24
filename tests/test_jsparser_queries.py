@@ -1,4 +1,4 @@
-"""M5B-F syntax queries and CLI: inert fixtures, an explicit parser stand-in, no Docker."""
+"""Syntax queries and CLI: inert fixtures, an explicit parser stand-in, no Docker."""
 
 import contextlib
 from dataclasses import replace

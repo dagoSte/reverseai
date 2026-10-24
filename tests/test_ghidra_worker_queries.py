@@ -1,5 +1,5 @@
-"""Ghidra worker M3d query modes (decisions m3d-contract, m3d-seams-w, m3d-seams-q, m3d-seams-from): ghidra.functions,
-ghidra.function and ghidra.xrefs from canned query output built from the refs fixtures; no Ghidra, no container."""
+"""Ghidra worker query modes: ghidra.functions, ghidra.function and ghidra.xrefs from canned query output
+built from the refs fixtures; no Ghidra, no container."""
 
 import copy
 import json
@@ -341,7 +341,7 @@ class LongFunctionTests(unittest.TestCase):
 
 
 class CountLimitTests(unittest.TestCase):
-    """FIX-M3D-W (RD-M3D-CODEX-W R1, R2, I1; decision m3d-fix-round): totals are complete counts; past MAX_ROWS rows or
+    """Totals are complete counts; past MAX_ROWS rows or
     MAX_FUNCTION_INSTRUCTIONS instructions, or on the query's overflow marker, the run fails with TooManyRows."""
 
     def test_the_contract_ceilings(self):

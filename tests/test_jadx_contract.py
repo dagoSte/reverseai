@@ -1,4 +1,4 @@
-"""M4b contract: identity arguments for contained tools and the derived android.java claim (decision m4b-contract)."""
+"""Identity arguments for contained tools and the derived android.java claim."""
 
 import unittest
 
@@ -44,7 +44,7 @@ class IdentityArgumentTests(unittest.TestCase):
         literal = OperationSpec("jadx.method", {"class": ArgSpec("literal", 1, 255)}, lambda d, a: [], derived=True)
         with self.assertRaises(ContractError):
             ToolSpec(JADX, {"jadx.method": literal}, contained=True)
-        with self.assertRaises(ContractError):  # RD-M4B-CODEX-C R2: the contract bound is 255
+        with self.assertRaises(ContractError):  # The contract bound is 255
             ArgSpec("identity", 0, 256)
 
 
@@ -63,7 +63,7 @@ class JavaClaimTests(unittest.TestCase):
         for field, value in bad:
             self.assertEqual(judge({**ROW, field: value}), "unsupported", (field, value))
         self.assertEqual(judge({**ROW, "form": "error"}), "unsupported")
-        self.assertEqual(judge({**ROW, "form": "omitted"}), "unsupported")  # decision m4b-omitted: no text
+        self.assertEqual(judge({**ROW, "form": "omitted"}), "unsupported")  # No text
         self.assertEqual(judge({**ROW, "extra": 1}), "unsupported")
 
 

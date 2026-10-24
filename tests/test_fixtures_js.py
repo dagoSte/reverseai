@@ -1,5 +1,5 @@
 """The JavaScript fixtures checked against their own declared layouts with readers written here, zipfile and json,
-so the M5a lanes can trust the layouts as expectations."""
+so the JavaScript tests can trust the layouts as expectations."""
 
 import hashlib
 import io

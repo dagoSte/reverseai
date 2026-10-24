@@ -1,4 +1,4 @@
-"""M5c: children inside one whole gzip stream (artifact method 1, decision m5c-contract)."""
+"""Children inside one whole gzip stream (artifact method 1)."""
 
 import gzip
 import io
@@ -126,7 +126,7 @@ class GzipStreamTests(unittest.TestCase):
         self.assertEqual(reviewed(DATA, [artifact(n) for n in names], [dict(FILES)[n] for n in names]),
                          (["supported", "supported"], 1))
 
-    # RD-M5C-CODEX-C C2: each stream guard pinned on its own, with a positive control
+    # Each stream guard pinned on its own, with a positive control
     def test_a_wrong_header_crc_refuses_the_stream(self):
         header = bytearray(DATA[:10])
         header[3] = 2  # FHCRC alone
@@ -173,7 +173,7 @@ class GzipStreamTests(unittest.TestCase):
                 restore()
             self.assertEqual(result, expected)
 
-    # RD-M5C-CODEX-C C1: the gateway charges a new stream's bound before inflating it
+    # The gateway charges a new stream's bound before inflating it
     def test_the_gateway_refuses_a_new_stream_before_inflating_past_the_cap(self):
         data, bounds = DATA + SECOND, 100 * len(DATA) + 100 * len(SECOND)
         tool = ToolRef("js", "0.1.0")
