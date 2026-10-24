@@ -342,6 +342,10 @@ facts against the same file later.
 
 **Next**
 
+- **x86-64**: container images for Intel and AMD machines (Linux servers, Windows
+  PCs, Intel Macs), with the same offline, unprivileged containment proven natively
+  on each. Today the containers run on ARM64 (Apple silicon and Linux ARM64);
+  x86-64 programs can already be analysed there.
 - **Benchmark**: measured accuracy on a public corpus of files with known
   answers, with the method and raw results published.
 - **AI analyst team**: agents that plan and ask questions in parallel, with the
@@ -351,8 +355,6 @@ facts against the same file later.
 
 - **Enterprise mode**: the same engine hosted on our infrastructure and reachable
   over MCP, for teams that need central policy and audit trails.
-- **More platforms**: x86-64 container images and proofs on Windows and Linux
-  x86-64.
 - **Clean-room kit**: evidence-cited functional specifications that support
   clean-room reimplementation.
 
