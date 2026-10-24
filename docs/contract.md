@@ -1282,8 +1282,11 @@ same validation, budgets, gateway, reviewer and reports.
   Markdown report, cut at 256 KiB with a closing note when longer. `structuredContent` is `{"report": <report.json>}`
   when that object serialises to at most 1 MiB, otherwise `{"report": null, "omitted": "<reason>"}` with a hint to
   narrow or page the query. An unknown tool name is a protocol error (-32602, "Unknown tool: <name>"). Arguments that do not
-  fit the tool's `inputSchema`, a refused input, a failed analysis or an exceeded budget are tool results with
-  `isError` true and a fixed, actionable message, never a traceback.
+  fit the tool's `inputSchema`, a refused input, a failed targeted query or an exceeded budget are tool results
+  with `isError` true and a fixed message, never a traceback; a CLI refusal is forwarded only from an allow-list of
+  fixed, path-free lines (decision mcp-fix-s-seams). `analyze_file` is an error only when the review has no
+  supported or derived verdict or a budget was exceeded; when a contained tool does not apply to the format, the
+  report is returned with a first line naming the incomplete operations (decision mcp-real-test-findings).
 
 ## Known-answer fixtures
 
