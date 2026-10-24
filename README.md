@@ -28,8 +28,8 @@
 
 **ReverseAI is an open-source engine for static reverse engineering of untrusted
 files.** It opens programs, Android apps and JavaScript packages *without running
-them*, puts the heavy analysis tools inside locked, offline containers, and only
-reports what it can prove from the file's own bytes. Every answer says where in
+them*, puts the heavy analysis tools inside locked, offline containers, and reports as
+verified only what it can prove from the file's own bytes. Every answer says where in
 the file it comes from, which tool produced it and whether ReverseAI verified it
 or it is a tool's interpretation.
 
@@ -49,8 +49,9 @@ ReverseAI removes both kinds of blind trust:
 - **Heavy tools are locked away.** Decompilers and parsers run in a fresh
   container per question, with no network, a read-only system, no privileges and
   hard limits. Nothing of your home folder or workspace is visible to them.
-- **Nothing is taken on faith.** ReverseAI re-reads every value a tool reports
-  from the original bytes. A single mismatch rejects the tool's whole answer, so a
+- **Nothing is taken on faith.** ReverseAI recomputes every byte-level fact a
+  tool reports, such as headers, offsets, matches and code anchors, from the
+  original bytes. A single mismatch rejects the tool's whole answer, so a
   compromised or buggy tool can hide evidence but cannot invent verified evidence.
 - **Facts and interpretations stay apart.** Decompiled code and call graphs are
   useful but are a tool's reading; they are always labelled as such and can never
@@ -64,7 +65,7 @@ ReverseAI removes both kinds of blind trust:
 | You give it | You get |
 | --- | --- |
 | **Native programs**: Linux (ELF), Windows (PE) and macOS (Mach-O) executables and libraries | File structure, segments and sections, entry point, imported libraries and functions, symbols, strings and raw byte ranges. With Ghidra: the list of functions, decompiled pseudocode, assembly, who calls what, and cross-references. |
-| **Android apps**: APK packages and DEX bytecode | Package contents, the binary manifest's declarations such as the package name and permissions, classes, methods and the references between them. With JADX: the decompiled Java of a chosen method. |
+| **Android apps**: APK packages and the DEX bytecode inside them | Package contents, the binary manifest's declarations such as the package name and permissions, classes, methods and the references between them. With JADX: the decompiled Java of a chosen method. |
 | **JavaScript applications**: ZIP archives, Electron ASAR archives, npm packages (`.tgz`) and single bundles | The file inventory, `package.json` declarations (including install scripts, read but never run) and hints such as process spawning, dynamic code or credential access. With the Babel parser: where modules are imported and where sensitive functions are called. |
 
 You can ask for a **full report** on a file (`analyze`) or ask **one precise
@@ -88,7 +89,7 @@ malicious or behaves in a certain way.
 ## How it works
 
 <p align="center">
-  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and fingerprinted; a gateway runs only allowlisted operations within time and output budgets; built-in parsers read native, Android and JavaScript formats in-process, while LIEF, YARA-X, Ghidra, JADX and a JavaScript parser each run in a locked container per request; the host re-derives every value and anchor from the original bytes; evidence records the file fingerprint, tool, operation and exact byte range; analysts cite evidence, an independent reviewer re-checks every citation, and the report separates supported, derived, unsupported and contradicted findings.">
+  <img src="media/how-it-works.svg" width="100%" alt="How ReverseAI works: an approved file is frozen and fingerprinted; a gateway runs only allowlisted operations within time and output budgets; built-in parsers read native, Android and JavaScript formats in-process, while LIEF, YARA-X, Ghidra, JADX and a JavaScript parser each run in a locked container per request; the host re-derives every byte-level value and anchor from the original bytes; evidence records the file fingerprint, tool, operation and exact byte range; analysts cite evidence, an independent reviewer re-checks every citation, and the report separates supported, derived, unsupported and contradicted findings.">
 </p>
 
 1. **Freeze the file.** You approve one regular file. ReverseAI copies it into a
@@ -104,10 +105,11 @@ malicious or behaves in a certain way.
 4. **Run heavy tools in a locked container.** Ghidra, JADX, LIEF, YARA-X and the
    JavaScript parser run one fresh container per request, as described
    [below](#the-secure-container-infrastructure).
-5. **Check the tool's answer.** The host recomputes every value the tool reports
-   from the original bytes and rejects the whole reply on any mismatch. A
-   decompiled function or Java method is accepted only if it is anchored to code
-   that ReverseAI located and verified itself.
+5. **Check the tool's answer.** The host recomputes every byte-level fact the
+   tool reports from the original bytes and rejects the whole reply on any
+   mismatch. A decompiled function or Java method is accepted only if it is
+   anchored to code that ReverseAI located and verified itself; its text and
+   relationships remain the tool's interpretation.
 6. **Record evidence.** Each item of evidence binds the file fingerprint, the tool
    and its version, the operation, and the exact byte range with its own hash. For
    a file inside an archive it also records which member it came from and how that
@@ -190,8 +192,8 @@ Analyse a file, or ask one question about it:
 
 Add `--with-ghidra`, `--with-jadx`, `--with-lief`, `--with-yarax` or
 `--with-jsparser` to bring in a contained tool. The
-[installation guide](docs/INSTALL.md) covers building the images offline and
-running the native proof; the [usage guide](docs/USAGE.md) lists every question,
+[installation guide](docs/INSTALL.md) covers building the images (offline,
+except Ghidra's build, which still needs network) and running the native proof; the [usage guide](docs/USAGE.md) lists every question,
 option and known limit.
 
 ## Platforms
