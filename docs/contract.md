@@ -1065,7 +1065,7 @@ checkable without a download, a paid call or a hosted CI run. Hosted CI, amd64
 images and a Windows proof are M6b and wait for the owner. The analysis
 contract above is unchanged.
 
-- **Version**: `reverseai.__version__` is the single source, `0.6.0` for M6, `0.6.1` for M6b, `0.6.2` for the presentation release `0.7.0` for the MCP server and `0.8.0` for the reconstruction export;
+- **Version**: `reverseai.__version__` is the single source, `0.6.0` for M6, `0.6.1` for M6b, `0.6.2` for the presentation release, `0.7.0` for the MCP server and `0.8.0` for the reconstruction export;
   `pyproject.toml` declares the same static version and a test pins the two equal.
 - **pyproject.toml** (PEP 621): name `reverseai`, the version, a one-line
   description, `readme = "README.md"`, `requires-python = ">=3.12"`, no
@@ -1212,7 +1212,7 @@ Decisions `owner-license-mit`, `owner-ci-manual`, `m6b-contract`. M6b is version
   builders; Ghidra still online), `docs/SECURITY.md` (Windows report binding,
   the CI's permissions and pinned actions, what a manual CI receipt proves),
   `CHANGELOG.md` under "Unreleased: M6b", and `media/how-it-works.svg`. Release
-  status lines are written by coord at the gate from the receipts.
+  status lines are written at the release gate from the receipts.
 - **Platforms (M6b)**: the whole suite on macOS arm64 and in the Linux arm64
   container as in M6a, natives on rc1, and the manual CI receipts for Linux
   x86-64 (host suite and wheel, not containers) and Windows x86-64 once the owner
@@ -1340,15 +1340,26 @@ bytes; the cached project is always untrusted (a matching digest proves storage 
   rows (<= 4,096 bytes each, uint64 offsets checked before every seek); program pages are served from them without a
   JVM. Caps fixed at prepare: 65,536 functions, 262,144 calls, 262,144 references, 65,536 strings, 8,388,608
   instruction visits overall, 1,000,000 per function; exceeding any cap fails prepare (never a clipped total).
-- **Queries.** Existing queries are unchanged without a prepared file and use it when present. New:
+- **Queries.** Existing queries are unchanged without a prepared file; once a file is prepared, its existing Ghidra
+  queries are answered from the prepared analysis (same wire shapes, still derived). New:
   `procedure_pseudo_code` gains `mode=preview|paged` (default preview; preview refuses a nonzero `text_start`) and
   `text_start` 0..1,048,576; `export_function(select, entry, name, part=info|pseudocode|assembly|callees|callers|
   references|strings, start 0..1,048,575, limit 1..128 default 32, text_start, max_chars 64..2048 default 1024)` pages
   one part; `export_program(part=functions|calls|references|strings, start, limit)` has no selector. Arguments unused
   by a part must keep their defaults. Paged pseudocode and both exports require a prepared file; a miss returns
   "Prepared Ghidra analysis is missing or invalid; run reverseai prepare FILE --with-ghidra." Program pages decompile
-  nothing; function pages decompile at most the selected function.
-- **Wire shapes (worker/1, coord's ruling on the two designs).** Every reply starts with a derived metadata value
+  nothing; function pages decompile at most the selected function. Exports cover the instructions Ghidra places in a
+  function's body at a unique offset of the original file; others are not listed.
+- **Fixed failure lines.** `prepare` prints exactly one of: "reverseai: analysis failed: Ghidra preparation failed or
+  exceeded its limits", "reverseai: analysis failed: Prepared Ghidra analysis is missing or invalid; run reverseai
+  prepare FILE --with-ghidra.", "reverseai: analysis failed: Ghidra cache busy; retry prepare.", "reverseai: analysis
+  failed: Private Ghidra cache is unsafe or unavailable."; queries print the same three cache messages after the
+  prefix "reverseai: query refused: ". Unknown cache error text is replaced by the unsafe line and never echoed; input
+  refusals keep "reverseai: input refused: " with the error class only. A timeout, the 64 MiB artifact limit and a
+  row cap all fail prepare with the preparation line; nothing is published.
+- **Capacity.** The 64 MiB artifact holds the Ghidra database and the export tables together, so it binds before the
+  row caps on real programs: a program whose prepared analysis exceeds it cannot be prepared.
+- **Wire shapes (worker/1).** Every reply starts with a derived metadata value
   `{kind: "export_page", scope: function|program, part, entry: uint64|null, status: ok|not_found|decompile_failed,
   start, total, count, next_start: int|null}` anchored at the original `Location(0, min(64, size))`; `start =
   min(requested, total)`, rows contiguous, `next_start = start + count` while below total, else null; a non-ok page
@@ -1388,13 +1399,20 @@ bytes; the cached project is always untrusted (a matching digest proves storage 
   `code.export_instructions`, `code.pseudocode_page` are derived, at most 64 citations per finding. Reports show
   `rows a..b of N` or `characters a..b of N`, the next cursor, analysis_id and "derived"; all sample text is inert.
 - **MCP compact view.** Analyse and query tools gain an MCP-only `view=compact|full` (default compact, removed before
-  CLI validation): the same reviewed analysis without evidence bodies or duplicate values, text <= 4 KiB, structured
-  <= 64 KiB, an explicit omission note when rows do not fit ("reduce limit or max_chars, or use view=full").
-- **Proof.** Unit and hostile tests as the two designs list (archive grammar, store races and crashes, lying workers,
-  cursor and Unicode edges, compact/full equality). Native: the revision route on Docker, prepare once per ELF/PE/Mach-O
+  CLI validation): the same reviewed analysis without evidence bodies or duplicate values, structured <= 64 KiB, an
+  explicit omission note when rows do not fit ("reduce limit or max_chars, or use view=full"). The text content is the
+  untrusted-data notice followed by that same compact JSON, so a client that passes only text to its model receives
+  every value.
+- **MCP prepare.** `prepare_file` runs the fixed argv `prepare FILE --with-ghidra --json` and writes no report files. The
+  bounded captured stdout (<= 8,192 bytes) must be exactly one strict `reverseai.prepare/1` receipt with the contract's
+  keys and no path; it is returned as `structuredContent` and as text after the notice. Failures return only the fixed
+  failure lines above.
+- **Proof.** Unit and hostile tests (archive grammar, store races and crashes, lying workers, cursor and Unicode
+  edges, compact/full equality). Native: the revision route on Docker, prepare once per ELF/PE/Mach-O
   fixture and cached answers equal to fresh ones, restore negatives inside the container, flood +1 controls, and one
-  scale receipt on a code-built (never executed) image with 10,000 functions recording counts, timings and sizes; a
-  cap or timeout is reported as a limit, not as success.
+  scale receipt on a code-built (never executed) image with 10,000 minimal functions (no calls, references or
+  strings) recording counts, timings and sizes; a cap or timeout is reported as a limit, not as success. That receipt
+  proves paging at 10,000 functions, not that a real program of that size fits the 64 MiB artifact.
 
 ## Known-answer fixtures
 

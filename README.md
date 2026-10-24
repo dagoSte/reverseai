@@ -133,7 +133,7 @@ image; at analysis time nothing is downloaded, pulled or installed.
 | Tool | What it does in ReverseAI | How its answer is checked |
 | --- | --- | --- |
 | **Built-in parsers** (Python standard library) | Structure, imports, strings and bytes of ELF, PE and Mach-O files; APK members, the binary manifest and DEX classes, methods and references; JavaScript archives, packages and hints | They are the verified reference that every other tool is checked against. |
-| [**Ghidra**](https://github.com/NationalSecurityAgency/ghidra) 12.1.4 | Functions, decompiled pseudocode, assembly, calls and cross-references of native programs; a prepared analysis, kept once per file, exports whole functions and the whole program in pages | Every address and byte anchor is re-read from the file; its interpretations are labelled derived. The kept analysis is opened only inside a locked container and is bound to the file, the image and the worker code. |
+| [**Ghidra**](https://github.com/NationalSecurityAgency/ghidra) 12.1.4 | Functions, decompiled pseudocode, assembly, calls and cross-references of native programs; a prepared analysis, kept once per file, exports each function's code and the whole program's listings in pages | Every address and byte anchor is re-read from the file; its interpretations are labelled derived. The kept analysis is opened only inside a locked container and is bound to the file, the image and the worker code. |
 | [**JADX**](https://github.com/skylot/jadx) 1.5.6 | Decompiled Java for a chosen Android method | Accepted only for the method ReverseAI's own DEX decoder verified, with the same code position and instruction count. |
 | [**LIEF**](https://github.com/lief-project/LIEF) 1.0.0 | A second reading of executable headers and sections | Every reported value is recomputed from the bytes; any difference rejects the reply. |
 | [**YARA-X**](https://github.com/VirusTotal/yara-x) 1.21.0 | Signature matching with a reviewed set of literal rules | Every match is found again at its exact offset. |
@@ -159,7 +159,7 @@ verified against the real Docker engine:
 | **Privileges** | An unprivileged user, every Linux capability dropped and privilege escalation disabled (`no-new-privileges`). |
 | **Resources** | Hard limits on processes, memory (with no swap), CPUs, wall-clock time and the size of the reply. |
 | **Input** | A single read-only mount: the frozen snapshot of the approved file in a dedicated staging folder, deleted after the run. Never your home folder or workspace. |
-| **Output** | One bounded JSON reply, treated as untrusted data and re-checked by the host before anything becomes evidence. Container logging is off. |
+| **Output** | One bounded JSON reply, treated as untrusted data and re-checked by the host before anything becomes evidence. Preparing a Ghidra analysis is the one exception: its output is a bounded archive that the host stores without opening and that only a later locked container reads. Container logging is off. |
 
 **Proven, not assumed.** A native verifier inspects each image and the running
 configuration, then starts control containers that try to reach the network,
@@ -246,8 +246,9 @@ and the full security model, are in the [MCP guide](docs/MCP.md).
 ## Use cases
 
 The commands below assume the virtual environment from the quick start is active and
-that each file has been copied into a folder of approved inputs. Every command writes
-its JSON and Markdown report into a new folder; nothing is executed. Prompts for an
+that each file has been copied into a folder of approved inputs. Every `analyze` and
+`query` command writes its JSON and Markdown report into a new folder (`prepare` prints a
+short receipt instead); nothing is executed. Prompts for an
 agent work once the MCP server is connected as shown above.
 
 ### Check an Electron app before installing it
@@ -313,10 +314,12 @@ function calls. Mark which findings are verified and which are Ghidra's reading.
 
 ### Rebuild a program you are allowed to rebuild
 
-For software whose licence permits it, your own program whose source was lost, or a
-malicious sample you need to understand in depth, prepare the analysis once and export
-it page by page; an agent can then rebuild the program function by function from the
-cited evidence:
+For software whose licence permits reconstruction, or a program whose copyright you hold
+and whose source was lost, prepare the analysis once and export it page by page; an agent
+can then rebuild the program function by function from the cited evidence. For a
+malicious sample, use the same exports only to reconstruct its logic as readable,
+annotated code for analysis: never compile or run it outside an isolated lab you are
+authorised to use.
 
 ```sh
 reverseai prepare tool.bin --with-ghidra --json
@@ -326,10 +329,12 @@ reverseai query tool.bin --with-ghidra --query procedure_pseudo_code --arg mode=
 ```
 
 Copy a real entry from the function page in place of `0x401000`, and follow each
-page's next cursor. Everything Ghidra reconstructs stays labelled derived; checking the
-rebuilt program against the original is your responsibility (see the
-[legal notice](#responsible-use-and-legal-notice)). Details are in the
-[usage guide](docs/USAGE.md#prepared-native-exports).
+page's next cursor. Everything Ghidra reconstructs stays labelled derived, and ReverseAI
+never compiles or runs anything: building the rebuilt program, or comparing it with the
+original, is a separate step that you run only where you are entitled to (see the
+[legal notice](#responsible-use-and-legal-notice)). The prepared analysis is kept in a
+private cache on your machine (see [Your data](#responsible-use-and-legal-notice)).
+Details are in the [usage guide](docs/USAGE.md#prepared-native-exports).
 
 Agent prompt: *"Prepare tool.bin, list its functions page by page, and rebuild it in C
 starting from the functions that call nothing else. Cite the export page for each
@@ -368,9 +373,11 @@ facts against the same file later.
 - An MCP server (protocol revision 2026-07-28, with older clients supported) that
   gives AI agents the same verified questions, confined to a folder you choose.
 - Reconstruction export: a Ghidra analysis prepared once per file and kept in a
-  private cache, then whole functions, complete pseudocode and the whole program
-  (functions, calls, references, strings) exported in pages, over the command line
-  and MCP; compact answers for agents by default.
+  private cache, then each function's complete pseudocode, assembly, calls, references
+  and strings, and the whole program's functions, calls, references and strings,
+  exported in pages over the command line and MCP; compact answers for agents by
+  default. The prepared analysis is limited to 64 MiB, which in practice bounds the
+  size of program it can hold; a 10,000-function test program is proven.
 
 **Next**
 
@@ -401,7 +408,9 @@ your responsibility.
 - **Intended purpose.** ReverseAI is built for defensive security work: examining
   suspicious or potentially dangerous software, such as malware, untrusted packages and
   third-party components, to understand its risks without running it, for incident
-  response, threat analysis and pre-adoption review.
+  response, threat analysis and pre-adoption review. It also supports reconstructing
+  software whose licence permits it or whose copyright you hold, such as a program
+  whose source was lost.
 - **Analyse only what you may analyse.** Use ReverseAI on files you own or are authorised
   to examine. Licence agreements of third-party software may restrict reverse
   engineering, decompilation or disassembly, and the law of your country may allow such
@@ -419,7 +428,11 @@ your responsibility.
   files themselves may be malicious. Store and handle them according to your
   organisation's policy.
 - **Your data.** Reports can contain text taken from the analysed files. When an AI agent
-  uses ReverseAI, results go to that agent and its model provider.
+  uses ReverseAI, results go to that agent and its model provider. Preparing a file for
+  Ghidra keeps its analysis, which includes the file's bytes, in a private cache on your
+  machine (`~/Library/Caches/ReverseAI/ghidra/v1` on macOS, `~/.cache/reverseai/ghidra/v1`
+  or under `$XDG_CACHE_HOME` on Linux) until newer entries replace it; delete that folder
+  to remove every prepared analysis at once.
 - **No warranty, no liability.** ReverseAI is provided "as is", without warranty of any
   kind, under the [MIT License](LICENSE). To the maximum extent permitted by applicable
   law, the authors and contributors are not liable for any claim, damages or other
