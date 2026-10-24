@@ -1288,6 +1288,93 @@ same validation, budgets, gateway, reviewer and reports.
   supported or derived verdict or a budget was exceeded; when a contained tool does not apply to the format, the
   report is returned with a first line naming the incomplete operations (decision mcp-real-test-findings).
 
+## Reconstruction export: prepared Ghidra analysis and paged exports (0.8.0)
+
+Goal: let an agent rebuild larger programs from evidence. Ghidra analyses a file once; the analysis is kept as an
+opaque artifact that only locked containers ever open; whole functions and the whole program are exported in pages.
+The analysis path still never executes the input. Every observation is still admitted against the ORIGINAL input
+bytes; the cached project is always untrusted (a matching digest proves storage identity, not honest analysis).
+
+- **Offline image revision (r7).** `tools/build_ghidra_image.py revise` builds a new locked image from the approved
+  local r6 parent `sha256:ac77fda75da8580e0479087580f83b6e5495fb16df97b9696a2bdf3ae100f452` without network: route A
+  (a closed Dockerfile FROM that local parent, COPY of the reviewed worker files only, `--pull=false --network=none`,
+  fail-closed engine preflight) and route B (create the parent with `--pull never`, never start it, copy the fixed
+  files, commit, remove the container). The parent is inspected by ID first; a missing or different parent fails
+  before any build. The result is verified (parent layer prefix, unchanged JDK and Ghidra, user, environment,
+  entrypoint, exact file set). Lock keys r7: adapter_version, base_digest, ghidra_sha256, jdk_sha256,
+  parent_image_id, bundle_sha256, cache_format, image_id, platform; `bundle_sha256` is the SHA-256 of the canonical
+  JSON map relative path -> SHA-256 of every worker, helper, Java script and options file. An r6 lock is never
+  admitted as r7. The full networked build stays as it is.
+- **Prepare.** CLI `reverseai prepare FILE --with-ghidra [--json]` and the MCP tool `prepare_file(file)` (listed only
+  with `--with-ghidra`) run the internal operation `ghidra.prepare` (args `{}`): import, fixed analysis, export tables,
+  close, then write ONLY an uncompressed USTAR archive on stdout through a dedicated streaming sink (<= 64 MiB, never
+  JSON or base64). Failure, timeout, overflow or incomplete analysis publishes nothing. The host never parses the tar;
+  after exit 0 it builds the manifest `{format, input_sha256, image_id, bundle_sha256, size, artifact_sha256}`.
+  Key `K = SHA-256(canonical {input_sha256, image_id, bundle_sha256, cache_format: 1})`; `analysis_id =
+  SHA-256(canonical {key: K, artifact_sha256})`. Receipt `{schema: "reverseai.prepare/1", input: {sha256, size},
+  analysis_id, state: created|reused, runtime: {image, platform, bundle_sha256}, cache_format: 1, artifact_size,
+  elapsed_seconds}`; no cache path in any output. Prepare profile: 900 s host wall (840 s headless, 720 s
+  auto-analysis), JVM heap 1 GiB, 2 GiB memory and swap, 2 CPUs, 256 PIDs, 512 MiB noexec tmpfs; controller
+  deadline 1020 s including a 30 s lock wait. Queries keep their current profile (240 s, 262,144-byte replies,
+  4,096-byte observations).
+- **Store.** Private per user: macOS `~/Library/Caches/ReverseAI/ghidra/v1`, Linux `$XDG_CACHE_HOME/reverseai/ghidra/v1`
+  when absolute and safe, else `~/.cache/reverseai/ghidra/v1`; Windows unsupported in 0.8.0. Directories 0700, files
+  0600, owned by the user, link count 1, descriptor-relative no-follow access, nothing repaired or chmod-ed. Entry =
+  `<K>.tar` + `<K>.json` (<= 8 KiB). At most 32 entries and 2 GiB including in-progress bytes; least-recently-used
+  eviction, ties by K. One OS lock serialises cold prepares (a second waits <= 30 s, then "Ghidra cache busy; retry
+  prepare."); a short index lock guards publication and eviction; hits never wait for prepare. Publish = fsync body
+  and manifest, atomic rename, index last, fsync directory. A lookup re-hashes the whole body. `doctor` reports
+  `ghidra_cache {state: absent|unsafe|ready|unsupported, entries, bytes, max_entries, max_bytes, artifact_max_bytes}`
+  read-only.
+- **Restore.** A cached call stages `input`, `project.tar` and a <= 4,096-byte host-built `cache.json` in the same
+  disposable read-only `/snapshot` (no new mount or flag). The worker re-hashes and strictly unpacks into fresh tmpfs:
+  USTAR only, valid checksums and octal sizes, <= 4,096 headers, <= 64 MiB tar, <= 128 MiB unpacked, depth <= 16, names
+  relative ASCII <= 240 bytes with components `[A-Za-z0-9_.~+-]{1,64}` (not `.` or `..`), only `cache/project/...` and
+  `cache/tables/...`, regular files and directories only; no links, devices, pax/GNU, sparse or base-256 fields,
+  duplicates or case collisions; two zero end blocks; files written exclusively, no-follow, 0600/0700. It opens the
+  project with `-process input -noanalysis -readOnly`, binds it to the staged input, image and bundle, and never
+  writes back. Tables `cache/tables/{functions,calls,references,strings}.{jsonl,idx}` and `meta.json` hold bounded
+  rows (<= 4,096 bytes each, uint64 offsets checked before every seek); program pages are served from them without a
+  JVM. Caps fixed at prepare: 65,536 functions, 262,144 calls, 262,144 references, 65,536 strings, 8,388,608
+  instruction visits overall, 1,000,000 per function; exceeding any cap fails prepare (never a clipped total).
+- **Queries.** Existing queries are unchanged without a prepared file and use it when present. New:
+  `procedure_pseudo_code` gains `mode=preview|paged` (default preview; preview refuses a nonzero `text_start`) and
+  `text_start` 0..1,048,576; `export_function(select, entry, name, part=info|pseudocode|assembly|callees|callers|
+  references|strings, start 0..1,048,575, limit 1..128 default 32, text_start, max_chars 64..2048 default 1024)` pages
+  one part; `export_program(part=functions|calls|references|strings, start, limit)` has no selector. Arguments unused
+  by a part must keep their defaults. Paged pseudocode and both exports require a prepared file; a miss returns
+  "Prepared Ghidra analysis is missing or invalid; run reverseai prepare FILE --with-ghidra." Program pages decompile
+  nothing; function pages decompile at most the selected function.
+- **Wire shapes (worker/1, coord's ruling on the two designs).** Every reply starts with a derived metadata value
+  `{kind: "export_page", scope: function|program, part, entry: uint64|null, status: ok|not_found|decompile_failed,
+  start, total, count, next_start: int|null}` anchored at the original `Location(0, min(64, size))`; `start =
+  min(requested, total)`, rows contiguous, `next_start = start + count` while below total, else null; a non-ok page
+  has zero counts. Rows: function `{index, name, entry, size, signature|null, signature_truncated, library_hint|null}`
+  (name and hint <= 128, signature <= 512 printable characters); call `{index, from, from_size, at, to, to_name}`;
+  reference `{index, from, from_size, at, to, type, to_name}`; assembly `{index, delta, length, text}`; string
+  `{index, from, from_size, at, address, encoding, text, truncated}` (instruction and string bytes cited separately);
+  info `{name, entry, size, matches, signature, signature_truncated, library_hint, totals: {assembly, callees,
+  callers, references, strings}, pseudocode_status: "not_requested"}`; pseudocode `{kind: "pseudocode_page", entry,
+  text_sha256, start, total, text, next_start, status}`. Pseudocode units are Unicode scalars after `printable_text`
+  normalization, never split; `total` is the complete normalized text (<= 1,048,576 scalars, above that a fixed
+  failure; the old 65,536-unit Java cut does not apply to paged modes); a page is the longest prefix fitting both
+  `max_chars` and the 4,096-byte value. Each instruction anchor maps uniquely from original executable bytes and lies
+  inside its `(from, from_size)` span. Names, spans, targets, relationships and text stay derived.
+- **Host admission and reports.** Exact field sets, strict types, bounds, order, duplicates, binding, totals and
+  progress are checked before any row is admitted; the host then adds its own `analysis_id` to every new
+  observation (81 bytes reserved), never one from the worker or the client. New claims `code.export_page`,
+  `code.export_functions`, `code.export_calls`, `code.export_references`, `code.export_strings`,
+  `code.export_instructions`, `code.pseudocode_page` are derived, at most 64 citations per finding. Reports show
+  `rows a..b of N` or `characters a..b of N`, the next cursor, analysis_id and "derived"; all sample text is inert.
+- **MCP compact view.** Analyse and query tools gain an MCP-only `view=compact|full` (default compact, removed before
+  CLI validation): the same reviewed analysis without evidence bodies or duplicate values, text <= 4 KiB, structured
+  <= 64 KiB, an explicit omission note when rows do not fit ("reduce limit or max_chars, or use view=full").
+- **Proof.** Unit and hostile tests as the two designs list (archive grammar, store races and crashes, lying workers,
+  cursor and Unicode edges, compact/full equality). Native: the revision route on Docker, prepare once per ELF/PE/Mach-O
+  fixture and cached answers equal to fresh ones, restore negatives inside the container, flood +1 controls, and one
+  scale receipt on a code-built (never executed) image with 10,000 functions recording counts, timings and sizes; a
+  cap or timeout is reported as a limit, not as success.
+
 ## Known-answer fixtures
 
 Each lane writes a deterministic generator for its own synthetic fixtures under
