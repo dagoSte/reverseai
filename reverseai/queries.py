@@ -5,6 +5,7 @@ import re
 from types import MappingProxyType
 
 from reverseai.contract import ArgSpec, ContractError, OperationRequest, OperationSpec
+from reverseai import ghidra_args
 
 
 def _integer(low, high, default=None):
@@ -30,6 +31,7 @@ class QuerySpec:
     optional: tuple = ()  # included only when the tool's operation is registered
     details: object = None  # the "detail" argument's value -> routes of the operations it selects
     check: object = None  # (validated arguments) -> None, raising ContractError when they do not fit together
+    dispatch: str = "detail"
 
     def validate(self, raw):
         args = OperationSpec("query.arguments", self.args, lambda data, args: ()).validate_args(raw)
@@ -38,7 +40,7 @@ class QuerySpec:
         return args
 
     def requests(self, args, *, available=()):
-        routes = self.details[args["detail"]] if self.details else self.routes
+        routes = self.details[args[self.dispatch]] if self.details else self.routes
 
         def arguments(name):
             if routes:
@@ -49,9 +51,9 @@ class QuerySpec:
                      if name not in self.optional or name in available)
 
 
-def _query(operation, args, *, fixed=None):
+def _query(operation, args, *, fixed=None, check=None):
     return QuerySpec((operation,), MappingProxyType(args), "code" if operation.startswith("ghidra.") else "structural",
-                     MappingProxyType(fixed or {}))
+                     MappingProxyType(fixed or {}), check=check)
 
 
 def _routes(routes):
@@ -65,11 +67,11 @@ def _routed(args, routes, *, optional=()):
     return QuerySpec(tuple(routes), MappingProxyType(args), routes=_routes(routes), optional=optional)
 
 
-def _detailed(args, details, check):
+def _detailed(args, details, check, *, dispatch="detail", role="structural"):
     """A query whose "detail" argument selects its operations: details[value] = routes as _routed takes them."""
     operations = tuple(dict.fromkeys(name for routes in details.values() for name in routes))
-    return QuerySpec(operations, MappingProxyType(args), details=MappingProxyType(
-        {detail: _routes(routes) for detail, routes in details.items()}), check=check)
+    return QuerySpec(operations, MappingProxyType(args), role=role, details=MappingProxyType(
+        {detail: _routes(routes) for detail, routes in details.items()}), check=check, dispatch=dispatch)
 
 
 # Android: one DEX member by name, or "" for every classes*.dex member;
@@ -102,6 +104,14 @@ def _javascript(args):
         raise ContractError("Integer argument out of range")
 
 
+def _pseudocode(args):
+    if args["mode"] == "preview":
+        if args["text_start"] != 0:
+            raise ContractError("Query argument unused by preview")
+    else:
+        ghidra_args.check("ghidra.pseudocode", {key: args[key] for key in ghidra_args.OPERATIONS["ghidra.pseudocode"]})
+
+
 TABLE = MappingProxyType({
     "binary_overview": QuerySpec(tuple("structure." + name for name in ("identify", "headers", "sections", "imports", "entry")),
                                  MappingProxyType({})),
@@ -124,12 +134,19 @@ TABLE = MappingProxyType({
     **{name: _query("ghidra.function", {**FUNCTION_ARGS, **args}, fixed={"parts": part})
        for name, part, args in (
            ("procedure_info", "info", {}),
-           ("procedure_pseudo_code", "pseudocode", {"max_chars": _integer(64, 2048, 1024)}),
            ("procedure_assembly", "assembly", {"start": START, "limit": LIMIT}),
            ("procedure_callees", "callees", {"max_calls": _integer(0, 256, 64)}),
            ("procedure_callers", "callers", {"max_calls": _integer(0, 256, 64)}),
            ("analyze_function", "all", {"start": START, "limit": LIMIT, "max_chars": _integer(64, 2048, 1024),
                                          "max_calls": _integer(0, 256, 64), "max_refs": _integer(0, 128, 64)}))},
+    "procedure_pseudo_code": _detailed(
+        {**FUNCTION_ARGS, **ghidra_args.TEXT, "mode": ArgSpec("enum", choices=("preview", "paged"), default="preview")},
+        {"preview": {"ghidra.function": (("select", "entry", "name", "max_chars"), {"parts": "pseudocode"})},
+         "paged": {"ghidra.pseudocode": (("select", "entry", "name", "text_start", "max_chars"), {})}},
+        _pseudocode, dispatch="mode", role="code"),
+    **{name: _query(operation, ghidra_args.OPERATIONS[operation],
+                   check=lambda args, operation=operation: ghidra_args.check(operation, args))
+       for name, operation in (("export_function", "ghidra.export_function"), ("export_program", "ghidra.export_program"))},
     "xrefs": _query("ghidra.xrefs", {"address": _integer(0, 2**64 - 1), "start": START, "limit": LIMIT}),
     "inspect_android_package": _routed(
         {"member_start": START, "member_limit": ANDROID_LIMIT, "attribute_start": START,

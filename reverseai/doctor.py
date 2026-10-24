@@ -12,6 +12,7 @@ import sys
 
 import reverseai
 from reverseai import contained
+from reverseai.ghidra_cache import CacheStore
 
 MIN_PYTHON = (3, 12)
 DOCKER_SECONDS = 10
@@ -72,6 +73,7 @@ def collect(*, version_info=None, ask_docker=docker_version, inspect=None):
         "platform": {"system": platform.system(), "machine": platform.machine(), "release": platform.release()},
         "docker": {"answered": server is not None, "server_version": server, "timeout_seconds": DOCKER_SECONDS},
         "tools": [tool_facts(name, module, inspect) for name, module in TOOLS],
+        "ghidra_cache": CacheStore().facts(),
         "host_ok": supported,
     }
 
@@ -93,6 +95,8 @@ def to_text(facts):
         else:
             state = "available" if tool["available"] else "unavailable: the lock does not match its local files"
         lines.append(f"{tool['tool']} {tool['version']}: {state}")
+    cache = facts["ghidra_cache"]
+    lines.append(f"Ghidra cache: {cache['state']}; entries {cache['entries']}; bytes {cache['bytes']}")
     lines.append("host features: " + ("ok" if facts["host_ok"] else "not usable"))
     return "\n".join(lines) + "\n"
 

@@ -64,10 +64,19 @@ package does not install these images.
 
 The [image build guide](docs/INSTALL.md#approved-image-inputs-and-build-recipes)
 names the pinned inputs, hashes and commands. Get explicit approval before any
-download or build that needs network; Ghidra's build still needs network.
+download or build that needs network; a full Ghidra build still needs network. An approved local parent image can
+be revised offline by the operator; this is separate from ordinary analysis.
 Do not change Docker settings, restart Docker or widen file sharing as part of
 this quick start. Use the appropriate `--with-*` flag only once that tool is
 available; see [USAGE](docs/USAGE.md).
+
+## Prepare native code pages
+
+If the operator has enabled the pinned Ghidra image, run `reverseai prepare FILE --with-ghidra` before asking for
+paged pseudocode or function/program exports. Preparation can take several minutes; later pages reuse that analysis.
+The project remains opaque and private on the host and is retained in a bounded cache after the session ends.
+Use [the prepared export workflow](docs/USAGE.md#prepared-native-exports) to follow cursors and keep analysis IDs
+consistent. Existing bounded previews still work without preparation; no reconstructed code is executed.
 
 ## Connect an agent
 

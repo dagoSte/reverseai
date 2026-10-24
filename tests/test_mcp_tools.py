@@ -23,7 +23,7 @@ class ArgumentSchemaTests(unittest.TestCase):
             schema = tools[name]["inputSchema"]
             self.assertFalse(schema["additionalProperties"])
             self.assertEqual(schema["type"], "object")
-            self.assertEqual(set(schema["properties"]), {"file", *(
+            self.assertEqual(set(schema["properties"]), {"file", "view", *(
                 "member_file" if key == "file" else key for key in query.args)})
             self.assertEqual(schema["required"], ["file", *(
                 "member_file" if key == "file" else key for key, spec in query.args.items() if spec.default is None)])
@@ -55,7 +55,7 @@ class ArgumentSchemaTests(unittest.TestCase):
         host = mcp_tools.catalog(frozenset())
         self.assertEqual([tool["name"] for tool in host], ["list_files", "analyze_file", *host_names])
         full = mcp_tools.catalog(frozenset(mcp_tools.ENABLE))
-        self.assertEqual([tool["name"] for tool in full], ["list_files", "analyze_file", *queries.TABLE])
+        self.assertEqual([tool["name"] for tool in full], ["list_files", "analyze_file", "prepare_file", *queries.TABLE])
         self.assertEqual(host[0]["inputSchema"], {"type": "object", "properties": {}, "required": [],
                                                 "additionalProperties": False})
         for tool in full:

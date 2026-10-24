@@ -3,6 +3,9 @@
 import hashlib
 import json
 import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 import tempfile
 import threading
@@ -33,6 +36,18 @@ class CacheTests(unittest.TestCase):
         self.assertIsNone(self.store.lookup(identity()))
         self.assertEqual(self.store.facts()["state"], "absent")
         self.assertFalse(self.root.exists())
+
+    def test_linux_unsafe_xdg_location_falls_back_without_writing(self):
+        base = Path(self.temp.name).resolve()
+        linked = base / "linked"
+        linked.symlink_to(base, target_is_directory=True)
+        with patch.object(cache.sys, "platform", "linux"), patch.object(cache.Path, "home", return_value=base):
+            for value in ("relative", str(linked), str(base / "absent")):
+                with self.subTest(value=value), patch.dict(os.environ, {"XDG_CACHE_HOME": value}):
+                    self.assertEqual(cache.default_root(), base / ".cache/reverseai/ghidra/v1")
+            with patch.dict(os.environ, {"XDG_CACHE_HOME": str(base)}):
+                self.assertEqual(cache.default_root(), base / "reverseai/ghidra/v1")
+        self.assertFalse((base / ".cache").exists())
 
     def test_prepare_reuses_identity_and_host_computes_exact_hash(self):
         calls = []
@@ -208,6 +223,54 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(calls, [True])
         self.assertEqual({reply[2] for reply in replies}, {"created", "reused"})
+
+    def test_killed_preparer_releases_its_kernel_lock_and_next_prepare_removes_partial(self):
+        ready = Path(self.temp.name) / "ready"
+        script = '''
+import hashlib,sys,time
+from pathlib import Path
+sys.path.insert(0,sys.argv[1])
+from reverseai.ghidra_cache import CacheStore,identity
+value=identity(hashlib.sha256(b'0').hexdigest(),{'image_id':'sha256:'+'a'*64,'bundle_sha256':'b'*64,'cache_format':1})
+def produce(sink):
+    sink.write(b'partial')
+    Path(sys.argv[3]).write_text('ready')
+    time.sleep(60)
+CacheStore(Path(sys.argv[2])).prepare(value,produce)
+'''
+        process = subprocess.Popen([sys.executable, "-I", "-B", "-c", script, str(Path(__file__).resolve().parents[1]),
+                                    str(self.root), str(ready)], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready.exists())
+            process.kill()
+            process.wait(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            process.stderr.close()
+        self.assertTrue(any(p.name.startswith(".tmp-") for p in self.root.iterdir()))
+        self.assertEqual(self.prepare()[2], "created")
+        self.assertFalse(any(p.name.startswith(".tmp-") for p in self.root.iterdir()))
+        with self.store.lookup(identity()):
+            pass
+
+    def test_final_directory_fsync_failure_never_publishes_and_is_recovered(self):
+        import stat
+        original = os.fsync
+        def fail(directory):
+            if stat.S_ISDIR(os.fstat(directory).st_mode):
+                raise OSError("fixed directory sync failure")
+            return original(directory)
+        with patch.object(cache.os, "fsync", side_effect=fail), self.assertRaises((OSError, cache.CacheError)):
+            self.prepare()
+        self.assertIsNone(self.store.lookup(identity()))
+        self.assertEqual(self.prepare()[2], "created")
+        self.assertEqual(self.store.facts()["state"], "ready")
 
 
 if __name__ == "__main__":

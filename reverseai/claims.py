@@ -7,6 +7,7 @@ supported. Rules are trusted reviewer code, independent of the analysts.
 """
 
 from reverseai.contract import canonical_json, sha256_hex
+from reverseai import export_claims
 
 
 def _one(values):
@@ -436,6 +437,11 @@ def _import_names(kind):
 # claim_key -> (confidence the claim must carry, {operation it may cite: derive(observations) -> expected value or None}).
 # A claim may cite several allowed operations; each operation's citations must yield the same value.
 RULES = {
+    **{key: ("inferred", {operation: derive for operation in export_claims.OPERATIONS
+                          if key == "code.export_page" or (key == "code.pseudocode_page"
+                          and operation != "ghidra.export_program") or (key != "code.pseudocode_page"
+                          and operation != "ghidra.pseudocode")})
+       for key, derive in export_claims.DERIVATIONS.items()},
     "format.container": ("observed", {"structure.identify": _format, "lief.headers": _format}),
     "format.machine": ("observed", {"structure.headers": _machine, "lief.headers": _machine}),
     "format.section_count": ("observed", {"structure.headers": _count, "lief.headers": _count}),
@@ -492,6 +498,13 @@ DERIVED_CLAIMS = frozenset(key for key, (_, derivations) in RULES.items()
 
 # claim_key -> the fixed statement a supported finding makes; the value column says what it found.
 STATEMENTS = {
+    "code.export_page": "Prepared analysis page status and cursor (derived)",
+    "code.export_functions": "Prepared function metadata (derived)",
+    "code.export_calls": "Prepared call sites (derived)",
+    "code.export_references": "Prepared data references (derived)",
+    "code.export_strings": "Prepared referenced strings (derived)",
+    "code.export_instructions": "Prepared instruction page (derived)",
+    "code.pseudocode_page": "Prepared pseudocode character page (derived)",
     "format.container": "File format identified from its magic bytes",
     "format.machine": "Machine named in the header",
     "format.section_count": "Number of sections declared in the header",

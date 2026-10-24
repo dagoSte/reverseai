@@ -137,7 +137,7 @@ class DoctorCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         facts = json.loads(raw)
         self.assertEqual(doctor.to_text(facts), text)
-        self.assertEqual(sorted(facts), ["docker", "host_ok", "platform", "python", "reverseai", "tools"])
+        self.assertEqual(sorted(facts), ["docker", "ghidra_cache", "host_ok", "platform", "python", "reverseai", "tools"])
 
     def test_doctor_takes_no_file_and_no_output_directory(self):
         for extra in (["sample.bin"], ["--out", "reports"]):

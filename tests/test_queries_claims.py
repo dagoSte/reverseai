@@ -11,7 +11,7 @@ from reverseai.review import review
 
 DATA = b"MZ" + bytes(range(256)) * 3 + b"hello world\x00" + "wide".encode("utf-16-le") + b"\x00\x00" + bytes(64)
 INPUT = InputRef(sha256_hex(DATA), len(DATA), "sample.bin")
-STRUCTURE, STRINGS, GHIDRA = ToolRef("structure", "0.1.0"), ToolRef("strings", "0.1.0"), ToolRef("ghidra", "12.1.4-r6")
+STRUCTURE, STRINGS, GHIDRA = ToolRef("structure", "0.1.0"), ToolRef("strings", "0.1.0"), ToolRef("ghidra", "12.1.4-r7")
 OPERATIONS = {STRUCTURE: ("structure.segments", "structure.entry", "structure.symbols", "structure.read_bytes"),
               STRINGS: ("strings.list", "strings.search"),
               GHIDRA: ("ghidra.functions", "ghidra.function", "ghidra.xrefs")}

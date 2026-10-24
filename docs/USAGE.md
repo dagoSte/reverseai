@@ -34,11 +34,13 @@ Pages show `rows a..b of N` and the next `start` (Java pages: `characters a..b o
 | `list_procedures` | File-backed executable functions | Derived (Ghidra) |
 | `search_procedures` | Functions whose names contain text | Derived (Ghidra) |
 | `procedure_info` | A function selected by entry or exact name | Derived (Ghidra) |
-| `procedure_pseudo_code` | The selected function's decompiled text | Derived (Ghidra) |
+| `procedure_pseudo_code` | Bounded preview, or character pages with `mode=paged` after preparation | Derived (Ghidra) |
 | `procedure_assembly` | An instruction page for the selected function | Derived (Ghidra) |
 | `procedure_callees` | Functions called by the selected function | Derived (Ghidra) |
 | `procedure_callers` | Call sites targeting the selected function | Derived (Ghidra) |
 | `analyze_function` | Function info, pseudocode, assembly, calls and references | Derived (Ghidra) |
+| `export_function` | One prepared function part: metadata, pseudocode, assembly, calls, references or strings | Derived (Ghidra) |
+| `export_program` | A page of prepared functions, calls, references or referenced strings | Derived (Ghidra) |
 | `xrefs` | References to the selected address | Derived (Ghidra) |
 | `inspect_android_package` | APK members and binary manifest declarations | Verified (host) |
 | `search_android_classes` | DEX classes whose descriptors contain the search text | Verified (host) |
@@ -46,6 +48,45 @@ Pages show `rows a..b of N` and the next `start` (Java pages: `characters a..b o
 | `inspect_android_method` | The class's methods and the selected method's code references; with `--with-jadx`, the method's decompiled Java | Verified (host); Java derived (JADX) |
 | `trace_android_references` | References from or to a method, selected by class, name and optional prototype | Verified (host) |
 | `analyze_javascript_application` | Files, package.json declarations and lexical hints (`detail` `summary`, `files`, `package` or `hints`); with `--with-jsparser`, module sources, sensitive calls and parse status (`modules`, `calls`, `parse`) | Verified (host); syntax derived (parser) |
+
+## Prepared native exports
+
+With the pinned Ghidra image available, prepare an approved file explicitly, then export bounded pages:
+
+```sh
+reverseai prepare /path/to/approved-program --with-ghidra --json
+reverseai query /path/to/approved-program --with-ghidra --query export_program --arg part=functions --arg limit=32 --out new-functions-page
+reverseai query /path/to/approved-program --with-ghidra --query export_program --arg part=calls --out new-call-page
+reverseai query /path/to/approved-program --with-ghidra --query export_function --arg entry=0x401000 --arg part=info --out new-function-info
+reverseai query /path/to/approved-program --with-ghidra --query procedure_pseudo_code --arg mode=paged --arg entry=0x401000 --arg text_start=0 --arg max_chars=1024 --out new-pseudocode-page
+```
+
+Copy a real entry from the function listing in place of `0x401000`. `export_function` also accepts
+`select=name` with an exact `name`; duplicate names select the lowest entry and metadata gives the match count.
+Choose one `part`: `info` (default), `pseudocode`, `assembly`, `callees`, `callers`, `references` or `strings`.
+Program parts are `functions` (default), `calls`, `references` and `strings`; they never decompile all functions.
+Each call writes normal report.json/report.md into a fresh output folder; it does not write compilable source files.
+
+Follow the displayed `next_start` for row pages and use it as `text_start` for pseudocode. Row limits are 1..128
+(default 32); text pages request 64..2048 characters (default 1024) but may be smaller to fit the byte limit.
+Pseudocode offsets count Unicode characters after display normalization, not bytes or UTF-16 units. `total` is the
+complete bounded decompilation, not the old preview prefix. Keep input hash, `analysis_id` and `text_sha256` while
+assembling text; restart if they change. Empty pages and failed decompilation carry explicit status. A truncated or
+failed page never proves absence. `analyze_function` and the default `mode=preview` remain bounded previews.
+
+Preparation has a fixed 900-second worker limit and 1,020-second overall deadline, a project limit of 64 MiB and
+bounded tables; a large file may exceed these limits. A page does not repeat auto-analysis, but function text still
+requires a bounded decompilation in a fresh container. Names, signatures, spans and relationships remain derived;
+`library_hint` is currently null. Data references identify addresses, not verified global types: use `read_bytes`
+for bounded byte ranges. Preparation and queries never execute the file or rebuilt code.
+
+Projects are opaque on the host and keyed by input hash, exact image, reviewed worker bundle and format. On macOS
+they live under `~/Library/Caches/ReverseAI/ghidra/v1`; on Linux under the safe absolute XDG cache location or
+`~/.cache/reverseai/ghidra/v1`. The private cache retains up to 32 projects / 2 GiB, including temporary data;
+least-recently-used entries are evicted. These files can contain sensitive input-derived content and outlive a CLI
+or MCP session. `doctor` reports cache metadata read-only; ready describes the store, not a promise that a particular
+file is prepared. Windows contained Ghidra/cache is unsupported. On a missing/invalid entry, run prepare again;
+queries do not silently warm up or use an old-image project. No client can choose a cache path or project ID.
 
 ## Examples
 

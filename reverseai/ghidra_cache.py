@@ -29,6 +29,7 @@ CONTROLLER_SECONDS = 1020
 MISSING = "Prepared Ghidra analysis is missing or invalid; run reverseai prepare FILE --with-ghidra."
 UNSAFE = "Private Ghidra cache is unsafe or unavailable."
 BUSY = "Ghidra cache busy; retry prepare."
+ERRORS = (MISSING, UNSAFE, BUSY)
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _IMAGE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _TEMP = re.compile(r"\.tmp-[0-9a-f]{32}\Z")
@@ -59,12 +60,29 @@ def analysis_id(key, artifact_sha256):
 
 def default_root():
     home = Path.home().resolve()
+    if os.name == "nt":
+        return home / ".cache/reverseai/ghidra/v1"
     if sys.platform == "darwin":
         return home / "Library/Caches/ReverseAI/ghidra/v1"
     base = Path(os.environ.get("XDG_CACHE_HOME", ""))
-    if not base.is_absolute():
+    if not base.is_absolute() or not _safe_base(base):
         base = home / ".cache"
     return base / "reverseai/ghidra/v1"
+
+
+def _safe_base(path):
+    """An environment override is usable only through an owned, unlinked path."""
+    try:
+        if any(part in (".", "..") for part in path.parts):
+            return False
+        for ancestor in reversed((path, *path.parents)):
+            value = ancestor.lstat()
+            if (not stat.S_ISDIR(value.st_mode) or value.st_uid not in (0, os.geteuid())
+                    or value.st_mode & 0o022 and not (value.st_uid == 0 and value.st_mode & stat.S_ISVTX)):
+                return False
+        return path.stat().st_uid == os.geteuid()
+    except OSError:
+        return False
 
 
 def _pairs(pairs):
@@ -257,6 +275,8 @@ class CacheStore:
         fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
         try:
             parts = self.root.parts[1:]
+            if not parts or any(part in (".", "..") for part in parts):
+                raise CacheError(UNSAFE)
             for index, part in enumerate(parts):
                 created = False
                 try:
@@ -383,10 +403,15 @@ class CacheStore:
                 found = None
             if found is not None:
                 with found:
+                    if time.monotonic() >= started + CONTROLLER_SECONDS:
+                        raise TimeoutError("Ghidra preparation exceeded its limits")
                     return dict(found.manifest), found.analysis_id, "reused", time.monotonic() - started
             with _locked(directory, "index.lock"):
                 index = self._index(directory)
                 _, names = self._inventory(directory)
+                for existing in tuple(index["entries"]):
+                    if existing + ".tar" not in names or existing + ".json" not in names:
+                        del index["entries"][existing]
                 for name in names:
                     if _TEMP.fullmatch(name) or (re.fullmatch(r"[0-9a-f]{64}\.(?:tar|json)", name)
                             and name[:64] not in index["entries"]):
@@ -419,6 +444,8 @@ class CacheStore:
                             "artifact_sha256": sink.digest.hexdigest()}
                 with _locked(directory, "index.lock"):
                     index = self._index(directory)
+                    if time.monotonic() >= sink.deadline:
+                        raise TimeoutError("Ghidra preparation exceeded its limits")
                     os.replace(temporary, key + ".tar", src_dir_fd=directory, dst_dir_fd=directory)
                     published = True
                     _atomic_json(directory, key + ".json", manifest)
@@ -426,6 +453,8 @@ class CacheStore:
                     index["entries"][key] = index["sequence"]
                     _atomic_json(directory, "index.json", index)
                     os.fsync(directory)
+                    if time.monotonic() >= sink.deadline:
+                        raise TimeoutError("Ghidra preparation exceeded its limits")
                 return manifest, analysis_id(key, manifest["artifact_sha256"]), "created", time.monotonic() - started
             except BaseException:
                 if published:

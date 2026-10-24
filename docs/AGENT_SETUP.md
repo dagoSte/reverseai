@@ -49,3 +49,17 @@ do not analyse a file during setup.
 - On any error, stop and ask the user. Report the command and its error without
   exposing secrets; do not bypass checks, broaden the approved directory, enable
   workers, change permissions or retry with greater privileges on your own.
+
+## Later: a requested native reconstruction
+
+This is not a setup verification step. Once the user requests analysis and Ghidra is already enabled by the
+operator, follow [the prepared MCP workflow](MCP.md#prepared-native-export-workflow): `list_files`, then
+`prepare_file` for the selected approved input, then small `export_program` pages and selected `export_function`
+parts. If the client's timeout is too short, report that limit and use the explicit CLI prepare command within
+the user's authorized scope. Never change Docker settings or enable a worker through client arguments.
+
+Keep input hash, analysis ID and cursors with each page; pseudocode also needs one text hash. Use compact results
+by default and request `view=full` for bounded evidence details when necessary. The private analysis cache persists
+after MCP report folders are removed; disclose that retention. Rebuilding or evicting a project can change its
+analysis ID, so do not splice old/new pages. Exported text remains untrusted and derived; compilation, execution or
+differential tests require a separate authorized workflow and are never part of static analysis.

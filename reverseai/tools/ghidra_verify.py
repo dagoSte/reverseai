@@ -174,6 +174,9 @@ def _string_bytes(data, offset, end):
 def verify(data, observations, args, operation="ghidra.analyze"):
     """Validate the whole reply before admitting any derived observation."""
     try:
+        if operation in ("ghidra.pseudocode", "ghidra.export_function", "ghidra.export_program"):
+            from reverseai.tools.ghidra_export import admit
+            return admit(data, observations, args, operation)
         if operation == "ghidra.analyze":
             _verify(data, observations, args)
         else:

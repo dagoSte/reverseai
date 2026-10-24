@@ -36,6 +36,9 @@ class _Execution:
 
 
 def _error(operation, exc):
+    from reverseai.ghidra_cache import CacheError, ERRORS
+    if isinstance(exc, CacheError) and str(exc) in ERRORS:
+        return f"{operation}: {exc}"
     # Exception messages can contain input bytes or host paths.
     return f"{operation}: {type(exc).__name__}"[:200]
 
