@@ -29,8 +29,9 @@ to fit the 4,096-byte observation limit, decision m3c-pseudocode-fit), calls fro
 only, inside their span. Then the M3c kinds (decision m3c-contract), each added only while the encoded
 reply stays within its limit: instruction listings in the pseudocode order, each instruction's bytes
 confirmed; non-call references with their contract type; and the strings the referenced bytes hold,
-decoded here from the snapshot by the contract rule. Errors are class names only. Nothing but the
-one JSON object is written, to stdout only.
+decoded here from the snapshot by the contract rule. Query errors are class names in the single bounded JSON
+reply on stdout. A successful ghidra.prepare instead writes only a bounded uncompressed USTAR archive to stdout;
+preparation failures write the error class to stderr and exit nonzero.
 """
 
 import hashlib
