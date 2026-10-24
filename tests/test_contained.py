@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
 from reverseai.contained import (
     DockerExecutor, ContainedError, ContainedTimeout, MAX_WORKER_REPLY_BYTES,
@@ -575,6 +575,40 @@ class ProcessRunnerTests(unittest.TestCase):
 
 
 class PreparedGhidraTests(unittest.TestCase):
+    def check_prepare_deadline(self, clocks, *, stdout_eof=False):
+        from reverseai import contained
+        process = Mock()
+        process.stdout = io.BytesIO()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        selector = MagicMock()
+        selector.__enter__.return_value = selector
+        selector.get_map.return_value = {} if stdout_eof else {"stdout": object()}
+        selector.select.return_value = []
+        with patch.object(contained.subprocess, "Popen", return_value=process), \
+                patch.object(contained.selectors, "DefaultSelector", return_value=selector), \
+                patch.object(contained.time, "monotonic", side_effect=clocks):
+            with self.assertRaises(ContainedError) as caught:
+                contained.run_prepare_bounded(["inert-command"], io.BytesIO())
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with()
+        self.assertTrue(process.stdout.closed)
+        self.assertIs(type(caught.exception), ContainedTimeout)
+        self.assertEqual(str(caught.exception), "WorkerTimeout")
+        return selector
+
+    def test_prepare_deadline_before_select_preserves_timeout_and_cleanup(self):
+        selector = self.check_prepare_deadline((100.0, 1000.0))
+        selector.select.assert_not_called()
+
+    def test_prepare_empty_select_preserves_timeout_and_cleanup(self):
+        selector = self.check_prepare_deadline((100.0, 101.0))
+        selector.select.assert_called_once_with(899.0)
+
+    def test_prepare_deadline_after_stdout_eof_preserves_timeout_and_cleanup(self):
+        selector = self.check_prepare_deadline((100.0, 1000.0), stdout_eof=True)
+        selector.select.assert_not_called()
+
     def test_r7_lock_fields_are_closed_and_old_locks_are_refused(self):
         from reverseai.contained import GHIDRA_VERSION
         for change in ({"cache_format": True}, {"cache_format": 2}, {"bundle_sha256": "x"},
