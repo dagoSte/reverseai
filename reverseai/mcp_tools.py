@@ -106,9 +106,12 @@ def catalog(enabled: frozenset) -> list[dict]:
         spec = queries.TABLE[name]
         properties = {"file": dict(file_schema),
                       **{_argument_name(key): _schema(value) for key, value in spec.args.items()}}
-        if name == "analyze_javascript_application" and "jsparser" not in enabled:
-            properties["detail"]["enum"] = [value for value in properties["detail"]["enum"]
-                                              if value not in queries.JS_SYNTAX_DETAILS]
+        if name == "analyze_javascript_application":
+            properties["member_file"]["description"] = ("Printable archive member selector used with detail hints, "
+                                                        "package, modules, calls or parse; leave empty for summary or files.")
+            if "jsparser" not in enabled:
+                properties["detail"]["enum"] = [value for value in properties["detail"]["enum"]
+                                                  if value not in queries.JS_SYNTAX_DETAILS]
         required = ["file", *(_argument_name(key) for key, value in spec.args.items() if value.default is None)]
         title, description = _QUERY_TEXT[name]
         tools.append(_tool(name, title, description, properties, required))

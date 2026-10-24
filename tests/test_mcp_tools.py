@@ -85,6 +85,13 @@ class ArgumentSchemaTests(unittest.TestCase):
             with self.subTest(flags=flags), self.assertRaises(mcp_tools.ToolInputError):
                 mcp_tools.catalog(flags)
 
+    def test_member_selector_description_explains_the_details_that_use_it(self):
+        for enabled in (frozenset(), frozenset({"jsparser"})):
+            tools = {tool["name"]: tool for tool in mcp_tools.catalog(enabled)}
+            field = tools["analyze_javascript_application"]["inputSchema"]["properties"]["member_file"]
+            self.assertEqual(field["description"], "Printable archive member selector used with detail hints, "
+                             "package, modules, calls or parse; leave empty for summary or files.")
+
 
 class RelativeNameTests(unittest.TestCase):
     def test_relative_posix_segments_and_utf8_byte_bound(self):
@@ -146,6 +153,22 @@ class FileTests(unittest.TestCase):
         self.symlink(outside, self.root / "linked")
         self.assertEqual(mcp_tools.list_files(str(self.root)), {
             "files": [{"name": "ordinary.bin", "size": 3}], "truncated": False})
+
+    def test_inventory_skips_reparse_entries_before_listing_or_descending(self):
+        outside = SimpleNamespace(name="outside.bin", path=str(self.work / "outside.bin"),
+                                  stat=lambda **kwargs: SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_size=7))
+        for mode in (stat.S_IFDIR, stat.S_IFREG):
+            with self.subTest(mode=mode):
+                entry = SimpleNamespace(name="reparse", path=str(self.root / "reparse"),
+                                        stat=lambda **kwargs: SimpleNamespace(
+                                            st_mode=mode | 0o700, st_file_attributes=0x400, st_size=7))
+
+                def scan(path):
+                    return contextlib.nullcontext(iter([entry] if path == str(self.root) else [outside]))
+
+                with patch.object(mcp_tools.os, "scandir", side_effect=scan) as scanned:
+                    self.assertEqual(mcp_tools.list_files(str(self.root)), {"files": [], "truncated": False})
+                scanned.assert_called_once_with(str(self.root))
 
     def test_unaddressable_names_are_omitted_with_an_honest_partial_listing(self):
         self.make_file()
