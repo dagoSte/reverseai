@@ -1368,7 +1368,12 @@ bytes; the cached project is always untrusted (a matching digest proves storage 
     bytes, so the finding cites both (the worker's 129-observation cap is unchanged);
   - `{kind: "function_info", name, entry, size, matches, signature, signature_truncated, library_hint, totals:
     {assembly, callees, callers, references, strings}, pseudocode_status: "not_requested"}` at the function's anchor;
-  - `{kind: "pseudocode_page", entry, text_sha256, start, total, text, next_start, status}` at the function's anchor.
+  - `{kind: "pseudocode_page", entry, size, text_sha256, start, total, text, next_start, status}` at the function's
+    anchor (`size` lets the host re-derive that anchor).
+  A pseudocode reply counts characters in its metadata too (`count` = length of `text`, equal start/total/next_start).
+  The info reply has `start` 0, `total` = `count` = 1, `next_start` null and `entry` = the target. A non-ok reply is
+  the metadata alone with zero counts and `next_start` null. Host-added citations are not counted. `signature_truncated`
+  is false when `signature` is null.
   `(from, from_size)` is the containing function, so no row depends on an earlier page. Pseudocode units are Unicode
   scalars after `printable_text` normalization, never split; `total` is the complete normalized text (<= 1,048,576
   scalars, above that a fixed failure; the old 65,536-unit Java cut does not apply to paged modes); a page is the
