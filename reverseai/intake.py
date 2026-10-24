@@ -1,8 +1,8 @@
-"""Freeze the bytes of one approved regular file (reverseai.contract/1 intake).
+"""Freeze the bytes of one approved regular file.
 
 Copyright (c) 2026 Stefano D'Agostino. MIT License; see LICENSE.
 
-Only the final path component is checked: the owner approves the path, and
+Only the final path component is checked: the operator approves the path, and
 parent directories may legitimately be links (for example /tmp on macOS).
 Error messages never contain the path or input bytes.
 """

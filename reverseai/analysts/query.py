@@ -15,14 +15,14 @@ PAGES = {
     "strings.search": ("string", "strings.matches", ("offset", "encoding", "text", "truncated")),
     "ghidra.functions": ("function_row", "code.function_list", ("name", "entry", "size")),
     "ghidra.xrefs": ("xref", "code.xrefs", ("at", "from", "type")),
-    # contract/3, M4a: Android packages
+    # Android packages
     "apk.inventory": ("member", "android.members", ("name", "method", "compressed_size", "size", "crc32", "sha256", "flags")),
     "apk.manifest": ("manifest_attribute", "android.manifest", ("element_index", "element", "attribute", "type", "value")),
     "dex.classes": ("class", "android.classes", ("dex", "name", "access", "superclass")),
     "dex.methods": ("method", "android.methods", ("dex", "class", "name", "prototype", "access", "code_offset", "code_units")),
     "dex.references": ("dex_ref", "android.references",
                        ("dex", "from_class", "from_method", "from_prototype", "at", "ref_kind", "target", "target_truncated")),
-    # M5a: JavaScript applications on the host
+    # JavaScript applications on the host
     "js.files": ("js_file", "javascript.files", ("file", "size", "sha256", "lines", "max_line", "flags")),
     "js.package": ("package_field", "javascript.package", ("file", "path", "value", "truncated")),
     "js.hints": ("js_hint", "javascript.hints", ("file", "category", "hint", "text", "truncated")),
@@ -49,7 +49,7 @@ def _chunks(items):
 
 
 def _within(item, task):
-    """Inside the input, or inside the child artifact the evidence names (contract/3)."""
+    """Inside the input, or inside the child artifact the evidence names."""
     return item.location.within(task.input.size if item.artifact is None else item.artifact["size"])
 
 

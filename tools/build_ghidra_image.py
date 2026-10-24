@@ -4,7 +4,7 @@ Usage (from the repository root):
     python3 -B tools/build_ghidra_image.py --download-dir DIR [--download] [--tag TAG] [--lock PATH]
 
 Ghidra 12.1.4 and the Temurin JDK 21.0.12.1+1 (aarch64) are fetched on the host
-(decision owner-m3-downloads) from their fixed GitHub release URLs, following
+from their fixed GitHub release URLs, following
 redirects only to GitHub's release-asset hosts over HTTPS, with a size cap and the
 SHA-256 checked before a file is kept. The image is built from the digest-pinned
 python:3.12-slim base: one internal "natives" stage installs Debian's g++ and make
@@ -64,7 +64,7 @@ def logical_instructions(text):
     """Logical instructions as BuildKit reads them: a line ending in exactly one backslash (then only spaces or tabs)
     continues on the next one, comment and empty lines inside a continuation are skipped, and nothing is inserted at
     the join (A\\ then DD is ADD). A run of two or more trailing backslashes ends its instruction: measured natively
-    with buildx v0.37.2 for runs of 1 to 5 (M3B-W). Lines are split on LF only: the caller has refused every other
+    with buildx v0.37.2 for runs of 1 to 5. Lines are split on LF only: the caller has refused every other
     control byte."""
     joined, current = [], None
     for line in text.split("\n"):

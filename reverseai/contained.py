@@ -89,7 +89,7 @@ class ContainedTimeout(ContainedError, TimeoutError):
 
 
 def load_lock(lock, *, adapter_version="1.0.0-r2", extra_keys=()):
-    """Validate tool-provided pins; the default version preserves legacy M2a callers."""
+    """Validate tool-provided pins; the default version is the LIEF adapter's, for callers that name none."""
     try:
         if isinstance(lock, Mapping):
             value = dict(lock)

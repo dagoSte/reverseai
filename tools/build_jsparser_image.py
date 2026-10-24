@@ -3,7 +3,7 @@
 Usage (from the repository root):
     python3 -B tools/build_jsparser_image.py --download-dir DIR [--tag TAG] [--lock PATH]
 
-Nothing is downloaded here. --download-dir must already hold the five downloads of decision owner-m5b-downloads:
+Nothing is downloaded here. --download-dir must already hold the five pinned downloads:
 node-v24.22.1-linux-arm64.tar.xz (checked by size and SHA-256) and the npm tarballs of @babel/parser 8.0.4,
 @babel/types 8.0.4, @babel/helper-string-parser 8.0.6 and @babel/helper-validator-identifier 8.0.6 (checked by size
 and their registry sha512 integrity). The digest-pinned python:3.12-slim base must already be present locally: the
@@ -12,7 +12,7 @@ and its licence from the Node.js tarball and writes the four packages' regular f
 checks every download again before use), and the final stage copies only /opt/node and /opt/reverseai/node_modules
 from it. The Dockerfile check allows exactly that shape and runs again on the copied build context; the lock's driver
 and worker hashes are those of the copied context, the bytes Docker builds, and the tool refuses to write a lock when
-the repository files differ from them after the build (RD-M4B-CODEX-W M1, CARRY-N-W). Every docker call is an argv
+the repository files differ from them after the build. Every docker call is an argv
 list; nothing goes through a shell.
 """
 

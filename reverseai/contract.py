@@ -1,6 +1,6 @@
-"""Shared task, operation, evidence, finding and review contract (reverseai.contract/1).
+"""Shared task, operation, evidence, finding and review contract.
 
-Every lane builds against these types. Tools return Observations; only the gateway
+Every component builds against these types. Tools return Observations; only the gateway
 turns them into Evidence with make_evidence, so evidence IDs and excerpt hashes are
 computed in one place and the reviewer can recompute them from the frozen bytes.
 """
@@ -39,7 +39,7 @@ _ID = re.compile(r"[a-z]{2,4}-[0-9a-f]{16}\Z")
 
 
 class ContractError(ValueError):
-    """A value does not satisfy reverseai.contract/1."""
+    """A value does not satisfy the contract."""
 
 
 def require(condition, message):
@@ -119,7 +119,7 @@ class Location:
 class Observation:
     """What a tool handler returns: a byte range and a bounded JSON description.
 
-    contract/3: with an artifact, the location is inside that child artifact (a member of the input, such as
+    With an artifact, the location is inside that child artifact (a member of the input, such as
     classes.dex in an APK), which the gateway and the reviewer re-materialize from the input bytes.
     """
 
@@ -136,11 +136,11 @@ class Observation:
             check_artifact(self.artifact)
 
 
-# contract/3 child artifacts: bytes stored or deflated inside the input, bound by size, CRC-32 and SHA-256.
+# Child artifacts: bytes stored or deflated inside the input, bound by size, CRC-32 and SHA-256.
 MAX_CHILD_BYTES = 32 * 1024 * 1024
 MAX_CHILD_RATIO = 100
 ARTIFACT_KEYS = frozenset({"member", "method", "data_offset", "compressed_size", "size", "crc32", "sha256"})
-# M5c: method 1 is a range of one whole gzip stream (RFC 1952) inside the input, after inflating it (decision m5c-contract).
+# Method 1 is a range of one whole gzip stream (RFC 1952) inside the input, after inflating it.
 GZIP_ARTIFACT_KEYS = ARTIFACT_KEYS | {"inner_offset"}
 MAX_STREAM_BYTES = 128 * 1024 * 1024
 
@@ -248,7 +248,7 @@ class Evidence:
     location: Location
     excerpt_sha256: str
     observation: dict
-    artifact: dict | None = None  # contract/3: the location and excerpt are inside this child artifact
+    artifact: dict | None = None  # the location and excerpt are inside this child artifact
 
     def __post_init__(self):
         require(isinstance(self.input_sha256, str) and _SHA256.match(self.input_sha256), "Invalid evidence input sha256")
@@ -285,7 +285,7 @@ def evidence_id(input_sha256, tool, operation, location, excerpt_sha256, observa
         "excerpt_sha256": excerpt_sha256,
         "observation": observation,
     }
-    if artifact is not None:  # contract/2 evidence keeps its ID
+    if artifact is not None:  # evidence without an artifact keeps its ID
         content["artifact"] = artifact
     return content_id("ev", content)
 
@@ -348,9 +348,9 @@ def evidence_from_dict(raw) -> Evidence:
 class ArgSpec:
     """Bounded argument: an int range, a short string or a closed set. Never a path or a flag.
 
-    "literal" (M3d) is search text for in-process tools only: minimum..maximum printable characters, and it may
+    "literal" is search text for in-process tools only: minimum..maximum printable characters, and it may
     contain "/" or start with "-"; a contained tool may not declare one (ToolSpec refuses it).
-    "identity" (M4b) is an escaped DEX identity as rows show it: minimum..maximum printable ASCII characters; a
+    "identity" is an escaped DEX identity as rows show it: minimum..maximum printable ASCII characters; a
     contained tool may declare it, and its worker compares it as text only, never as a path, option or program.
     """
 
@@ -398,7 +398,7 @@ class OperationSpec:
     args: Mapping[str, ArgSpec]
     handler: Handler  # (frozen bytes, validated args) -> list[Observation]
     max_observations: int = 1024
-    derived: bool = False  # contract/2: values are the tool's interpretation; the host re-derives only the anchor
+    derived: bool = False  # values are the tool's interpretation; the host re-derives only the anchor
 
     def __post_init__(self):
         require(isinstance(self.name, str) and _OPERATION.match(self.name), "Invalid operation name")

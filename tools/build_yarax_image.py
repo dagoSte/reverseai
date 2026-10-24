@@ -4,7 +4,7 @@ Usage (from the repository root):
     python3 -B tools/build_yarax_image.py --wheel-dir DIR [--download] [--tag TAG] [--lock PATH]
 
 The digest-pinned linux/arm64 base (the same one as the LIEF worker) must already be
-present locally: the tool never pulls (decision m6b-contract), and the Dockerfile must
+present locally: the tool never pulls, and the Dockerfile must
 build FROM exactly that reference and nothing else.
 The YARA-X wheel must be in DIR (or, with --download, is fetched from the single PyPI
 URL below, refusing any redirect) and must match the SHA-256 in
@@ -52,7 +52,7 @@ def logical_instructions(text):
     """Logical instructions as BuildKit reads them: a line ending in exactly one backslash (then only spaces or tabs)
     continues on the next one, comment and empty lines inside a continuation are skipped, and nothing is inserted at
     the join (A\\ then DD is ADD). A run of two or more trailing backslashes ends its instruction: measured natively
-    with buildx v0.37.2 for runs of 1 to 5 (M3B-W). Lines are split on LF only: the caller has refused every other
+    with buildx v0.37.2 for runs of 1 to 5. Lines are split on LF only: the caller has refused every other
     control byte."""
     joined, current = [], None
     for line in text.split("\n"):

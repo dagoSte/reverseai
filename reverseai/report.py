@@ -289,7 +289,7 @@ def _runs(indexes):
 
 
 def _javascript_details(rows, args=None, *, syntax=False):
-    """M5a lexical or M5b derived syntax pages, combining findings without spanning unshown rows."""
+    """Lexical or derived syntax pages, combining findings without spanning unshown rows."""
     columns_by_key = JAVASCRIPT_SYNTAX_PAGES if syntax else JAVASCRIPT_PAGES
     lines = (["", "### JavaScript syntax (parser's reading)", "",
               "Syntax roles are the pinned parser's reading (derived); their anchors cite host-checked bytes. "
@@ -395,7 +395,7 @@ def to_markdown(analysis):
 
     lines += table(supported) if supported else ["No finding was supported by the evidence."]
     if derived:
-        # contract/2: the tool's reading, anchored in the input but not verified against it
+        # the tool's reading, anchored in the input but not verified against it
         lines += ["", "## Derived by analysis tools (not verified against the bytes)", ""] + table(derived)
         lines += _code_details(derived)
         lines += _java_details(derived, report["tools"])
