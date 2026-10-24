@@ -174,31 +174,52 @@ in the [security guide](docs/SECURITY.md).
 
 ## Quick start
 
-Requirements: Python 3.12 or later. Host analysis needs nothing else; the
-contained tools also need Docker and their locally built images.
+Start with the [step-by-step guide](START.md), or tell your coding agent:
+**"Read docs/AGENT_SETUP.md and follow it."** The [setup prompt](docs/AGENT_SETUP.md)
+asks for your approved input directory before connecting your client.
+
+Requirements: Python 3.12 or later, with venv and pip. Host analysis needs no
+Docker. On Windows, use CPython 3.12.4 or later and the paths in
+[INSTALL](docs/INSTALL.md); every analysis needs a new output directory.
+
+Recommended on macOS or Linux, from a trusted checkout already on your machine:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install --no-index --no-deps .
-.venv/bin/reverseai doctor
+. .venv/bin/activate
+python -m pip install --no-index --no-deps .
+reverseai doctor
 ```
 
-`doctor` checks the setup without touching any sample or starting any container.
+The install uses local source without a package download. `doctor` reads no
+sample and never pulls, builds or starts a container; inspect its tool rows as
+well as its exit status.
 
-Analyse a file, or ask one question about it:
+Other local installation paths:
+
+| Path | Command |
+| --- | --- |
+| uv, if already installed | `uv tool install --offline --no-python-downloads --python python3 /path/to/reverseai` |
+| An approved wheel, inside the dedicated venv | `python -m pip install --no-index --no-deps /approved/reverseai-0.7.0-py3-none-any.whl` |
+| Editable development install, inside the dedicated venv and trusted checkout | `python -m pip install --no-index --no-deps -e .` |
+
+The uv path creates a tool environment; use the executable location it prints.
+Editable installs keep the checkout on Python's import path: use a dedicated
+venv and keep the checkout in place. All paths use trusted source or an approved
+local wheel; never install an analysed package or run its install scripts.
+
+With the recommended venv active, analyse a file or ask one question:
 
 ```sh
-.venv/bin/reverseai analyze path/to/approved-file --out new-report-folder
-.venv/bin/reverseai query path/to/approved-file --query list_segments --out new-query-folder
-.venv/bin/reverseai query path/to/approved.apk --query search_android_classes --arg query=Main --out new-android-folder
-.venv/bin/reverseai query path/to/approved-package.tgz --query analyze_javascript_application --out new-js-folder
+reverseai analyze "/path/to/approved-file" --out new-report-folder
+reverseai query "/path/to/approved-file" --query list_strings --out new-query-folder
 ```
 
-Add `--with-ghidra`, `--with-jadx`, `--with-lief`, `--with-yarax` or
-`--with-jsparser` to bring in a contained tool. The
-[installation guide](docs/INSTALL.md) covers building the images (offline,
-except Ghidra's build, which still needs network) and running the native proof; the [usage guide](docs/USAGE.md) lists every question,
-option and known limit.
+Each output folder contains `report.json` and `report.md`. Choose a fresh folder
+for each call. The [usage guide](docs/USAGE.md) lists format-specific questions
+and paging. Contained tools need Docker and their exact local images; the
+[installation guide](docs/INSTALL.md) covers building them from approved inputs
+(offline except Ghidra's build, which still needs network) and the native proof.
 
 ### Use it from an AI agent
 
