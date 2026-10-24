@@ -8,10 +8,12 @@ from pathlib import Path
 import struct
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from unittest.mock import Mock, patch
 
+from reverseai import contained
 from reverseai.contract import canonical_json, sha256_hex
 from tests import verify_m2_runtime as old, verify_r1_runtime as verifier
 from tests.fixtures_scale import elf_scale
@@ -110,6 +112,11 @@ class SourcePins(unittest.TestCase):
         self.folder = tempfile.TemporaryDirectory()
         self.addCleanup(self.folder.cleanup)
         self.source = Path(self.folder.name)
+        self.shared = self.source / "shared-staging"
+        self.shared.mkdir(mode=0o700)
+        staging = patch.object(contained, "STAGING_ROOT", self.shared)
+        staging.start()
+        self.addCleanup(staging.stop)
         for name in old.GHIDRA_BUNDLE_FILES:
             path = self.source / name
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -379,7 +386,8 @@ class SmokeTests(SourcePins):
             receipt = {"schema": "reverseai.r1-smoke/1", "offline": True, "platform": old.PLATFORM,
                        "checks": [], "cleanup": [], "lock": lock, "lock_sha256": "a" * 64,
                        "sources": {"trusted": "b" * 64}, "image_id": lock["image_id"]}
-            native = verifier.R1Verifier(boundary, lock, receipt, folder)
+            reply_dir = Path(folder) / "replies"
+            native = verifier.R1Verifier(boundary, lock, receipt, folder, reply_dir=reply_dir)
             native.image = image_fixture()
             data, layout = old.elf_code()
             def anchor(function):
@@ -440,6 +448,17 @@ class SmokeTests(SourcePins):
                     changed = copy.deepcopy(receipt)
                     mutate(changed)
                     self.assertFalse(verifier.smoke_passes(changed))
+            self.assertEqual(len(receipt["replies"]), 3)
+            self.assertEqual(reply_dir.stat().st_mode & 0o077, 0)
+            for saved in receipt["replies"]:
+                path = reply_dir / saved["file"]
+                self.assertEqual(sha256_hex(path.read_bytes()), saved["sha256"])
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                request = path.with_name(path.name.replace(".reply.json", ".request.json"))
+                self.assertEqual(sha256_hex(request.read_bytes()), saved["request_sha256"])
+                self.assertEqual(json.loads(request.read_bytes())["fixture"], "elf_code")
+            with self.assertRaises(FileExistsError):
+                native.save_reply(data, "ghidra.functions", {"query": "", "start": 0, "limit": 1}, b"no overwrite")
             self.assertEqual(len(boundary.prepare_calls), 1)
             self.assertEqual([row["operation"] for row in native.requests],
                              ["ghidra.prepare", "ghidra.export_program", "ghidra.export_function", "ghidra.functions"])
@@ -570,6 +589,84 @@ class MainTests(SourcePins):
             self.assertFalse(proof["passed"])
             self.assertEqual(proof["checks"][0]["reason"], "R1NewOutputRequired")
             self.assertTrue(any(row["status"] == "not_run" for row in proof["checks"]))
+
+
+class StagingAndDiagnosticsTests(SourcePins):
+    def test_both_entrypoints_stage_privately_under_the_configured_share_and_clean_only_their_run(self):
+        sibling = self.shared / "other-run"
+        sibling.mkdir()
+        (sibling / "keep").write_text("not ours")
+        for smoke in (True, False):
+            target, receipt = self.source / f"lock-{smoke}", self.source / f"receipt-{smoke}"
+            if smoke:
+                target.write_text(canonical_json(r7_lock()))
+            def revise(argv):
+                target.write_text(canonical_json(r7_lock()))
+                return 0
+            builder = types.SimpleNamespace(main=revise)
+            created = []
+            def make_native(boundary, lock, proof, folder):
+                path = Path(folder)
+                self.assertEqual(path.parent, self.shared)
+                self.assertEqual(path.stat().st_mode & 0o077, 0)
+                self.assertTrue(path.name.startswith("reverseai-r1-smoke-" if smoke else "reverseai-r1-proof-"))
+                created.append(path)
+                result = Mock()
+                result.requests = []
+                return result
+            with patch.object(verifier, "source_hashes", return_value={"source": "a" * 64}), \
+                    patch.object(verifier.importlib, "import_module", return_value=builder), \
+                    patch.object(verifier, "preflight"), patch.object(verifier, "R1Verifier", side_effect=make_native), \
+                    patch.object(verifier, "receipt_passes", return_value=False), \
+                    patch.object(verifier, "smoke_passes", return_value=False), patch.object(sys, "stderr", io.StringIO()):
+                args = ["--offline", "--lock", str(target), "--receipt", str(receipt)]
+                args.extend(["--smoke"] if smoke else ["--route", "B"])
+                self.assertEqual(verifier.main(args), 1)
+            self.assertEqual(len(created), 1, json.loads(receipt.read_bytes()))
+            self.assertFalse(created[0].exists())
+            self.assertEqual(list(self.shared.iterdir()), [sibling])
+            self.assertEqual((sibling / "keep").read_text(), "not ours")
+
+    @unittest.skipIf(os.name == "nt", "native R1 Docker controller uses POSIX pipe selectors")
+    def test_docker_stderr_is_drained_but_only_a_4096_byte_prefix_is_kept_and_handles_close(self):
+        self.assertTrue(hasattr(verifier, "docker_stderr"))
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(read_fd, "rb", buffering=0)
+        process = types.SimpleNamespace(stderr=stream)
+        text = b"bind source path does not exist: " + b"x" * (128 * 1024)
+        def write():
+            try:
+                view = memoryview(text)
+                while view:
+                    view = view[os.write(write_fd, view):]
+            finally:
+                os.close(write_fd)
+        with patch.object(verifier.subprocess, "Popen", return_value=process) as real:
+            with verifier.docker_stderr() as captured:
+                writer = threading.Thread(target=write, daemon=True)
+                verifier.subprocess.Popen(["docker", "create", "fixed"], stderr=verifier.subprocess.DEVNULL)
+                writer.start()
+                writer.join(3)
+                self.assertFalse(writer.is_alive(), "stderr flood blocked the trusted runner")
+            self.assertEqual(bytes(captured), text[:4096])
+            self.assertEqual(real.call_args.kwargs["stderr"], verifier.subprocess.PIPE)
+            self.assertEqual(real.call_args.args[0], ["docker", "create", "fixed"])
+        self.assertTrue(stream.closed)
+
+    def test_failed_receipt_keeps_bounded_diagnostic_and_success_has_no_stderr_field(self):
+        with tempfile.TemporaryDirectory() as folder:
+            native = verifier.R1Verifier(FakeBoundary(), r7_lock(), {"checks": [], "cleanup": []}, folder)
+            def fail():
+                native.failed_stderr = ("bad UTF-8 \ufffd" * 1000).encode()
+                raise old.VerificationError("WorkerProcessError")
+            self.assertFalse(native.record("prepare", fail))
+            row = native.receipt["checks"][-1]
+            self.assertEqual(row["reason"], "WorkerProcessError")
+            self.assertIn("docker_stderr", row)
+            self.assertTrue(row["docker_stderr"].startswith("bad UTF-8"))
+            self.assertLessEqual(len(row["docker_stderr"].encode()), 4096)
+            self.assertTrue(native.record("success", lambda: {"ok": True}))
+            self.assertNotIn("docker_stderr", native.receipt["checks"][-1])
 
 
 if __name__ == "__main__":
