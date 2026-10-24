@@ -13,8 +13,9 @@ import unittest
 from unittest.mock import patch
 
 import reverseai
-from reverseai import cli, mcp, pipeline
-from reverseai.contract import canonical_json
+from reverseai import cli, intake, mcp, pipeline
+from reverseai.contract import AnalysisResult, canonical_json
+from tests.fixtures_code import elf_code
 
 
 def request(method, params=None, *, identifier=1, modern=True):
@@ -319,6 +320,113 @@ class ServerTests(unittest.TestCase):
             self.assertNotIn(root.encode(), raw)
             self.assertNotIn(str(out).encode(), raw)
 
+    def test_cli_intake_refusals_keep_the_fixed_line_and_clean_the_temporary_directory(self):
+        for problem in ("hard_link", "too_large", "changed_during_read"):
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory() as root:
+                sample = Path(root, "sample.bin"); sample.write_bytes(b"abcdefgh")
+                if problem == "hard_link":
+                    os.link(sample, Path(root, "second.bin"))
+                elif problem == "too_large":
+                    with sample.open("r+b") as handle:
+                        handle.truncate(intake.MAX_INPUT_BYTES + 1)
+                def snapshot(*args, **kwargs):
+                    raise intake.IntakeError("Input changed while reading")
+                changed = (patch.object(intake, "snapshot", side_effect=snapshot) if problem == "changed_during_read"
+                           else contextlib.nullcontext())
+                with changed:
+                    _, replies, raw, _ = self.serve(request("tools/call", {
+                        "name": "read_bytes", "arguments": {"file": "sample.bin"}}), root=root)
+                result = replies[0]["result"]
+                self.assertTrue(result["isError"])
+                self.assertEqual(result["content"][0]["text"], mcp.NOTICE + "\n\nreverseai: input refused: IntakeError")
+                self.assertNotIn(root.encode(), raw)
+                self.assertNotIn(b"Traceback", raw)
+                self.assertFalse(Path(self.tools.calls[-1][3]).parent.exists())
+
+    def test_first_fixed_intake_line_is_selected_without_returning_other_diagnostics(self):
+        def refuse(argv, **kwargs):
+            print("private diagnostic /private/secret", file=sys.stderr)
+            print("reverseai: input refused: IntakeError", file=sys.stderr)
+            print("reverseai: input refused: OSError", file=sys.stderr)
+            raise SystemExit(1)
+        with patch.object(cli, "main", side_effect=refuse):
+            _, replies, raw, _ = self.serve(request("tools/call", {"name": "read_bytes", "arguments": {"file": "sample.bin"}}))
+        self.assertEqual(replies[0]["result"]["content"][0]["text"],
+                         mcp.NOTICE + "\n\nreverseai: input refused: IntakeError")
+        self.assertNotIn(b"/private/secret", raw)
+        self.assertNotIn(b"OSError", raw)
+
+    def test_other_cli_failures_keep_the_generic_message(self):
+        for line in ("reverseai: output failed: OSError", "reverseai: error: /private/secret", "/private/secret"):
+            def fail(argv, **kwargs):
+                print(line, file=sys.stderr)
+                raise SystemExit(1)
+            with self.subTest(line=line), patch.object(cli, "main", side_effect=fail):
+                _, replies, _, _ = self.serve(request("tools/call", {"name": "read_bytes", "arguments": {"file": "sample.bin"}}))
+            self.assertEqual(replies[0]["result"]["content"][0]["text"], mcp.NOTICE + "\n\n" + mcp.FAILURE_MESSAGE)
+
+    def test_fixed_query_limit_refusal_keeps_the_cli_line(self):
+        def refuse(argv, **kwargs):
+            print("reverseai: analysis failed: ValueError", file=sys.stderr)
+            raise SystemExit(1)
+        with patch.object(cli, "main", side_effect=refuse):
+            _, replies, _, _ = self.serve(request("tools/call", {"name": "read_bytes", "arguments": {"file": "sample.bin"}}))
+        result = replies[0]["result"]
+        self.assertTrue(result["isError"])
+        self.assertEqual(result["content"][0]["text"], mcp.NOTICE + "\n\nreverseai: analysis failed: ValueError")
+
+    def test_whole_file_partial_analysis_keeps_usable_facts_and_names_the_failed_operation(self):
+        original = pipeline.analyze_bytes
+        def partial(data, ref, **kwargs):
+            analysis = original(data, ref, **kwargs)
+            failed = AnalysisResult("tk-" + "1" * 16, "code", "error", (), (), ("ghidra.analyze: ContainedError",))
+            return replace(analysis, results=analysis.results + (failed,))
+        for json_limit in (1024 * 1024, 128):
+            with self.subTest(json_limit=json_limit), tempfile.TemporaryDirectory() as root, \
+                    patch.object(pipeline, "analyze_bytes", side_effect=partial), \
+                    patch.object(mcp, "MAX_STRUCTURED_BYTES", json_limit):
+                Path(root, "sample.bin").write_bytes(elf_code()[0])
+                _, replies, _, _ = self.serve(request("tools/call", {
+                    "name": "analyze_file", "arguments": {"file": "sample.bin"}}), root=root)
+            result = replies[0]["result"]
+            self.assertFalse(result["isError"])
+            if json_limit == 128:
+                self.assertIsNone(result["structuredContent"]["report"])
+            else:
+                self.assertGreater(result["structuredContent"]["report"]["summary"]["supported"], 0)
+            body = result["content"][0]["text"].split("\n\n", 1)[1]
+            self.assertIn("ghidra.analyze", body.splitlines()[0])
+            self.assertIn("error", body.splitlines()[0])
+
+    def test_whole_file_usability_comes_from_the_reviewer_and_budget_always_stays_an_error(self):
+        original = pipeline.analyze_bytes
+        for status, usable_kind, expected in (("ok", "none", True), ("error", "none", True),
+                                               ("error", "supported", False), ("budget_exceeded", "supported", True),
+                                               ("ok", "derived", False)):
+            def analyze(data, ref, **kwargs):
+                analysis = original(data, ref, **kwargs)
+                verdicts = (() if usable_kind == "none" else
+                            tuple(replace(v, status="derived", reasons=("Synthetic derived reading",)) for v in analysis.verdicts)
+                            if usable_kind == "derived" else analysis.verdicts)
+                return replace(analysis, results=tuple(replace(row, status=status) for row in analysis.results), verdicts=verdicts)
+            with self.subTest(status=status, usable_kind=usable_kind), tempfile.TemporaryDirectory() as root, \
+                    patch.object(pipeline, "analyze_bytes", side_effect=analyze):
+                Path(root, "sample.bin").write_bytes(elf_code()[0])
+                _, replies, _, _ = self.serve(request("tools/call", {
+                    "name": "analyze_file", "arguments": {"file": "sample.bin"}}), root=root)
+            self.assertEqual(replies[0]["result"]["isError"], expected)
+
+    def test_only_known_fixed_cli_failures_are_forwarded(self):
+        for line in ("reverseai: query refused: ContractError", "reverseai: this query requires --with-ghidra",
+                     "reverseai: this detail requires --with-jsparser",
+                     "reverseai: the Ghidra worker is unavailable (image lock, image or Docker missing)"):
+            def fail(argv, **kwargs):
+                print(line, file=sys.stderr)
+                raise SystemExit(1)
+            with self.subTest(line=line), patch.object(cli, "main", side_effect=fail):
+                _, replies, _, _ = self.serve(request("tools/call", {"name": "read_bytes", "arguments": {"file": "sample.bin"}}))
+            self.assertEqual(replies[0]["result"]["content"][0]["text"], mcp.NOTICE + "\n\n" + line)
+
     def fake_report(self, argv, *, _on_status=None, markdown="Static report", report=None, code=0):
         report = report if report is not None else {"results": []}
         if _on_status is not None:
@@ -424,9 +532,12 @@ class CommandTests(unittest.TestCase):
                 def query(*args, **kwargs):
                     analysis = original(*args, **kwargs)
                     return replace(analysis, results=tuple(replace(row, status=status) for row in analysis.results))
-                results, statuses = [], []
+                results, statuses, metadata = [], [], []
                 with patch.object(pipeline, "query_bytes", side_effect=query):
-                    for number, callback in enumerate((None, statuses.append)):
+                    def record(statuses_value, **details):
+                        statuses.append(statuses_value)
+                        metadata.append(details)
+                    for number, callback in enumerate((None, record)):
                         stdout, stderr = io.StringIO(), io.StringIO()
                         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                             try:
@@ -438,6 +549,8 @@ class CommandTests(unittest.TestCase):
                 self.assertEqual(results[0], results[1])
                 self.assertEqual(results[0][0], expected_code)
                 self.assertEqual(statuses, [(status,)])
+                self.assertTrue(metadata[0]["usable"])
+                self.assertEqual(metadata[0]["incomplete"], () if status == "ok" else (("structural", status),))
 
     def test_subcommand_resolves_root_and_passes_only_operator_flags(self):
         with tempfile.TemporaryDirectory() as folder:

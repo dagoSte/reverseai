@@ -151,7 +151,13 @@ def main(argv=None, *, _on_status=None):
             analysis = (pipeline.query_bytes(data, ref, args.query, checked, tools=tools) if args.command == "query"
                         else pipeline.analyze_bytes(data, ref, tools=tools))
             if _on_status is not None:
-                _on_status(tuple(result.status for result in analysis.results))
+                incomplete = tuple(dict.fromkeys(
+                    (operation.partition(":")[0], result.status)
+                    for result in analysis.results if result.status != "ok"
+                    for operation in (result.errors or (result.role,))))
+                _on_status(tuple(result.status for result in analysis.results),
+                           usable=any(verdict.status in ("supported", "derived") for verdict in analysis.verdicts),
+                           incomplete=incomplete)
             if args.command == "query" and any(result.status == "error" for result in analysis.results):
                 raise ValueError("Query operation failed")
         except ValueError as error:

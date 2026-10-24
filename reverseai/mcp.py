@@ -25,6 +25,11 @@ INSTRUCTIONS = "Analyse the operator-approved files using the listed tools. " + 
 TEXT_CUT = "\n\n[Report truncated; narrow or page the query.]"
 JSON_CUT = "Report exceeds 1 MiB; narrow or page the query."
 FAILURE_MESSAGE = "Analysis failed or exceeded its limits. Narrow the query or choose a smaller file."
+CLI_FAILURE_PREFIXES = ("reverseai: input refused: ", "reverseai: query refused: ", "reverseai: analysis failed: ")
+CLI_FIXED_FAILURES = frozenset(("reverseai: this query requires --with-ghidra",
+                                "reverseai: this detail requires --with-jsparser",
+                                *(f"reverseai: the {label} worker is unavailable (image lock, image or Docker missing)"
+                                  for label in ("LIEF", "YARA-X", "Ghidra", "JADX", "JavaScript parser"))))
 
 
 class _ProtocolError(Exception):
@@ -167,17 +172,26 @@ class _Session:
                 argv = self.tools.command(name, arguments, root=self.root, out=str(out), enabled=self.enabled)
                 captured_out, captured_err = _Capture(), _Capture()
                 failed = False
-                def on_status(statuses):
+                status_details = []
+                def on_status(statuses, *, usable=False, incomplete=()):
                     nonlocal failed
-                    failed = any(status in ("error", "budget_exceeded") for status in statuses)
+                    status_details[:] = incomplete
+                    failed = ("budget_exceeded" in statuses or
+                              (not usable if name == "analyze_file" else "error" in statuses))
                 with redirect_stdout(captured_out), redirect_stderr(captured_err):
                     try:
                         code = cli.main(argv, _on_status=on_status)
                     except SystemExit as error:
                         code = error.code
                 if code is not None and (type(code) is not int or code != 0):
+                    for line in captured_err.getvalue().splitlines():
+                        if line.startswith(CLI_FAILURE_PREFIXES) or line in CLI_FIXED_FAILURES:
+                            return _failed(line)
                     return _failed()
                 markdown, structured = _reports(out)
+                if status_details:
+                    warning = ", ".join(f"{operation} ({status})" for operation, status in status_details)
+                    markdown = "Incomplete operations: " + warning + ".\n\n" + markdown
                 if failed:
                     markdown = FAILURE_MESSAGE + "\n\n" + markdown
                 return _tool_result(markdown, structured, error=failed)
