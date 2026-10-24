@@ -356,6 +356,37 @@ facts against the same file later.
 - **Clean-room kit**: evidence-cited functional specifications that support
   clean-room reimplementation.
 
+## Responsible use and legal notice
+
+ReverseAI is a tool for examining files you are entitled to examine. How you use it is
+your responsibility.
+
+- **Analyse only what you may analyse.** Use ReverseAI on files you own or are authorised
+  to examine. Licence agreements of third-party software may restrict reverse
+  engineering, decompilation or disassembly, and the law of your country may allow such
+  activities only for specific purposes (for example interoperability or security
+  research) and under specific conditions. Complying with those licences and laws,
+  including copyright, trade-secret, computer-misuse, data-protection and export-control
+  rules, is up to you.
+- **No misuse.** Do not use ReverseAI to infringe intellectual property, circumvent
+  protection measures, build or improve malware, or access systems or data without
+  authorisation.
+- **No advice.** Findings, decompiled code and any AI-generated summary can be incomplete
+  or wrong. Check them before relying on them. Nothing ReverseAI produces is legal,
+  security or compliance advice.
+- **Dangerous files stay dangerous.** ReverseAI never executes the files it reads, but the
+  files themselves may be malicious. Store and handle them according to your
+  organisation's policy.
+- **Your data.** Reports can contain text taken from the analysed files. When an AI agent
+  uses ReverseAI, results go to that agent and its model provider.
+- **No warranty, no liability.** ReverseAI is provided "as is", without warranty of any
+  kind, under the [MIT License](LICENSE). To the maximum extent permitted by applicable
+  law, the authors and contributors are not liable for any claim, damages or other
+  liability arising from the use or misuse of the software or of its results, including
+  any analysis of third-party software or files.
+- **Trademarks.** Names of third-party tools and products belong to their owners; their
+  mention does not imply endorsement.
+
 ## Open source
 
 ReverseAI is free and open source under the [MIT License](LICENSE). The engine,
