@@ -2,6 +2,8 @@
   <img src="media/banner.svg" width="100%" alt="ReverseAI: look inside untrusted files without running them. Open reverse-engineering tools in locked, offline containers. Every finding points at exact bytes, checked twice.">
 </p>
 
+https://github.com/user-attachments/assets/884cff5d-e37e-49c3-9bb7-8fbcf118e2ee
+
 <p align="center">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square">
   <img alt="Version 0.7.0" src="https://img.shields.io/badge/version-0.7.0-38bdf8?style=flat-square">
