@@ -1349,17 +1349,28 @@ bytes; the cached project is always untrusted (a matching digest proves storage 
   `{kind: "export_page", scope: function|program, part, entry: uint64|null, status: ok|not_found|decompile_failed,
   start, total, count, next_start: int|null}` anchored at the original `Location(0, min(64, size))`; `start =
   min(requested, total)`, rows contiguous, `next_start = start + count` while below total, else null; a non-ok page
-  has zero counts. Rows: function `{index, name, entry, size, signature|null, signature_truncated, library_hint|null}`
-  (name and hint <= 128, signature <= 512 printable characters); call `{index, from, from_size, at, to, to_name}`;
-  reference `{index, from, from_size, at, to, type, to_name}`; assembly `{index, delta, length, text}`; string
-  `{index, from, from_size, at, address, encoding, text, truncated}` (instruction and string bytes cited separately);
-  info `{name, entry, size, matches, signature, signature_truncated, library_hint, totals: {assembly, callees,
-  callers, references, strings}, pseudocode_status: "not_requested"}`; pseudocode `{kind: "pseudocode_page", entry,
-  text_sha256, start, total, text, next_start, status}`. Pseudocode units are Unicode scalars after `printable_text`
-  normalization, never split; `total` is the complete normalized text (<= 1,048,576 scalars, above that a fixed
-  failure; the old 65,536-unit Java cut does not apply to paged modes); a page is the longest prefix fitting both
-  `max_chars` and the 4,096-byte value. Each instruction anchor maps uniquely from original executable bytes and lies
-  inside its `(from, from_size)` span. Names, spans, targets, relationships and text stay derived.
+  has zero counts. At most 129 observations per reply (metadata + 128 rows). Rows, each with its `kind`:
+  - `{kind: "function_export", index, name, entry, size, signature|null, signature_truncated, library_hint|null}`
+    at the function's anchor (the existing first-bytes rules); name and hint <= 128, signature <= 512 printable
+    characters; `library_hint` is always null in 0.8.0;
+  - `{kind: "instruction_export", index, from, from_size, at, length, text}` at the instruction bytes (`length`
+    1..16, text <= 64 printable characters);
+  - `{kind: "call_export", index, from, from_size, at, to, to_name}` at the call instruction bytes;
+  - `{kind: "reference_export", index, from, from_size, at, to, type, to_name}` at the referencing instruction bytes,
+    `type` from the existing `refs` enumeration;
+  - `{kind: "string_export", index, from, from_size, at, instruction_length, address, encoding, text, truncated}` at
+    the string bytes, with the instruction `[at, at + instruction_length)` mapped and cited separately, one row per
+    `(from, at, address, encoding)` and the existing decoding rules;
+  - `{kind: "function_info", name, entry, size, matches, signature, signature_truncated, library_hint, totals:
+    {assembly, callees, callers, references, strings}, pseudocode_status: "not_requested"}` at the function's anchor;
+  - `{kind: "pseudocode_page", entry, text_sha256, start, total, text, next_start, status}` at the function's anchor.
+  `(from, from_size)` is the containing function, so no row depends on an earlier page. Pseudocode units are Unicode
+  scalars after `printable_text` normalization, never split; `total` is the complete normalized text (<= 1,048,576
+  scalars, above that a fixed failure; the old 65,536-unit Java cut does not apply to paged modes); a page is the
+  longest prefix fitting both `max_chars` and the 4,096-byte value. No row that is too large is silently dropped: a
+  page that leaves rows remaining with `count` 0 is an error. Every instruction anchor maps uniquely from original
+  executable bytes and lies inside its `(from, from_size)` span. Names, spans, targets, relationships and text stay
+  derived.
 - **Host admission and reports.** Exact field sets, strict types, bounds, order, duplicates, binding, totals and
   progress are checked before any row is admitted; the host then adds its own `analysis_id` to every new
   observation (81 bytes reserved), never one from the worker or the client. New claims `code.export_page`,
