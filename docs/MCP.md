@@ -30,8 +30,9 @@ over its standard input and output; you do not run it by hand.
   instructions. A file can still contain text written to mislead an agent, so keep a person in the loop for any
   action an agent proposes after reading a report.
 - **Bounded results.** Analysis/query calls default to `view=compact`: reviewed findings and minimal citations,
-  without repeated evidence bodies. The compact JSON projection, bounded to 64 KiB, is included in both the text
-  and `structuredContent`, so text-only clients receive the data too. Use `view=full` to request the
+  without repeated evidence bodies. The text includes the untrusted-data notice and the same compact JSON as
+  `structuredContent`; the complete text and the structured content are each bounded to 64 KiB. The JSON is never
+  cut, so text-only clients receive the data too. Use `view=full` to request the
   bounded Markdown/JSON reports (256 KiB text, 1 MiB structured). An oversized report is explicitly omitted; reduce
   the page limit or `max_chars`. Temporary report folders are removed after each call; prepared projects persist
   in the private cache with a copy of the file's bytes until eviction or deletion. See
