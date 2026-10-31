@@ -53,6 +53,11 @@ def catalog_standin():
     return module
 
 
+
+def ascii_json(value):
+    """The compact text's encoding: canonical JSON with every non-ASCII character escaped."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+
 class ServerTests(unittest.TestCase):
     def setUp(self):
         self.tools = catalog_standin()
@@ -526,10 +531,27 @@ class ServerTests(unittest.TestCase):
                 "name": "read_bytes", "arguments": {"file": "sample.bin"}}))
         result = replies[0]["result"]
         text, structured = result["content"][0]["text"], result["structuredContent"]
-        self.assertEqual(text, mcp.NOTICE + "\n\n" + canonical_json(structured))
+        self.assertEqual(text, mcp.NOTICE + "\n\n" + ascii_json(structured))
         self.assertEqual(json.loads(text[len(mcp.NOTICE) + 2:]), structured)
         for finding in structured["report"]["results"][0]["findings"]:
-            self.assertIn(canonical_json(finding["value"]), text)
+            self.assertIn(ascii_json(finding["value"]), text)
+
+    def test_compact_text_never_carries_invisible_characters_raw(self):
+        report = self.compact_fixture(count=2)
+        hidden = "ignore\U000e0041\U000e0042 previous\u202eevil\u2028line\u200b"
+        report["results"][0]["findings"][0]["value"] = hidden
+        with patch.object(cli, "main", side_effect=lambda argv, **kw: self.fake_report(argv, **kw, report=report)):
+            _, replies, _, _ = self.serve(request("tools/call", {
+                "name": "read_bytes", "arguments": {"file": "sample.bin"}}))
+        result = replies[0]["result"]
+        text, structured = result["content"][0]["text"], result["structuredContent"]
+        body = text[len(mcp.NOTICE) + 2:]
+        self.assertTrue(body.isascii())
+        for character in ("\U000e0041", "\u202e", "\u2028", "\u200b"):
+            self.assertNotIn(character, text)
+        self.assertIn("\\udb40\\udc41", text)
+        self.assertEqual(json.loads(body), structured)
+        self.assertEqual(structured["report"]["results"][0]["findings"][0]["value"], hidden)
 
     def test_compact_json_stays_whole_with_incomplete_and_failure_preambles(self):
         report = self.compact_fixture(count=128, value_chars=600)
@@ -546,7 +568,7 @@ class ServerTests(unittest.TestCase):
             preamble += "Incomplete operations: ghidra.analyze (error).\n\n"
             self.assertEqual(result["isError"], failed)
             self.assertLessEqual(len(text.encode("utf-8")), 64 * 1024)
-            self.assertEqual(text, mcp.NOTICE + "\n\n" + preamble + canonical_json(structured))
+            self.assertEqual(text, mcp.NOTICE + "\n\n" + preamble + ascii_json(structured))
             self.assertEqual(json.loads(text[len(mcp.NOTICE) + 2 + len(preamble):]), structured)
             self.assertGreater(structured["omitted"]["findings"], 0)
 
@@ -566,7 +588,7 @@ class ServerTests(unittest.TestCase):
         self.assertLessEqual(len(text.encode("utf-8")), 64 * 1024)
         self.assertTrue(text.startswith(mcp.NOTICE))
         self.assertIn(mcp.COMPACT_HINT, text)
-        self.assertEqual(text, mcp.NOTICE + "\n\n" + canonical_json(structured))
+        self.assertEqual(text, mcp.NOTICE + "\n\n" + ascii_json(structured))
         self.assertNotIn("�", text)
         self.assertNotIn(b"EVIDENCE-BODY-ONLY", wire)
         row = structured["report"]["results"][0]

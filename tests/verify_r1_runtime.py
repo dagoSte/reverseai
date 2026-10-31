@@ -197,20 +197,35 @@ def semantic_report(report):
                           for row in result["evidence"]]} for result in report["results"]]
 
 
+def fixture_edges(layout):
+    """Calls and references as the pinned Ghidra reports them.
+
+    A refs fixture's jump to a function entry is a tail call (CALL_TERMINATOR): Ghidra and the prepare script count it
+    as a call, not as a reference, exactly as compare_ghidra_observations in verify_m2_runtime models it.
+    """
+    entries = {row["entry"] for row in layout.get("functions", [])}
+    tail_calls = [row for row in layout.get("refs", []) if row["type"] == "jump" and row["to"] in entries]
+    calls = list(layout.get("calls", [])) + tail_calls
+    refs = [row for row in layout.get("refs", []) if row not in tail_calls]
+    return calls, refs
+
+
 def fixture_program_totals(name, data):
     old.need(name in old.GHIDRA_FIXTURE_NAMES, "R1UnknownFixture")
     expected, layout = getattr(old, name)()
     old.need(data == expected, "R1FixtureBytes")
-    return {part: len(layout.get(key, [])) for part, key in
-            (("functions", "functions"), ("calls", "calls"), ("references", "refs"), ("strings", "strings"))}
+    calls, refs = fixture_edges(layout)
+    return {"functions": len(layout.get("functions", [])), "calls": len(calls), "references": len(refs),
+            "strings": len(layout.get("strings", []))}
 
 
 def fixture_function_totals(layout, function):
     entry = function["entry"]
+    calls, refs = fixture_edges(layout)
     return {"assembly": len(function["instructions"]),
-            "callees": sum(row["from"] == entry for row in layout["calls"]),
-            "callers": sum(row["to"] == entry for row in layout["calls"]),
-            "references": sum(row["from"] == entry for row in layout["refs"]),
+            "callees": sum(row["from"] == entry for row in calls),
+            "callers": sum(row["to"] == entry for row in calls),
+            "references": sum(row["from"] == entry for row in refs),
             "strings": sum(entry in row["from"] for row in layout["strings"])}
 
 
