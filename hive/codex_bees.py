@@ -1,18 +1,34 @@
 """Codex bees and mixed Claude/Codex councils.
 
-Codex bees have a sandboxed shell with no network and writes limited to their folder
-(councillors are read-only). They can read the disk. Use them only for software the
-operator would run anyway, never for malware.
+Codex bees have a shell, can read the disk and can execute programs. On macOS,
+codex-cli 0.165.0 allowed network access through `codex exec` in both sandbox modes,
+despite network_access=false; `codex sandbox` blocked the same command. A preliminary
+probe decides whether each sandbox mode may run bees; an inconclusive probe refuses
+them. This reachability check is not a guarantee of isolation against every destination.
+An explicit --codex-allow-network opt-out warns on every result. Use Codex bees only
+for software the operator would run anyway, never for malware.
 """
 
 import json
 import re
+import shlex
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 from hive.bees import SCHEMAS, brief
+
+NETWORK_REFUSAL = "Codex sandbox allowed network access; Codex bees refused"
+NETWORK_WARNING = "Codex bees ran without network isolation"
+NETWORK_COMMAND = "curl --max-time 5 --silent --show-error --output /dev/null https://example.com"
+NETWORK_SCHEMA = {"type": "object", "properties": {"exit_code": {"type": "integer"}},
+                  "required": ["exit_code"], "additionalProperties": False}
+NETWORK_TASK = ("Network isolation probe. Run exactly this shell command once, with no extra commands, "
+                "wrappers, redirections or file reads:\n" + NETWORK_COMMAND
+                + "\nReport its actual exit code. Never invent a result or substitute another command. "
+                "If execution is unavailable, report -1.")
 
 
 def strict_schema(schema):
@@ -43,7 +59,7 @@ def drop_nulls(value):
 
 
 def _matches(value, schema):
-    """Validate the object/array/string/null vocabulary used by the bee schemas."""
+    """Validate the small schema vocabulary used by bees and the network probe."""
     if "anyOf" in schema:
         return any(_matches(value, alternative) for alternative in schema["anyOf"])
     if "enum" in schema and value not in schema["enum"]:
@@ -57,6 +73,8 @@ def _matches(value, schema):
         return isinstance(value, list) and all(_matches(item, schema["items"]) for item in value)
     if kind == "string":
         return isinstance(value, str)
+    if kind == "integer":
+        return type(value) is int
     return kind == "null" and value is None
 
 
@@ -64,28 +82,32 @@ class CodexBees:
     """One non-interactive Codex process and ReverseAI MCP server per named bee."""
 
     def __init__(self, *, engine, inputs, enabled=("ghidra",), codex="codex", model=None, effort=None,
-                 timeout=2400, python=sys.executable, config_dir):
+                 timeout=2400, python=sys.executable, config_dir, allow_network=False):
         self.engine, self.inputs = str(Path(engine).resolve()), str(Path(inputs).resolve())
         self.enabled, self.codex, self.model = tuple(enabled), codex, model
         self.effort, self.timeout, self.python = effort, timeout, str(python)
         self.config_dir = Path(config_dir).resolve()
+        self.allow_network = allow_network
+        self._network_checks = {}
+        self._network_lock = threading.Lock()
 
     def _paths(self, name):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise ValueError("invalid bee name")
         return self.config_dir / f"{name}.schema.json", self.config_dir / f"{name}.output.json"
 
-    def argv(self, role, name, folder):
+    def argv(self, role, name, folder, *, schema=None):
         schema_path, output_path = self._paths(name)
         self.config_dir.mkdir(parents=True, exist_ok=True)
-        schema_path.write_text(json.dumps(strict_schema(SCHEMAS[role])), encoding="utf-8")
+        schema_path.write_text(json.dumps(strict_schema(SCHEMAS[role]) if schema is None else schema),
+                               encoding="utf-8")
         output_path.unlink(missing_ok=True)  # A failed retry must not reuse an earlier answer.
         mcp_args = ["-B", "-m", "reverseai", "mcp", "--inputs", self.inputs,
                     *("--with-" + tool for tool in self.enabled)]
         mcp = ("mcp_servers={reverseai={command=" + json.dumps(self.python)
                + ",args=" + json.dumps(mcp_args) + ",env={PYTHONPATH=" + json.dumps(self.engine)
                + ',PYTHONDONTWRITEBYTECODE="1"}}}')
-        argv = [self.codex, "exec", "--ignore-user-config", "--skip-git-repo-check", "--ephemeral",
+        argv = [self.codex, "exec", "--ignore-user-config", "--skip-git-repo-check", "--ephemeral", "--json",
                 "-C", str(Path(folder).resolve()), "--sandbox",
                 "read-only" if role == "councillor" else "workspace-write",
                 "-c", 'approval_policy="never"', "-c", "sandbox_workspace_write.network_access=false",
@@ -99,27 +121,64 @@ class CodexBees:
             argv += ["-c", "model_reasoning_effort=" + json.dumps(self.effort)]
         return [*argv, "-"]
 
+    def _execute(self, role, name, task, folder, *, schema=None):
+        completed = subprocess.run(self.argv(role, name, folder, schema=schema), input=task, cwd=folder,
+                                   capture_output=True, text=True, timeout=self.timeout, check=False)
+        if completed.returncode:
+            diagnostic = (completed.stderr or completed.stdout or "no diagnostic").strip()[-240:]
+            raise ValueError(f"exit {completed.returncode}: {diagnostic}")
+        _, output_path = self._paths(name)
+        output = json.loads(output_path.read_text(encoding="utf-8"))
+        if not _matches(output, strict_schema(SCHEMAS[role]) if schema is None else schema):
+            raise ValueError("answer does not match the bee's output schema")
+        return completed, output
+
+    def _network_ok(self, role, folder):
+        mode = "read-only" if role == "councillor" else "workspace-write"
+        with self._network_lock:
+            if mode not in self._network_checks:
+                self._network_checks[mode] = False
+                try:
+                    completed, output = self._execute(role, f"network-probe-{mode}", NETWORK_TASK,
+                                                      folder, schema=NETWORK_SCHEMA)
+                    events = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+                    commands = [event["item"] for event in events if event.get("type") == "item.completed"
+                                and event.get("item", {}).get("type") == "command_execution"]
+                    if len(commands) == 1:
+                        command = commands[0]
+                        argv = shlex.split(command["command"])
+                        if (len(argv) == 3 and Path(argv[0]).name in ("sh", "bash", "zsh")
+                                and argv[1] in ("-c", "-lc")):
+                            argv = shlex.split(argv[2])
+                        # DNS/connect refusals qualify; TLS, local errors and timeouts do not.
+                        self._network_checks[mode] = (
+                            argv == shlex.split(NETWORK_COMMAND)
+                            and type(command.get("exit_code")) is int and command["exit_code"] in (6, 7)
+                            and output["exit_code"] == command["exit_code"]
+                            and any(event.get("type") == "turn.completed" for event in events))
+                except Exception:
+                    pass  # Missing or inconsistent native evidence leaves this mode refused.
+            return self._network_checks[mode]
+
     def __call__(self, role, name, task, folder):
         started = time.monotonic()
+        warning = {"warning": NETWORK_WARNING} if self.allow_network else {}
         try:
-            completed = subprocess.run(self.argv(role, name, folder), input=brief(role, task),
-                                       cwd=folder, capture_output=True, text=True,
-                                       timeout=self.timeout, check=False)
-            if completed.returncode:
-                diagnostic = (completed.stderr or completed.stdout or "no diagnostic").strip()[-240:]
-                raise ValueError(f"exit {completed.returncode}: {diagnostic}")
-            _, output_path = self._paths(name)
-            output = json.loads(output_path.read_text(encoding="utf-8"))
-            if not _matches(output, strict_schema(SCHEMAS[role])):
-                raise ValueError("answer does not match the bee's output schema")
+            self._paths(name)
+            if role not in SCHEMAS:
+                raise ValueError(f"unknown bee role: {role}")
+            if not self.allow_network and not self._network_ok(role, folder):
+                return {"ok": False, "output": None, "error": NETWORK_REFUSAL,
+                        "seconds": round(time.monotonic() - started, 1)}
+            _, output = self._execute(role, name, brief(role, task), folder)
             return {"ok": True, "output": drop_nulls(output),
-                    "seconds": round(time.monotonic() - started, 1)}
+                    "seconds": round(time.monotonic() - started, 1), **warning}
         except subprocess.TimeoutExpired:
             return {"ok": False, "output": None, "error": f"no answer within {self.timeout} s",
-                    "seconds": self.timeout}
+                    "seconds": self.timeout, **warning}
         except Exception as error:
             return {"ok": False, "output": None, "error": str(error)[:300],
-                    "seconds": round(time.monotonic() - started, 1)}
+                    "seconds": round(time.monotonic() - started, 1), **warning}
 
 
 class MixedBees:
@@ -156,11 +215,14 @@ def add_arguments(parser):
     parser.add_argument("--codex", default="codex", help="Codex CLI executable")
     parser.add_argument("--codex-model", help="Model for Codex bees (default: Codex CLI's default)")
     parser.add_argument("--codex-effort", help="Reasoning effort for Codex bees")
+    parser.add_argument("--codex-allow-network", action="store_true",
+                        help="Accept Codex network access: skip the isolation probe and warn on every bee result")
 
 
 def build(args, claude_runner, **runner_kwargs):
     """Build from CLI options; kwargs are CodexBees' shared engine/input/config settings."""
     if args.bee_policy == "claude":
         return claude_runner
-    codex = CodexBees(**dict(runner_kwargs, codex=args.codex, model=args.codex_model, effort=args.codex_effort))
+    codex = CodexBees(**dict(runner_kwargs, codex=args.codex, model=args.codex_model, effort=args.codex_effort,
+                             allow_network=args.codex_allow_network))
     return codex if args.bee_policy == "codex" else MixedBees(claude_runner, codex, args.bee_policy)
