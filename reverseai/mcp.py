@@ -132,6 +132,16 @@ def _reports(out):
     return markdown, _read_report(out)
 
 
+def _ascii_json(value):
+    """The compact text copy: canonical JSON with every non-ASCII character escaped, so invisible, bidi or tag
+    characters from a sample never reach the text content raw. Its length is its size in bytes."""
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+
+
+def _size(value):
+    return len(_ascii_json(value))
+
+
 def _compact(structured, *, text_prefix=""):
     """Project bounded report JSON, keeping whole findings and their byte citations."""
     budget = min(MAX_COMPACT_STRUCTURED_BYTES,
@@ -139,7 +149,7 @@ def _compact(structured, *, text_prefix=""):
     source = structured["report"]
     if source is None:
         result = {"report": None, "view": "compact", "omitted": structured["omitted"], "note": COMPACT_HINT}
-        if len(canonical_json(result).encode("utf-8")) > budget:
+        if _size(result) > budget:
             raise ValueError("Compact preamble too large")
         return result
     rows = source.get("results", [])
@@ -150,12 +160,12 @@ def _compact(structured, *, text_prefix=""):
     projected = {"results": []}
     omitted = {**totals, "evidence_bodies": totals["citations"], "metadata_fields": 0}
     result = {"report": projected, "view": "compact", "counts": totals, "omitted": omitted, "note": COMPACT_HINT}
-    size = len(canonical_json(result).encode("utf-8"))
+    size = _size(result)
     if size > budget:
         raise ValueError("Compact preamble too large")
     # Omission counters start at their largest values, reserving their final byte cost.
     for key, value in metadata.items():
-        cost = len(canonical_json({key: value}).encode("utf-8")) - 1
+        cost = _size({key: value}) - 1
         if size + cost <= budget:
             projected[key] = value
             size += cost
@@ -164,7 +174,7 @@ def _compact(structured, *, text_prefix=""):
     for source_row in rows:
         row = {key: source_row[key] for key in ("task_id", "role", "status", "errors") if key in source_row}
         row.update(findings=[], evidence=[])
-        cost = len(canonical_json(row).encode("utf-8")) + bool(projected["results"])
+        cost = _size(row) + bool(projected["results"])
         if size + cost > budget:
             continue
         projected["results"].append(row)
@@ -180,8 +190,8 @@ def _compact(structured, *, text_prefix=""):
         for finding in source_row.get("findings", []):
             needed = [citations[key] for key in dict.fromkeys(finding.get("evidence_ids", []))
                       if key in citations and key not in shown]
-            cost = len(canonical_json(finding).encode("utf-8")) + bool(row["findings"])
-            cost += sum(len(canonical_json(citation).encode("utf-8")) + bool(row["evidence"] or index)
+            cost = _size(finding) + bool(row["findings"])
+            cost += sum(_size(citation) + bool(row["evidence"] or index)
                         for index, citation in enumerate(needed))
             if size + cost > budget:
                 continue
@@ -194,7 +204,7 @@ def _compact(structured, *, text_prefix=""):
         for key, citation in citations.items():
             if key in shown:
                 continue
-            cost = len(canonical_json(citation).encode("utf-8")) + bool(row["evidence"])
+            cost = _size(citation) + bool(row["evidence"])
             if size + cost <= budget:
                 row["evidence"].append(citation)
                 omitted["citations"] -= 1
@@ -203,7 +213,7 @@ def _compact(structured, *, text_prefix=""):
 
 
 def _compact_text(structured, preamble):
-    return preamble + canonical_json(structured)
+    return preamble + _ascii_json(structured)
 
 
 def _prepare_receipt(capture):

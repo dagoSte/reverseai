@@ -573,11 +573,12 @@ class HarnessTests(SourcePins):
                     {"kind": "instruction_export", "index": index, "from": function["entry"],
                      "at": function["entry"] + delta, "length": length})
                     for index, (delta, length) in enumerate(function["instructions"])]
-            elif part != "callees":
-                kind = {"info": "function_info", "callers": "call_export", "references": "reference_export", "strings": "string_export"}[part]
-                records = [(anchor, {"kind": kind}) for _ in range({"strings": 2, "references": 6}.get(part, 1))]
+            else:
+                kind = {"info": "function_info", "callees": "call_export", "callers": "call_export",
+                        "references": "reference_export", "strings": "string_export"}[part]
+                records = [(anchor, {"kind": kind}) for _ in range({"strings": 2, "references": 5}.get(part, 1))]
                 if part == "info":
-                    records[0][1]["totals"] = {"assembly": 6, "callees": 0, "callers": 1, "references": 6, "strings": 2}
+                    records[0][1]["totals"] = {"assembly": 6, "callees": 1, "callers": 1, "references": 5, "strings": 2}
             return function_report(data, function["entry"], part, 0, len(records), records)
         with patch.object(self.native, "public_query", side_effect=query) as public:
             parts = self.native.function_parts()
@@ -775,8 +776,7 @@ class ReceiptTests(SourcePins):
                 "prepare": prepared(data), "fresh_equal_cached": True, "prepare_operations": 1,
                 "query_cases": query_cases,
                 "cache_requests": {"fresh": 1 + query_cases, "cached": 1 + query_cases, "program": 4},
-                "program_totals": {part: len(layout.get(key, [])) for part, key in
-                                   (("functions", "functions"), ("calls", "calls"), ("references", "refs"), ("strings", "strings"))},
+                "program_totals": verifier.fixture_program_totals(name, data),
                 "fresh_semantics_sha256": "a" * 64, "cached_semantics_sha256": "a" * 64, "elapsed_seconds": .2}
         data, _ = elf_scale()
         evidence["scale.10000"] = {"input_sha256": sha256_hex(data), "input_bytes": len(data), "functions": 10_000,
@@ -784,8 +784,8 @@ class ReceiptTests(SourcePins):
         refs, layout = old.elf_refs()
         entry = layout["functions"][-1]["entry"]
         evidence["function.parts"] = {"input_sha256": sha256_hex(refs), "entry": entry, "analysis_id": "f" * 64,
-            "totals": {"info": 1, "pseudocode": 130, "assembly": 6, "callees": 0, "callers": 1,
-                       "references": 6, "strings": 2}, "requests": 7}
+            "totals": {"info": 1, "pseudocode": 130, "assembly": 6, "callees": 1, "callers": 1,
+                       "references": 5, "strings": 2}, "requests": 7}
         evidence["function.pseudocode"] = {"input_sha256": sha256_hex(refs), "entry": entry, "analysis_id": "f" * 64,
             "characters": 130, "text_sha256": "b" * 64, "export_pages": 3, "procedure_pages": 3, "requests": 6}
         evidence["function.not_found"] = {"input_sha256": sha256_hex(refs), "analysis_id": "f" * 64, "rows": 0}
@@ -992,3 +992,26 @@ class StagingAndDiagnosticsTests(SourcePins):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FixtureTotalsTailCallTests(unittest.TestCase):
+    """The fixture totals follow the pinned Ghidra: a refs fixture's tail jump is a call, not a reference."""
+
+    def test_describe_totals_match_the_native_receipt(self):
+        _, layout = old.elf_refs()
+        describe = next(row for row in layout["functions"] if row["name"] == "describe")
+        # Recorded by the native run on this bundle (.coordination/r1/native/receipt-r1-full.json, function.parts).
+        self.assertEqual(verifier.fixture_function_totals(layout, describe),
+                         {"assembly": 6, "callees": 1, "callers": 1, "references": 5, "strings": 2})
+
+    def test_edges_agree_with_the_m2_known_answer_model(self):
+        for name in ("elf_refs", "pe_refs", "macho_refs"):
+            data, layout = getattr(old, name)()
+            entries = {row["entry"] for row in layout["functions"]}
+            tail = [row for row in layout["refs"] if row["type"] == "jump" and row["to"] in entries]
+            self.assertTrue(tail, name)
+            calls, refs = verifier.fixture_edges(layout)
+            self.assertEqual(len(calls), len(layout["calls"]) + len(tail), name)
+            self.assertEqual(len(refs), len(layout["refs"]) - len(tail), name)
+            totals = verifier.fixture_program_totals(name, data)
+            self.assertEqual((totals["calls"], totals["references"]), (len(calls), len(refs)), name)
