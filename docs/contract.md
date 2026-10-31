@@ -1403,7 +1403,8 @@ bytes; the cached project is always untrusted (a matching digest proves storage 
   CLI validation): the same reviewed analysis without evidence bodies or duplicate values, structured <= 64 KiB, an
   explicit omission note when rows do not fit ("reduce limit or max_chars, or use view=full"). The text content is the
   untrusted-data notice followed by that same compact JSON, so a client that passes only text to its model receives
-  every value.
+  every value; in the text every non-ASCII character is escaped (`\uXXXX`), so invisible, bidi or tag characters from a
+  sample never reach it raw (decision `r1-compact-text-ascii`).
 - **MCP prepare.** `prepare_file` runs the fixed argv `prepare FILE --with-ghidra --json` and writes no report files. The
   bounded captured stdout (<= 8,192 bytes) must be exactly one strict `reverseai.prepare/1` receipt with the contract's
   keys and no path; it is returned as `structuredContent` and as text after the notice. Failures return only the fixed
