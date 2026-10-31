@@ -229,6 +229,8 @@ class BeeCommandTests(unittest.TestCase):
             allowed = argv[argv.index("--allowedTools") + 1:]
             self.assertEqual(allowed[0], "mcp__reverseai__*")
             self.assertEqual(allowed[1:], [f"{tool}(./**)" for tool in tools])  # file tools fenced to the bee's folder
+            if "Write" in tools:
+                self.assertIn("Edit(./**)", allowed)  # Claude Code checks file writes against Edit rules
             self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
             config = json.loads(Path(argv[argv.index("--mcp-config") + 1]).read_text())
             server = config["mcpServers"]["reverseai"]

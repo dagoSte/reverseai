@@ -19,13 +19,14 @@ from pathlib import Path
 ROLES = Path(__file__).with_name("roles")
 COMMON = "common.md"
 
-# Built-in tools per role; every role also gets the read-only ReverseAI MCP tools.
+# Built-in tools per role; every role also gets the read-only ReverseAI MCP tools. Claude Code governs
+# file writes through Edit rules, so every role that writes also needs Edit (its rule is fenced too).
 TOOLSETS = {
-    "planner": ("Read", "Write"),
+    "planner": ("Read", "Write", "Edit"),
     "worker": ("Read", "Write", "Edit"),
     "repair": ("Read", "Write", "Edit"),
     "councillor": ("Read",),
-    "tester": ("Read", "Write"),
+    "tester": ("Read", "Write", "Edit"),
 }
 
 _STR = {"type": "string"}
