@@ -1,8 +1,10 @@
 """Opaque project tests use inert bytes and temporary private stores only."""
 
 import hashlib
+from contextlib import contextmanager
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -127,6 +129,21 @@ class CacheTests(unittest.TestCase):
         self.assertIs(caught.exception, failure)
         self.assertIsNone(self.store.lookup(identity()))
 
+    def test_controller_deadline_after_production_is_a_timeout_without_publication(self):
+        now = [100.0]
+        def produce(sink):
+            sink.write(self.blob)
+            now[0] += cache.CONTROLLER_SECONDS
+        with patch.object(cache.time, "monotonic", side_effect=lambda: now[0]):
+            with self.assertRaises((TimeoutError, cache.CacheError)) as caught:
+                self.store.prepare(identity(), produce)
+        self.assertIsNone(self.store.lookup(identity()))
+        self.assertFalse(any(p.name.startswith(".tmp-") for p in self.root.iterdir()))
+        self.assertEqual(self.store.facts()["entries"], 0)
+        self.assertIs(type(caught.exception), TimeoutError)
+        self.assertEqual(str(caught.exception), "Ghidra preparation exceeded its limits")
+        self.assertEqual(self.prepare()[2], "created")
+
     def test_cap_plus_one_is_refused_before_writing_the_extra_bytes(self):
         with patch.object(cache, "MAX_ARTIFACT_BYTES", 16):
             with self.assertRaises(cache.CacheError):
@@ -213,6 +230,62 @@ class CacheTests(unittest.TestCase):
         with patch.object(cache, "_atomic_json", side_effect=fail), self.assertRaises((OSError, cache.CacheError)):
             self.prepare()
         self.assertIsNone(self.store.lookup(identity()))
+        self.assertEqual(self.prepare()[2], "created")
+
+    def test_warm_prepare_never_takes_a_cold_preparers_lock(self):
+        first = self.prepare()
+        original = cache._locked
+        def locked(directory, name, **kwargs):
+            self.assertNotEqual(name, "prepare.lock", "a cache hit must bypass the cold prepare lock")
+            return original(directory, name, **kwargs)
+        with self.store._directory() as directory, original(directory, "prepare.lock"), \
+                patch.object(cache, "_locked", side_effect=locked):
+            reused = self.store.prepare(identity(), lambda sink: self.fail("duplicate preparation"))
+        self.assertEqual(reused[:2], first[:2])
+        self.assertEqual(reused[2], "reused")
+
+    def test_post_publication_failure_rolls_back_index_inside_its_lock(self):
+        self.prepare(1)
+        key = cache.cache_key(identity())
+        original_lock, original_unlink, original_fsync = cache._locked, cache.os.unlink, cache.os.fsync
+        for failure in ("fsync", "deadline"):
+            depth, cleanup, triggered, now = [0], [], [False], [100.0]
+            @contextmanager
+            def locked(directory, name, **kwargs):
+                with original_lock(directory, name, **kwargs):
+                    if name == "index.lock":
+                        depth[0] += 1
+                    try:
+                        yield
+                    finally:
+                        if name == "index.lock":
+                            depth[0] -= 1
+            def unlink(name, **kwargs):
+                if name in (key + ".tar", key + ".json"):
+                    cleanup.append((name, depth[0]))
+                return original_unlink(name, **kwargs)
+            def fsync(fd):
+                if (not triggered[0] and stat.S_ISDIR(os.fstat(fd).st_mode)
+                        and (self.root / (key + ".tar")).exists()):
+                    triggered[0] = True
+                    if failure == "fsync":
+                        raise OSError("controlled post-publication failure")
+                    now[0] += cache.CONTROLLER_SECONDS
+                return original_fsync(fd)
+            with self.subTest(failure=failure), patch.object(cache, "_locked", side_effect=locked), \
+                    patch.object(cache.os, "unlink", side_effect=unlink), \
+                    patch.object(cache.os, "fsync", side_effect=fsync), \
+                    patch.object(cache.time, "monotonic", side_effect=lambda: now[0]):
+                with self.assertRaises(OSError):
+                    self.prepare()
+            self.assertTrue(triggered[0])
+            self.assertEqual(cleanup, [(key + ".tar", 1), (key + ".json", 1)])
+            index = json.loads((self.root / "index.json").read_text())
+            self.assertNotIn(key, index["entries"])
+            self.assertIsNone(self.store.lookup(identity()))
+            self.assertFalse(any(p.name.startswith(".tmp-") for p in self.root.iterdir()))
+            with self.store.lookup(identity(1)) as handle:
+                self.assertIsNotNone(handle)
         self.assertEqual(self.prepare()[2], "created")
 
     def test_two_simultaneous_prepares_build_once_and_a_hit_ignores_prepare_lock(self):

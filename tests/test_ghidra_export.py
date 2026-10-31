@@ -162,6 +162,32 @@ class AdmissionTests(unittest.TestCase):
             with self.subTest(key=key), self.assertRaises(ContractError):
                 self.admit(items, args, "ghidra.pseudocode")
 
+    def test_forged_pseudocode_reply_refuses_noninteger_next_cursor(self):
+        from reverseai.contract import parse_worker_reply
+        args = {"entry": self.layout["entry"]}
+        baseline = self.pseudocode("ab", 0, 1)
+        self.assertEqual(self.admit(baseline, args, "ghidra.pseudocode"), baseline)
+        for invalid in (True, 1.0):
+            items = copy.deepcopy(baseline)
+            items[-1].value["next_start"] = invalid
+            raw = json.dumps({"protocol": "reverseai.worker/1", "status": "ok",
+                              "snapshot_sha256": sha256_hex(self.data),
+                              "observations": [{"location": {"offset": o.location.offset, "length": o.location.length},
+                                                "value": o.value} for o in items]}).encode()
+            with self.subTest(cursor=invalid), self.assertRaises(ContractError):
+                decoded = parse_worker_reply(raw, input_sha256=sha256_hex(self.data), max_observations=129)
+                self.admit(decoded, args, "ghidra.pseudocode")
+
+    def test_independent_pseudocode_rule_refuses_noninteger_next_cursor(self):
+        from reverseai import export_claims
+        baseline = [{**o.value, "analysis_id": "a" * 64} for o in self.pseudocode("ab", 0, 1)]
+        self.assertIsNotNone(export_claims.pseudocode(baseline))
+        for invalid in (True, 1.0):
+            forged = copy.deepcopy(baseline)
+            forged[-1]["next_start"] = invalid
+            with self.subTest(cursor=invalid):
+                self.assertIsNone(export_claims.pseudocode(forged))
+
     def test_function_parts_are_independent_bounded_pages(self):
         for part in ("callees", "callers", "references", "strings", "assembly"):
             target = self.layout["functions"][1 if part == "callers" else 2 if part == "callees" else -1]
@@ -239,6 +265,23 @@ class PreparedToolTests(unittest.TestCase):
         self.assertEqual(len(got), 1 + len(self.layout["functions"]))
         self.assertTrue(all(o.value["analysis_id"] == first["analysis_id"] for o in got))
         self.assertEqual(self.calls[-1][0], "ghidra.export_program")
+
+    def test_legacy_query_after_prepare_receives_the_prepared_project(self):
+        receipt = ghidra_tool.prepare(self.data, executor=self.executor, store=self.store)
+        projects = []
+        def run(operation, args, data, digest, *, project=None):
+            self.assertEqual(operation, "ghidra.functions")
+            projects.append(project)
+            return json.dumps({"protocol": "reverseai.worker/1", "status": "ok",
+                               "snapshot_sha256": digest, "observations": []}).encode()
+        self.executor.run = run
+        tool = ghidra_tool.make_tool(self.executor, store=self.store)
+        self.assertEqual(tool.operations["ghidra.functions"].handler(self.data, {"query": "absent"}), ())
+        self.assertEqual(len(projects), 1)
+        self.assertIsNotNone(projects[0])
+        self.assertEqual(projects[0].analysis_id, receipt["analysis_id"])
+        self.assertEqual(projects[0].manifest["input_sha256"], sha256_hex(self.data))
+        self.assertIsNone(projects[0].fd)
 
     def test_real_gateway_reviewer_and_report_keep_false_semantics_derived(self):
         from reverseai.contract import InputRef

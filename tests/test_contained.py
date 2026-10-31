@@ -609,6 +609,58 @@ class PreparedGhidraTests(unittest.TestCase):
         selector = self.check_prepare_deadline((100.0, 1000.0), stdout_eof=True)
         selector.select.assert_not_called()
 
+    def test_prepare_sink_deadline_becomes_a_contained_timeout_and_cleans_up(self):
+        from reverseai import contained, ghidra_cache
+        process = Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        selector = MagicMock()
+        selector.__enter__.return_value = selector
+        selector.get_map.return_value = {"stdout": object()}
+        selector.select.return_value = [(object(), 1)]
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as target:
+            stdout.write(b"opaque worker bytes")
+            stdout.seek(0)
+            process.stdout = stdout
+            sink = ghidra_cache._Sink(target.fileno(), deadline=0)
+            with patch.object(contained.subprocess, "Popen", return_value=process), \
+                    patch.object(contained.selectors, "DefaultSelector", return_value=selector), \
+                    patch.object(contained.time, "monotonic", return_value=100):
+                with self.assertRaises(ContainedError) as caught:
+                    contained.run_prepare_bounded(["inert-command"], sink)
+            process.kill.assert_called_once_with()
+            process.wait.assert_called_once_with()
+            self.assertTrue(stdout.closed)
+            self.assertEqual(target.tell(), 0)
+            self.assertIs(type(caught.exception), ContainedTimeout)
+            self.assertEqual(str(caught.exception), "WorkerTimeout")
+
+    def test_prepare_nonzero_exit_never_publishes_partial_stdout(self):
+        from reverseai import contained, ghidra_cache
+        process = Mock()
+        process.poll.return_value = 17
+        process.wait.return_value = 17
+        selector = MagicMock()
+        selector.__enter__.return_value = selector
+        selector.get_map.return_value = {"stdout": object()}
+        selector.select.return_value = [(object(), 1)]
+        with tempfile.TemporaryDirectory() as folder, tempfile.TemporaryFile() as stdout:
+            store = ghidra_cache.CacheStore(Path(folder).resolve() / "cache")
+            expected = ghidra_cache.identity(sha256_hex(b"inert"), ghidra_lock())
+            stdout.write(b"partial opaque project")
+            stdout.seek(0)
+            process.stdout = stdout
+            with patch.object(contained.subprocess, "Popen", return_value=process), \
+                    patch.object(contained.selectors, "DefaultSelector", return_value=selector), \
+                    patch.object(contained.time, "monotonic", return_value=100):
+                with self.assertRaisesRegex(ContainedError, "^WorkerProcessError$"):
+                    store.prepare(expected, lambda sink: contained.run_prepare_bounded(["inert-command"], sink))
+            self.assertTrue(stdout.closed)
+            process.wait.assert_called_once_with(timeout=900)
+            process.kill.assert_not_called()
+            self.assertIsNone(store.lookup(expected))
+            self.assertFalse(any(p.suffix in (".tar",) or p.name.startswith(".tmp-") for p in store.root.iterdir()))
+
     def test_r7_lock_fields_are_closed_and_old_locks_are_refused(self):
         from reverseai.contained import GHIDRA_VERSION
         for change in ({"cache_format": True}, {"cache_format": 2}, {"bundle_sha256": "x"},

@@ -399,7 +399,7 @@ def run_prepare_bounded(argv, sink, *, timeout=GHIDRA_PREPARE_WALL_SECONDS):
             raise ContainedError("WorkerProcessError")
     except ContainedError:
         raise
-    except subprocess.TimeoutExpired:
+    except (subprocess.TimeoutExpired, TimeoutError):
         raise ContainedTimeout("WorkerTimeout") from None
     except OSError:
         raise ContainedError("WorkerProcessError") from None

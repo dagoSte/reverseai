@@ -111,6 +111,7 @@ def catalog(enabled: frozenset) -> list[dict]:
         tools.append(_tool("prepare_file", "Prepare a native file",
                            "Create or reuse a private pinned Ghidra analysis without executing the input. This can take up to 17 minutes.",
                            {"file": dict(file_schema)}, ["file"]))
+        tools[-1]["annotations"]["readOnlyHint"] = False
     for name in _query_names(enabled):
         spec = queries.TABLE[name]
         properties = {"file": dict(file_schema),

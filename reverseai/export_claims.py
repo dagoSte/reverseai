@@ -95,6 +95,7 @@ def pseudocode(observations):
     value = rows[0]
     if (value["analysis_id"] != header["analysis_id"] or value["entry"] != header["entry"]
             or not _integer(value["size"], 2**64 - 1) or value["size"] == 0
+            or value["next_start"] is not None and type(value["next_start"]) is not int
             or any(value[k] != header[k] for k in ("start", "total", "next_start", "status"))
             or not isinstance(value["text"], str) or len(value["text"]) != header["count"]
             or len(value["text"]) > 2048 or not isinstance(value["text_sha256"], str)

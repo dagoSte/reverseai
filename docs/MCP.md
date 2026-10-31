@@ -30,10 +30,13 @@ over its standard input and output; you do not run it by hand.
   instructions. A file can still contain text written to mislead an agent, so keep a person in the loop for any
   action an agent proposes after reading a report.
 - **Bounded results.** Analysis/query calls default to `view=compact`: reviewed findings and minimal citations,
-  without repeated evidence bodies, up to 4 KiB text and 64 KiB structured JSON. Use `view=full` to request the
+  without repeated evidence bodies. The text includes the untrusted-data notice and the same compact JSON as
+  `structuredContent`; the complete text and the structured content are each bounded to 64 KiB. The JSON is never
+  cut, so text-only clients receive the data too. Use `view=full` to request the
   bounded Markdown/JSON reports (256 KiB text, 1 MiB structured). An oversized report is explicitly omitted; reduce
   the page limit or `max_chars`. Temporary report folders are removed after each call; prepared projects persist
-  in the private cache until eviction and can contain sensitive input-derived data.
+  in the private cache with a copy of the file's bytes until eviction or deletion. See
+  [cache retention and deletion](#cache-retention-and-deletion).
 - **Errors are messages.** A wrong argument, a refused file, a failed analysis or an exceeded budget comes back as a
   tool result marked as an error with a short, fixed explanation.
 
@@ -65,13 +68,16 @@ syntax details.
 listing. It visits at most 10,000 entries to a depth of 8 and returns at most 1,000 files; names that are not plain
 portable relative names (not UTF-8, or with a backslash, a colon or a control character) are skipped. `truncated`
 is true whenever a limit was reached or a name was skipped. Analysis/query tools return `structuredContent`
-`{"report": ...}`; `prepare_file` returns `{"preparation": ...}` with its storage/runtime receipt.
+`{"report": ...}`. `prepare_file` returns the bare `reverseai.prepare/1` receipt as `structuredContent`, with
+top-level `schema`, `input`, `analysis_id`, `state`, `runtime`, `cache_format`, `artifact_size` and `elapsed_seconds`.
+The text includes the same receipt and the untrusted-data notice.
 
 ## Prepared native export workflow
 
 With Ghidra enabled by the operator, call `prepare_file({"file":"program"})` once. It can take up to 1,020 seconds,
 including lock wait and host work; if the client cannot wait that long, run `reverseai prepare FILE --with-ghidra`
 in the terminal first. No analysis call silently starts this warm-up. Existing preview queries still work without it.
+Once an input is prepared, its ordinary Ghidra queries also use the prepared analysis.
 
 Then ask for bounded pages:
 
@@ -89,6 +95,18 @@ also share `text_sha256`. A missing/invalid cache entry gives the explicit prepa
 opaque project's size/hash, while observations still cite the original file bytes; signatures, functions and
 relationships remain Ghidra's interpretation. No program export decompiles all functions, compiles code or executes
 an input. See [the CLI workflow and limits](USAGE.md#prepared-native-exports).
+
+## Cache retention and deletion
+
+Prepared analyses include a copy of the file's bytes and survive CLI and MCP sessions until least-recently-used
+eviction or manual deletion (up to 32 projects / 2 GiB). They remain sensitive even after the original file is removed.
+The private folder is `~/Library/Caches/ReverseAI/ghidra/v1` on macOS. On Linux it is
+`$XDG_CACHE_HOME/reverseai/ghidra/v1` when that base is absolute and safe, otherwise `~/.cache/reverseai/ghidra/v1`.
+
+To erase the retained analyses, stop ReverseAI instances using the cache and delete that entire `ghidra/v1` folder.
+This is also the recovery for a stray file such as `.DS_Store` or a damaged entry that triggers
+`Private Ghidra cache is unsafe or unavailable.` Run prepare again to create a fresh private cache and analysis.
+An unsafe parent directory still needs its ownership or permissions corrected.
 
 ## Configuring a client
 
@@ -138,11 +156,12 @@ private paths out of it):
 [mcp_servers.reverseai]
 command = "/path/to/.venv/bin/reverseai"
 args = ["mcp", "--inputs", "/path/to/approved-inputs"]
-tool_timeout_sec = 300
+tool_timeout_sec = 1200
 ```
 
-Codex stops a tool call after 60 seconds by default; Ghidra queries can take up to 240 seconds, so raise
-`tool_timeout_sec` when you enable `--with-ghidra`.
+The example allows 1,200 seconds for a tool call: Ghidra queries can take up to 240 seconds, while prepare has a
+1,020-second overall deadline. Use this longer timeout when enabling `--with-ghidra`, or prepare through the CLI
+first if your client cannot wait that long.
 
 ### Cursor
 
