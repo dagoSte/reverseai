@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -78,7 +79,8 @@ class CodexRunnerTests(unittest.TestCase):
         self.folder = self.root / "bee"
         self.folder.mkdir()
         self.runner = CodexBees(engine=self.root / 'engine "quoted"', inputs=self.root / "inputs with spaces",
-                                python='/python "quoted"', config_dir=self.root / "config", timeout=7)
+                                python='/python "quoted"', config_dir=self.root / "config", timeout=7,
+                                allow_network=True)
 
     def run_bee(self, role="worker", *, answer=None, returncode=0, stderr="", write=True):
         def run(argv, **kwargs):
@@ -90,7 +92,7 @@ class CodexRunnerTests(unittest.TestCase):
             result = self.runner(role, "bee-1", "TASK", self.folder)
         return result, process.call_args
 
-    def test_argv_locks_sandbox_approvals_network_and_the_single_mcp_server(self):
+    def test_argv_requests_sandbox_approvals_network_and_the_single_mcp_server(self):
         for role in ("planner", "worker", "repair", "councillor", "tester"):
             with self.subTest(role=role):
                 result, call = self.run_bee(role)
@@ -99,6 +101,7 @@ class CodexRunnerTests(unittest.TestCase):
                 self.assertEqual(argv[:2], ["codex", "exec"])
                 for flag in ("--ignore-user-config", "--skip-git-repo-check", "--ephemeral"):
                     self.assertIn(flag, argv)
+                self.assertIn("--json", argv)
                 self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", argv)
                 self.assertNotIn("--approve-for-me", argv)
                 self.assertNotIn("--add-dir", argv)
@@ -205,6 +208,201 @@ class CodexRunnerTests(unittest.TestCase):
             self.assertNotEqual(first[first.index(flag) + 1], second[second.index(flag) + 1])
 
 
+class NetworkGateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.folder = self.root / "bee"
+        self.folder.mkdir()
+        self.runner = CodexBees(engine=self.root, inputs=self.root, config_dir=self.root / "config", timeout=7)
+        self.calls = []
+        self.probe_exit = 6
+        self.probe_report = None
+        self.probe_events = None
+        self.probe_cli_rc = 0
+        self.probe_error = None
+        self.probe_write = True
+        self.probe_stdout = None
+
+    def fake_codex(self, argv, **kwargs):
+        schema = json.loads(Path(argv[argv.index("--output-schema") + 1]).read_text())
+        probe = list(schema["properties"]) == ["exit_code"]
+        self.calls.append((probe, argv, kwargs))
+        if probe and self.probe_error:
+            raise self.probe_error
+        output = Path(argv[argv.index("-o") + 1])
+        if probe:
+            command = "curl --max-time 5 --silent --show-error --output /dev/null https://example.com"
+            self.assertIn(command, kwargs["input"])
+            events = self.probe_events if self.probe_events is not None else [
+                {"type": "item.completed", "item": {"type": "command_execution", "command": command,
+                 "exit_code": self.probe_exit, "status": "failed" if self.probe_exit else "completed"}},
+                {"type": "turn.completed"}]
+            if self.probe_write:
+                output.write_text(json.dumps(self.probe_report if self.probe_report is not None else
+                                            {"exit_code": self.probe_exit}))
+            stdout = self.probe_stdout if self.probe_stdout is not None else "\n".join(json.dumps(event) for event in events)
+            return subprocess.CompletedProcess(argv, self.probe_cli_rc, stdout, "")
+        role = "councillor" if "verdict" in schema["properties"] else "worker"
+        output.write_text(json.dumps(ANSWERS[role]))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def test_network_success_refuses_worker_before_its_task(self):
+        self.probe_exit = 0
+        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+            result = self.runner("worker", "m02-build", "PRIVATE TASK", self.folder)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "Codex sandbox allowed network access; Codex bees refused")
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(self.calls[0][0])
+        self.assertNotIn("PRIVATE TASK", self.calls[0][2]["input"])
+
+    def test_native_network_refusal_allows_the_worker_with_identical_sandbox_config(self):
+        self.runner.model, self.runner.effort = "chosen-model", "high"
+        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+            result = self.runner("worker", "m02-build", "PRIVATE TASK", self.folder)
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("warning", result)
+        self.assertEqual([probe for probe, _, _ in self.calls], [True, False])
+        probe, bee = [call[1] for call in self.calls]
+        for flag in ("--sandbox", "-C", "-m"):
+            self.assertEqual(probe[probe.index(flag) + 1], bee[bee.index(flag) + 1])
+        self.assertEqual(overrides(probe), overrides(bee))
+        self.assertEqual(probe[probe.index("--sandbox") + 1], "workspace-write")
+        self.assertEqual(overrides(probe)["approval_policy"], "never")
+        self.assertEqual(set(overrides(probe)["mcp_servers"]), {"reverseai"})
+        for flag in ("--ignore-user-config", "--json", "--ephemeral", "--skip-git-repo-check"):
+            self.assertIn(flag, probe)
+        self.assertIsNotNone(result["output"])
+
+    def test_probe_outcomes_are_cached_per_sandbox_mode(self):
+        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+            for name in ("m02-build", "m04-build"):
+                self.assertTrue(self.runner("worker", name, "TASK", self.folder)["ok"])
+            self.probe_exit = 0
+            for name in ("m01-council-r1-io", "m01-council-r1-control"):
+                self.assertFalse(self.runner("councillor", name, "TASK", self.folder)["ok"])
+            self.assertTrue(self.runner("worker", "m06-build", "TASK", self.folder)["ok"])
+        probes = [argv for probe, argv, _ in self.calls if probe]
+        self.assertEqual([argv[argv.index("--sandbox") + 1] for argv in probes], ["workspace-write", "read-only"])
+        self.assertEqual(sum(not probe for probe, _, _ in self.calls), 3)
+
+    def test_read_only_probe_can_allow_councillors(self):
+        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+            result = self.runner("councillor", "m01-council-r1-io", "TASK", self.folder)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(all(argv[argv.index("--sandbox") + 1] == "read-only" for _, argv, _ in self.calls))
+
+    def test_concurrent_workers_share_one_probe(self):
+        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(lambda n: self.runner("worker", f"m{n:02}-build", "TASK", self.folder),
+                                        (2, 4, 6, 8)))
+        self.assertTrue(all(result["ok"] for result in results), results)
+        self.assertEqual(sum(probe for probe, _, _ in self.calls), 1)
+
+    def test_probe_exceptions_missing_output_and_native_failure_are_refused_and_cached(self):
+        for error in (subprocess.TimeoutExpired("codex", 7), FileNotFoundError("missing codex"),
+                      OSError("cannot start")):
+            with self.subTest(error=error):
+                self.runner._network_checks.clear()
+                self.calls.clear()
+                self.probe_error = error
+                with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+                    for name in ("m02-build", "m04-build"):
+                        result = self.runner("worker", name, "TASK", self.folder)
+                        self.assertFalse(result["ok"])
+                        self.assertEqual(result["error"], "Codex sandbox allowed network access; Codex bees refused")
+                self.assertEqual(len(self.calls), 1)
+        self.probe_error = None
+        for write, rc in ((False, 0), (True, 1)):
+            self.runner._network_checks.clear()
+            self.calls.clear()
+            self.probe_write, self.probe_cli_rc = write, rc
+            with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+                self.assertFalse(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
+            self.assertEqual(len(self.calls), 1)
+
+    def test_missing_malformed_and_inconsistent_native_evidence_never_allows_a_bee(self):
+        command = "curl --max-time 5 --silent --show-error --output /dev/null https://example.com"
+        for events in ([], [{"type": "turn.completed"}], [None],
+                       [{"type": "item.completed", "item": {"type": "command_execution", "command": "echo blocked",
+                         "exit_code": 6}}, {"type": "turn.completed"}],
+                       [{"type": "item.completed", "item": {"type": "command_execution", "command": command,
+                         "exit_code": 0}}, {"type": "turn.completed"}],
+                       [{"type": "item.completed", "item": {"type": "command_execution", "command": command,
+                         "exit_code": 6}}]):
+            with self.subTest(events=events):
+                self.runner._network_checks.clear()
+                self.calls.clear()
+                self.probe_events = events
+                with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+                    self.assertFalse(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
+                self.assertEqual(len(self.calls), 1)
+
+    def test_only_definite_dns_or_connect_failures_qualify(self):
+        for code in (-1, 2, 23, 28, 60, 126, 127, "6", True):
+            with self.subTest(exit_code=code):
+                self.runner._network_checks.clear()
+                self.calls.clear()
+                self.probe_exit = code
+                with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+                    self.assertFalse(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
+                self.assertEqual(len(self.calls), 1)
+        self.runner._network_checks.clear()
+        self.probe_exit = 7
+        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+            self.assertTrue(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
+
+    def test_invalid_probe_report_extra_commands_and_broken_jsonl_are_refused(self):
+        for report in ({}, {"exit_code": "6"}, {"exit_code": True}, {"exit_code": 0},
+                       {"exit_code": 6, "extra": "claim"}):
+            with self.subTest(report=report):
+                self.runner._network_checks.clear()
+                self.probe_report = report
+                with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+                    self.assertFalse(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
+        self.probe_report = None
+        for stdout in ("{broken", "[]", "null"):
+            self.runner._network_checks.clear()
+            self.probe_stdout = stdout
+            with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+                self.assertFalse(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
+        self.probe_stdout = None
+        self.runner._network_checks.clear()
+        command = "curl --max-time 5 --silent --show-error --output /dev/null https://example.com"
+        self.probe_events = [{"type": "item.completed", "item": {"type": "command_execution", "command": command,
+                              "exit_code": code}} for code in (0, 6)] + [{"type": "turn.completed"}]
+        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+            self.assertFalse(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
+
+    def test_shell_wrapped_exact_probe_command_is_recognized(self):
+        self.probe_events = [
+            {"type": "item.completed", "item": {"type": "command_execution", "exit_code": 6,
+             "command": "/bin/zsh -lc 'curl --max-time 5 --silent --show-error --output /dev/null https://example.com'"}},
+            {"type": "turn.completed"}]
+        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+            self.assertTrue(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
+
+    def test_opt_out_skips_probe_and_warns_on_success_and_failure(self):
+        self.runner.allow_network = True
+        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+            result = self.runner("worker", "m02-build", "TASK", self.folder)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["warning"], "Codex bees ran without network isolation")
+        self.assertEqual([probe for probe, _, _ in self.calls], [False])
+        self.assertEqual(self.runner._network_checks, {})
+        with patch("hive.codex_bees.subprocess.run", side_effect=OSError("cannot start")):
+            result = self.runner("worker", "m04-build", "TASK", self.folder)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["warning"], "Codex bees ran without network isolation")
+        with patch("hive.codex_bees.subprocess.run", side_effect=subprocess.TimeoutExpired("codex", 7)):
+            result = self.runner("worker", "m06-build", "TASK", self.folder)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["warning"], "Codex bees ran without network isolation")
+
+
 class RoutingTests(unittest.TestCase):
     def setUp(self):
         self.claude = Mock(return_value={"ok": True, "output": {"runner": "claude"}})
@@ -269,7 +467,11 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(runner.codex.model, "chosen-model")
         self.assertEqual(runner.codex.effort, "high")
         self.assertEqual(runner.codex.timeout, 123)
+        self.assertFalse(runner.codex.allow_network)
         self.assertIsInstance(build(parser.parse_args(["--bee-policy", "codex"]), self.claude, **settings), CodexBees)
+        opted_out = build(parser.parse_args(["--bee-policy", "codex", "--codex-allow-network"]),
+                          self.claude, **settings)
+        self.assertTrue(opted_out.allow_network)
 
 
 if __name__ == "__main__":
