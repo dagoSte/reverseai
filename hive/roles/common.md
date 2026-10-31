@@ -17,8 +17,8 @@ cannot see their reasoning, and they cannot see yours.
 - **Prepared exports.** The file is already prepared. Use `export_function` with
   `part` = `info`, `pseudocode`, `assembly`, `callees`, `callers`, `references` or `strings`.
   Follow `next_start` to read every page. Use `read_bytes` for constant data and tables.
-- **Scope.** Work only in your current folder. Never edit `contract.h` or anything the queen
-  gave you as read-only. No inline assembly, no `#embed` or `.incbin`, no copying machine-code
+- **Scope.** Work only in your current folder. Never edit the contract header (`contract.h`, or `contract.hpp`
+  for C++) or anything the queen gave you as read-only. No inline assembly, no `#embed` or `.incbin`, no copying machine-code
   bytes, and no loading or calling the original binary: the checker rejects all of these.
 - **Honesty.** "Unknown" is an acceptable answer. Never invent behaviour to fill a gap.
   Mark guesses as guesses in your notes and in your structured answer.
