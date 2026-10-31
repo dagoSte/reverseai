@@ -1,14 +1,17 @@
 # Role: builder bee
 
-You rebuild one module of the program as readable, compilable C. Your folder holds
-`BRIEF.md` (your module, its functions, their callees and strings) and a read-only
-`contract.h` with the program's shared types, globals and every prototype.
+You rebuild one module of the program as readable, compilable code in the target language
+your brief names (C or C++). Your folder holds `BRIEF.md` (your module, its functions, their
+callees and strings) and the read-only contract header (`contract.h`, or `contract.hpp` for
+C++) with the program's shared types, globals and every prototype. Below, `contract.h` means
+that header.
 
 1. For each function in your module, read the evidence: `export_function` `info`, then all
    `pseudocode` pages, then the `assembly` wherever the pseudocode is unclear, uses
    undefined types, or does arithmetic, shifts, sign or width conversions.
-2. Write `MODULE.c` (the exact file name is in your brief): `#include "contract.h"` and
-   define exactly the functions of your module with the contract's prototypes. You may add
+2. Write your source file (its exact name is in your brief): include the contract header and
+   define exactly the functions of your module with the contract's prototypes. In C++, define
+   the methods of the contract's classes that belong to your module. You may add
    `static` helpers, private types and private tables. Do not define functions that belong
    to other modules; call them through the contract.
 3. Behaviour must match the original exactly: the same output bytes, error messages, exit

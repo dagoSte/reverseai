@@ -30,9 +30,11 @@ import time
 from pathlib import Path
 
 from hive import bees as bees_module
+from hive import languages
 
 ROOT = Path(__file__).resolve().parents[1]
-CFLAGS = ("-std=gnu11", "-O1", "-Wall", "-Wextra", "-Wno-unused-parameter", "-fwrapv", "-fno-strict-aliasing")
+WARNINGS = ("-O1", "-Wall", "-Wextra", "-Wno-unused-parameter", "-fwrapv", "-fno-strict-aliasing")
+CFLAGS = (languages.C.standard, *WARNINGS)
 FORBIDDEN = re.compile(r"\b(?:asm|__asm__|__asm)\b|\.incbin|#\s*embed\b|\bdlopen\b")
 PROTOTYPE = re.compile(r"([A-Za-z_]\w*)\s*\([^;{}]*\)\s*;\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
 LENSES = (
@@ -166,13 +168,21 @@ def contract_names(text):
 # --- Building and checking -------------------------------------------------------------------------
 
 class Build:
-    def __init__(self, folder, cc=None, cflags=CFLAGS, ldflags=("-lm",)):
-        self.folder, self.cc = Path(folder), cc or os.environ.get("CC", "cc")
-        self.cflags, self.ldflags = tuple(cflags), tuple(ldflags)
+    def __init__(self, folder, cc=None, cflags=None, ldflags=("-lm",), language=languages.C):
+        self.folder, self._cc, self._cflags = Path(folder), cc, cflags
+        self.language, self.ldflags = language, tuple(ldflags)
         (self.folder / "obj").mkdir(parents=True, exist_ok=True)
 
+    @property
+    def cc(self):
+        return self._cc or self.language.cc()
+
+    @property
+    def cflags(self):
+        return tuple(self._cflags) if self._cflags is not None else (self.language.standard, *WARNINGS)
+
     def syntax(self, header):
-        done = subprocess.run([self.cc, *self.cflags, "-fsyntax-only", "-x", "c", str(header)],
+        done = subprocess.run([self.cc, *self.cflags, "-fsyntax-only", "-x", self.language.syntax_kind, str(header)],
                               capture_output=True, text=True, check=False)
         return done.returncode == 0, done.stderr
 
@@ -187,9 +197,9 @@ class Build:
         stage = self.folder / "stage" / module_id
         shutil.rmtree(stage, ignore_errors=True)
         stage.mkdir(parents=True)
-        shutil.copyfile(source, stage / f"{module_id}.c")
-        shutil.copyfile(contract, stage / "contract.h")
-        done = subprocess.run([self.cc, *self.cflags, "-c", f"{module_id}.c", "-o",
+        shutil.copyfile(source, stage / self.language.source(module_id))
+        shutil.copyfile(contract, stage / self.language.header)
+        done = subprocess.run([self.cc, *self.cflags, "-c", self.language.source(module_id), "-o",
                                str(self.folder / "obj" / f"{module_id}.o")],
                               cwd=stage, capture_output=True, text=True, check=False)
         errors = "\n".join(line for line in done.stderr.splitlines() if "error" in line)
@@ -265,7 +275,7 @@ def compare(original, rebuilt):
 class Queen:
     def __init__(self, *, engine, out, bees, slots=4, max_functions=12, compile_rounds=3, council_rounds=2,
                  lenses=len(LENSES), link_rounds=3, behaviour_rounds=2, run_original=False, cases=40,
-                 max_bees=400, build=None, check=None):
+                 max_bees=400, build=None, check=None, language="c"):
         self.engine, self.out, self.bees = engine, Path(out), bees
         self.slots = threading.BoundedSemaphore(slots)
         self.workers = slots
@@ -274,6 +284,8 @@ class Queen:
         self.link_rounds, self.behaviour_rounds = link_rounds, behaviour_rounds
         self.run_original, self.case_target, self.max_bees = run_original, cases, max_bees
         self.build = build or Build(self.out / "build")
+        self.requested_language = language
+        self.lang = self.build.language
         self.check = check
         self.lock = threading.RLock()
         self.spent = {"bees": 0, "seconds": 0.0, "cost_usd": 0.0}
@@ -312,22 +324,25 @@ class Queen:
         shutil.copyfile(self.out / "survey" / "map.json", folder / "map.json")
         task = (f"Program file: `{self.engine.file}` with {len(program_map['functions'])} functions and "
                 f"{len(program_map['imports'])} imported names. Function limit per module: {self.max_functions}. "
-                "Read `map.json`, then write `contract.h` and `PLAN.md` in this folder and answer with the plan.")
+                f"Target language: {self.lang.label}. {self.lang.guidance} Read `map.json`, then write the "
+                f"interface as `{self.lang.header}` (it replaces `contract.h` in your role card) and `PLAN.md` in "
+                "this folder and answer with the plan.")
         answer = self.bee("planner", "planner", task, folder)
         if not answer.get("ok"):
             raise HiveError("the planner did not produce a plan: " + answer.get("error", ""))
         modules, skipped = normalise_plan(answer["output"], program_map, self.max_functions)
-        contract = folder / "contract.h"
+        contract = folder / self.lang.header
         for attempt in range(1 + self.compile_rounds):
-            ok, errors = self.build.syntax(contract) if contract.is_file() else (False, "contract.h was not written")
+            ok, errors = (self.build.syntax(contract) if contract.is_file()
+                          else (False, f"{self.lang.header} was not written"))
             if ok:
                 break
             if attempt == self.compile_rounds:
-                raise HiveError("contract.h does not compile: " + errors[-1000:])
+                raise HiveError(f"{self.lang.header} does not compile: " + errors[-1000:])
             self.bee("planner", f"planner-fix{attempt + 1}",
-                     "Your `contract.h` does not compile on its own. Fix only these errors, keep the plan, and "
+                     f"Your `{self.lang.header}` does not compile on its own. Fix only these errors, keep the plan, and "
                      f"answer with the same plan:\n```\n{errors[-4000:]}\n```", folder)
-        frozen = self.out / "src" / "contract.h"
+        frozen = self.out / "src" / self.lang.header
         frozen.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(contract, frozen)
         frozen.chmod(0o444)
@@ -340,7 +355,9 @@ class Queen:
         by_hex = {f["hex"]: f for f in program_map["functions"]}
         lines = [f"# Module {module['id']}: {module['title']}", "",
                  f"Input file: `{self.engine.file}` (for MCP `file` and in claims.json).",
-                 f"Write your code in `{module['id']}.c` (one file; `#include \"contract.h\"`).", "",
+                 f"Language: {self.lang.label}. {self.lang.guidance}",
+                 f"Write your code in `{self.lang.source(module['id'])}` (one file; "
+                 f"`#include \"{self.lang.header}\"`; the role card's `contract.h` means `{self.lang.header}`).", "",
                  "| Entry (hex) | Entry (decimal, for MCP) | Contract name | Ghidra name | Size | Ghidra signature |",
                  "| --- | --- | --- | --- | --- | --- |"]
         for entry in module["functions"]:
@@ -371,12 +388,12 @@ class Queen:
                 return status
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "BRIEF.md").write_text(self.brief(module, program_map, names), encoding="utf-8")
-        local = folder / "contract.h"
+        local = folder / self.lang.header
         if local.exists():
             local.chmod(0o644)
         shutil.copyfile(contract, local)
         local.chmod(0o444)
-        source = folder / f"{mid}.c"
+        source = folder / self.lang.source(mid)
         status = {"id": mid, "title": module["title"], "functions": module["functions"], "rounds": []}
         answer = self.bee("worker", f"{mid}-build", f"Rebuild module {mid}. Read `BRIEF.md` first.", folder)
         status["worker"] = answer.get("output")
@@ -396,7 +413,7 @@ class Queen:
             listing = "\n".join(f"- {d['function']}: {d['problem']} (evidence: {d['evidence']}; "
                                 f"suggested fix: {d.get('fix', '-')})" for d in defects)
             self.repair(status, f"{mid}-repair-c{round_number}",
-                     f"The independent council found these behavioural differences in `{mid}.c`. Fix each one, "
+                     f"The independent council found these behavioural differences in `{source.name}`. Fix each one, "
                      f"or prove with the assembly or a finding ID that the original does the same:\n{listing}", folder)
             compiled = self.compile_loop(mid, folder, source, contract, status)
             if not compiled["ok"]:
@@ -421,7 +438,8 @@ class Queen:
                 return result
             problem = result["errors"] if not result["ok"] else result["warnings"]
             self.repair(status, f"{mid}-repair-b{attempt + 1}",
-                        f"`{mid}.c` does not compile cleanly with `cc {' '.join(self.build.cflags)}`. Fix exactly these "
+                        f"`{source.name}` does not compile cleanly with `{self.build.cc} {' '.join(self.build.cflags)}`. "
+                        "Fix exactly these "
                         f"messages without changing behaviour:\n```\n{problem[-4000:]}\n```", folder)
         return result
 
@@ -437,11 +455,12 @@ class Queen:
             seat = self.out / "council" / f"{mid}-r{round_number}-{lens[0]}"
             shutil.rmtree(seat, ignore_errors=True)
             seat.mkdir(parents=True)
-            shutil.copyfile(source, seat / f"{unit}.c")
-            shutil.copyfile(contract, seat / "contract.h")
+            shutil.copyfile(source, seat / f"{unit}{self.lang.extension}")
+            shutil.copyfile(contract, seat / self.lang.header)
             shutil.copyfile(folder / "BRIEF.md", seat / "BRIEF.md")
             answer = self.bee("councillor", f"{mid}-council-r{round_number}-{lens[0]}",
-                              f"Review `{unit}.c` against the original functions listed in `BRIEF.md`. "
+                              f"Review `{unit}{self.lang.extension}` ({self.lang.label}) against the original "
+                              "functions listed in `BRIEF.md`. "
                               f"Your lens: {lens[1]}.", seat)
             return answer.get("output") if answer.get("ok") else None
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.lenses)) as pool:
@@ -485,7 +504,7 @@ class Queen:
                 self.bee("repair", f"{mid}-repair-l{attempt + 1}",
                          "Linking the whole program failed because of this module. Fix these problems:\n"
                          + "\n".join("- " + p for p in problems), folder)
-                self.build.compile(mid, folder / f"{mid}.c", contract)
+                self.build.compile(mid, folder / self.lang.source(mid), contract)
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
                 list(pool.map(repair, sorted(blamed.items())))
         self.log(f"link: {'ok' if result['ok'] else 'FAILED'}")
@@ -530,11 +549,11 @@ class Queen:
         folder = self.out / "fixes" / f"b{round_number}"
         folder.mkdir(parents=True, exist_ok=True)
         for module in modules:
-            source = self.out / "modules" / module["id"] / f"{module['id']}.c"
+            source = self.out / "modules" / module["id"] / self.lang.source(module["id"])
             if source.is_file():
                 shutil.copyfile(source, folder / source.name)
-        shutil.copyfile(contract, folder / "contract.h")
-        (folder / "contract.h").chmod(0o444)
+        shutil.copyfile(contract, folder / self.lang.header)
+        (folder / self.lang.header).chmod(0o444)
         by_id = {c["id"]: c for c in cases}
         lines = []
         for case_id in different[:25]:
@@ -542,12 +561,12 @@ class Queen:
                          f"original: {json.dumps(original[case_id], ensure_ascii=False)[:1500]}\n"
                          f"rebuild:  {json.dumps(rebuilt[case_id], ensure_ascii=False)[:1500]}\n")
         (folder / "FAILURES.md").write_text("\n".join(lines), encoding="utf-8")
-        before = {p.name: sha256(p) for p in folder.glob("m*.c")}
+        before = {p.name: sha256(p) for p in folder.glob(f"m*{self.lang.extension}")}
         self.bee("repair", f"behaviour-fix-{round_number}",
                  "The rebuilt program behaves differently from the original in the cases listed in `FAILURES.md` "
                  "(stdout is compared by hash, with its first bytes shown). The module sources are in this "
                  "folder. Find the cause with the MCP tools and fix the modules; change nothing else.", folder)
-        changed = [p for p in folder.glob("m*.c") if before.get(p.name) != sha256(p)]
+        changed = [p for p in folder.glob(f"m*{self.lang.extension}") if before.get(p.name) != sha256(p)]
         for path in changed:
             mid = path.stem
             if self.build.compile(mid, path, contract)["ok"]:
@@ -581,6 +600,10 @@ class Queen:
         map_file = self.out / "survey" / "map.json"
         program_map = (json.loads(map_file.read_text()) if map_file.is_file()
                        else survey(self.engine, self.out / "survey", self.log))
+        self.lang, reasons = languages.choose(self.requested_language, program_map)
+        self.build.language = self.lang
+        self.language_reasons = reasons
+        self.log(f"language: {self.lang.label} ({'; '.join(reasons)})")
         modules, skipped, contract = self.plan(program_map)
         names = contract_names(contract.read_text(encoding="utf-8"))
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
@@ -622,6 +645,7 @@ class Queen:
             reasons.append(f"{len(conformance['different'])} conformance case(s) differ")
         return {
             "file": self.engine.file, "input_sha256": program_map["input_sha256"],
+            "language": self.lang.label, "language_reasons": getattr(self, "language_reasons", []),
             "functions": len(program_map["functions"]), "skipped": len(skipped), "modules": states,
             "link": link["ok"], "binary": link.get("binary") if link["ok"] else None,
             "check": check, "claims": claim_count, "conformance": conformance,
@@ -635,6 +659,7 @@ class Queen:
 def render(result):
     lines = [f"# Hive report: {result['file']}", "", f"**Verdict: {result['verdict']}.** {result['reason']}.", "",
              f"- Input SHA-256: `{result['input_sha256']}`",
+             f"- Language: {result.get('language', 'C')} ({'; '.join(result.get('language_reasons', []))})",
              f"- Functions: {result['functions']} ({result['skipped']} skipped as library or runtime code)",
              f"- Modules: {len(result['modules'])}; accepted "
              f"{sum(s == 'accepted' for s in result['modules'].values())}",
