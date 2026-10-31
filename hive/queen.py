@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 
 from hive import bees as bees_module
-from hive import languages
+from hive import codex_bees, languages, preflight
 
 ROOT = Path(__file__).resolve().parents[1]
 WARNINGS = ("-O1", "-Wall", "-Wextra", "-Wno-unused-parameter", "-fwrapv", "-fno-strict-aliasing")
@@ -275,7 +275,7 @@ def compare(original, rebuilt):
 class Queen:
     def __init__(self, *, engine, out, bees, slots=4, max_functions=12, compile_rounds=3, council_rounds=2,
                  lenses=len(LENSES), link_rounds=3, behaviour_rounds=2, run_original=False, cases=40,
-                 max_bees=400, build=None, check=None, language="c"):
+                 max_bees=400, build=None, check=None, language="c", preflight=None, allow_packed=False):
         self.engine, self.out, self.bees = engine, Path(out), bees
         self.slots = threading.BoundedSemaphore(slots)
         self.workers = slots
@@ -285,6 +285,7 @@ class Queen:
         self.run_original, self.case_target, self.max_bees = run_original, cases, max_bees
         self.build = build or Build(self.out / "build")
         self.requested_language = language
+        self.preflight, self.allow_packed, self.preflight_result = preflight, allow_packed, None
         self.lang = self.build.language
         self.check = check
         self.lock = threading.RLock()
@@ -600,6 +601,12 @@ class Queen:
         map_file = self.out / "survey" / "map.json"
         program_map = (json.loads(map_file.read_text()) if map_file.is_file()
                        else survey(self.engine, self.out / "survey", self.log))
+        if self.preflight:
+            self.preflight_result = self.preflight(self.engine, program_map, self.out / "survey" / "preflight")
+            verdict = self.preflight_result["verdict"]
+            self.log(f"pre-flight: {verdict}" + "".join(f"; {s['detail']}" for s in self.preflight_result["signals"]))
+            if verdict == "packed" and not self.allow_packed:
+                return self.stop_packed(program_map, started)
         self.lang, reasons = languages.choose(self.requested_language, program_map)
         self.build.language = self.lang
         self.language_reasons = reasons
@@ -626,6 +633,21 @@ class Queen:
         self.log(f"verdict: {result['verdict']} — {result['reason']}")
         return result
 
+    def stop_packed(self, program_map, started):
+        pre = self.preflight_result
+        result = {"file": self.engine.file, "input_sha256": program_map["input_sha256"],
+                  "functions": len(program_map["functions"]), "skipped": 0, "modules": {}, "link": False,
+                  "binary": None, "check": None, "claims": 0, "preflight": pre,
+                  "conformance": {"ran": False, "reason": "the run stopped at the pre-flight"},
+                  "verdict": "not started",
+                  "reason": "the pre-flight found a packed program (" + (", ".join(pre["packers"]) or "high entropy")
+                            + "); " + pre["advice"] + " Start with --allow-packed to try anyway",
+                  "seconds": round(time.monotonic() - started), "spent": self.spent}
+        (self.out / "result.json").write_text(json.dumps(result, indent=1, ensure_ascii=False))
+        (self.out / "REPORT.md").write_text(render(result), encoding="utf-8")
+        self.log(f"verdict: {result['verdict']} — {result['reason']}")
+        return result
+
     def verdict(self, program_map, modules, skipped, statuses, link, check, claim_count, conformance):
         states = {s["id"]: s["state"] for s in statuses}
         stubs = sum(1 for s in statuses for f in (s.get("worker") or {}).get("functions", []) if f.get("status") != "rebuilt")
@@ -646,6 +668,7 @@ class Queen:
         return {
             "file": self.engine.file, "input_sha256": program_map["input_sha256"],
             "language": self.lang.label, "language_reasons": getattr(self, "language_reasons", []),
+            "preflight": self.preflight_result,
             "functions": len(program_map["functions"]), "skipped": len(skipped), "modules": states,
             "link": link["ok"], "binary": link.get("binary") if link["ok"] else None,
             "check": check, "claims": claim_count, "conformance": conformance,
@@ -659,7 +682,10 @@ class Queen:
 def render(result):
     lines = [f"# Hive report: {result['file']}", "", f"**Verdict: {result['verdict']}.** {result['reason']}.", "",
              f"- Input SHA-256: `{result['input_sha256']}`",
-             f"- Language: {result.get('language', 'C')} ({'; '.join(result.get('language_reasons', []))})",
+             (f"- Language: {result['language']} ({'; '.join(result.get('language_reasons', []))})"
+              if result.get("language") else "- Language: not chosen"),
+             "- Pre-flight: " + (f"{result['preflight']['verdict']}" + "".join(
+                 f"; {s['detail']}" for s in result["preflight"]["signals"]) if result.get("preflight") else "not run"),
              f"- Functions: {result['functions']} ({result['skipped']} skipped as library or runtime code)",
              f"- Modules: {len(result['modules'])}; accepted "
              f"{sum(s == 'accepted' for s in result['modules'].values())}",
@@ -696,6 +722,11 @@ def main(argv=None):
     run.add_argument("--run-original", action="store_true",
                      help="Allow running the original program on the conformance cases (benign software only)")
     run.add_argument("--cases", type=int, default=40, help="Conformance cases to ask for (default 40)")
+    run.add_argument("--language", choices=("auto", "c", "cpp"), default="auto",
+                     help="Language to rebuild in (default: detected from the program)")
+    run.add_argument("--allow-packed", action="store_true",
+                     help="Continue even when the pre-flight finds a packed program")
+    codex_bees.add_arguments(run)
     args = parser.parse_args(argv)
     if not args.inputs.is_dir() or not (args.inputs / args.file).is_file():
         parser.error("--file must name a regular file inside --inputs")
@@ -705,13 +736,15 @@ def main(argv=None):
     from tools import hive_check
     inputs = args.inputs.resolve()
     engine = Engine(root=ROOT, inputs=inputs, file=args.file)
-    bees = bees_module.ClaudeBees(engine=ROOT, inputs=inputs, claude=args.claude, model=args.model,
-                                  config_dir=args.out.resolve() / ".hive" / "mcp")
+    config_dir = args.out.resolve() / ".hive" / "mcp"
+    claude = bees_module.ClaudeBees(engine=ROOT, inputs=inputs, claude=args.claude, model=args.model,
+                                    config_dir=config_dir)
+    bees = codex_bees.build(args, claude, engine=ROOT, inputs=inputs, config_dir=config_dir.parent / "codex")
     def check(claims, out):
         return hive_check.check(inputs, claims, out, enabled=frozenset({"ghidra"}), jobs=args.check_jobs)
     queen = Queen(engine=engine, out=args.out, bees=bees, slots=args.bees, max_functions=args.max_functions,
                   lenses=args.council, run_original=args.run_original, cases=args.cases, max_bees=args.max_bees,
-                  check=check)
+                  check=check, language=args.language, preflight=preflight.run, allow_packed=args.allow_packed)
     try:
         result = queen.run()
     except HiveError as error:

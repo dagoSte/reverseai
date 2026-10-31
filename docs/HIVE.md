@@ -1,13 +1,14 @@
 # The hive: an AI analyst team on top of ReverseAI
 
 The hive is an optional team of AI agents that analyses a native program with ReverseAI and
-rebuilds it as C source. A **queen** splits the work, a **hive of bees** works in parallel, and
+rebuilds it as C or C++ source. A **queen** splits the work, a **hive of bees** works in parallel, and
 an **independent council** plus a deterministic **evidence checker** decide what is accepted.
 The ReverseAI engine itself stays model-free: the hive is a separate layer in `hive/` that
 talks to the engine only through its MCP server and command line.
 
 Status: experimental. It needs prepared Ghidra exports (`reverseai prepare`, ReverseAI 0.8.0)
-and Claude Code logged in with your own subscription. No API key is used.
+and Claude Code logged in with your own subscription; Codex bees, if you choose them, use your
+Codex login. No API key is used.
 
 ## Roles
 
@@ -24,29 +25,33 @@ and Claude Code logged in with your own subscription. No API key is used.
 1. **Survey.** The queen prepares the file once (Ghidra analyses it in its locked container and
    keeps the project in the private cache), then exports every function, call and string into
    `survey/map.json`.
-2. **Plan.** The planner proposes modules and `contract.h`. The queen checks that every function
+2. **Pre-flight.** Before any bee is spent, the queen checks whether the program is packed or
+   obfuscated (see [Pre-flight](#pre-flight)). A packed program stops the run with the reasons,
+   unless you start it with `--allow-packed`. Then the queen chooses the language: C, or C++ when
+   the map shows C++ (see [Languages](#languages)).
+3. **Plan.** The planner proposes modules and `contract.h`. The queen checks that every function
    is either skipped with a reason or in exactly one module, splits oversized modules, checks
    that the contract compiles on its own, and freezes it read-only.
-3. **Build.** Builders work in parallel, one folder each. Every module is compiled alone from a
+4. **Build.** Builders work in parallel, one folder each. Every module is compiled alone from a
    clean stage that holds only its source and the frozen contract, with
    `-Wall -Wextra -fwrapv -fno-strict-aliasing`. Inline assembly, `#embed`, `.incbin` and
    `dlopen` fail the module outright. Compiler messages go back to the builder, at most three
    times.
-4. **Council.** Three councillors, each with a fresh context, review a renamed copy of the module
+5. **Council.** Three councillors, each with a fresh context, review a renamed copy of the module
    without the builder's notes. Only behavioural differences with evidence (an address in the
    original or a finding ID) count. The builder must fix them or disprove them with evidence; a
    fresh council reviews again. A module still refuted after two rounds is **disputed**, never
    silently accepted.
-5. **Link.** The queen links all modules and routes undefined or duplicate symbols to the module
+6. **Link.** The queen links all modules and routes undefined or duplicate symbols to the module
    that owns them, at most three rounds.
-6. **Evidence check.** `tools/hive_check.py` re-runs every question that a claim cites, through
+7. **Evidence check.** `tools/hive_check.py` re-runs every question that a claim cites, through
    ReverseAI itself, and keeps a claim only if each cited finding ID comes back with a
    `supported` or `derived` verdict. Finding IDs are bound to the file's hash and the result's
    content, so a made-up ID, an ID from another file or a stale ID is rejected.
-7. **Behaviour (optional).** With `--run-original`, the tester writes cases; the queen runs the
+8. **Behaviour (optional).** With `--run-original`, the tester writes cases; the queen runs the
    original and the rebuild on each case in a fresh folder and compares stdout, stderr, exit
    code and every file created. Differences go to one fixer bee, at most two rounds.
-8. **Verdict.** Code computes it: **accepted** only if the program links, every module is
+9. **Verdict.** Code computes it: **accepted** only if the program links, every module is
    accepted by its council, no function is a stub, the checker rejected no claim and every
    conformance case is identical. Without `--run-original` the best verdict is
    **accepted without behaviour proof**.
@@ -69,10 +74,56 @@ and Claude Code logged in with your own subscription. No API key is used.
 - `--bees N` sets how many bees work at once (default 4). Each contained Ghidra question uses up
   to 2 CPUs and 2 GiB, so size N to your Docker VM. `--max-bees` caps the whole run.
 
+## Pre-flight
+
+Rebuilding a packed program from static evidence only rebuilds its unpacking stub, and
+obfuscation (flattened control flow, virtual machines) defeats decompilation, so the queen checks
+first, deterministically, in `hive/preflight.py`:
+
+- packer section names (UPX, MPRESS, ASPack, PECompact, Themida, VMProtect, Enigma, NsPack, ...)
+  and packer marker strings in the file;
+- byte entropy of each executable segment and of the whole file, computed from the approved file
+  over the segment ranges that ReverseAI verifies (compressed or encrypted bytes are close to
+  8 bits per byte);
+- imports that only load more code (`LoadLibrary`/`GetProcAddress`, `dlopen`/`dlsym`, ...);
+- very few functions or strings for the code size, or one function holding most of the code.
+
+Any strong signal gives **packed** (the run stops); two weak signals give **suspected** (the run
+warns and continues). The result is in `survey/preflight/preflight.json` and in the report.
+Nothing is unpacked or executed: unpacking stays your decision. A clean verdict does not prove
+that a program is neither packed nor obfuscated.
+
+## Languages
+
+`--language auto` (the default) rebuilds in C, or in C++ when the map shows at least two signs of
+C++: mangled names (`_Z...`), qualified names (`Class::method`), C++ runtime imports
+(`__cxa_throw`, `__gxx_personality_v0`, ...) or `operator new`/`delete`. `--language c` and
+`--language cpp` force a choice. C++ builders rebuild classes with the layout the assembly shows,
+pinned with `static_assert`, and virtual methods in vtable order; the contract becomes
+`contract.hpp` and the queen compiles with `c++ -std=gnu++17`. Other languages (Java for Android
+apps, ports to Rust, Go or Python) are not handled yet.
+
+## Bee models
+
+`--bee-policy claude` (the default) runs every bee on Claude Code. `--bee-policy codex` runs every
+bee on the Codex CLI (`codex exec`), and `--bee-policy mixed` alternates: odd-numbered modules are
+built by Claude and even ones by Codex, repairs stay with the module's builder, and each council
+gives two of its three seats to the model that did not build the module, so the majority of every
+council is non-author. The planner, the tester and the behaviour fixer stay on Claude. Different
+models make fewer of the same mistakes, which is why mixed councils are worth having.
+
+Codex bees are less fenced than Claude bees, and this was measured on 2026-10-31 with
+codex-cli 0.165.0 on macOS: writes outside the bee's folder were denied, but a Codex bee could read
+files elsewhere on the disk, run programs (including the input), and reach the network from inside
+`codex exec` in both its read-only and workspace-write modes, although `codex sandbox` alone blocks
+it. The hive therefore probes the Codex sandbox before its first Codex bee and refuses Codex bees
+while the probe reaches the network. `--codex-allow-network` skips that refusal for operators who
+accept the risk on software they would run anyway; never use Codex bees on malware.
+
 ## Safety
 
-- Bees read text that comes from untrusted binaries. No bee has a shell, the web or the ability to
-  start other agents. Each bee runs with Claude Code's `dontAsk` permission mode and file rules
+- Bees read text that comes from untrusted binaries. No Claude bee has a shell, the web or the
+  ability to start other agents (Codex bees differ: see [Bee models](#bee-models)). Each bee runs with Claude Code's `dontAsk` permission mode and file rules
   limited to its own folder (`Read(./**)`, `Write(./**)`, `Edit(./**)`), so reads and writes
   anywhere else are denied; councillors can only read. ReverseAI's MCP tools are read-only and
   never execute the input.
@@ -115,7 +166,8 @@ council already decided are kept.
 
 ## Limits
 
-- C output only; C++, Objective-C, Swift, Go and Rust programs are not handled specially.
-- Packed or obfuscated programs are not detected yet.
+- C and C++ output only; Objective-C, Swift, Go and Rust programs are not handled specially.
+- The pre-flight recognises common packers and strong signs of obfuscation; it does not unpack,
+  and it can miss custom packers or light obfuscation.
 - Rebuilt code follows Ghidra's and the agents' reading of the assembly. It is not the original
   source, and conformance cases show equal behaviour only on the cases run.
