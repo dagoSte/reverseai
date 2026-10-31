@@ -81,6 +81,7 @@ class Engine:
         return json.loads(done.stdout)
 
     def query(self, name, args, out):
+        Path(out).parent.mkdir(parents=True, exist_ok=True)  # the CLI creates --out itself, not its parents
         argv = ["query", str(self.path), "--query", name, "--out", str(out), *("--with-" + t for t in self.enabled)]
         for key, value in args.items():
             argv += ["--arg", f"{key}={value}"]
