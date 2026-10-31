@@ -1,5 +1,8 @@
 # Security model
 
+> To report a vulnerability, use GitHub's private form; see
+> [Reporting a security problem privately](#reporting-a-security-problem-privately).
+
 ReverseAI performs static analysis of an approved file. It does not execute,
 import or evaluate sample code, install sample packages, run their scripts, or
 resolve their dependencies. Contained tools parse and decompile bytes as data.
@@ -157,12 +160,14 @@ pinned and checked by hash, but pinning is not a vulnerability audit.
 ## Reporting a security problem privately
 
 Please report suspected containment, evidence-integrity or disclosure problems
-privately to the repository owner, Stefano D'Agostino. Use GitHub's private
-vulnerability form if it is enabled on the repository. Otherwise use an
-established authenticated private channel, or open a contact-only issue asking
-the owner for one. That issue must contain no vulnerability details, sample or
-confidential metadata. See [GitHub's private-reporting guide](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/report-privately).
-No security email or response-time commitment is published here.
+privately to the repository owner, Stefano D'Agostino, with GitHub's private
+vulnerability form: the **Report a vulnerability** button on the repository's
+Security tab, or directly
+[this link](https://github.com/dagoSte/reverseai/security/advisories/new). Only
+the owner and you can read the report. Do not open a public issue about a
+vulnerability. See [GitHub's private-reporting guide](https://docs.github.com/en/code-security/how-tos/report-and-fix-vulnerabilities/report-privately).
+Fixes go into the latest release. No security email or response-time commitment
+is published here.
 
 Provide the affected tag or commit, Python/OS/architecture, relevant image and
 lock identifiers, expected versus observed behaviour, and a minimal synthetic
