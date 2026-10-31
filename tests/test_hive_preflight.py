@@ -1,10 +1,11 @@
+import hashlib
 import json
 import tempfile
 import unittest
 import zlib
 from pathlib import Path
 
-from hive import preflight
+from hive import preflight, queen
 
 # Low-entropy stand-in for machine code: a few repeating instruction-like words.
 CODE = (b"\xfd\x7b\xbf\xa9\xfd\x03\x00\x91\x00\x00\x80\x52\xc0\x03\x5f\xd6" * 8192)[:96 * 1024]
@@ -75,29 +76,75 @@ class AssessTests(unittest.TestCase):
 
 
 class RunTests(unittest.TestCase):
-    def test_run_reads_segments_and_imports_from_reverseai(self):
-        tmp = Path(tempfile.mkdtemp())
-        (tmp / "program").write_bytes(PACKED + b"\x00" * 4096)
+    """run() reads the approved file through intake and binds every report and the bytes to the survey's hash."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.inputs = self.tmp / "inputs"
+        self.inputs.mkdir()
+        self.program = self.inputs / "program"
+        self.program.write_bytes(PACKED + b"\x00" * 4096)
+        self.sha = hashlib.sha256(self.program.read_bytes()).hexdigest()
+        self.map = {"input_sha256": self.sha, "functions": functions(300), "strings": [{}] * 500}
+
+    def engine(self, after_overview=None, report_sha=None):
+        test = self
 
         class Engine:
-            path = tmp / "program"
+            inputs, file, path = test.inputs, "program", test.program
             asked = []
 
             def query(self, name, args, out):
                 self.asked.append((name, dict(args)))
+                header = {"input": {"sha256": report_sha or test.sha}}
                 if name == "list_segments":
                     rows = [list(row) for row in segments()][args["start"]:args["start"] + args["limit"]]
-                    return {"results": [{"findings": [{"claim_key": "segments.list", "verdict": "supported",
-                                                       "value": {"rows": rows}}]}]}
-                return {"results": [{"findings": [{"claim_key": "imports.symbols", "verdict": "supported",
-                                                   "value": NORMAL_IMPORTS}]}]}
+                    return {**header, "results": [{"findings": [{"claim_key": "segments.list", "verdict": "supported",
+                                                                 "value": {"rows": rows}}]}]}
+                if after_overview:
+                    after_overview()
+                return {**header, "results": [{"findings": [{"claim_key": "imports.symbols", "verdict": "supported",
+                                                             "value": NORMAL_IMPORTS}]}]}
+        return Engine()
 
-        engine = Engine()
-        result = preflight.run(engine, {"functions": functions(300), "strings": [{}] * 500}, tmp / "pre")
+    def test_run_reads_segments_and_imports_from_reverseai(self):
+        engine = self.engine()
+        result = preflight.run(engine, self.map, self.tmp / "pre")
         self.assertEqual(result["verdict"], "packed")
         self.assertEqual([name for name, _ in engine.asked], ["list_segments", "binary_overview"])
-        self.assertEqual(json.loads((tmp / "pre" / "preflight.json").read_text())["verdict"], "packed")
+        self.assertEqual(json.loads((self.tmp / "pre" / "preflight.json").read_text())["verdict"], "packed")
 
+    def test_a_link_swapped_in_after_the_queries_is_refused(self):
+        outside = self.tmp / "outside"
+        outside.write_bytes(CODE + b"\x00" * 4096)  # clean bytes that would hide the packed verdict
+
+        def swap():
+            self.program.unlink()
+            self.program.symlink_to(outside)
+        with self.assertRaises(queen.HiveError):
+            preflight.run(self.engine(after_overview=swap), self.map, self.tmp / "pre")
+        self.assertFalse((self.tmp / "pre" / "preflight.json").exists())
+
+    def test_a_changed_regular_file_is_refused(self):
+        def change():
+            self.program.write_bytes(CODE + b"\x00" * 4096)
+        with self.assertRaises(queen.HiveError) as raised:
+            preflight.run(self.engine(after_overview=change), self.map, self.tmp / "pre")
+        self.assertIn("changed since the survey", str(raised.exception))
+
+    def test_reports_about_another_input_are_refused(self):
+        with self.assertRaises(queen.HiveError):
+            preflight.run(self.engine(report_sha="0" * 64), self.map, self.tmp / "pre")
+        with self.assertRaises(queen.HiveError):
+            preflight.run(self.engine(), {"functions": []}, self.tmp / "pre2")
+
+    def test_a_truncated_segment_is_judged_on_the_bytes_present(self):
+        data = CODE[:16384] + PACKED[:256]
+        rows = [("__TEXT", 0, 16384, 1 << 32, 16384, True, False, True),
+                ("TAIL", 16384, 4096, (1 << 32) + 16384, 4096, True, False, True)]  # declares 4096, has 256
+        result = preflight.assess(data, rows, NORMAL_IMPORTS)
+        self.assertEqual(result["verdict"], "clean")
+        self.assertEqual(result["executable_bytes"], 16384)
 
 if __name__ == "__main__":
     unittest.main()
