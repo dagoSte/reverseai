@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.hive_compiler import confined
 from hive import languages, queen
 
 CXX = shutil.which("c++")
@@ -118,7 +119,7 @@ class CppBees:
         raise AssertionError(role)
 
 
-@unittest.skipUnless(CXX, "needs a C++ compiler")
+@unittest.skipUnless(confined("cpp"), "needs a Clang++ compiler the hive can confine")
 class CppRunTests(unittest.TestCase):
     def test_a_cpp_program_is_rebuilt_as_cpp(self):
         tmp = Path(tempfile.mkdtemp())

@@ -12,6 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tests.hive_compiler import confined
 from hive import codex_bees, languages, queen
 from tests.test_hive_queen import CONTRACT, GOOD, WRONG_EXIT, FakeBees, FakeEngine
 
@@ -43,7 +44,7 @@ class RecordedBees(FakeBees):
         return result
 
 
-@unittest.skipUnless(shutil.which("cc"), "requires a C compiler")
+@unittest.skipUnless(confined("c"), "needs a Clang compiler the hive can confine")
 class QueenFixTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="hive-queen-fixes-")
@@ -296,7 +297,7 @@ class QueenFixTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
 
 
-@unittest.skipUnless(shutil.which("cc"), "requires a C compiler")
+@unittest.skipUnless(confined("c"), "needs a Clang compiler the hive can confine")
 class CompilerBoundaryTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="hive-compiler-fixes-")

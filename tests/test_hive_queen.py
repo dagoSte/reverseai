@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.hive_compiler import confined
 from hive import bees, queen
 
 CC = shutil.which("cc")
@@ -111,7 +112,7 @@ CASES = [{"id": "no-args", "steps": [{"args": []}]},
          {"id": "file-escape", "files": [{"name": "../outside", "text": "x"}], "steps": [{"args": ["x"]}]}]
 
 
-@unittest.skipUnless(CC, "needs a C compiler")
+@unittest.skipUnless(confined("c"), "needs a Clang compiler the hive can confine")
 class QueenRunTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())

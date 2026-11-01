@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests.hive_compiler import confined
 from hive import codex_bees, preflight, queen
 from tests.test_hive_queen import FakeBees, FakeEngine, GOOD
 
@@ -38,12 +39,14 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("Pre-flight: packed", report)
         self.assertIn("Language: not chosen", report)
 
+    @unittest.skipUnless(confined("c"), "needs a Clang compiler the hive can confine")
     def test_the_operator_can_allow_a_packed_program(self):
         bees = FakeBees(GOOD)
         result = self.queen(bees, PACKED, allow_packed=True).run()
         self.assertTrue(bees.calls)
         self.assertEqual(result["preflight"]["verdict"], "packed")
 
+    @unittest.skipUnless(confined("c"), "needs a Clang compiler the hive can confine")
     def test_a_clean_program_runs_and_reports_its_preflight(self):
         result = self.queen(FakeBees(GOOD), CLEAN).run()
         self.assertEqual(result["verdict"], "accepted without behaviour proof")
