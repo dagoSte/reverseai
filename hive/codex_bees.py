@@ -256,12 +256,16 @@ def add_arguments(parser):
     parser.add_argument("--codex-effort", help="Reasoning effort for Codex bees")
     parser.add_argument("--codex-allow-network", action="store_true",
                         help="Accept Codex network access: skip the isolation probe and warn on every bee result")
+    from hive import selfhost
+    selfhost.add_arguments(parser)
 
 
 def build(args, claude_runner, **runner_kwargs):
     """Build from CLI options; kwargs are CodexBees' shared engine/input/config settings."""
+    from hive import selfhost
+    runner, extra = selfhost.apply(args, claude_runner)
     if args.bee_policy == "claude":
         return claude_runner
-    codex = CodexBees(**dict(runner_kwargs, codex=args.codex, model=args.codex_model, effort=args.codex_effort,
-                             allow_network=args.codex_allow_network))
+    codex = runner(**dict(runner_kwargs, codex=args.codex, model=args.codex_model, effort=args.codex_effort,
+                          allow_network=args.codex_allow_network), **extra)
     return codex if args.bee_policy == "codex" else MixedBees(claude_runner, codex, args.bee_policy)

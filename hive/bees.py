@@ -118,10 +118,11 @@ class ClaudeBees:
     """Run each bee as `claude -p` in its own folder with its own ReverseAI MCP server."""
 
     def __init__(self, *, engine, inputs, enabled=("ghidra",), claude="claude", model=None, effort=None,
-                 timeout=2400, python=sys.executable, config_dir):
+                 timeout=2400, python=sys.executable, config_dir, env=None):
         self.engine, self.inputs, self.enabled = str(engine), str(inputs), tuple(enabled)
         self.claude, self.model, self.effort, self.timeout, self.python = claude, model, effort, timeout, python
         self.config_dir = Path(config_dir)
+        self.env = env  # None inherits this process's environment; hive.selfhost sets a self-hosted one
 
     def _mcp_config(self, name):
         self.config_dir.mkdir(parents=True, exist_ok=True)
@@ -147,7 +148,7 @@ class ClaudeBees:
     def __call__(self, role, name, task, folder):
         started = time.monotonic()
         try:
-            completed = subprocess.run(self.argv(role, name), input=brief(role, task), cwd=folder,
+            completed = subprocess.run(self.argv(role, name), input=brief(role, task), cwd=folder, env=self.env,
                                        capture_output=True, text=True, timeout=self.timeout, check=False)
         except subprocess.TimeoutExpired:
             return {"ok": False, "error": f"no answer within {self.timeout} s", "seconds": self.timeout}
