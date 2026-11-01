@@ -24,6 +24,7 @@ https://github.com/user-attachments/assets/884cff5d-e37e-49c3-9bb7-8fbcf118e2ee
   <a href="#how-it-works">How it works</a> ·
   <a href="#the-tools">The tools</a> ·
   <a href="#the-secure-container-infrastructure">Secure containers</a> ·
+  <a href="#ai-analyst-team-the-hive">AI analyst team</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#roadmap">Roadmap</a>
 </p>
@@ -38,6 +39,9 @@ or it is a tool's interpretation.
 It works from the command line and from AI agents: its MCP server lets Claude Code,
 Codex, Cursor or any other Model Context Protocol client investigate a file, while
 every answer it receives stays checkable and the file never leaves its locked setup.
+On top of it, an optional **AI analyst team** (the *hive*) splits a native program
+among parallel agents, has an independent council challenge every part, and rebuilds
+the program as C or C++ that compiles and is checked against the original.
 
 ## Why ReverseAI
 
@@ -173,6 +177,61 @@ host program are trusted; the built-in parsers run on the host, outside the
 containers. Containment is currently proven for Linux ARM64 containers under
 Docker Desktop on macOS; other platforms need their own proof. The full model is
 in the [security guide](docs/SECURITY.md).
+
+## AI analyst team (the hive)
+
+<p align="center">
+  <img src="media/hive.svg" width="100%" alt="The hive: a program is prepared once with Ghidra and exported as a map; a pre-flight stops packed programs before any agent is spent; the queen, which is code and not a model, plans with one planner agent, freezes the shared contract header and schedules builder bees in parallel, one module each, each with its own ReverseAI MCP server and a folder it alone can write; an independent council of three non-authors per module tries to refute each module against the assembly; the queen compiles and links from a clean stage, a deterministic evidence checker re-runs every cited question, and, only when allowed, the original and the rebuild run the same conformance cases; code computes the verdict.">
+</p>
+
+The hive turns ReverseAI's evidence into a rebuilt program, fast and with every step
+checked by someone or something other than its author:
+
+- **The queen is code, not a model.** She exports the program map, asks one planner
+  agent to split the functions into modules and freeze a shared contract header,
+  schedules the bees, compiles, links and computes the verdict. She cannot write code,
+  vote or overrule a check.
+- **Bees work in parallel**, one module each, each with its own ReverseAI MCP server
+  so contained Ghidra questions run side by side. Claude bees have no shell and no web,
+  and can read and write only in their own folder; every claim they make cites the
+  finding IDs ReverseAI returned.
+- **An independent council** of three non-authors per module, each with its own lens
+  (control flow and arithmetic, input and output, data and memory), tries to refute the
+  module against the original's assembly. Only differences backed by evidence count;
+  they go back for repair, and a module still refuted is reported as disputed. Every
+  seat must answer, and code changed after a council read goes back to the council.
+- **The final word is deterministic.** A checker re-runs every question a claim cites
+  and drops any claim whose finding IDs do not come back for the same file; the rebuild
+  must compile cleanly, in a closed compiler file system with inline assembly disabled;
+  and, only if you allow it, the original and the rebuild run the same conformance cases
+  and must match byte for byte.
+- **Before spending anything**, a pre-flight stops packed programs (UPX, VMProtect,
+  Themida and others, high-entropy code, loader-only imports). The hive rebuilds in C,
+  or in C++ when the program shows C++. Codex bees and mixed Claude/Codex councils are
+  available and are refused automatically while the Codex sandbox lets a probe reach the
+  network.
+
+It runs on your own Claude Code (and optionally Codex) subscription, with no API key,
+and the ReverseAI engine itself stays model-free.
+
+| Program | Size | Functions rebuilt | Council | Evidence checker | Behaviour | Wall time |
+| --- | --- | --- | --- | --- | --- | --- |
+| wordtally (stripped, never published) | 34 KB | 9 in 2 modules | 2/2 accepted | 16/16 claims | 43/43 and 92/92 cases identical | 25 min |
+| lz4 1.10.0 (open source: BSD-2 library, GPL-2 command line) | 254 KB | 282 in 30 modules | 30/30 accepted | 448/448 claims | 68/68 and 127/127 cases identical\* | 4 h 34 min, 136 bees |
+
+\* The 127-case battery was written outside the hive (compression levels, block modes, multithreading, cross-decompression,
+corrupt frames) and catches a one-character change in an error message. Both runs used the queen as it was before the review of
+2026-11-01, which let 13 lz4 modules be changed after their council read (link and behaviour repairs) without a new read; the
+current queen sends such modules back to the council. Both behaviour batteries ran on the final binary.
+
+```sh
+python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-hive-run --bees 5
+python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-hive-run --run-original
+```
+
+`--run-original` lets the hive run the original program on the conformance cases: use it
+only for software you would run anyway, never for malware. The [hive guide](docs/HIVE.md)
+covers roles, safety, the pre-flight, languages, bee models and the workspace.
 
 ## Quick start
 
@@ -340,6 +399,11 @@ Agent prompt: *"Prepare tool.bin, list its functions page by page, and rebuild i
 starting from the functions that call nothing else. Cite the export page for each
 function you write."*
 
+Or let the [AI analyst team](#ai-analyst-team-the-hive) do it end to end: it plans,
+rebuilds in parallel, has every module challenged by an independent council, compiles
+and links the result, and re-checks every citation. The hive is a separate layer: it
+compiles the rebuild, and it runs the original only when you pass `--run-original`.
+
 ### Keep an evidence record for an audit or an incident
 
 ```sh
@@ -378,6 +442,9 @@ facts against the same file later.
   exported in pages over the command line and MCP; compact answers for agents by
   default. The prepared analysis is limited to 64 MiB, which in practice bounds the
   size of program it can hold; a 10,000-function test program is proven.
+- AI analyst team (the hive): a queen in code, parallel builder bees, an independent
+  council and a deterministic evidence checker that rebuild native programs as C or
+  C++; a pre-flight for packed programs; optional Codex bees and mixed councils.
 
 **Next**
 
@@ -385,13 +452,10 @@ facts against the same file later.
   PCs, Intel Macs), with the same offline, unprivileged containment proven natively
   on each. Today the containers run on ARM64 (Apple silicon and Linux ARM64);
   x86-64 programs can already be analysed there.
-- **Reconstruction, next steps**: types, structures, signatures and global data;
-  recognising known libraries; then an agent team that plans, rebuilds and checks
-  each function against the original.
+- **Reconstruction, next steps**: recognising known libraries, per-function comparison
+  against the original in an emulator, and more languages (Java for Android apps).
 - **Benchmark**: measured accuracy on a public corpus of files with known
   answers, with the method and raw results published.
-- **AI analyst team**: agents that plan and ask questions in parallel, with the
-  independent reviewer keeping the final word.
 
 **Later**
 
