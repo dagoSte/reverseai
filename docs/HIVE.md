@@ -37,11 +37,18 @@ Codex login. No API key is used.
    `-Wall -Wextra -fwrapv -fno-strict-aliasing`. This requires Clang with a closed virtual
    filesystem (`-ivfsoverlay`, no fallthrough): generated includes and include-existence queries
    can see only that stage and the compiler's system header directories. Other compilers are
-   refused. Symlinked or hard-linked sources and contracts are refused. The queen checks both
-   the supplied and expanded generated code for inline assembly, `#embed`, `.incbin`, `dlopen`
-   and linker-loading `#pragma comment` directives;
-   generated source-location overrides are refused. Compiler messages go back to the builder,
-   at most three times. A builder must report every assigned function rebuilt and status `done`.
+   refused. Before the planner starts, a native positive/negative probe checks the selected
+   compiler once: the outside-file query must fail and nonempty inline assembly must be disabled
+   in the selected C or C++ mode. The compiler receives `-fno-gnu-inline-asm` and `-fno-asm-blocks`;
+   the preprocessor VFS alone does not confine the assembler. Symlinked or hard-linked sources
+   and contracts are refused. The queen scans the whole expanded output for file-loading
+   constructs, without trusting source line markers, then compiles the original source in the
+   same confinement so macro context is kept. Generated source-location overrides are refused.
+   Each compiler command has a 60-second deadline and captured-output limits of 16 MiB stdout
+   and 256 KiB stderr; crossing a limit stops the command (the owned process group on POSIX).
+   Compiler messages go back to the builder, at most three times. A builder must report every
+   assigned function rebuilt and status `done`; repair reports update the entries they touch
+   while preserving the other functions' reported state.
 5. **Council.** Three councillors, each with a fresh context, review a renamed copy of the module
    without the builder's notes. Only behavioural differences with evidence (an address in the
    original or a finding ID) count. The builder must fix them or disprove them with evidence; a
@@ -62,6 +69,8 @@ Codex login. No API key is used.
    code and every file created. At least **two nonempty cases**, with unique IDs after filename
    normalisation, must complete; empty suites, colliding IDs and timeouts cannot prove behaviour.
    Differences go to one fixer bee, at most two rounds; changed modules return to council.
+   A failed relink removes the older binary, invalidates the link result and stops the behaviour
+   proof; the queen never falls back to a binary built from earlier objects.
 9. **Verdict.** Code computes it: **accepted** only if the program links, every module is
    accepted by its council, no function is a stub, the checker rejected no claim and every
    conformance case is identical. Without `--run-original` the best verdict is
@@ -159,7 +168,7 @@ python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-h
 ```
 
 Run the same command again with the same `--out` to resume. Accepted modules are kept only when
-their input, assignment, source, contract and compiled object still match the queen's saved
+their input, assignment, source, contract, compiled object and compiler policy still match the queen's saved
 decision. The authoritative decisions live outside bee folders, in `.hive/status/`; module
 `status.json` files are informational copies. Frozen contracts can be replaced on a resumed run.
 

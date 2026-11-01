@@ -6,12 +6,13 @@ import io
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from hive import codex_bees, queen
+from hive import codex_bees, languages, queen
 from tests.test_hive_queen import CONTRACT, GOOD, WRONG_EXIT, FakeBees, FakeEngine
 
 
@@ -129,6 +130,73 @@ class QueenFixTests(unittest.TestCase):
         self.assertIn("councillor", after)
         self.assertIn("check", after)
         self.assertEqual(result["verdict"], "accepted")
+
+    def test_failed_behaviour_relink_never_proves_the_old_binary(self):
+        duplicate = GOOD["m02"] + 'int greet_line(const char *name) { return 0; }\n'
+        cases = [{"id": "a", "steps": [{"args": []}]}, {"id": "b", "steps": [{"args": ["x"]}]}]
+        q, _ = self.make(RecordedBees(repaired={"m02": duplicate}, cases=cases), run_original=True)
+        rebuilt_runs = []
+        def execute(cases, binary, folder, timeout=20):
+            original = "/original/" in str(binary)
+            if not original:
+                rebuilt_runs.append(binary)
+            code = 1 if not original and len(rebuilt_runs) == 1 else 0
+            return {c["id"]: {"steps": [{"code": code}], "files": {}} for c in cases}
+        with patch.object(queen, "run_cases", side_effect=execute):
+            result = self.run_quietly(q)
+        objects = [str(q.build.folder / "obj" / f"{mid}.o") for mid in ("m01", "m02")]
+        control = subprocess.run([q.build.cc, *objects, "-o", str(self.root / "relink-control")],
+                                 capture_output=True, text=True)
+        self.assertNotEqual(control.returncode, 0)
+        self.assertEqual(result["verdict"], "not accepted")
+        self.assertFalse(result["link"])
+        self.assertIsNone(result["binary"])
+        self.assertFalse((q.build.folder / "bin/greet").exists())
+        self.assertEqual(len(rebuilt_runs), 1)
+
+    def test_repairs_merge_reports_for_only_the_touched_entries(self):
+        both = GOOD["m01"] + GOOD["m02"]
+        class PartialRepair(RecordedBees):
+            def __call__(self, role, name, task, folder):
+                folder = Path(folder)
+                if role == "planner":
+                    self.calls.append((role, name))
+                    (folder / "contract.h").write_text(CONTRACT)
+                    return {"ok": True, "output": {"modules": [
+                        {"title": "all", "functions": ["0x1000", "0x1040"]}],
+                        "skipped": [{"entry": "0x1080", "reason": "import"}]}}
+                if role in ("worker", "repair"):
+                    self.calls.append((role, name))
+                    (folder / "m01.c").write_text(both)
+                    (folder / "claims.json").write_text(json.dumps({"claims": [
+                        {"id": "x", "text": "fixture", "citations": []}]}))
+                    entries = ["0x1000", "0x1040"] if role == "worker" else ["0x1000"]
+                    return {"ok": True, "output": {"status": "done", "functions": [
+                        {"entry": entry, "status": "rebuilt"} for entry in entries]}}
+                return super().__call__(role, name, task, folder)
+        q, _ = self.make(PartialRepair(refute_first={"m01"}))
+        result = self.run_quietly(q)
+        self.assertEqual(result["verdict"], "accepted without behaviour proof", result["reason"])
+        status = json.loads((q.out / "modules/m01/status.json").read_text())
+        self.assertEqual({row["entry"] for row in status["worker"]["functions"]}, {"0x1000", "0x1040"})
+
+    def test_unsupported_compiler_is_refused_before_the_planner(self):
+        q, bees = self.make()
+        q.build._cc = str(self.root / "missing-compiler")
+        with self.assertRaises(queen.HiveError):
+            self.run_quietly(q)
+        self.assertEqual(bees.calls, [])
+
+    def test_resume_rebuilds_objects_from_an_older_compiler_policy(self):
+        q, bees = self.make()
+        self.assertEqual(self.run_quietly(q)["verdict"], "accepted without behaviour proof")
+        cache = q.out / ".hive/status/m01.json"
+        status = json.loads(cache.read_text())
+        status["compiled"].pop("compiler_sha256", None)
+        cache.write_text(json.dumps(status))
+        builds = bees.calls.count(("worker", "m01-build"))
+        self.assertEqual(self.run_quietly(q)["verdict"], "accepted without behaviour proof")
+        self.assertEqual(bees.calls.count(("worker", "m01-build")), builds + 1)
 
     def test_empty_or_colliding_cases_never_prove_behaviour(self):
         for cases in ([], [{"id": "only", "steps": [{"args": []}]}], [
@@ -258,6 +326,50 @@ class CompilerBoundaryTests(unittest.TestCase):
         result = self.compile(f'#if __has_include("{self.secret}")\n#error EXTERNAL_EXISTS\n#endif\n'
                               'int main(void) { return 0; }\n')
         self.assertTrue(result["ok"], result)
+
+    def test_assembler_cannot_include_or_embed_host_files_from_a_system_header_macro(self):
+        binary = self.root / "outside.bin"
+        binary.write_bytes(b"SYNTHETIC_BIN_9911")
+        payloads = [f'.include \\"{self.secret}\\"',
+                    f'.data\\n.globl _hv_blob\\n_hv_blob:\\n.inc" "bin \\"{binary}\\"\\n.byte 0']
+        for payload in payloads:
+            with self.subTest(payload=payload):
+                text = ('#define J(a,b) a ## b\n'
+                        '#define remove hv_pad(void); J(__as,m__)("' + payload + '"); int hv_remove\n'
+                        '#include <stdio.h>\n#include "contract.h"\nint main(void) { return 0; }\n')
+                result = self.compile(text)
+                obj = self.build.folder / "obj/m01.o"
+                embedded = obj.is_file() and binary.read_bytes() in obj.read_bytes()
+                self.assertEqual((result["ok"], self.token in json.dumps(result), embedded),
+                                 (False, False, False), result)
+
+    def test_cpp_raw_string_line_markers_do_not_hide_assembler_file_reads(self):
+        header = self.root / "contract.hpp"
+        header.write_text("int main();\n")
+        source = self.root / "m.cpp"
+        source.write_text('#include "contract.hpp"\n#define J(a,b) a ## b\n'
+                          'static const char *hv = R"q(\\\n# 300 "/trusted/system/header.h" 3\n)q";\n'
+                          f'J(__as,m__)(".include \\"{self.secret}\\"");\n'
+                          'int main() { return hv[0] == 0; }\n')
+        result = queen.Build(self.root / "cpp-build", language=languages.CPP).compile("m01", source, header)
+        self.assertFalse(result["ok"], result)
+        self.assertNotIn(self.token, json.dumps(result))
+
+    def test_original_macro_context_does_not_add_preprocessed_input_warnings(self):
+        result = self.compile('#include "contract.h"\n#define EQ(a,b) ((a) == (b))\n'
+                              'static int f(int x) { if (EQ(x, 1)) return 1; return 0; }\n'
+                              'int main(void) { return f(0); }\n')
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["warnings"], "")
+
+    def test_preprocessor_output_is_bounded(self):
+        definitions = ['#define L0 0,']
+        definitions += [f'#define L{i} ' + ' '.join([f'L{i-1}'] * 10) for i in range(1, 6)]
+        text = '\n'.join(definitions) + '\nint values[] = { L5 };\nint main(void) { return values[0]; }\n'
+        with patch.object(queen, "MAX_COMPILER_STDOUT", 32768, create=True):
+            result = self.compile(text)
+        self.assertFalse(result["ok"], result)
+        self.assertIn("output limit", result["errors"])
 
     def test_macro_assembly_and_header_assembly_are_rejected(self):
         result = self.compile('#define JOIN(a,b) a ## b\nint main(void) { JOIN(__as,m__)("nop"); return 0; }\n')

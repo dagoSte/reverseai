@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,10 @@ ROOT = Path(__file__).resolve().parents[1]
 WARNINGS = ("-O1", "-Wall", "-Wextra", "-Wno-unused-parameter", "-fwrapv", "-fno-strict-aliasing")
 CFLAGS = (languages.C.standard, *WARNINGS)
 FORBIDDEN = re.compile(r"\b(?:asm|__asm__|__asm)\b|\.incbin|#\s*embed\b|\bdlopen\b|#\s*pragma\s+comment\b")
+EXPANDED_FORBIDDEN = re.compile(r"\.(?:incbin|include)\b|#\s*embed\b|\bdlopen\b|#\s*pragma\s+comment\b")
+COMPILED_IDENTITY = ("source_sha256", "contract_sha256", "object_sha256", "compiler_sha256")
+MAX_COMPILER_STDOUT = 16 * 1024 * 1024
+MAX_COMPILER_STDERR = 256 * 1024
 PROTOTYPE = re.compile(r"([A-Za-z_]\w*)\s*\([^;{}]*\)\s*;\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
 LENSES = (
     ("control", "control flow and arithmetic: conditions, loops, integer widths, signedness, overflow, "
@@ -188,6 +193,7 @@ class Build:
         self._cflags = tuple(cflags) if cflags is not None else None
         self.language, self.ldflags = language, tuple(ldflags)
         self.include_paths = {}
+        self.checked_compiler = None
         (self.folder / "obj").mkdir(parents=True, exist_ok=True)
 
     @property
@@ -198,14 +204,77 @@ class Build:
     def cflags(self):
         return self._cflags if self._cflags is not None else (self.language.standard, *WARNINGS)
 
-    def _run(self, argv, stage, *, input=None):
+    @property
+    def compiler_sha256(self):
+        policy = [str(self.cc), [str(flag) for flag in self.cflags], self.language.name, "no-inline-asm-v2"]
+        return hashlib.sha256(json.dumps(policy).encode()).hexdigest()
+
+    def _run(self, argv, stage):
         env = {k: os.environ[k] for k in ("PATH", "SDKROOT", "DEVELOPER_DIR", "SystemRoot") if k in os.environ}
         env.update(HOME=str(stage), TMPDIR=str(stage), LC_ALL="C")
+        process = None
+        buffers = [bytearray(), bytearray()]
+        overflow = threading.Event()
+        capture_error = threading.Event()
+        stopped = threading.Event()
+        stop_lock = threading.Lock()
+        def stop():
+            with stop_lock:
+                if stopped.is_set():
+                    return
+                stopped.set()
+                try:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                except ProcessLookupError:
+                    pass
+        def drain(pipe, buffer, limit):
+            try:
+                while chunk := os.read(pipe.fileno(), min(65536, limit + 1 - len(buffer))):
+                    if len(buffer) + len(chunk) > limit:
+                        overflow.set()
+                        stop()
+                        break
+                    buffer.extend(chunk)
+            except OSError:
+                capture_error.set()
+                stop()
+            finally:
+                pipe.close()
         try:
-            return subprocess.run(argv, cwd=stage, input=input, env=env, capture_output=True,
-                                  text=True, timeout=60, check=False)
-        except subprocess.TimeoutExpired:
-            return subprocess.CompletedProcess(argv, 124, "", "compiler timed out")
+            process = subprocess.Popen(argv, cwd=stage, env=env, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       start_new_session=os.name == "posix")
+            readers = [threading.Thread(target=drain, args=(pipe, buffer, limit), daemon=True)
+                       for pipe, buffer, limit in zip((process.stdout, process.stderr), buffers,
+                                                       (MAX_COMPILER_STDOUT, MAX_COMPILER_STDERR))]
+            for reader in readers:
+                reader.start()
+            deadline = time.monotonic() + 60
+            try:
+                # Drain before reaping so a limiting reader still owns the process-group identity.
+                for reader in readers:
+                    reader.join(timeout=max(0, deadline - time.monotonic()))
+                if any(reader.is_alive() for reader in readers):
+                    raise subprocess.TimeoutExpired(argv, 60)
+                code = process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                stop()
+                process.wait()
+                return subprocess.CompletedProcess(argv, 124, "", "compiler timed out")
+            finally:
+                for reader in readers:
+                    reader.join(timeout=1)
+            if overflow.is_set():
+                return subprocess.CompletedProcess(argv, 125, "", "compiler output limit exceeded")
+            if capture_error.is_set():
+                return subprocess.CompletedProcess(argv, 125, "", "compiler output could not be read")
+            if any(reader.is_alive() for reader in readers):
+                return subprocess.CompletedProcess(argv, 125, "", "compiler output streams did not close")
+            return subprocess.CompletedProcess(argv, code, buffers[0].decode("utf-8", errors="replace"),
+                                                buffers[1].decode("utf-8", errors="replace"))
         except OSError as error:
             return subprocess.CompletedProcess(argv, 127, "", f"compiler could not start: {type(error).__name__}")
 
@@ -230,26 +299,16 @@ class Build:
             (stage / self.language.source(unit)).write_text(f'#include "{self.language.header}"\n')
         return stage
 
-    def _expanded_generated(self, text, stage):
-        generated, active = [], False
-        for line in text.splitlines():
-            marker = re.match(r'^#\s+\d+\s+("(?:[^"\\]|\\.)*")', line)
-            if marker:
-                name = json.loads(marker[1])
-                active = not name.startswith("<") and Path(os.path.abspath(stage / name)).parent == stage
-            elif active:
-                generated.append(line)
-        return "\n".join(generated)
-
-    def _compile(self, stage, unit, *, syntax=False):
-        flags = [self.cc, *self.cflags, "--no-default-config", "-fno-modules"]
+    def _closed(self, stage, unit):
+        flags = [self.cc, *self.cflags, "--no-default-config", "-fno-modules",
+                 "-fno-gnu-inline-asm", "-fno-asm-blocks"]
         key = (self.cc, self.cflags, self.language.name)
         if key not in self.include_paths:
-            discovery = self._run([*flags, "-E", "-v", "-x", self.language.syntax_kind, "-"], stage, input="")
+            discovery = self._run([*flags, "-E", "-v", "-x", self.language.syntax_kind, "-"], stage)
             match = re.search(r"#include <\.\.\.> search starts here:(.*?)End of search list\.",
                               discovery.stderr, re.S)
             if discovery.returncode or not match:
-                return subprocess.CompletedProcess(flags, 1, "", "a Clang compiler with a closed VFS is required")
+                raise HiveError("a Clang compiler with a closed VFS is required")
             self.include_paths[key] = [line.strip().removesuffix(" (framework directory)")
                                        for line in match[1].splitlines() if line.strip()]
         roots = [{"type": "directory-remap", "name": str(path), "external-contents": str(path)}
@@ -257,23 +316,40 @@ class Build:
         control = self.folder / "vfs" / f"{unit}.json"
         control.parent.mkdir(exist_ok=True)
         control.write_text(json.dumps({"version": 0, "case-sensitive": "true", "fallthrough": False, "roots": roots}))
-        closed = [*flags, "-ivfsoverlay", str(control)]
+        return [*flags, "-ivfsoverlay", str(control)]
+
+    def ensure_confinement(self):
+        if self.checked_compiler == self.compiler_sha256:
+            return
+        stage = self.folder / "stage" / "capability"
+        stage.mkdir(parents=True, exist_ok=True)
+        source = stage / self.language.source("capability")
+        closed = self._closed(stage, "capability")
+        outside = self.folder / "vfs" / "outside-capability.h"
+        outside.write_text("#error outside capability marker\n")
+        source.write_text('#include <stddef.h>\n#if __has_include(' + json.dumps(str(outside)) + ')\n'
+                          '#error compiler VFS is not closed\n#endif\nint main(void) { return 0; }\n')
+        positive = self._run([*closed, "-x", self.language.syntax_kind, "-c", source.name,
+                              "-o", str(stage / "positive.o")], stage)
+        if positive.returncode:
+            raise HiveError("compiler confinement unavailable: " + positive.stderr[-1000:])
+        source.write_text('#define J(a,b) a ## b\nJ(__as,m__)("nop");\n'
+                          'int main(void) { J(__as,m__)("nop"); return 0; }\n')
+        negative = self._run([*closed, "-x", self.language.syntax_kind, "-fsyntax-only", source.name], stage)
+        if negative.returncode == 0 or negative.stderr.count("GNU-style inline assembly is disabled") != 2:
+            raise HiveError("compiler does not refuse nonempty inline assembly")
+        self.checked_compiler = self.compiler_sha256
+
+    def _compile(self, stage, unit, *, syntax=False):
+        closed = self._closed(stage, unit)
         expanded = self._run([*closed, "-E", "-x", self.language.syntax_kind, self.language.source(unit)], stage)
         if expanded.returncode:
             return expanded
-        if FORBIDDEN.search(self._expanded_generated(expanded.stdout, stage)):
+        # Symbol labels in system declarations are not assembly statements; the compiler disables those.
+        if EXPANDED_FORBIDDEN.search(expanded.stdout):
             return subprocess.CompletedProcess(closed, 1, "", "forbidden constructs after preprocessing")
-        source = stage / "unit.i"
-        source.write_text(expanded.stdout, encoding="utf-8")
         action = ["-fsyntax-only"] if syntax else ["-c", "-o", str(stage / "unit.o")]
-        kind = "cpp-output" if self.language.name == "c" else "c++-cpp-output"
-        frontend = [*flags, "-Xclang", "-ivfsoverlay", "-Xclang", str(control)]
-        try:
-            done = self._run([*frontend, "-x", kind, *action, str(source)], stage)
-        finally:
-            source.unlink(missing_ok=True)
-        done.stderr = expanded.stderr + done.stderr
-        return done
+        return self._run([*closed, "-x", self.language.syntax_kind, *action, self.language.source(unit)], stage)
 
     def syntax(self, header):
         try:
@@ -291,7 +367,8 @@ class Build:
             stage = self._stage(module_id, source, contract)
             done = self._compile(stage, module_id)
             identity = {"source_sha256": sha256(stage / self.language.source(module_id)),
-                        "contract_sha256": sha256(stage / self.language.header)}
+                        "contract_sha256": sha256(stage / self.language.header),
+                        "compiler_sha256": self.compiler_sha256}
             if done.returncode == 0:
                 (stage / "unit.o").replace(obj)
                 identity["object_sha256"] = sha256(obj)
@@ -303,10 +380,17 @@ class Build:
     def link(self, module_ids, name):
         output = self.folder / "bin" / name
         output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_name(output.name + ".link")
+        output.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
         objects = [str(self.folder / "obj" / f"{m}.o") for m in module_ids]
-        done = subprocess.run([self.cc, *objects, "-o", str(output), *self.ldflags],
-                              capture_output=True, text=True, check=False)
-        return {"ok": done.returncode == 0, "log": done.stderr[-8000:], "binary": str(output)}
+        done = self._run([self.cc, "--no-default-config", *objects, "-o", str(temporary), *self.ldflags], self.folder)
+        if done.returncode == 0:
+            temporary.replace(output)
+        else:
+            temporary.unlink(missing_ok=True)
+        return {"ok": done.returncode == 0, "log": done.stderr[-8000:],
+                "binary": str(output) if done.returncode == 0 else None}
 
 
 def link_blame(log, owners, module_ids):
@@ -526,7 +610,7 @@ class Queen:
     def compile_loop(self, mid, folder, source, contract, status):
         for attempt in range(self.compile_rounds + 1):
             result = self.build.compile(mid, source, contract)
-            status["compiled"] = {k: result[k] for k in ("source_sha256", "contract_sha256", "object_sha256") if k in result}
+            status["compiled"] = {k: result[k] for k in COMPILED_IDENTITY if k in result}
             status.setdefault("compiles", []).append({"ok": result["ok"], "errors": result["errors"][-1000:]})
             if result["ok"] and not result["warnings"].strip():
                 return result
@@ -541,8 +625,32 @@ class Queen:
 
     def repair(self, status, name, task, folder):
         answer = self.bee("repair", name, task, folder)
-        status["worker"] = answer.get("output") if answer.get("ok") else None
+        self.merge_worker(status, answer)
         return answer
+
+    def merge_worker(self, status, answer, *, all_functions=None):
+        report = answer.get("output") if answer.get("ok") else None
+        previous = status.get("worker") or {}
+        try:
+            if not isinstance(report, dict) or report.get("status") not in ("done", "partial", "blocked"):
+                raise ValueError
+            expected = {int(entry, 16) for entry in status["functions"]}
+            allowed = {int(entry, 16) for entry in all_functions} if all_functions is not None else expected
+            def rows(data, permitted):
+                result = {}
+                for row in data:
+                    entry = int(row["entry"], 0)
+                    if entry not in permitted or entry in result or row.get("status") not in ("rebuilt", "stub", "skipped"):
+                        raise ValueError
+                    result[entry] = row
+                return result
+            updates = {entry: row for entry, row in rows(report["functions"], allowed).items() if entry in expected}
+            merged = {} if set(updates) == expected else rows(previous.get("functions", []), expected)
+            for entry, row in updates.items():
+                merged[entry] = dict(merged.get(entry, {}), **row)
+            status["worker"] = {**previous, **report, "functions": list(merged.values())}
+        except (KeyError, TypeError, ValueError):
+            status["worker"] = None
 
     def complete_worker(self, status):
         report = status.get("worker") or {}
@@ -560,7 +668,8 @@ class Queen:
             source = self.out / "modules" / mid / self.lang.source(mid)
             return {"source_sha256": intake.snapshot(source)[1].sha256,
                     "contract_sha256": intake.snapshot(contract)[1].sha256,
-                    "object_sha256": sha256(self.build.folder / "obj" / f"{mid}.o")}
+                    "object_sha256": sha256(self.build.folder / "obj" / f"{mid}.o"),
+                    "compiler_sha256": self.build.compiler_sha256}
         except (OSError, intake.IntakeError):
             return None
 
@@ -652,7 +761,8 @@ class Queen:
         self.log(f"link: {'ok' if result['ok'] else 'FAILED'}")
         return result
 
-    def conformance(self, binary, modules, contract):
+    def conformance(self, binary, modules, contract, *, link=None):
+        link = link if link is not None else {"ok": True, "binary": binary}
         folder = self.out / "tests"
         folder.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(self.out / "survey" / "map.json", folder / "map.json")
@@ -685,8 +795,12 @@ class Queen:
             self.log(f"conformance round {round_number}: {len(same)}/{len(cases)} identical")
             if not different or round_number == self.behaviour_rounds:
                 break
-            rebuilt_binary = self.behaviour_fix(round_number + 1, cases, original, rebuilt, different, modules,
-                                                contract) or rebuilt_binary
+            repaired = self.behaviour_fix(round_number + 1, cases, original, rebuilt, different, modules, contract)
+            link.clear()
+            link.update(repaired)
+            if not link["ok"]:
+                return {"ran": False, "reason": "the current objects failed to relink after a behaviour fix"}
+            rebuilt_binary = link["binary"]
         (folder / "results.json").write_text(json.dumps({"original": original, "rebuilt": rebuilt}, indent=1))
         expected = {c["id"] for c in cases}
         complete = set(original) == set(rebuilt) == expected and all(
@@ -723,11 +837,9 @@ class Queen:
             if mid not in self.statuses:
                 continue
             status = self.statuses[mid]
-            report = answer.get("output") if answer.get("ok") else None
-            status["worker"] = dict(report, functions=[f for f in report.get("functions", [])
-                                      if f.get("entry") in status["functions"]]) if report else None
+            self.merge_worker(status, answer, all_functions=[entry for module in modules for entry in module["functions"]])
             compiled = self.build.compile(mid, path, contract)
-            status["compiled"] = {k: compiled[k] for k in ("source_sha256", "contract_sha256", "object_sha256") if k in compiled}
+            status["compiled"] = {k: compiled[k] for k in COMPILED_IDENTITY if k in compiled}
             module_folder = self.out / "modules" / mid
             if compiled["ok"]:
                 write_file(module_folder / path.name,
@@ -739,7 +851,7 @@ class Queen:
         self.log(f"behaviour fix {round_number}: {len(changed)} module(s) changed")
         result = self.build.link([m["id"] for m in modules if (self.out / "build" / "obj" / f"{m['id']}.o").is_file()],
                                  self.engine.file)
-        return result["binary"] if result["ok"] else None
+        return result
 
     def claims(self, modules):
         merged = []
@@ -779,6 +891,7 @@ class Queen:
         self.build.language = self.lang
         self.language_reasons = reasons
         self.log(f"language: {self.lang.label} ({'; '.join(reasons)})")
+        self.build.ensure_confinement()
         modules, skipped, contract = self.plan(program_map)
         names = contract_names(contract.read_text(encoding="utf-8"))
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
@@ -787,7 +900,7 @@ class Queen:
         link = self.integrate(modules, names, contract)
         conformance = {"ran": False, "reason": "not allowed: start with --run-original to run the original"}
         if self.run_original and link["ok"]:
-            conformance = self.conformance(link["binary"], modules, contract)
+            conformance = self.conformance(link["binary"], modules, contract, link=link)
         claims_path, claim_count = self.claims(modules)
         check = None
         if self.check and claim_count:
