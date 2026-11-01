@@ -90,8 +90,10 @@ class FakeBees:
                     (folder / f"{name_}.c").write_text(text)
             (folder / "claims.json").write_text(json.dumps({"file": "greet", "claims": [
                 {"id": "c1", "text": "t", "citations": [{"tool": "export_function", "args": {"entry": 1}, "id": FI}]}]}))
+            entries = {"m01": ["0x1040"], "m02": ["0x1000"]}
+            mids = list(self.repaired) if folder.parent.name == "fixes" else [mid]
             return {"ok": True, "seconds": 1, "output": {"status": "done", "functions": [
-                {"entry": "0x1", "status": "rebuilt"}]}}
+                {"entry": entry, "status": "rebuilt"} for unit in mids for entry in entries.get(unit, [])]}}
         if role == "councillor":
             mid = name.split("-")[0]
             if mid in self.refute_first and "-r1-" in name and name.endswith("-io"):
@@ -122,7 +124,8 @@ class QueenRunTests(unittest.TestCase):
     def queen(self, fake, *, rejected=0, **kwargs):
         def check(claims, out):
             count = len(json.loads(Path(claims).read_text())["claims"])
-            return {"claims": count, "confirmed": count - rejected, "rejected": rejected, "questions": 1}, []
+            return {"claims": count, "confirmed": count - rejected, "rejected": rejected, "questions": 1,
+                    "input_sha256": ["cd" * 32]}, []
         return queen.Queen(engine=FakeEngine(self.inputs), out=self.tmp / "run", bees=fake, slots=2,
                            check=check, **kwargs)
 
