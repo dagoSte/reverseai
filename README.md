@@ -217,6 +217,9 @@ and the ReverseAI engine itself stays model-free.
 Because the bees run on Claude Code, Anthropic's usage policies and cyber safeguards apply to
 them; a refused bee fails its task, and the run ends not accepted rather than passing silently.
 The engine, its command line and its MCP server use no model and are not affected.
+ReverseAI was built for defensive security work; rebuilding is for software whose licence
+permits it or whose copyright you hold, not for recompiling proprietary software (see the
+[responsible-use notice](#responsible-use-and-legal-notice)).
 
 | Program | Size | Functions rebuilt | Council | Evidence checker | Behaviour | Wall time |
 | --- | --- | --- | --- | --- | --- | --- |
