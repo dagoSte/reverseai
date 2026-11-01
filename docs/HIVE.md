@@ -38,7 +38,8 @@ Codex login. No API key is used.
    filesystem (`-ivfsoverlay`, no fallthrough): generated includes and include-existence queries
    can see only that stage and the compiler's system header directories. Other compilers are
    refused. Symlinked or hard-linked sources and contracts are refused. The queen checks both
-   the supplied and expanded generated code for inline assembly, `#embed`, `.incbin` and `dlopen`;
+   the supplied and expanded generated code for inline assembly, `#embed`, `.incbin`, `dlopen`
+   and linker-loading `#pragma comment` directives;
    generated source-location overrides are refused. Compiler messages go back to the builder,
    at most three times. A builder must report every assigned function rebuilt and status `done`.
 5. **Council.** Three councillors, each with a fresh context, review a renamed copy of the module

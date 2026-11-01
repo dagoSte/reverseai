@@ -266,6 +266,12 @@ class CompilerBoundaryTests(unittest.TestCase):
         result = self.compile('#include "contract.h"\nint main(void) { SAFE_NOP("nop"); return 0; }\n')
         self.assertFalse(result["ok"], result)
 
+    def test_generated_linker_pragmas_cannot_add_host_file_inputs(self):
+        for prefix in (f'#pragma comment(lib, "{self.secret}")\n',
+                       '_Pragma(' + json.dumps(f'comment(lib, "{self.secret}")') + ')\n'):
+            with self.subTest(prefix=prefix):
+                result = self.compile(prefix + 'int main(void) { return 0; }\n')
+                self.assertFalse(result["ok"], result)
     def test_planner_header_has_the_same_boundary(self):
         self.header.write_text(f'#include "{self.secret}"\n')
         ok, diagnostics = self.build.syntax(self.header)

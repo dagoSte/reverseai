@@ -36,7 +36,7 @@ from reverseai import intake
 ROOT = Path(__file__).resolve().parents[1]
 WARNINGS = ("-O1", "-Wall", "-Wextra", "-Wno-unused-parameter", "-fwrapv", "-fno-strict-aliasing")
 CFLAGS = (languages.C.standard, *WARNINGS)
-FORBIDDEN = re.compile(r"\b(?:asm|__asm__|__asm)\b|\.incbin|#\s*embed\b|\bdlopen\b")
+FORBIDDEN = re.compile(r"\b(?:asm|__asm__|__asm)\b|\.incbin|#\s*embed\b|\bdlopen\b|#\s*pragma\s+comment\b")
 PROTOTYPE = re.compile(r"([A-Za-z_]\w*)\s*\([^;{}]*\)\s*;\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
 LENSES = (
     ("control", "control flow and arithmetic: conditions, loops, integer widths, signedness, overflow, "
