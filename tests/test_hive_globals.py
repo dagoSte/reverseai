@@ -171,7 +171,11 @@ class NarrowGrammarTests(unittest.TestCase):
                   "extern struct { int a; } (settings); /* 0x5000 */\n",
                   "extern struct { int a; } * const settings; /* 0x5000 */\n",
                   "extern struct tagged { int a; } settings; /* 0x5000 */\n",
-                  "extern union { int a; float b; } settings[2]; /* 0x5000 */\n")
+                  "extern union { int a; float b; } settings[2]; /* 0x5000 */\n",
+                  'extern struct { char a[sizeof("}")]; } settings; /* 0x5000 */\n',
+                  "extern struct { char a['}' == 125 ? 1 : 2]; } settings; /* 0x5000 */\n",
+                  'extern struct { char a[sizeof("{")]; } settings; /* 0x5000 */\n',
+                  'extern struct { char a[sizeof("x")]; } settings; /* 0x5000 */\n')
 
     def test_unhandled_forms_are_problems_with_the_canonical_form(self):
         for text in self.UNREADABLE:
@@ -202,6 +206,23 @@ class NarrowGrammarTests(unittest.TestCase):
                 "extern \"C\" int main(int argc, char **argv); /* 0x1100 */\n")
         self.assertEqual(queen.contract_global_problems(text), [])
         self.assertEqual(queen.contract_globals(text), {0x5000: "counter", 0x5100: "inside"})
+
+    def test_literals_and_continued_directives_do_not_hide_a_global(self):
+        text = ("#define PAIR(a, b) \\\n  { a; b; }\n#define UNUSED(x) \\\n  ((void)(x))\n"
+                "extern int settings; /* 0x5000 */\n"
+                'extern const char *greeting; /* 0x5100 */\nstatic const char *odd = "}; /* 0x9999 */";\n'
+                "extern char separator; /* 0x5200 */\n")
+        self.assertEqual(queen.contract_global_problems(text), [])
+        self.assertEqual(queen.contract_globals(text), {0x5000: "settings", 0x5100: "greeting", 0x5200: "separator"})
+
+    def test_a_statement_the_scan_cannot_isolate_is_refused_not_dropped(self):
+        problems = queen.contract_global_problems("__attribute__((unused)) extern int counter; /* 0x5000 */\n")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("at 0x5000", problems[0])
+
+    def test_problems_quote_the_declaration_as_written(self):
+        problems = queen.contract_global_problems('extern struct { char a[sizeof("}")]; } settings; /* 0x5000 */\n')
+        self.assertIn('sizeof("}")', problems[0])
 
     def test_an_unannotated_inline_struct_is_not_a_problem(self):
         self.assertEqual(queen.contract_global_problems("extern struct { int a; } scratch;\n"), [])

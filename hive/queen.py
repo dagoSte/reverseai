@@ -48,7 +48,8 @@ PLAIN_DECLARATOR = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[\]\s*)*$")
 LAST_NAME = re.compile(r"\b([A-Za-z_]\w*)$")
 ADDRESS_COMMENT = re.compile(r"/\*\s*0x([0-9a-fA-F]+)\s*\*/")
 BLOCK_HEAD = re.compile(r'(?:\bextern\s*"C(?:\+\+)?"|\bnamespace(?:\s+[A-Za-z_]\w*)?|\))\s*\Z')  # before a block's {
-NOT_CODE = re.compile(r"/\*.*?\*/|//[^\n]*|^[ \t]*#[^\n]*(?:\\\n[^\n]*)*", re.S | re.M)  # comments, preprocessor
+NOT_CODE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*|^[ \t]*#(?:\\\r?\n|[^\n])*',
+                      re.S | re.M)  # string and character literals, comments, preprocessor lines (with continuations)
 DATA_REFERENCE_TYPES = frozenset({"read", "write", "read_write", "data"})
 QUALIFIERS = frozenset({"const", "volatile", "restrict", "__restrict", "_Atomic"})
 # Words that can never be a global's or a function's name in a contract declaration.
@@ -254,34 +255,45 @@ def _extern_kind(body):
 
 
 def _code_only(text):
-    """The text with comments and preprocessor lines blanked out; same length, so positions still match."""
+    """The text with comments and preprocessor lines blanked out, and the punctuation inside literals too (a "}" in a
+    string is not a brace); same length, so positions still match. Literal letters stay, so `extern "C"` is still read."""
     code = list(text)
     for match in NOT_CODE.finditer(text):
+        literal = match.group()[0] in "\"'"
         for index in range(match.start(), match.end()):
-            if code[index] != "\n":
+            character = code[index]
+            if character != "\n" and not (literal and (character.isalnum() or character in "_+\"'")):
                 code[index] = " "
     return "".join(code)
 
 
 def _annotated_statements(text):
-    """(statement, address) for every `...; /* 0xADDRESS */`: the whole statement the comment closes, braces included."""
+    """(statement, original, address, readable) for every `...; /* 0xADDRESS */`: the whole statement the comment closes,
+    braces included, as scanned and as written; readable is False when its braces do not balance, so the caller refuses
+    it instead of guessing."""
     code = _code_only(text)
     for match in ADDRESS_COMMENT.finditer(text):
+        if code[match.start():match.end()].strip():
+            continue  # inside a string literal, not a comment
         end = len(text[:match.start()].rstrip())
         if end == 0 or text[end - 1] != ";":
             continue
-        index = end - 2
+        index, readable = end - 2, True
         while index >= 0:
             character = code[index]
             if character in ";{":
                 break  # the previous statement, or the start of an enclosing block such as extern "C" { ... }
             if character == "}":
                 opening = _opening(code, index)
-                if opening < 0 or BLOCK_HEAD.search(code, 0, opening):
+                if opening < 0:
+                    readable = False
+                    break
+                if BLOCK_HEAD.search(code, 0, opening):
                     break  # an earlier extern "C" block, namespace or function body ends here
                 index = opening  # an inline type's body belongs to this statement
             index -= 1
-        yield " ".join(code[index + 1:end - 1].split()), int(match.group(1), 16)
+        yield (" ".join(code[index + 1:end - 1].split()), " ".join(text[index + 1:end - 1].split()),
+               int(match.group(1), 16), readable)
 
 
 def _opening(code, closing):
@@ -303,13 +315,18 @@ def _global_declarations(text):
     (`extern struct { ... } name;`) is unreadable: the planner is asked for a typedef. contract_global_problems sends
     every unreadable one back to the planner instead of losing it."""
     found = []
-    for statement, address in _annotated_statements(text):
-        if not re.match(r"extern\b", statement):
+    for statement, original, address, readable in _annotated_statements(text):
+        starts = re.match(r"extern\b", statement)
+        written = re.sub(r"^extern\b\s*", "", original)
+        if not readable or (not starts and re.search(r"\bextern\b", statement)):
+            found.append((None, address, written))  # the scan could not isolate it: refuse, never drop
+            continue
+        if not starts:
             continue
         body = statement[len("extern"):].strip()
         kind, name = ("unreadable", None) if "{" in body or "}" in body else _extern_kind(body)
         if kind != "function":
-            found.append((name, address, body))
+            found.append((name, address, written))
     return found
 
 
