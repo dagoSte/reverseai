@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -37,6 +38,12 @@ def owner(result):
 class PartitionTests(unittest.TestCase):
     def setUp(self):
         self.assertIsNotNone(partition, "Phase A partitioner is not implemented on the original base")
+
+    def valid_partition(self, source, **limits):
+        try:
+            return partition.partition(source, **limits)
+        except ValueError as error:
+            self.fail(f"valid map must partition instead of aborting: {error}")
 
     def check_bounds(self, source, result, count, size, summary):
         entries = [entry for group in result["groups"] for entry in group["functions"]]
@@ -113,11 +120,16 @@ class PartitionTests(unittest.TestCase):
         self.assertEqual(len(result["groups"]), 12)
         self.assertTrue(all(g["map"]["functions"][0]["signature"] == "é漢" * 80 for g in result["groups"]))
 
-    def test_impossible_singleton_is_explicit_instead_of_losing_evidence(self):
+    def test_large_string_row_has_an_oversized_group_and_full_side_file(self):
         source = program(1)
         source["strings"] = [{"from": "0x1000", "address": "0x8000", "text": "x" * 5000}]
-        with self.assertRaisesRegex(ValueError, r"0x1000.*[Bb]ytes"):
-            partition.partition(source, max_bytes=1000)
+        result = self.valid_partition(source, max_bytes=1000)
+        group = result["groups"][0]
+        self.assertTrue(group["oversized"])
+        self.assertLessEqual(group["bytes"], 1000)
+        detail = group["overflow"]["strings"]
+        self.assertEqual((detail["total"], detail["retained"], detail["deferred"]), (1, 0, 1))
+        self.assertEqual(result["side_files"][detail["file"]]["rows"], source["strings"])
         source = program(1)
         source["file"] = "x" * 2000
         with self.assertRaises(ValueError):
@@ -165,6 +177,8 @@ class PartitionTests(unittest.TestCase):
         source = program(24)
         source["strings"] = [{"from": f["hex"], "address": "0x8000", "text": "common"}
                              for f in source["functions"]]
+        source["strings"].append({"from": "0x1000", "address": "0x9000", "text": "manual" * 12000})
+        source["references"] = [{"from": "0xbeef", "to": "0xdead", "type": "DATA"}]
         script = ("import json,sys,hashlib; from hive.partition import partition,encode; "
                   "print(hashlib.sha256(encode(partition(json.load(sys.stdin),max_functions=5))).hexdigest())")
         digests = []
@@ -172,7 +186,8 @@ class PartitionTests(unittest.TestCase):
             env = dict(os.environ, PYTHONHASHSEED=seed)
             done = subprocess.run([sys.executable, "-B", "-c", script], env=env,
                                   cwd=Path(__file__).resolve().parents[1], input=json.dumps(source),
-                                  text=True, capture_output=True, timeout=20, check=True)
+                                  text=True, capture_output=True, timeout=20)
+            self.assertEqual(done.returncode, 0, done.stderr)
             digests.append(done.stdout.strip())
         self.assertEqual(digests[0], digests[1])
         self.assertEqual(len(digests[0]), hashlib.sha256().digest_size * 2)
@@ -205,7 +220,7 @@ class PartitionTests(unittest.TestCase):
         actual = {f["hex"]: f for g in result["groups"] for f in g["map"]["functions"]}
         self.assertEqual(actual, {f["hex"]: f for f in source["functions"]})
         self.assertEqual(result["summary"]["entry_points"], ["0x1020", "0x1030"])
-        self.assertEqual(result["summary"]["entry_hints"], ["0x1000"])
+        self.assertEqual(result["summary"]["entry_hints"], ["0x1000", "0x1010"])
         result["groups"][0]["map"]["functions"][0]["name"] = "changed"
         self.assertEqual(source, before)
 
@@ -237,6 +252,178 @@ class PartitionTests(unittest.TestCase):
                          sorted((r["from"], r["to"]) for r in cuts))
         self.assertGreaterEqual(len(result["groups"]), 47)
         self.assertLessEqual(len(result["groups"]), 100)
+
+    def test_reference_target_also_gets_the_full_reference_row(self):
+        source = program(4)
+        row = {"from": "0x1000", "to": "0x1030", "type": "DATA"}
+        source["references"] = [row]
+        result = partition.partition(source, max_functions=1)
+        self.check_bounds(source, result, 1, 65536, 8192)
+        by_entry = {g["functions"][0]: g["map"] for g in result["groups"]}
+        self.assertEqual(by_entry["0x1030"]["references"], [row])
+        self.assertEqual(by_entry["0x1000"]["references"], [row])
+        self.assertEqual(by_entry["0x1010"]["references"], [])
+
+    def test_explicit_entries_are_restricted_to_their_slice(self):
+        source = program(4)
+        source["entry_points"] = [f["hex"] for f in source["functions"]]
+        result = partition.partition(source, max_functions=1)
+        for group in result["groups"]:
+            self.assertEqual(group["map"]["entry_points"], group["functions"])
+
+    def test_declared_entry_is_excluded_from_hints(self):
+        source = program(1)
+        source["functions"][0]["name"] = "main"
+        source["entry_points"] = ["0x1000"]
+        result = partition.partition(source)
+        self.assertEqual(result["summary"]["entry_points"], ["0x1000"])
+        self.assertEqual(result["summary"]["entry_hints"], [])
+
+    def test_entry_name_and_roots_are_hints_not_declared_entries(self):
+        source = program(4)
+        source["functions"][0]["name"] = "main"
+        source["functions"][2]["name"] = "entry"
+        source["entry_points"] = ["0x1000"]
+        source["calls"] = [{"from": "0x1000", "to": "0x1010"},
+                           {"from": "0x1010", "to": "0x1000"},
+                           {"from": "0x1030", "to": "0x1020"}]
+        result = partition.partition(source)
+        self.assertEqual(result["summary"]["entry_points"], ["0x1000"])
+        self.assertEqual(result["summary"]["entry_hints"], ["0x1020", "0x1030"])
+
+    def test_call_affinity_wins_over_an_unrelated_shared_text(self):
+        source = program(4)
+        source["calls"] = [{"from": "0x1000", "to": "0x1020"}]
+        source["strings"] = [{"from": "0x1000", "address": "0x8000", "text": "shared"},
+                             {"from": "0x1010", "address": "0x9000", "text": "shared"}]
+        result = partition.partition(source, max_functions=2)
+        owners = owner(result)
+        self.assertEqual(owners["0x1000"], owners["0x1020"])
+        self.assertNotEqual(owners["0x1000"], owners["0x1010"])
+
+    def test_named_entry_hint_precedes_roots_in_a_small_summary(self):
+        source = program(200)
+        source["functions"][-1]["name"] = "entry"
+        result = partition.partition(source, max_functions=1, summary_bytes=512)
+        self.assertTrue(result["summary"]["entry_hints"])
+        self.assertEqual(result["summary"]["entry_hints"][0], source["functions"][-1]["hex"])
+        self.assertGreater(result["summary"]["omitted"]["entry_hints"], 0)
+
+    def test_high_fan_in_uses_an_isolated_group_and_exact_caller_group_counts(self):
+        source = program(1301)
+        hub = source["functions"][-1]["hex"]
+        source["calls"] = [{"from": f["hex"], "to": hub, "to_name": "helper", "at": f["entry"] + 1}
+                           for f in source["functions"][:-1]]
+        result = self.valid_partition(source)
+        self.check_bounds(source, result, 128, 65536, 8192)
+        group = next(g for g in result["groups"] if hub in g["functions"])
+        self.assertEqual(group["functions"], [hub])
+        self.assertTrue(group["oversized"])
+        self.assertEqual(result["summary"]["oversized"], 1)
+        detail = group["overflow"]["incoming_calls"]
+        self.assertEqual(detail["total"], 1300)
+        self.assertLessEqual(detail["retained"], 128)
+        self.assertEqual(detail["retained"] + detail["deferred"], 1300)
+        payload = result["side_files"][detail["file"]]
+        self.assertEqual(sorted(map(encoded, payload["rows"])), sorted(map(encoded, source["calls"])))
+        owners = owner(result)
+        expected = {}
+        for row in source["calls"]:
+            mid = owners[row["from"]]
+            expected[mid] = expected.get(mid, 0) + 1
+        self.assertEqual(payload["by_group"], expected)
+        self.assertEqual(len(result["cut_edges"]), 1300)
+        self.assertEqual(len(group["map"]["calls"]), detail["retained"])
+
+    def test_hugehelp_strings_are_counted_and_the_complete_file_is_written(self):
+        source = program(3)
+        source["strings"] = [{"from": "0x1010", "address": hex(0x100000 + i * 80),
+                              "text": "é" * 73 + str(i)} for i in range(5704)]
+        before = copy.deepcopy(source)
+        result = self.valid_partition(source)
+        self.check_bounds(source, result, 128, 65536, 8192)
+        group = next(g for g in result["groups"] if "0x1010" in g["functions"])
+        self.assertEqual(group["functions"], ["0x1010"])
+        self.assertTrue(group["oversized"])
+        detail = group["overflow"]["strings"]
+        self.assertEqual(detail["total"], 5704)
+        self.assertLessEqual(detail["retained"], 128)
+        self.assertEqual(detail["retained"], len(group["map"]["strings"]))
+        self.assertEqual(detail["deferred"], 5704 - detail["retained"])
+        with tempfile.TemporaryDirectory() as folder:
+            partition.write_side_files(result, folder)
+            raw = (Path(folder) / detail["file"]).read_bytes()
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), detail["sha256"])
+            self.assertEqual(sorted(map(encoded, json.loads(raw)["rows"])), sorted(map(encoded, source["strings"])))
+        self.assertEqual(source, before)
+
+    def test_incoming_and_string_sample_limits_also_obey_the_byte_cap(self):
+        source = program(4)
+        source["calls"] = [{"from": hex(0x3000 + i * 16), "to": "0x1030", "at": i, "to_name": "x" * 200}
+                           for i in range(15)]
+        source["strings"] = [{"from": "0x1030", "address": hex(0x8000 + i), "text": "x" * 500}
+                             for i in range(15)]
+        import inspect
+        self.assertIn("incoming_limit", inspect.signature(partition.partition).parameters)
+        self.assertIn("string_limit", inspect.signature(partition.partition).parameters)
+        result = self.valid_partition(source, max_bytes=1000, incoming_limit=2, string_limit=2)
+        group = next(g for g in result["groups"] if "0x1030" in g["functions"])
+        self.assertTrue(group["oversized"])
+        self.assertLessEqual(group["bytes"], 1000)
+        self.assertLessEqual(group["overflow"]["incoming_calls"]["retained"], 2)
+        self.assertLessEqual(group["overflow"]["strings"]["retained"], 2)
+        for limits in ({"incoming_limit": 0}, {"string_limit": True}):
+            with self.subTest(limits=limits), self.assertRaises(ValueError):
+                partition.partition(source, **limits)
+
+    def test_orphan_rows_are_preserved_and_counted_even_without_functions(self):
+        for count in (0, 2):
+            with self.subTest(functions=count):
+                source = program(count)
+                source["calls"] = [{"from": "0xbeef", "to": "0xdead", "at": 1}] * 2
+                source["strings"] = [{"from": "0xbeef", "address": "0x8000", "text": "manual" * 1000}]
+                source["references"] = [{"from": "0xbeef", "to": "0x9000", "type": "DATA"}]
+                source["data_refs"] = [{"from": "0xcafe", "to": "0xa000"}]
+                result = partition.partition(source)
+                self.assertIn("unattached", result)
+                for key in ("calls", "strings", "references", "data_refs"):
+                    self.assertEqual(result["unattached"][key], source[key])
+                    self.assertEqual(result["summary"]["unattached"][key], len(source[key]))
+                with tempfile.TemporaryDirectory() as folder:
+                    partition.write_side_files(result, folder)
+                    self.assertEqual(json.loads((Path(folder) / "unattached.json").read_text()), result["unattached"])
+
+    def test_all_irreducible_offenders_are_reported_together(self):
+        source = program(3)
+        source["functions"][0]["signature"] = "x" * 5000
+        source["functions"][2]["signature"] = "y" * 5000
+        with self.assertRaises(ValueError) as caught:
+            partition.partition(source, max_bytes=1000)
+        self.assertIn("0x1000", str(caught.exception))
+        self.assertIn("0x1020", str(caught.exception))
+        self.assertIn("bytes", str(caught.exception))
+
+    def test_malformed_map_rows_have_contextual_value_errors(self):
+        cases = [([], "map"), ({}, "functions"), ({"functions": None}, "functions"),
+                 ({"functions": [42]}, "functions"), ({"functions": [{}]}, "functions"),
+                 ({"functions": [], "calls": {}}, "calls"),
+                 ({"functions": [], "calls": ["bad"]}, "calls"),
+                 ({"functions": [], "calls": [{"from": "0x1000"}]}, "calls"),
+                 ({"functions": [], "strings": [{"from": "0x1000", "address": 8192, "text": 5}]}, "strings"),
+                 ({"functions": [], "strings": [{"from": "0x1000", "address": 8192, "text": "\ud800"}]}, "JSON"),
+                 ({"functions": [], "file": "\ud800"}, "JSON"),
+                 ({"functions": [], "imports": [1]}, "imports"),
+                 ({"functions": [], "entry_points": None}, "entry_points"),
+                 ({"functions": [], "extra": {1, 2}}, "JSON")]
+        for source, message in cases:
+            with self.subTest(source=repr(source)):
+                try:
+                    partition.partition(source)
+                except Exception as error:
+                    self.assertIs(type(error), ValueError, f"malformed input raised {type(error).__name__}")
+                    self.assertRegex(str(error), message)
+                else:
+                    self.fail("malformed input was accepted")
 
 
 if __name__ == "__main__":

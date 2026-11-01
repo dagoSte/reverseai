@@ -3,19 +3,24 @@
 ``partition`` returns lossless map slices, all directed cut calls, and a bounded
 summary. Count/byte caps take precedence over affinity: a connected component may
 be split. No function is classified or skipped; library/runtime metadata survives.
-Byte limits refer to ``encode(slice)`` (compact, sorted-key UTF-8 JSON). An
-indivisible function whose complete slice exceeds the cap raises ValueError.
-This module does not read files, execute programs or invoke a model.
+Byte limits refer to ``encode(slice)`` (compact, sorted-key UTF-8 JSON). Oversized
+singletons have bounded views and complete side-file payloads; write_side_files
+materializes them. No program execution or model invocation is performed.
 """
 
+import hashlib
 import json
 from collections import defaultdict
+from pathlib import Path
 
 
 def encode(value):
     """Canonical serialization used for the slice and summary byte budgets."""
-    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
-                      allow_nan=False).encode("utf-8")
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+                          allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, RecursionError) as error:
+        raise ValueError(f"invalid UTF-8 JSON: {error}") from None
 
 
 def _address(value):
@@ -33,17 +38,67 @@ def _entry(value):
     return _address(value.get("entry", value.get("hex"))) if isinstance(value, dict) else _address(value)
 
 
-def _summary(groups, cuts, declared, hints, budget):
+def _validate(source):
+    if not isinstance(source, dict):
+        raise ValueError("program map must be a JSON object")
+    if "functions" not in source:
+        raise ValueError("map.functions is required")
+    for key in ("functions", "calls", "strings", "references", "data_refs", "entry_points", "imports"):
+        if key in source and not isinstance(source[key], list):
+            raise ValueError(f"map.{key} must be a list")
+    for key in ("functions", "calls", "strings", "references", "data_refs"):
+        for index, row in enumerate(source.get(key, [])):
+            label = f"{key}[{index}]"
+            if not isinstance(row, dict):
+                raise ValueError(f"{label} must be an object")
+            fields = (("entry",) if "entry" in row else ("hex",)) if key == "functions" else (
+                "from", "address" if key == "strings" else "to")
+            for field in fields:
+                try:
+                    _address(row[field])
+                except (KeyError, ValueError):
+                    raise ValueError(f"{label}.{field} must contain a valid address") from None
+            if key == "strings" and not isinstance(row.get("text"), str):
+                raise ValueError(f"{label}.text must be a string")
+            if key == "functions" and "name" in row and not isinstance(row["name"], str):
+                raise ValueError(f"{label}.name must be a string")
+            if key == "calls" and row.get("to_name") is not None and not isinstance(row["to_name"], str):
+                raise ValueError(f"{label}.to_name must be a string or null")
+    if any(not isinstance(name, str) for name in source.get("imports", [])):
+        raise ValueError("map.imports must contain strings")
+    for index, entry in enumerate(source.get("entry_points", [])):
+        try:
+            _entry(entry)
+        except ValueError:
+            raise ValueError(f"entry_points[{index}] must contain a valid address") from None
+
+
+def write_side_files(result, folder):
+    """Write the complete JSON payloads referenced by oversized/orphan manifests."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    for name, payload in result["side_files"].items():
+        if Path(name).name != name or not name.endswith(".json"):
+            raise ValueError("invalid side-file name")
+        (folder / name).write_bytes(encode(payload))
+
+
+def _summary(groups, cuts, declared, hints, named_hints, unattached, budget):
+    hint_order = sorted(hints - declared)
     lists = {
-        "groups": [{"id": g["id"], "functions": len(g["functions"]), "bytes": g["bytes"]} for g in groups],
+        "groups": [{"id": g["id"], "functions": len(g["functions"]), "bytes": g["bytes"],
+                    **({"oversized": True} if g["oversized"] else {})} for g in groups],
         "cut_edges": [{k: c[k] for k in ("from", "to", "from_group", "to_group")} for c in cuts],
         "entry_points": [hex(e) for e in sorted(declared)],
-        "entry_hints": [hex(e) for e in sorted(hints - declared)],
+        "entry_hints": [hex(e) for e in hint_order if e in named_hints]
+                       + [hex(e) for e in hint_order if e not in named_hints],
     }
     result = {key: [] for key in lists}
     result["totals"] = {key: len(rows) for key, rows in lists.items()}
     result["totals"]["functions"] = sum(len(g["functions"]) for g in groups)
     result["omitted"] = {key: len(rows) for key, rows in lists.items()}
+    result["unattached"] = {key: len(rows) for key, rows in unattached.items()}
+    result["oversized"] = sum(g["oversized"] for g in groups)
     if len(encode(result)) > budget:
         raise ValueError("summary budget cannot hold its counts and omission labels")
     # Round-robin samples keep group sizes, entry points and cut edges represented.
@@ -62,7 +117,8 @@ def _summary(groups, cuts, declared, hints, budget):
     return result
 
 
-def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=8192):
+def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=8192,
+              incoming_limit=128, string_limit=128):
     """Group related functions within hard caps; return groups/cut_edges/summary.
 
     Function rows must have consistent unique numeric entry/hex addresses. Call
@@ -78,16 +134,22 @@ def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=
     address tie breaks. Remaining groups are packed in address order. This is a
     bounded deterministic heuristic, not a minimum-cut claim.
 
-    Summary entry_points are explicit metadata/flags; entry_hints are main/start
-    name hints, not proven executable entry points. Only summary samples may be
-    omitted, with exact totals. Complete slices and cut edges are never truncated.
+    Entry hints include entry/main/start names and functions without callers;
+    these are not proven entry points. Oversized singletons stay isolated. Their
+    bounded map view retains up to incoming_limit incoming calls and string_limit
+    strings (fewer if needed for bytes). The overflow manifest references complete
+    rows in side_files, with incoming counts per calling group. Unattached rows
+    also survive explicitly. Only the views are shortened, never the evidence.
+    Call write_side_files on the result to materialize the referenced JSON files.
     """
     for name, value in (("max_functions", max_functions), ("max_bytes", max_bytes),
-                        ("summary_bytes", summary_bytes)):
+                        ("summary_bytes", summary_bytes), ("incoming_limit", incoming_limit),
+                        ("string_limit", string_limit)):
         if type(value) is not int or value < 1:
             raise ValueError(f"{name} must be a positive integer")
     # Detach every output from the caller, while rejecting non-JSON/NaN inputs.
     source = json.loads(encode(program_map))
+    _validate(source)
     functions = {}
     for row in source["functions"]:
         entry = _entry(row)
@@ -101,7 +163,7 @@ def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=
     if source.get("entry_point") is not None:
         declared.add(_entry(source["entry_point"]))
     declared.update(e for e, f in functions.items() if f.get("is_entry") is True)
-    hints = {e for e, f in functions.items() if f.get("name") in ("main", "_main", "start", "_start")}
+    hints = {e for e, f in functions.items() if f.get("name") in ("entry", "main", "_main", "start", "_start")}
 
     tables = {key: sorted(source[key], key=encode)
               for key in ("calls", "strings", "references", "data_refs") if key in source}
@@ -130,6 +192,11 @@ def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=
         ordered = sorted(users)
         for a, b in zip(ordered, ordered[1:]):
             relate(a, b, 2 if kind == "text" else 3)
+    named_hints = set(hints)
+    hints.update(known - {_address(row["to"]) for row in tables.get("calls", [])})
+    assigned = set().union(*attached.values()) if attached else set()
+    unattached = {key: [row for i, row in enumerate(values) if (key, i) not in assigned]
+                  for key, values in tables.items()}
 
     def slice_map(entries, row_ids):
         result = dict(source)
@@ -147,6 +214,7 @@ def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=
     parent = {e: e for e in known}
     members = {e: {e} for e in known}
     rows = {e: attached[e] for e in known}
+    oversized, full_rows, original_bytes = set(), {}, {}
 
     def root(e):
         while parent[e] != e:
@@ -155,6 +223,8 @@ def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=
         return e
 
     def merge(a, b):
+        if a in oversized or b in oversized:
+            return False
         entries = members[a] | members[b]
         if len(entries) > max_functions:
             return False
@@ -167,10 +237,33 @@ def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=
         del members[b], rows[b]
         return True
 
+    offenders = []
     for e in sorted(known):
         needed = len(encode(slice_map({e}, rows[e])))
-        if needed > max_bytes:
-            raise ValueError(f"function {hex(e)} needs {needed} bytes; max_bytes is {max_bytes}")
+        if needed <= max_bytes:
+            continue
+        oversized.add(e)
+        full_rows[e], original_bytes[e] = rows[e], needed
+        incoming = sorted((key, i) for key, i in rows[e] if key == "calls"
+                          and _address(tables[key][i]["from"]) != e)
+        strings = sorted((key, i) for key, i in rows[e] if key == "strings")
+        retained = rows[e] - set(incoming) - set(strings)
+        core_bytes = len(encode(slice_map({e}, retained)))
+        if core_bytes > max_bytes:
+            offenders.append(f"{hex(e)} needs {core_bytes} core bytes (original {needed})")
+            continue
+        for candidates, limit in ((incoming, incoming_limit), (strings, string_limit)):
+            lo, hi = 0, min(len(candidates), limit)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if len(encode(slice_map({e}, retained | set(candidates[:mid])))) <= max_bytes:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            retained.update(candidates[:lo])
+        rows[e] = retained
+    if offenders:
+        raise ValueError(f"irreducible slices exceed max_bytes={max_bytes}: " + "; ".join(offenders))
     for (a, b), weight in sorted(affinity.items(), key=lambda item: (-item[1], item[0])):
         a, b = root(a), root(b)
         if a != b:
@@ -186,12 +279,38 @@ def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=
         # Separate slices may touch the same row; give each its own JSON objects.
         data = encode(slice_map(entries, rows[e]))
         groups.append({"id": mid, "functions": [hex(a) for a in sorted(entries)],
-                       "map": json.loads(data), "bytes": len(data)})
+                       "map": json.loads(data), "bytes": len(data), "oversized": e in oversized})
         owners.update((a, mid) for a in entries)
     cuts = []
     for row in tables.get("calls", []):
         a, b = _address(row["from"]), _address(row["to"])
         if a in known and b in known and owners[a] != owners[b]:
             cuts.append({**row, "from_group": owners[a], "to_group": owners[b]})
-    summary = _summary(groups, cuts, declared, hints, summary_bytes)
-    return {"groups": groups, "cut_edges": cuts, "summary": summary, "summary_bytes": len(encode(summary))}
+    side_files = {}
+    if any(unattached.values()):
+        side_files["unattached.json"] = unattached
+    for group in groups:
+        e = _address(group["functions"][0])
+        if e not in oversized:
+            continue
+        group["original_bytes"], group["overflow"] = original_bytes[e], {}
+        for kind, table in (("incoming_calls", "calls"), ("strings", "strings")):
+            selected = [(key, i) for key, i in sorted(full_rows[e]) if key == table
+                        and (table != "calls" or _address(tables[key][i]["from"]) != e)]
+            retained = sum(item in rows[e] for item in selected)
+            if retained == len(selected):
+                continue
+            payload = {"rows": [tables[key][i] for key, i in selected]}
+            if kind == "incoming_calls":
+                counts = defaultdict(int)
+                for row in payload["rows"]:
+                    counts[owners.get(_address(row["from"]), "unattached")] += 1
+                payload["by_group"] = dict(sorted(counts.items()))
+            filename = f"{group['id']}-{kind}.json"
+            side_files[filename] = payload
+            group["overflow"][kind] = {"file": filename, "total": len(selected), "retained": retained,
+                                       "deferred": len(selected) - retained,
+                                       "sha256": hashlib.sha256(encode(payload)).hexdigest()}
+    summary = _summary(groups, cuts, declared, hints, named_hints, unattached, summary_bytes)
+    return {"groups": groups, "cut_edges": cuts, "summary": summary, "summary_bytes": len(encode(summary)),
+            "unattached": unattached, "side_files": side_files}
