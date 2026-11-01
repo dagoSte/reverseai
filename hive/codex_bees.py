@@ -113,7 +113,8 @@ class CodexBees:
     """One non-interactive Codex process and ReverseAI MCP server per named bee."""
 
     def __init__(self, *, engine, inputs, enabled=("ghidra",), codex="codex", model=None, effort=None,
-                 timeout=2400, python=sys.executable, config_dir, allow_network=False):
+                 timeout=2400, python=sys.executable, config_dir, allow_network=False, env=None):
+        self.env = env  # None inherits this process's environment; hive.selfhost sets a self-hosted one
         self.engine, self.inputs = str(Path(engine).resolve()), str(Path(inputs).resolve())
         self.enabled, self.codex, self.model = tuple(enabled), codex, model
         self.effort, self.timeout, self.python = effort, timeout, str(python)
@@ -153,7 +154,7 @@ class CodexBees:
         return [*argv, "-"]
 
     def _execute(self, role, name, task, folder, *, schema=None):
-        completed = subprocess.run(self.argv(role, name, folder, schema=schema), input=task, cwd=folder,
+        completed = subprocess.run(self.argv(role, name, folder, schema=schema), input=task, cwd=folder, env=self.env,
                                    capture_output=True, text=True, timeout=self.timeout, check=False)
         if completed.returncode:
             failures = failure_messages(completed.stdout)
@@ -256,12 +257,16 @@ def add_arguments(parser):
     parser.add_argument("--codex-effort", help="Reasoning effort for Codex bees")
     parser.add_argument("--codex-allow-network", action="store_true",
                         help="Accept Codex network access: skip the isolation probe and warn on every bee result")
+    from hive import selfhost
+    selfhost.add_arguments(parser)
 
 
 def build(args, claude_runner, **runner_kwargs):
     """Build from CLI options; kwargs are CodexBees' shared engine/input/config settings."""
+    from hive import selfhost
+    runner, extra = selfhost.apply(args, claude_runner)
     if args.bee_policy == "claude":
         return claude_runner
-    codex = CodexBees(**dict(runner_kwargs, codex=args.codex, model=args.codex_model, effort=args.codex_effort,
-                             allow_network=args.codex_allow_network))
+    codex = runner(**dict(runner_kwargs, codex=args.codex, model=args.codex_model, effort=args.codex_effort,
+                          allow_network=args.codex_allow_network), **extra)
     return codex if args.bee_policy == "codex" else MixedBees(claude_runner, codex, args.bee_policy)
