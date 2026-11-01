@@ -1,6 +1,8 @@
 import json
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -54,6 +56,34 @@ class RecogniseTests(unittest.TestCase):
             self.assertNotIn("refused", runner("worker", "w", "task", tmp))
 
 
+class CodexDiagnosticTests(unittest.TestCase):
+    """The whole Codex diagnostic is classified, not only the 240 characters kept for the report."""
+
+    def call(self, stdout="", stderr=""):
+        tmp = Path(tempfile.mkdtemp())
+        runner = codex_bees.CodexBees(engine=tmp, inputs=tmp, config_dir=tmp / "cfg", allow_network=True)
+        with mock.patch.object(codex_bees.subprocess, "run", return_value=completed(stdout, stderr, 1)):
+            return runner("worker", "w", "task", tmp)
+
+    def test_a_refusal_far_from_the_tail_of_stderr_is_marked(self):
+        answer = self.call(stderr=USAGE_POLICY + "\n" + "retrying the stream\n" * 200)
+        self.assertTrue(answer["refused"])
+        self.assertIn("Usage Policy", answer["error"])
+
+    def test_a_refusal_in_a_failed_turn_event_is_marked(self):
+        events = [{"type": "thread.started"}, {"type": "turn.failed", "error": {"message": CYBER}}]
+        answer = self.call(stdout="\n".join(json.dumps(e) for e in events), stderr="x" * 2000)
+        self.assertTrue(answer["refused"])
+
+    def test_refusal_words_in_tool_output_are_not_a_refusal(self):
+        events = [{"type": "item.completed", "item": {"type": "command_execution",
+                                                       "aggregated_output": "strings: content filter, usage policy"}},
+                  {"type": "turn.failed", "error": {"message": "rate limited"}}]
+        answer = self.call(stdout="\n".join(json.dumps(e) for e in events))
+        self.assertNotIn("refused", answer)
+        self.assertIn("rate limited", answer["error"])
+
+
 class QueenTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -89,6 +119,50 @@ class QueenTests(unittest.TestCase):
             self.hive({"planner"}).run()
         self.assertIn("refused the planner", str(raised.exception))
         self.assertEqual(self.calls, ["planner"])
+
+    def test_a_refused_planner_writes_a_not_started_verdict(self):
+        run = self.tmp / "run"
+        run.mkdir()
+        (run / "result.json").write_text(json.dumps({"verdict": "accepted"}))  # an earlier, accepted run
+        (run / "REPORT.md").write_text("**Verdict: accepted.** every check passed.\n")
+        with self.assertRaises(queen.ProviderRefused):
+            self.hive({"planner"}).run()
+        result = json.loads((run / "result.json").read_text())
+        self.assertEqual(result["verdict"], "not started")
+        self.assertIn("refused the planner", result["reason"])
+        self.assertEqual([r["bee"] for r in result["refusals"]], ["planner"])
+        report = (run / "REPORT.md").read_text()
+        self.assertIn("Verdict: not started", report)
+        self.assertNotIn("accepted.", report)
+        self.assertIn("Provider refusals: 1 (planner)", report)
+
+    def test_a_bee_queued_for_a_slot_does_not_start_after_the_limit(self):
+        hive = self.hive(set())  # default limit: 3 refusals
+        folder = self.tmp / "bees"
+        folder.mkdir()
+        (self.tmp / "run").mkdir(exist_ok=True)
+        calls = []
+
+        def provider(role, name, task, where):
+            calls.append(name)
+            if name == "last":  # hold the only slot until the next bee is queued behind it
+                deadline = time.monotonic() + 5
+                while hive.spent["bees"] < 4 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            return {"ok": False, "refused": True, "error": USAGE_POLICY, "seconds": 1}
+        hive.bees = provider
+        hive.bee("worker", "first", "t", folder)
+        hive.bee("worker", "second", "t", folder)
+        holder = threading.Thread(target=hive.bee, args=("worker", "last", "t", folder))
+        holder.start()
+        while "last" not in calls:
+            time.sleep(0.01)
+        queued = hive.bee("worker", "queued", "t", folder)
+        holder.join()
+        self.assertEqual(calls, ["first", "second", "last"])
+        self.assertIn("run stopped", queued["error"])
+        self.assertEqual(hive.spent["bees"], 3)  # a bee that never started is not counted
+        self.assertEqual(len(hive.refusals), 3)
 
     def test_refusals_over_the_limit_stop_new_bees_and_are_reported(self):
         result = self.hive({"worker"}, refusal_limit=1).run()
