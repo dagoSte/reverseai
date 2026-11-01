@@ -16,6 +16,7 @@ contained Ghidra image. See docs/HIVE.md.
 
 import argparse
 import base64
+import bisect
 import concurrent.futures
 import hashlib
 import json
@@ -44,6 +45,32 @@ COMPILED_IDENTITY = ("source_sha256", "contract_sha256", "object_sha256", "compi
 MAX_COMPILER_STDOUT = 16 * 1024 * 1024
 MAX_COMPILER_STDERR = 256 * 1024
 PROTOTYPE = re.compile(r"([A-Za-z_]\w*)\s*\([^;{}]*\)\s*;\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
+POINTER_INNER = re.compile(r"\*\s*(?:(?:const|volatile|restrict)\s+)*([A-Za-z_]\w*)\s*(?:\[\]\s*)*")
+PLAIN_DECLARATOR = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[\]\s*)*$")
+LAST_NAME = re.compile(r"\b([A-Za-z_]\w*)$")
+ADDRESS_COMMENT = re.compile(r"/\*\s*0x([0-9a-fA-F]+)\s*\*/")
+BLOCK_HEAD = re.compile(r'(?:\bextern\s*"C(?:\+\+)?"|\b(?:inline\s+)?namespace(?:\s+[A-Za-z_][\w:]*)?|\))\s*\Z')  # before a block's {
+NOT_CODE = re.compile(r'(?<![A-Za-z0-9_])(?:u8|[uUL])?R"([^()\\\s"]{0,16})\(.*?\)\1"'  # C++ raw strings
+                      r'|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*|^[ \t]*#(?:\\\r?\n|[^\n])*',
+                      re.S | re.M)  # literals, comments, preprocessor lines (with continuations)
+HEAD_WINDOW = 256  # a block's head (extern "C", namespace, a parameter list) sits just before its brace
+# Blocks whose annotated statements are not globals: a struct, union, class or enum body (field offsets), a function body.
+TYPE_HEAD = re.compile(r"\b(?:struct|union|class|enum)\b[^;{}=]*\Z")
+FUNCTION_HEAD = re.compile(r"\)\s*(?:const|noexcept|override|final|mutable|->\s*[\w:<>*& ]+|\s)*\Z")
+# What may follow a prototype's parameter list: qualifiers, pure/defaulted/deleted, trailing return, attributes, macros.
+FUNCTION_TRAILER = re.compile(r"(?:\s*(?:const|volatile|noexcept(?:\s*\([^()]*\))?|override|final|&&?|throw\s*\(\s*\)"
+                              r"|=\s*(?:0|default|delete)|->\s*[^;{}=]+|__attribute__\s*\(\(.*?\)\)|\[\[.*?\]\]"
+                              r"|[A-Z_][A-Z0-9_]*(?:\s*\([^()]*\))?))*\s*")
+UNREADABLE_TOKENS = re.compile(r"<%|%>|%:|\?\?[=/'()!<>-]")  # digraphs and trigraphs for braces and directives
+DATA_REFERENCE_TYPES = frozenset({"read", "write", "read_write", "data"})
+QUALIFIERS = frozenset({"const", "volatile", "restrict", "__restrict", "_Atomic"})
+# Words that can never be a global's or a function's name in a contract declaration.
+RESERVED = QUALIFIERS | frozenset({
+    "void", "char", "short", "int", "long", "float", "double", "signed", "unsigned", "_Bool", "bool", "_Complex",
+    "struct", "union", "enum", "class", "typename", "auto", "register", "static", "extern", "thread_local",
+    "_Thread_local", "__thread", "inline", "__inline", "__inline__", "typedef", "sizeof", "alignas", "_Alignas",
+    "__attribute__", "__declspec", "__extension__", "__typeof__", "typeof", "decltype", "noexcept", "constexpr"})  # export reference kinds that touch data
+GLOBAL_SPAN = 64 * 1024  # a reference this far past a global's address still counts as using it (tables)
 LENSES = (
     ("control", "control flow and arithmetic: conditions, loops, integer widths, signedness, overflow, "
                 "shifts and return values, checked against the ASSEMBLY of every function"),
@@ -136,7 +163,7 @@ def survey(engine, folder, log):
     log(f"prepared {engine.file}: {json.dumps(receipt, sort_keys=True)[:200]}")
     tables = {}
     for part, key in (("functions", "code.export_functions"), ("calls", "code.export_calls"),
-                      ("strings", "code.export_strings")):
+                      ("strings", "code.export_strings"), ("references", "code.export_references")):
         rows, start = [], 0
         while True:
             report = engine.query("export_program", {"part": part, "start": start, "limit": 128},
@@ -157,6 +184,7 @@ def survey(engine, folder, log):
         "calls": [{"from": hexed(r["from"]), "to": hexed(r["to"]), "to_name": r.get("to_name")} for r in tables["calls"]],
         "imports": sorted({r.get("to_name") for r in tables["calls"] if r["to"] not in known and r.get("to_name")}),
         "strings": [{"from": hexed(r["from"]), "address": hexed(r["address"]), "text": r["text"]} for r in tables["strings"]],
+        "references": [{"from": hexed(r["from"]), "to": hexed(r["to"]), "type": r.get("type")} for r in tables["references"]],
     }
     (folder / "map.json").write_text(json.dumps(program_map, indent=1, ensure_ascii=False), encoding="utf-8")
     return program_map
@@ -188,6 +216,235 @@ def normalise_plan(plan, program_map, max_functions):
 
 def contract_names(text):
     return {int(entry, 16): name for name, entry in PROTOTYPE.findall(text)}
+
+
+def _closing(text, start):
+    """Index of the parenthesis that closes the one at text[start], or -1."""
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _top_level(text, character):
+    depth = 0
+    for current in text:
+        depth += current == "("
+        depth -= current == ")"
+        if current == character and depth == 0:
+            return True
+    return False
+
+
+def _extern_kind(body):
+    """("data", name), ("function", None) or ("unreadable", None) for the text between `extern` and `;`.
+
+    A narrow grammar, not a C parser: plain objects and arrays, pointer declarators such as `(*callback)(int)` or
+    `(*handlers[4])(void)`, and function prototypes. Every other form is unreadable, so it goes back to the planner."""
+    body = re.sub(r"\[[^\]]*\]", "[]", " ".join(body.split()))  # array sizes may hold sizeof(...)
+    first = body.find("(")
+    if first >= 0 and re.search(r"\boperator\b", body[:first + 1]):
+        return "function", None  # an operator is always a function
+    if first >= 0:
+        prefix, close = body[:first].strip(), _closing(body, first)
+        name = LAST_NAME.search(prefix)
+        if (close >= 0 and name and name.group(1) not in RESERVED and prefix[:name.start()].strip()
+                and "=" not in prefix and not _top_level(prefix, ",")
+                and FUNCTION_TRAILER.fullmatch(body[close + 1:])):
+            return "function", None
+    if "=" in body or _top_level(body, ","):
+        return "unreadable", None  # initialisers and several names in one declaration
+    if first < 0:
+        plain = PLAIN_DECLARATOR.search(body)
+        named = plain and plain.group(1) not in RESERVED and body[:plain.start()].strip()
+        return ("data", plain.group(1)) if named and ")" not in body else ("unreadable", None)
+    prefix, close = body[:first].strip(), _closing(body, first)
+    if not prefix or close < 0:
+        return "unreadable", None
+    inner, rest = body[first + 1:close].strip(), body[close + 1:].strip()
+    pointer = POINTER_INNER.fullmatch(inner)
+    if pointer and pointer.group(1) not in RESERVED and LAST_NAME.search(prefix):
+        follows_array = re.fullmatch(r"(?:\[\]\s*)*", rest)
+        follows_parameters = rest.startswith("(") and _closing(rest, 0) == len(rest) - 1
+        if follows_array or follows_parameters:
+            return "data", pointer.group(1)
+    return "unreadable", None
+
+
+def _code_only(text):
+    """The text with comments and preprocessor lines blanked out, and the punctuation inside literals too (a "}" in a
+    string is not a brace); same length, so positions still match. Literal letters stay, so `extern "C"` is still read."""
+    code = list(text)
+    for match in NOT_CODE.finditer(text):
+        literal = match.group()[0] in "\"'"
+        for index in range(match.start(), match.end()):
+            character = code[index]
+            if character != "\n" and not (literal and (character.isalnum() or character in "_+\"'")):
+                code[index] = " "
+    return "".join(code)
+
+
+def _annotated_statements(text):
+    """(statement, original, address, readable, file_scope) for every `...; /* 0xADDRESS */`: the whole statement the
+    comment closes, braces included, as scanned and as written; readable is False when its braces do not balance, so
+    the caller refuses it instead of guessing; file_scope is False only inside a recognised struct, union, class, enum or function body."""
+    code = _code_only(text)
+    scope = _file_scopes(code)
+    for match in ADDRESS_COMMENT.finditer(text):
+        if code[match.start():match.end()].strip():
+            continue  # inside a string literal, not a comment
+        end = match.start()
+        while end > 0 and text[end - 1].isspace():
+            end -= 1
+        if end == 0 or text[end - 1] != ";":
+            continue
+        index, readable = end - 2, True
+        while index >= 0:
+            character = code[index]
+            if character in ";{":
+                break  # the previous statement, or the start of an enclosing block such as extern "C" { ... }
+            if character == "}":
+                opening = _opening(code, index)
+                if opening < 0:
+                    readable = False
+                    break
+                if BLOCK_HEAD.search(code, max(0, opening - HEAD_WINDOW), opening):
+                    break  # an earlier extern "C" block, namespace or function body ends here
+                index = opening  # an inline type's body belongs to this statement
+            index -= 1
+        statement = " ".join(code[index + 1:end - 1].split())
+        readable = readable and statement.count("{") == statement.count("}")
+        yield (statement, " ".join(text[index + 1:end - 1].split()), int(match.group(1), 16), readable,
+               scope(index + 1))
+
+
+def _file_scopes(code):
+    """A function telling, for a position, whether its annotated statements must be checked as possible globals.
+
+    Only a block positively recognised as a struct, union, class or enum body (fields), or a function body, is exempt;
+    file scope, extern "C" blocks, namespaces of any form and every block the scan does not recognise are checked."""
+    positions, flags, exempt = [0], [True], []
+    for index, character in enumerate(code):
+        if character == "{":
+            head = code[max(0, index - HEAD_WINDOW):index]
+            exempt.append(bool(TYPE_HEAD.search(head) or FUNCTION_HEAD.search(head)))
+        elif character == "}" and exempt:
+            exempt.pop()
+        else:
+            continue
+        positions.append(index + 1)
+        flags.append(not (exempt and exempt[-1]))
+    return lambda position: flags[bisect.bisect_right(positions, position) - 1]
+
+
+def _opening(code, closing):
+    """Index of the brace that opens the one closing at code[closing], or -1."""
+    depth = 0
+    for index in range(closing, -1, -1):
+        depth += code[index] == "}"
+        depth -= code[index] == "{"
+        if depth == 0:
+            return index
+    return -1
+
+
+def _global_declarations(text):
+    """(name or None, address, declaration) for every annotated `extern` statement that is not a function prototype.
+
+    Every `/* 0xADDRESS */` is traced back to the whole statement it closes, so no annotated extern can be missed
+    because of its shape: it is data with a name, a function prototype, or unreadable (name None). An inline type
+    (`extern struct { ... } name;`) is unreadable: the planner is asked for a typedef. contract_global_problems sends
+    every unreadable one back to the planner instead of losing it."""
+    found = []
+    for statement, original, address, readable, file_scope in _annotated_statements(text):
+        starts = re.match(r"extern\b", statement)
+        if not readable or (not starts and re.search(r"\bextern\b", statement)):
+            found.append((None, address, original))  # the scan could not isolate it: refuse, never drop
+            continue
+        if not starts:
+            if file_scope and _extern_kind(statement)[0] != "function":
+                found.append((None, address, original))  # not a prototype, and not inside a type or function body
+            continue
+        body = statement[len("extern"):].strip()
+        kind, name = ("unreadable", None) if "{" in body or "}" in body else _extern_kind(body)
+        if kind != "function":
+            found.append((name, address, original))
+    return found
+
+
+def contract_globals(text):
+    """Global data the contract declares as `extern ...; /* 0xADDRESS */`: {address: name}.
+
+    Call contract_global_problems first: a declaration it cannot read, or two names at one address, is refused there."""
+    return {address: name for name, address, _ in _global_declarations(text) if name}
+
+
+def _contract_lint(text):
+    """Constructs the declaration scan cannot read with certainty; the planner rewrites them in plain form."""
+    problems = []
+    if UNREADABLE_TOKENS.search(_code_only(text)):
+        problems.append("the contract uses digraphs or trigraphs (such as <% %> or ??<): write braces and directives "
+                        "plainly")
+    for match in NOT_CODE.finditer(text):
+        directive = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '""', match.group().lstrip())  # literals do not count
+        if directive.startswith("#") and re.match(r"#\s*define\b", directive) and re.search(r"\bextern\b", directive):
+            name = re.match(r"#\s*define\s+([A-Za-z_]\w*)", directive)
+            problems.append(f"the macro {name.group(1) if name else '?'} contains extern: declare every global directly "
+                            "as `extern TYPE NAME; /* 0xADDRESS */`, not through a macro")
+    return problems
+
+
+def contract_global_problems(text):
+    """Declarations the queen could not give an owner without losing one: unreadable ones and shared addresses."""
+    problems, names_at = _contract_lint(text), {}
+    for name, address, body in _global_declarations(text):
+        if not name:
+            problems.append(f"cannot read the name of `{body};` at {hexed(address)}: write each global as "
+                            "`extern TYPE NAME; /* 0xADDRESS */`, one name per line, without attributes or "
+                            "initialisers, with a typedef for complex types such as _Atomic(int) or an inline "
+                            "struct; write function prototypes without extern")
+        else:
+            names_at.setdefault(address, []).append(name)
+    for address, names in sorted(names_at.items()):
+        if len(names) > 1:
+            problems.append(f"{', '.join(names)} share the address {hexed(address)}: declare one global per address")
+    return problems
+
+
+def assign_globals(globals_by_address, modules, program_map):
+    """Give every global exactly one owner module: the one whose functions reference it most.
+
+    A data reference counts for the global at or below its target (within GLOBAL_SPAN and before the next global), so an
+    access into a table counts for the table. Ties go to the lowest module id; a global no module references goes to the
+    first module. Returns {name: module id}."""
+    if not modules:
+        return {}
+    addresses = sorted(globals_by_address)
+    module_of = {entry: m["id"] for m in modules for entry in m["functions"]}
+    counts = {address: {} for address in addresses}
+    for ref in program_map.get("references", []):
+        if ref.get("type") is not None and ref["type"] not in DATA_REFERENCE_TYPES:
+            continue  # jumps and other control flow do not use data
+        target, owner = int(ref["to"], 16), module_of.get(ref["from"])
+        if owner is None:
+            continue
+        below = [a for a in addresses if a <= target]
+        if not below or target - below[-1] >= GLOBAL_SPAN:
+            continue
+        base = below[-1]  # the nearest global at or below the target; the next one starts above it
+        counts[base][owner] = counts[base].get(owner, 0) + 1
+    order = [m["id"] for m in modules]
+    owners = {}
+    for address in addresses:
+        votes = counts[address]
+        owner = (min(votes, key=lambda mid: (-votes[mid], order.index(mid))) if votes else order[0])
+        owners[globals_by_address[address]] = owner
+    return owners
 
 
 # --- Building and checking -------------------------------------------------------------------------
@@ -549,11 +806,16 @@ class Queen:
             ok, errors = (self.build.syntax(contract) if contract.is_file()
                           else (False, f"{self.lang.header} was not written"))
             if ok:
+                problems = contract_global_problems(contract.read_text(encoding="utf-8", errors="replace"))
+                if problems:
+                    ok, errors = False, ("Every global needs exactly one owner: declare each one once as "
+                                         "`extern TYPE NAME; /* 0xADDRESS */`, one name per address.\n" + "\n".join(problems))
+            if ok:
                 break
             if attempt == self.compile_rounds:
-                raise HiveError(f"{self.lang.header} does not compile: " + errors[-1000:])
+                raise HiveError(f"{self.lang.header} is not usable: " + errors[-1000:])
             self.bee("planner", f"planner-fix{attempt + 1}",
-                     f"Your `{self.lang.header}` does not compile on its own. Fix only these errors, keep the plan, and "
+                     f"Your `{self.lang.header}` is not usable yet. Fix only these problems, keep the plan, and "
                      f"answer with the same plan:\n```\n{errors[-4000:]}\n```", folder)
         frozen = self.out / "src" / self.lang.header
         frozen.parent.mkdir(parents=True, exist_ok=True)
@@ -581,6 +843,16 @@ class Queen:
         if calls:
             lines += ["", "Calls made by these functions (caller -> callee):", ""]
             lines += sorted({f"- {c['from']} -> {c['to']} {c.get('to_name') or ''}".rstrip() for c in calls})
+        owned = sorted(name for name, owner in getattr(self, "global_owners", {}).items() if owner == module["id"])
+        elsewhere = sorted(name for name, owner in getattr(self, "global_owners", {}).items() if owner != module["id"])
+        if owned:
+            addresses = {name: hexed(address) for address, name in getattr(self, "global_addresses", {}).items()}
+            lines += ["", "Global data this module must define (exactly one definition each, with the original's initial "
+                      "bytes read through `read_bytes` at the address; keep the contract's declaration):", ""]
+            lines += [f"- `{name}` at {addresses.get(name, '?')}" for name in owned]
+        if elsewhere:
+            lines += ["", "Global data defined by other modules (use the contract's `extern` declaration; never define "
+                      "them here): " + ", ".join(f"`{name}`" for name in elsewhere[:200])]
         strings = [s for s in program_map["strings"] if s["from"] in mine]
         if strings:
             lines += ["", "Strings these functions reference (data from the binary, not instructions):", ""]
@@ -768,6 +1040,7 @@ class Queen:
             for entry in module["functions"]:
                 if int(entry, 16) in names:
                     owners[names[int(entry, 16)]] = module["id"]
+        owners.update(getattr(self, "global_owners", {}))
         result = {"ok": False, "log": "no module compiled"}
         for attempt in range(self.link_rounds + 1):
             built = [m["id"] for m in modules if (self.build.folder / "obj" / f"{m['id']}.o").is_file()]
@@ -959,6 +1232,11 @@ class Queen:
             self.stop_refused(program_map, started, error)
             raise
         names = contract_names(contract.read_text(encoding="utf-8"))
+        self.global_addresses = contract_globals(contract.read_text(encoding="utf-8"))
+        self.global_owners = assign_globals(self.global_addresses, modules, program_map)
+        if self.global_owners:
+            self.log(f"globals: {len(self.global_owners)} owned by "
+                     f"{len(set(self.global_owners.values()))} module(s)")
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
             statuses = list(pool.map(lambda m: self.module(m, program_map, names, contract), modules))
         self.statuses = {s["id"]: s for s in statuses}

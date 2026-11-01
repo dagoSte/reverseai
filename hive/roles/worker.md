@@ -14,6 +14,8 @@ that header.
    the methods of the contract's classes that belong to your module. You may add
    `static` helpers, private types and private tables. Do not define functions that belong
    to other modules; call them through the contract.
+   Define exactly the global data your brief assigns to this module, once each, with the original's
+   initial bytes (read them with `read_bytes`); never define globals the brief assigns elsewhere.
 3. Behaviour must match the original exactly: the same output bytes, error messages, exit
    codes, edge cases and arithmetic (integer widths, signedness, overflow, shifts).
    Constant tables must hold the same values; read them with `read_bytes`.
