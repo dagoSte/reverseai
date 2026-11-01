@@ -32,6 +32,7 @@ from pathlib import Path
 
 from hive import bees as bees_module
 from hive import codex_bees, languages, preflight
+from hive import fuzz as fuzz_module
 from reverseai import intake
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -458,7 +459,7 @@ class Queen:
     def __init__(self, *, engine, out, bees, slots=4, max_functions=12, compile_rounds=3, council_rounds=2,
                  lenses=len(LENSES), link_rounds=3, behaviour_rounds=2, run_original=False, cases=40,
                  max_bees=400, build=None, check=None, language="c", preflight=None, allow_packed=False,
-                 refusal_limit=3):
+                 refusal_limit=3, fuzz=0):
         self.engine, self.out, self.bees = engine, Path(out).resolve(), bees
         self.slots = threading.BoundedSemaphore(slots)
         self.workers = slots
@@ -466,6 +467,7 @@ class Queen:
         self.lenses = LENSES[:max(1, min(lenses, len(LENSES)))]
         self.link_rounds, self.behaviour_rounds = link_rounds, behaviour_rounds
         self.run_original, self.case_target, self.max_bees = run_original, cases, max_bees
+        self.fuzz = fuzz_module.count(fuzz)
         self.build = build or Build(self.out / "build")
         self.requested_language = language
         self.preflight, self.allow_packed, self.preflight_result = preflight, allow_packed, None
@@ -844,7 +846,22 @@ class Queen:
             for results in (original, rebuilt) for c in cases if c["id"] in results)
         if not complete:
             return {"ran": False, "reason": "conformance execution is incomplete or timed out"}
-        return {"ran": True, "cases": len(cases), "identical": len(same), "different": different}
+        result = {"ran": True, "cases": len(cases), "identical": len(same), "different": different}
+        if self.fuzz and self.run_original:
+            seed = sha256(stage)
+            mutants = fuzz_module.generate(cases, seed, self.fuzz, MAX_CASE_FILE)
+            fuzz_original = run_cases(mutants, str(stage), runs) if mutants else {}
+            fuzz_rebuilt = run_cases(mutants, rebuilt_binary, runs) if mutants else {}
+            summary = fuzz_module.summarise(mutants, fuzz_original, fuzz_rebuilt, seed, compare)
+            fuzz_module.write_report(folder / "fuzz.json", summary, mutants)
+            result["fuzz"] = summary
+            result["cases"] += summary["cases"]
+            result["identical"] += summary["identical"]
+            result["different"] += summary["different"]
+            if mutants and not summary["ran"]:
+                result.update(ran=False, reason=summary["reason"])
+            self.log(f"fuzz: {summary['identical']}/{summary['cases']} identical")
+        return result
 
     def behaviour_fix(self, round_number, cases, original, rebuilt, different, modules, contract):
         folder = self.out / "fixes" / f"b{round_number}"
@@ -1050,8 +1067,11 @@ def render(result):
     lines.append(f"- Evidence checker: {check['confirmed']}/{check['claims']} claims confirmed" if check
                  else f"- Evidence checker: not run ({result['claims']} claims)")
     conformance = result["conformance"]
-    lines.append(f"- Conformance: {conformance['identical']}/{conformance['cases']} cases identical"
-                 if conformance.get("ran") else f"- Conformance: not run ({conformance.get('reason')})")
+    proof = (f"{conformance['identical']}/{conformance['cases']} cases identical" if conformance.get("ran")
+             else f"not run ({conformance.get('reason')})")
+    if "fuzz" in conformance:
+        proof += f" ({conformance['fuzz']['cases']} fuzz)"
+    lines.append("- Conformance: " + proof)
     spent = result.get("spent", {})
     if result.get("refusals"):
         lines.append(f"- Provider refusals: {len(result['refusals'])} (" + ", ".join(
@@ -1081,6 +1101,9 @@ def main(argv=None):
     run.add_argument("--run-original", action="store_true",
                      help="Allow running the original program on the conformance cases (benign software only)")
     run.add_argument("--cases", type=int, default=40, help="Conformance cases to ask for (default 40)")
+    run.add_argument("--fuzz", type=fuzz_module.count, default=0,
+                     help="Extra file-mutating conformance cases after behaviour repairs "
+                          "(0-500, default 0; needs --run-original)")
     run.add_argument("--language", choices=("auto", "c", "cpp"), default="auto",
                      help="Language to rebuild in (default: detected from the program)")
     run.add_argument("--allow-packed", action="store_true",
@@ -1103,7 +1126,8 @@ def main(argv=None):
         return hive_check.check(inputs, claims, out, enabled=frozenset({"ghidra"}), jobs=args.check_jobs)
     queen = Queen(engine=engine, out=args.out, bees=bees, slots=args.bees, max_functions=args.max_functions,
                   lenses=args.council, run_original=args.run_original, cases=args.cases, max_bees=args.max_bees,
-                  check=check, language=args.language, preflight=preflight.run, allow_packed=args.allow_packed)
+                  check=check, language=args.language, preflight=preflight.run, allow_packed=args.allow_packed,
+                  fuzz=args.fuzz)
     try:
         result = queen.run()
     except HiveError as error:

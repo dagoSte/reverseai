@@ -77,6 +77,14 @@ Codex login. No API key is used.
    conformance case is identical. Without `--run-original` the best verdict is
    **accepted without behaviour proof**.
 
+With `--run-original --fuzz N`, add up to 500 deterministic mutants after the ordinary behaviour
+checks and repairs (`N` defaults to 0, off). They change only case-file bytes, including stdin files,
+using bit flips, insertion, deletion, truncation, boundary bytes and splicing between cases; arguments
+stay unchanged and each file stays within the 64 KiB case limit. The input SHA-256 and source case ID
+seed each sequence. Mutants use the final rebuilt binary and extend the conformance totals; differences
+are reported without another repair round. `tests/fuzz.json` records the seed and each divergent
+mutant's complete bounded input as base64 for reproduction. Cases without files add no mutants.
+
 ## Who has the final word
 
 - A failed check cannot be overruled by any agent. The council can only add a veto.
