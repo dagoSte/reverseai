@@ -48,12 +48,18 @@ POINTER_INNER = re.compile(r"\*\s*(?:(?:const|volatile|restrict)\s+)*([A-Za-z_]\
 PLAIN_DECLARATOR = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[\]\s*)*$")
 LAST_NAME = re.compile(r"\b([A-Za-z_]\w*)$")
 ADDRESS_COMMENT = re.compile(r"/\*\s*0x([0-9a-fA-F]+)\s*\*/")
-BLOCK_HEAD = re.compile(r'(?:\bextern\s*"C(?:\+\+)?"|\bnamespace(?:\s+[A-Za-z_]\w*)?|\))\s*\Z')  # before a block's {
+BLOCK_HEAD = re.compile(r'(?:\bextern\s*"C(?:\+\+)?"|\b(?:inline\s+)?namespace(?:\s+[A-Za-z_][\w:]*)?|\))\s*\Z')  # before a block's {
 NOT_CODE = re.compile(r'(?<![A-Za-z0-9_])(?:u8|[uUL])?R"([^()\\\s"]{0,16})\(.*?\)\1"'  # C++ raw strings
                       r'|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*|^[ \t]*#(?:\\\r?\n|[^\n])*',
                       re.S | re.M)  # literals, comments, preprocessor lines (with continuations)
 HEAD_WINDOW = 256  # a block's head (extern "C", namespace, a parameter list) sits just before its brace
-LINKAGE_HEAD = re.compile(r'(?:\bextern\s*"C(?:\+\+)?"|\bnamespace(?:\s+[A-Za-z_]\w*)?)\s*\Z')
+# Blocks whose annotated statements are not globals: a struct, union, class or enum body (field offsets), a function body.
+TYPE_HEAD = re.compile(r"\b(?:struct|union|class|enum)\b[^;{}=]*\Z")
+FUNCTION_HEAD = re.compile(r"\)\s*(?:const|noexcept|override|final|mutable|->\s*[\w:<>*& ]+|\s)*\Z")
+# What may follow a prototype's parameter list: qualifiers, pure/defaulted/deleted, trailing return, attributes, macros.
+FUNCTION_TRAILER = re.compile(r"(?:\s*(?:const|volatile|noexcept(?:\s*\([^()]*\))?|override|final|&&?|throw\s*\(\s*\)"
+                              r"|=\s*(?:0|default|delete)|->\s*[^;{}=]+|__attribute__\s*\(\(.*?\)\)|\[\[.*?\]\]"
+                              r"|[A-Z_][A-Z0-9_]*(?:\s*\([^()]*\))?))*\s*")
 UNREADABLE_TOKENS = re.compile(r"<%|%>|%:|\?\?[=/'()!<>-]")  # digraphs and trigraphs for braces and directives
 DATA_REFERENCE_TYPES = frozenset({"read", "write", "read_write", "data"})
 QUALIFIERS = frozenset({"const", "volatile", "restrict", "__restrict", "_Atomic"})
@@ -236,9 +242,18 @@ def _extern_kind(body):
     A narrow grammar, not a C parser: plain objects and arrays, pointer declarators such as `(*callback)(int)` or
     `(*handlers[4])(void)`, and function prototypes. Every other form is unreadable, so it goes back to the planner."""
     body = re.sub(r"\[[^\]]*\]", "[]", " ".join(body.split()))  # array sizes may hold sizeof(...)
+    first = body.find("(")
+    if first >= 0 and re.search(r"\boperator\b", body[:first + 1]):
+        return "function", None  # an operator is always a function
+    if first >= 0:
+        prefix, close = body[:first].strip(), _closing(body, first)
+        name = LAST_NAME.search(prefix)
+        if (close >= 0 and name and name.group(1) not in RESERVED and prefix[:name.start()].strip()
+                and "=" not in prefix and not _top_level(prefix, ",")
+                and FUNCTION_TRAILER.fullmatch(body[close + 1:])):
+            return "function", None
     if "=" in body or _top_level(body, ","):
         return "unreadable", None  # initialisers and several names in one declaration
-    first = body.find("(")
     if first < 0:
         plain = PLAIN_DECLARATOR.search(body)
         named = plain and plain.group(1) not in RESERVED and body[:plain.start()].strip()
@@ -253,9 +268,6 @@ def _extern_kind(body):
         follows_parameters = rest.startswith("(") and _closing(rest, 0) == len(rest) - 1
         if follows_array or follows_parameters:
             return "data", pointer.group(1)
-    name = LAST_NAME.search(prefix)
-    if name and name.group(1) not in RESERVED and prefix[:name.start()].strip() and not rest:
-        return "function", None
     return "unreadable", None
 
 
@@ -275,7 +287,7 @@ def _code_only(text):
 def _annotated_statements(text):
     """(statement, original, address, readable, file_scope) for every `...; /* 0xADDRESS */`: the whole statement the
     comment closes, braces included, as scanned and as written; readable is False when its braces do not balance, so
-    the caller refuses it instead of guessing; file_scope is False inside a struct, class or function body."""
+    the caller refuses it instead of guessing; file_scope is False only inside a recognised struct, union, class, enum or function body."""
     code = _code_only(text)
     scope = _file_scopes(code)
     for match in ADDRESS_COMMENT.finditer(text):
@@ -307,17 +319,21 @@ def _annotated_statements(text):
 
 
 def _file_scopes(code):
-    """A function telling, for a position, whether every block open there is an extern "C" block or a namespace."""
-    positions, flags, heads = [0], [True], []
+    """A function telling, for a position, whether its annotated statements must be checked as possible globals.
+
+    Only a block positively recognised as a struct, union, class or enum body (fields), or a function body, is exempt;
+    file scope, extern "C" blocks, namespaces of any form and every block the scan does not recognise are checked."""
+    positions, flags, exempt = [0], [True], []
     for index, character in enumerate(code):
         if character == "{":
-            heads.append(bool(LINKAGE_HEAD.search(code, max(0, index - HEAD_WINDOW), index)))
-        elif character == "}" and heads:
-            heads.pop()
+            head = code[max(0, index - HEAD_WINDOW):index]
+            exempt.append(bool(TYPE_HEAD.search(head) or FUNCTION_HEAD.search(head)))
+        elif character == "}" and exempt:
+            exempt.pop()
         else:
             continue
         positions.append(index + 1)
-        flags.append(all(heads))
+        flags.append(not (exempt and exempt[-1]))
     return lambda position: flags[bisect.bisect_right(positions, position) - 1]
 
 
@@ -346,8 +362,8 @@ def _global_declarations(text):
             found.append((None, address, original))  # the scan could not isolate it: refuse, never drop
             continue
         if not starts:
-            if file_scope and _extern_kind(statement)[0] == "data":
-                found.append((None, address, original))  # an object at file scope written without extern
+            if file_scope and _extern_kind(statement)[0] != "function":
+                found.append((None, address, original))  # not a prototype, and not inside a type or function body
             continue
         body = statement[len("extern"):].strip()
         kind, name = ("unreadable", None) if "{" in body or "}" in body else _extern_kind(body)

@@ -255,6 +255,40 @@ class NarrowGrammarTests(unittest.TestCase):
                   "int main(int argc, char **argv); /* 0x1100 */\n")
         self.assertEqual(queen.contract_global_problems(fields), [])  # field offsets and prototypes are not globals
 
+    def test_an_uncertain_scope_or_an_unreadable_statement_is_refused_not_ignored(self):
+        for text in ("namespace hive::nested { inline int settings; /* 0x5000 */ }\n",
+                     "inline namespace v1 { int settings; /* 0x5000 */ }\n",
+                     "namespace { int settings; /* 0x5000 */ }\n",
+                     "#define JOIN(a,b) a##b\n#define DECL(n) JOIN(ex,tern) int n\nDECL(settings); /* 0x5000 */\n",
+                     "EXPORT(int) settings; /* 0x5000 */\n"):
+            with self.subTest(text=text):
+                problems = queen.contract_global_problems(text)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("at 0x5000", problems[0])
+
+    def test_prototypes_methods_and_fields_are_not_globals(self):
+        text = ("#include <stddef.h>\n"
+                "int plain(void); /* 0x1000 */\n"
+                "void die(const char *why) __attribute__((noreturn)); /* 0x1010 */\n"
+                "int deprecated(int) CURL_DEPRECATED(7.1, \"use other\"); /* 0x1020 */\n"
+                "namespace hive::nested {\n"
+                "  int helper(int x) noexcept; /* 0x1030 */\n"
+                "  auto later(int x) -> long; /* 0x1040 */\n"
+                "  struct Point { int x; /* 0x0 */ int y; /* 0x4 */ };\n"
+                "  bool operator==(const Point &a, const Point &b); /* 0x1050 */\n"
+                "  class Parser {\n"
+                "   public:\n"
+                "    Parser(); /* 0x1060 */\n"
+                "    virtual ~Parser(); /* 0x1070 */\n"
+                "    virtual int parse(const char *text) const = 0; /* 0x1080 */\n"
+                "    int depth; /* 0x8 */\n"
+                "  };\n"
+                "  extern int counter; /* 0x5000 */\n"
+                "}\n"
+                "typedef struct __attribute__((packed)) { char tag; /* 0x0 */ int size; /* 0x1 */ } Header;\n")
+        self.assertEqual(queen.contract_global_problems(text), [])
+        self.assertEqual(queen.contract_globals(text), {0x5000: "counter"})
+
     def test_a_contract_the_size_of_curl_is_scanned_quickly(self):
         lines = ["#include <stdio.h>", "typedef struct { int a; int b; } Pair;"]
         lines += [f"extern int global_{i}; /* 0x{0x500000 + i * 8:x} */" for i in range(300)]
