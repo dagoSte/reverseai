@@ -22,6 +22,13 @@ CASES = [{"id": "first", "files": [{"name": "input.bin", "text": "seed"}],
 
 
 class MutationTests(unittest.TestCase):
+    def test_small_budget_includes_boundary_inputs_among_many_source_cases(self):
+        cases = [{"id":str(index), "files":[{"name":"input","text":chr(65 + index)*64}],
+                  "steps":[{"args":["input"]}]} for index in range(6)]
+        mutants = fuzz.generate(cases, SHA, 6, queen.MAX_CASE_FILE)
+        self.assertTrue(any(byte in fuzz.BOUNDARIES for case in mutants for item in case["files"]
+                            for byte in base64.b64decode(item["base64"])))
+
     def test_every_mutator_changes_only_bounded_bytes(self):
         data, donor = b"abcdefgh", b"XYZ"
         outputs = {operation: fuzz.mutate(data, operation, random.Random(7), 16, donor)

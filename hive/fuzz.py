@@ -84,7 +84,7 @@ def generate(cases, input_sha256, total, max_file_size):
     mutants, sequence = [], 1
     for index in range(total):
         source, files, rng = sources[index % len(sources)]
-        operation = operations[(index // len(sources)) % len(operations)]
+        operation = operations[index % len(operations)]
         at, other = rng.randrange(len(files)), b""
         if operation == "splice":
             donors = [data for case, contents, _ in sources if case["id"] != source["id"] for data in contents]
