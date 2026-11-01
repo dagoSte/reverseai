@@ -204,7 +204,8 @@ checked by someone or something other than its author:
   and drops any claim whose finding IDs do not come back for the same file; the rebuild
   must compile cleanly, in a closed compiler file system with inline assembly disabled;
   and, only if you allow it, the original and the rebuild run the same conformance cases
-  and must match byte for byte.
+  and must give the same exit code, the same stdout and files (compared by hash) and the
+  same stderr once the program's own path is masked (its first 2,000 characters).
 - **Before spending anything**, a pre-flight stops packed programs (UPX, VMProtect,
   Themida and others, high-entropy code, loader-only imports). The hive rebuilds in C,
   or in C++ when the program shows C++. Codex bees and mixed Claude/Codex councils are

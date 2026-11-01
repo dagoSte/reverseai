@@ -65,8 +65,9 @@ Codex login. No API key is used.
    every citation to the target file and requires the checker's input hash to match the survey.
    These checks run after the last repair, including behaviour repairs.
 8. **Behaviour (optional).** With `--run-original`, the tester writes cases; the queen runs the
-   original and the rebuild on each case in a fresh folder and compares stdout, stderr, exit
-   code and every file created. At least **two nonempty cases**, with unique IDs after filename
+   original and the rebuild on each case in a fresh folder and compares the exit code, stdout and
+   every file created (by hash), and stderr with the program's path masked (its first 2,000
+   characters). At least **two nonempty cases**, with unique IDs after filename
    normalisation, must complete; empty suites, colliding IDs and timeouts cannot prove behaviour.
    Differences go to one fixer bee, at most two rounds; changed modules return to council.
    A failed relink removes the older binary, invalidates the link result and stops the behaviour
