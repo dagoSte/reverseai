@@ -189,6 +189,9 @@ decision. The authoritative decisions live outside bee folders, in `.hive/status
 
 ## Limits
 
+- The bees run on Claude Code (and optionally Codex), so the provider's usage policies and safety
+  classifiers apply: work on malware in particular may be refused. A refused bee fails its task;
+  the module is failed or incomplete and the run ends not accepted, never as a silent pass.
 - C and C++ output only; Objective-C, Swift, Go and Rust programs are not handled specially.
 - The pre-flight recognises common packers and strong signs of obfuscation; it does not unpack,
   and it can miss custom packers or light obfuscation.
