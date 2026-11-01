@@ -1,5 +1,6 @@
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -223,6 +224,46 @@ class NarrowGrammarTests(unittest.TestCase):
     def test_problems_quote_the_declaration_as_written(self):
         problems = queen.contract_global_problems('extern struct { char a[sizeof("}")]; } settings; /* 0x5000 */\n')
         self.assertIn('sizeof("}")', problems[0])
+
+    def test_a_cpp_raw_string_does_not_hide_a_global(self):
+        problems = queen.contract_global_problems(
+            'extern struct { char a[sizeof(R"tag(" {)tag")]; } settings; /* 0x5000 */\n')
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("at 0x5000", problems[0])
+        text = 'typedef struct { char a[sizeof(R"tag(" {)tag")]; } Settings;\nextern Settings settings; /* 0x5000 */\n'
+        self.assertEqual((queen.contract_global_problems(text), queen.contract_globals(text)), ([], {0x5000: "settings"}))
+
+    def test_constructs_the_scan_cannot_read_are_refused(self):
+        for text, words in (("#define DECL(n) extern int n\nDECL(counter); /* 0x5000 */\n", "macro DECL contains extern"),
+                            ("#define EXT \\\n  extern\nEXT int counter; /* 0x5000 */\n", "macro EXT contains extern"),
+                            ("extern struct <% int a; %> settings; /* 0x5000 */\n", "digraphs or trigraphs"),
+                            ("extern struct ??< int a; ??> settings; /* 0x5000 */\n", "digraphs or trigraphs")):
+            with self.subTest(text=text):
+                self.assertTrue(any(words in problem for problem in queen.contract_global_problems(text)))
+        self.assertEqual(queen.contract_global_problems('#define GREETING "extern <% ??<"\nint f(void); /* 0x1000 */\n'),
+                         [])  # words inside a string literal or a non-extern macro are fine
+
+    def test_a_global_written_without_extern_is_refused_only_at_file_scope(self):
+        for text in ("int counter; /* 0x5000 */\n", 'extern "C" {\nint counter; /* 0x5000 */\n}\n',
+                     "namespace hive { int counter; /* 0x5000 */ }\n"):
+            with self.subTest(text=text):
+                problems = queen.contract_global_problems(text)
+                self.assertEqual(len(problems), 1, problems)
+                self.assertIn("at 0x5000", problems[0])
+        fields = ("typedef struct { int count; /* 0x10 */ char name[8]; /* 0x14 */ } Header;\n"
+                  "class Parser { public: int depth; /* 0x8 */ int parse(const char *text); /* 0x1000 */ };\n"
+                  "int main(int argc, char **argv); /* 0x1100 */\n")
+        self.assertEqual(queen.contract_global_problems(fields), [])  # field offsets and prototypes are not globals
+
+    def test_a_contract_the_size_of_curl_is_scanned_quickly(self):
+        lines = ["#include <stdio.h>", "typedef struct { int a; int b; } Pair;"]
+        lines += [f"extern int global_{i}; /* 0x{0x500000 + i * 8:x} */" for i in range(300)]
+        lines += [f"int function_{i}(const char *text, Pair *pair, int n); /* 0x{0x100000 + i * 16:x} */"
+                  for i in range(3000)]
+        started = time.monotonic()
+        self.assertEqual(queen.contract_global_problems("\n".join(lines)), [])
+        self.assertEqual(len(queen.contract_globals("\n".join(lines))), 300)
+        self.assertLess(time.monotonic() - started, 5)
 
     def test_an_unannotated_inline_struct_is_not_a_problem(self):
         self.assertEqual(queen.contract_global_problems("extern struct { int a; } scratch;\n"), [])

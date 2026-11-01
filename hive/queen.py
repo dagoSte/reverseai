@@ -16,6 +16,7 @@ contained Ghidra image. See docs/HIVE.md.
 
 import argparse
 import base64
+import bisect
 import concurrent.futures
 import hashlib
 import json
@@ -48,8 +49,12 @@ PLAIN_DECLARATOR = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[\]\s*)*$")
 LAST_NAME = re.compile(r"\b([A-Za-z_]\w*)$")
 ADDRESS_COMMENT = re.compile(r"/\*\s*0x([0-9a-fA-F]+)\s*\*/")
 BLOCK_HEAD = re.compile(r'(?:\bextern\s*"C(?:\+\+)?"|\bnamespace(?:\s+[A-Za-z_]\w*)?|\))\s*\Z')  # before a block's {
-NOT_CODE = re.compile(r'"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*|^[ \t]*#(?:\\\r?\n|[^\n])*',
-                      re.S | re.M)  # string and character literals, comments, preprocessor lines (with continuations)
+NOT_CODE = re.compile(r'(?<![A-Za-z0-9_])(?:u8|[uUL])?R"([^()\\\s"]{0,16})\(.*?\)\1"'  # C++ raw strings
+                      r'|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*|^[ \t]*#(?:\\\r?\n|[^\n])*',
+                      re.S | re.M)  # literals, comments, preprocessor lines (with continuations)
+HEAD_WINDOW = 256  # a block's head (extern "C", namespace, a parameter list) sits just before its brace
+LINKAGE_HEAD = re.compile(r'(?:\bextern\s*"C(?:\+\+)?"|\bnamespace(?:\s+[A-Za-z_]\w*)?)\s*\Z')
+UNREADABLE_TOKENS = re.compile(r"<%|%>|%:|\?\?[=/'()!<>-]")  # digraphs and trigraphs for braces and directives
 DATA_REFERENCE_TYPES = frozenset({"read", "write", "read_write", "data"})
 QUALIFIERS = frozenset({"const", "volatile", "restrict", "__restrict", "_Atomic"})
 # Words that can never be a global's or a function's name in a contract declaration.
@@ -268,14 +273,17 @@ def _code_only(text):
 
 
 def _annotated_statements(text):
-    """(statement, original, address, readable) for every `...; /* 0xADDRESS */`: the whole statement the comment closes,
-    braces included, as scanned and as written; readable is False when its braces do not balance, so the caller refuses
-    it instead of guessing."""
+    """(statement, original, address, readable, file_scope) for every `...; /* 0xADDRESS */`: the whole statement the
+    comment closes, braces included, as scanned and as written; readable is False when its braces do not balance, so
+    the caller refuses it instead of guessing; file_scope is False inside a struct, class or function body."""
     code = _code_only(text)
+    scope = _file_scopes(code)
     for match in ADDRESS_COMMENT.finditer(text):
         if code[match.start():match.end()].strip():
             continue  # inside a string literal, not a comment
-        end = len(text[:match.start()].rstrip())
+        end = match.start()
+        while end > 0 and text[end - 1].isspace():
+            end -= 1
         if end == 0 or text[end - 1] != ";":
             continue
         index, readable = end - 2, True
@@ -288,12 +296,29 @@ def _annotated_statements(text):
                 if opening < 0:
                     readable = False
                     break
-                if BLOCK_HEAD.search(code, 0, opening):
+                if BLOCK_HEAD.search(code, max(0, opening - HEAD_WINDOW), opening):
                     break  # an earlier extern "C" block, namespace or function body ends here
                 index = opening  # an inline type's body belongs to this statement
             index -= 1
-        yield (" ".join(code[index + 1:end - 1].split()), " ".join(text[index + 1:end - 1].split()),
-               int(match.group(1), 16), readable)
+        statement = " ".join(code[index + 1:end - 1].split())
+        readable = readable and statement.count("{") == statement.count("}")
+        yield (statement, " ".join(text[index + 1:end - 1].split()), int(match.group(1), 16), readable,
+               scope(index + 1))
+
+
+def _file_scopes(code):
+    """A function telling, for a position, whether every block open there is an extern "C" block or a namespace."""
+    positions, flags, heads = [0], [True], []
+    for index, character in enumerate(code):
+        if character == "{":
+            heads.append(bool(LINKAGE_HEAD.search(code, max(0, index - HEAD_WINDOW), index)))
+        elif character == "}" and heads:
+            heads.pop()
+        else:
+            continue
+        positions.append(index + 1)
+        flags.append(all(heads))
+    return lambda position: flags[bisect.bisect_right(positions, position) - 1]
 
 
 def _opening(code, closing):
@@ -315,18 +340,19 @@ def _global_declarations(text):
     (`extern struct { ... } name;`) is unreadable: the planner is asked for a typedef. contract_global_problems sends
     every unreadable one back to the planner instead of losing it."""
     found = []
-    for statement, original, address, readable in _annotated_statements(text):
+    for statement, original, address, readable, file_scope in _annotated_statements(text):
         starts = re.match(r"extern\b", statement)
-        written = re.sub(r"^extern\b\s*", "", original)
         if not readable or (not starts and re.search(r"\bextern\b", statement)):
-            found.append((None, address, written))  # the scan could not isolate it: refuse, never drop
+            found.append((None, address, original))  # the scan could not isolate it: refuse, never drop
             continue
         if not starts:
+            if file_scope and _extern_kind(statement)[0] == "data":
+                found.append((None, address, original))  # an object at file scope written without extern
             continue
         body = statement[len("extern"):].strip()
         kind, name = ("unreadable", None) if "{" in body or "}" in body else _extern_kind(body)
         if kind != "function":
-            found.append((name, address, written))
+            found.append((name, address, original))
     return found
 
 
@@ -337,12 +363,27 @@ def contract_globals(text):
     return {address: name for name, address, _ in _global_declarations(text) if name}
 
 
+def _contract_lint(text):
+    """Constructs the declaration scan cannot read with certainty; the planner rewrites them in plain form."""
+    problems = []
+    if UNREADABLE_TOKENS.search(_code_only(text)):
+        problems.append("the contract uses digraphs or trigraphs (such as <% %> or ??<): write braces and directives "
+                        "plainly")
+    for match in NOT_CODE.finditer(text):
+        directive = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '""', match.group().lstrip())  # literals do not count
+        if directive.startswith("#") and re.match(r"#\s*define\b", directive) and re.search(r"\bextern\b", directive):
+            name = re.match(r"#\s*define\s+([A-Za-z_]\w*)", directive)
+            problems.append(f"the macro {name.group(1) if name else '?'} contains extern: declare every global directly "
+                            "as `extern TYPE NAME; /* 0xADDRESS */`, not through a macro")
+    return problems
+
+
 def contract_global_problems(text):
     """Declarations the queen could not give an owner without losing one: unreadable ones and shared addresses."""
-    problems, names_at = [], {}
+    problems, names_at = _contract_lint(text), {}
     for name, address, body in _global_declarations(text):
         if not name:
-            problems.append(f"cannot read the name of `extern {body};` at {hexed(address)}: write each global as "
+            problems.append(f"cannot read the name of `{body};` at {hexed(address)}: write each global as "
                             "`extern TYPE NAME; /* 0xADDRESS */`, one name per line, without attributes or "
                             "initialisers, with a typedef for complex types such as _Atomic(int) or an inline "
                             "struct; write function prototypes without extern")
