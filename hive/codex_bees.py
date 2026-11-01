@@ -18,7 +18,7 @@ import threading
 import time
 from pathlib import Path
 
-from hive.bees import SCHEMAS, brief
+from hive.bees import SCHEMAS, brief, is_refusal
 
 NETWORK_REFUSAL = "Codex sandbox allowed network access; Codex bees refused"
 NETWORK_WARNING = "Codex bees ran without network isolation"
@@ -177,6 +177,9 @@ class CodexBees:
             return {"ok": False, "output": None, "error": f"no answer within {self.timeout} s",
                     "seconds": self.timeout, **warning}
         except Exception as error:
+            if is_refusal(str(error)):
+                return {"ok": False, "output": None, "error": str(error)[:300], "refused": True,
+                        "seconds": round(time.monotonic() - started, 1), **warning}
             return {"ok": False, "output": None, "error": str(error)[:300],
                     "seconds": round(time.monotonic() - started, 1), **warning}
 

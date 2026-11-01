@@ -215,7 +215,9 @@ checked by someone or something other than its author:
 It runs on your own Claude Code (and optionally Codex) subscription, with no API key,
 and the ReverseAI engine itself stays model-free.
 Because the bees run on Claude Code, Anthropic's usage policies and cyber safeguards apply to
-them; a refused bee fails its task, and the run ends not accepted rather than passing silently.
+them. The hive recognises a refusal and reports it as such: a refused planner stops the run before
+anything else is spent, after three refusals no further bee starts, and the run ends not accepted
+rather than passing silently.
 The engine, its command line and its MCP server use no model and are not affected.
 ReverseAI was built for defensive security work; rebuilding is for software whose licence
 permits it or whose copyright you hold, not for recompiling proprietary software (see the
