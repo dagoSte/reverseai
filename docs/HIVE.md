@@ -35,6 +35,9 @@ Codex login. No API key is used.
    declares (`extern ...; /* 0xADDRESS */`) gets exactly one owner module, the one whose functions
    reference it most in the exported data references; that builder defines it from the original's
    bytes and the others only use the declaration, so tables and settings are not left undefined.
+   A declaration the queen cannot read with certainty (an attribute, `_Atomic(int)`, an inline struct,
+   two names at once, two names at one address) goes back to the planner in the canonical form, and the
+   run stops before any builder if it is never fixed: no global is silently left without an owner.
 4. **Build.** Builders work in parallel, one folder each. Every module is compiled alone from a
    clean stage containing snapshots of its source and the frozen contract, with
    `-Wall -Wextra -fwrapv -fno-strict-aliasing`. This requires Clang with a closed virtual

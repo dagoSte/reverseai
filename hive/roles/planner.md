@@ -16,8 +16,10 @@ them, and the file's imports.
 3. Write the contract header in your folder (`contract.h` for C, `contract.hpp` for C++, as your
    task says): the frozen interface that every builder will include.
    It must hold the standard includes the program needs, every shared type and struct, every
-   global (as `extern`, each followed by the comment `/* 0xADDRESS */` with its address in the original, so the
-   queen can give every global one owner module), and one prototype for every function you did not skip, with a good
+   global (as `extern TYPE NAME;`, each followed by the comment `/* 0xADDRESS */` with its address in the original,
+   so the queen can give every global one owner module: one name per line, no attributes or initialisers, and a
+   `typedef` for complex types such as `_Atomic(int)` or an inline struct; function prototypes go without `extern`),
+   and one prototype for every function you did not skip, with a good
    descriptive name and the comment `/* 0xENTRY */`. Derive types and signatures from the
    evidence (signatures in the map, then pseudocode and assembly through the MCP tools for
    the functions where it matters). It must compile on its own in the target language. For C++,

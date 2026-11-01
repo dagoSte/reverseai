@@ -44,10 +44,20 @@ MAX_COMPILER_STDOUT = 16 * 1024 * 1024
 MAX_COMPILER_STDERR = 256 * 1024
 PROTOTYPE = re.compile(r"([A-Za-z_]\w*)\s*\([^;{}]*\)\s*;\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
 EXTERN_DECLARATION = re.compile(r"\bextern\b([^;{}]*);\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
-POINTER_DECLARATOR = re.compile(r"\(\s*\*\s*(?:const\s+)?([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*\)")
-PLAIN_DECLARATOR = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*$")
+POINTER_INNER = re.compile(r"\*\s*(?:(?:const|volatile|restrict)\s+)*([A-Za-z_]\w*)\s*(?:\[\]\s*)*")
+PLAIN_DECLARATOR = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[\]\s*)*$")
+LAST_NAME = re.compile(r"\b([A-Za-z_]\w*)$")
+INLINE_TYPE_EXTERN = re.compile(r"\bextern\b(?!\s*\"C(?:\+\+)?\")[^;{}]*\{")
+INLINE_TYPE_DECLARATOR = re.compile(r"\s*(?:\*\s*)*[A-Za-z_]\w*\s*(?:\[[^\]]*\]\s*)*;")  # `} name;` after a body
+ADDRESS_COMMENT = re.compile(r"\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
 DATA_REFERENCE_TYPES = frozenset({"read", "write", "read_write", "data"})
-QUALIFIERS = frozenset({"const", "volatile", "restrict", "__restrict", "_Atomic"})  # export reference kinds that touch data
+QUALIFIERS = frozenset({"const", "volatile", "restrict", "__restrict", "_Atomic"})
+# Words that can never be a global's or a function's name in a contract declaration.
+RESERVED = QUALIFIERS | frozenset({
+    "void", "char", "short", "int", "long", "float", "double", "signed", "unsigned", "_Bool", "bool", "_Complex",
+    "struct", "union", "enum", "class", "typename", "auto", "register", "static", "extern", "thread_local",
+    "_Thread_local", "__thread", "inline", "__inline", "__inline__", "typedef", "sizeof", "alignas", "_Alignas",
+    "__attribute__", "__declspec", "__extension__", "__typeof__", "typeof", "decltype", "noexcept", "constexpr"})  # export reference kinds that touch data
 GLOBAL_SPAN = 64 * 1024  # a reference this far past a global's address still counts as using it (tables)
 LENSES = (
     ("control", "control flow and arithmetic: conditions, loops, integer widths, signedness, overflow, "
@@ -192,23 +202,81 @@ def contract_names(text):
     return {int(entry, 16): name for name, entry in PROTOTYPE.findall(text)}
 
 
+def _closing(text, start):
+    """Index of the parenthesis that closes the one at text[start], or -1."""
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    return -1
+
+
+def _top_level(text, character):
+    depth = 0
+    for current in text:
+        depth += current == "("
+        depth -= current == ")"
+        if current == character and depth == 0:
+            return True
+    return False
+
+
+def _extern_kind(body):
+    """("data", name), ("function", None) or ("unreadable", None) for the text between `extern` and `;`.
+
+    A narrow grammar, not a C parser: plain objects and arrays, pointer declarators such as `(*callback)(int)` or
+    `(*handlers[4])(void)`, and function prototypes. Every other form is unreadable, so it goes back to the planner."""
+    body = re.sub(r"\[[^\]]*\]", "[]", " ".join(body.split()))  # array sizes may hold sizeof(...)
+    if "=" in body or _top_level(body, ","):
+        return "unreadable", None  # initialisers and several names in one declaration
+    first = body.find("(")
+    if first < 0:
+        plain = PLAIN_DECLARATOR.search(body)
+        named = plain and plain.group(1) not in RESERVED and body[:plain.start()].strip()
+        return ("data", plain.group(1)) if named and ")" not in body else ("unreadable", None)
+    prefix, close = body[:first].strip(), _closing(body, first)
+    if not prefix or close < 0:
+        return "unreadable", None
+    inner, rest = body[first + 1:close].strip(), body[close + 1:].strip()
+    pointer = POINTER_INNER.fullmatch(inner)
+    if pointer and pointer.group(1) not in RESERVED and LAST_NAME.search(prefix):
+        follows_array = re.fullmatch(r"(?:\[\]\s*)*", rest)
+        follows_parameters = rest.startswith("(") and _closing(rest, 0) == len(rest) - 1
+        if follows_array or follows_parameters:
+            return "data", pointer.group(1)
+    name = LAST_NAME.search(prefix)
+    if name and name.group(1) not in RESERVED and prefix[:name.start()].strip() and not rest:
+        return "function", None
+    return "unreadable", None
+
+
 def _global_declarations(text):
     """(name or None, address, declaration) for every `extern ...; /* 0xADDRESS */` that declares data.
 
-    Function prototypes marked extern are not data; pointer declarators such as `(*callback)` or `(*handlers[4])` are."""
+    Function prototypes marked extern are not data; pointer declarators such as `(*callback)` or `(*handlers[4])` are.
+    A form outside the narrow grammar of _extern_kind, or an extern that defines its type inline, has no name, so
+    contract_global_problems sends it back to the planner instead of losing it."""
     found = []
     for body, address in EXTERN_DECLARATION.findall(text):
-        body = " ".join(body.split())
-        pointer = POINTER_DECLARATOR.search(body)
-        if pointer and pointer.group(1) not in QUALIFIERS:
-            found.append((pointer.group(1), int(address, 16), body))
-        elif "(*" in body.replace(" ", ""):
-            found.append((None, int(address, 16), body))  # a pointer declarator whose name could not be read
-        elif "(" in body:
-            continue  # an extern function prototype; contract_names handles functions
-        else:
-            plain = PLAIN_DECLARATOR.search(body)
-            found.append((plain.group(1) if plain else None, int(address, 16), body))
+        kind, name = _extern_kind(body)
+        if kind != "function":
+            found.append((name, int(address, 16), " ".join(body.split())))
+    for match in INLINE_TYPE_EXTERN.finditer(text):
+        close, depth = match.end() - 1, 0
+        for close in range(match.end() - 1, len(text)):
+            depth += text[close] == "{"
+            depth -= text[close] == "}"
+            if depth == 0:
+                break
+        declarator = INLINE_TYPE_DECLARATOR.match(text, close + 1)
+        annotated = declarator and ADDRESS_COMMENT.match(text, declarator.end())
+        if annotated:
+            found.append((None, int(annotated.group(1), 16),
+                          " ".join(text[match.start() + 6:declarator.end() - 1].split())))
     return found
 
 
@@ -224,7 +292,10 @@ def contract_global_problems(text):
     problems, names_at = [], {}
     for name, address, body in _global_declarations(text):
         if not name:
-            problems.append(f"cannot read the name of `extern {body};` at {hexed(address)}")
+            problems.append(f"cannot read the name of `extern {body};` at {hexed(address)}: write each global as "
+                            "`extern TYPE NAME; /* 0xADDRESS */`, one name per line, without attributes or "
+                            "initialisers, with a typedef for complex types such as _Atomic(int) or an inline "
+                            "struct; write function prototypes without extern")
         else:
             names_at.setdefault(address, []).append(name)
     for address, names in sorted(names_at.items()):
