@@ -24,6 +24,8 @@ import json
 import math
 from pathlib import Path
 
+from reverseai import intake, mcp_tools
+
 PACKER_NAMES = {
     "UPX": ("upx0", "upx1", "upx2", "upx!", ".upx0", ".upx1", "__xhdr", "upx_data"),
     "MPRESS": (".mpress1", ".mpress2"),
@@ -95,9 +97,9 @@ def assess(data, segments, imports, functions=None, strings=None):
                    packer=packer)
     code_bytes = 0
     for name, offset, size, _address, _memsz, _r, _w, executable in segments:
-        if not executable or size < MIN_ENTROPY_BYTES or offset >= len(data):
+        chunk = data[offset:offset + size] if executable and 0 <= offset < len(data) else b""
+        if len(chunk) < MIN_ENTROPY_BYTES:  # judge the bytes actually present, not the declared size
             continue
-        chunk = data[offset:offset + size]
         code_bytes += len(chunk)
         value = round(entropy(chunk), 3)
         if value >= STRONG_SEGMENT_ENTROPY:
@@ -159,20 +161,49 @@ def imported_symbols(report):
     return []
 
 
+def approved_bytes(engine, expected_sha256):
+    """Read the approved file the way ReverseAI does, and bind it to the hash the survey saw.
+
+    The same path check as the MCP server (inside the inputs folder, no link anywhere on the way) and the engine's
+    intake (one regular file, stable identity while read); a different file, a link or a changed file stops the run.
+    """
+    from hive.queen import HiveError  # queen imports this module; import at call time
+    try:
+        path = mcp_tools._input_path(str(engine.inputs), engine.file)
+        data, ref = intake.snapshot(path)
+    except Exception as error:  # the MCP layer's and intake's own refusals
+        raise HiveError(f"pre-flight refused the input: {error}") from None
+    if ref.sha256 != expected_sha256:
+        raise HiveError("pre-flight refused the input: the approved file changed since the survey")
+    return data
+
+
 def run(engine, program_map, folder):
-    """Ask ReverseAI for segments and imports, read the approved file, write preflight.json."""
+    """Ask ReverseAI for segments and imports, read the approved file, write preflight.json.
+
+    Every report and the bytes assessed must carry the program map's input hash."""
+    from hive.queen import HiveError
+    expected = program_map.get("input_sha256")
+    if not isinstance(expected, str):
+        raise HiveError("pre-flight needs the survey's input hash")
+
+    def bound(report):
+        if (report.get("input") or {}).get("sha256") != expected:
+            raise HiveError("pre-flight refused a report about a different input")
+        return report
+
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     rows, start = [], 0
     while True:
-        report = engine.query("list_segments", {"start": start, "limit": 64}, folder / f"segments-{start:04d}")
+        report = bound(engine.query("list_segments", {"start": start, "limit": 64}, folder / f"segments-{start:04d}"))
         page = segment_rows(report)
         rows += page
         start += len(page)
         if len(page) < 64:
             break
-    overview = engine.query("binary_overview", {}, folder / "overview")
-    data = Path(engine.path).read_bytes()
+    overview = bound(engine.query("binary_overview", {}, folder / "overview"))
+    data = approved_bytes(engine, expected)
     result = assess(data, rows, imported_symbols(overview), program_map.get("functions"),
                     len(program_map.get("strings", [])))
     (folder / "preflight.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
