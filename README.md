@@ -244,9 +244,12 @@ Requirements: Python 3.12 or later, with venv and pip. Host analysis needs no
 Docker. On Windows, use CPython 3.12.4 or later and the paths in
 [INSTALL](docs/INSTALL.md); every analysis needs a new output directory.
 
-Recommended on macOS or Linux, from a trusted checkout already on your machine:
+Recommended on macOS or Linux: clone the repository (or use a trusted checkout
+already on your machine) and install it in a dedicated virtual environment:
 
 ```sh
+git clone https://github.com/dagoSte/reverseai.git
+cd reverseai
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --no-index --no-deps .

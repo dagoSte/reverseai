@@ -7,7 +7,9 @@ to an AI agent through MCP.
 ## What you need
 
 - Python 3.12 or later, with `venv` and pip available.
-- A trusted ReverseAI checkout already on your machine.
+- A ReverseAI checkout: clone it with
+  `git clone https://github.com/dagoSte/reverseai.git`, or use a trusted copy
+  already on your machine.
 - A directory containing only files you approve for analysis.
 
 The commands below use a macOS or Linux shell. Windows support is experimental;
@@ -17,7 +19,7 @@ with an existing parent directory.
 
 ## Install in a dedicated environment
 
-From the trusted checkout root:
+From the checkout root (`cd reverseai` after cloning):
 
 ```sh
 python3 --version
