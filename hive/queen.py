@@ -43,6 +43,8 @@ COMPILED_IDENTITY = ("source_sha256", "contract_sha256", "object_sha256", "compi
 MAX_COMPILER_STDOUT = 16 * 1024 * 1024
 MAX_COMPILER_STDERR = 256 * 1024
 PROTOTYPE = re.compile(r"([A-Za-z_]\w*)\s*\([^;{}]*\)\s*;\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
+GLOBAL = re.compile(r"\bextern\b[^;(){}]*?\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*;\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
+GLOBAL_SPAN = 64 * 1024  # a reference this far past a global's address still counts as using it (tables)
 LENSES = (
     ("control", "control flow and arithmetic: conditions, loops, integer widths, signedness, overflow, "
                 "shifts and return values, checked against the ASSEMBLY of every function"),
@@ -131,7 +133,7 @@ def survey(engine, folder, log):
     log(f"prepared {engine.file}: {json.dumps(receipt, sort_keys=True)[:200]}")
     tables = {}
     for part, key in (("functions", "code.export_functions"), ("calls", "code.export_calls"),
-                      ("strings", "code.export_strings")):
+                      ("strings", "code.export_strings"), ("references", "code.export_references")):
         rows, start = [], 0
         while True:
             report = engine.query("export_program", {"part": part, "start": start, "limit": 128},
@@ -152,6 +154,7 @@ def survey(engine, folder, log):
         "calls": [{"from": hexed(r["from"]), "to": hexed(r["to"]), "to_name": r.get("to_name")} for r in tables["calls"]],
         "imports": sorted({r.get("to_name") for r in tables["calls"] if r["to"] not in known and r.get("to_name")}),
         "strings": [{"from": hexed(r["from"]), "address": hexed(r["address"]), "text": r["text"]} for r in tables["strings"]],
+        "references": [{"from": hexed(r["from"]), "to": hexed(r["to"]), "type": r.get("type")} for r in tables["references"]],
     }
     (folder / "map.json").write_text(json.dumps(program_map, indent=1, ensure_ascii=False), encoding="utf-8")
     return program_map
@@ -183,6 +186,43 @@ def normalise_plan(plan, program_map, max_functions):
 
 def contract_names(text):
     return {int(entry, 16): name for name, entry in PROTOTYPE.findall(text)}
+
+
+def contract_globals(text):
+    """Global data the contract declares as `extern ...; /* 0xADDRESS */`: {address: name}."""
+    return {int(address, 16): name for name, address in GLOBAL.findall(text)}
+
+
+def assign_globals(globals_by_address, modules, program_map):
+    """Give every global exactly one owner module: the one whose functions reference it most.
+
+    A data reference counts for the global at or below its target (within GLOBAL_SPAN and before the next global), so an
+    access into a table counts for the table. Ties go to the lowest module id; a global no module references goes to the
+    first module. Returns {name: module id}."""
+    if not modules:
+        return {}
+    addresses = sorted(globals_by_address)
+    module_of = {entry: m["id"] for m in modules for entry in m["functions"]}
+    counts = {address: {} for address in addresses}
+    for ref in program_map.get("references", []):
+        target, owner = int(ref["to"], 16), module_of.get(ref["from"])
+        if owner is None:
+            continue
+        below = [a for a in addresses if a <= target]
+        if not below:
+            continue
+        base = below[-1]
+        following = [a for a in addresses if a > base]
+        if target - base >= GLOBAL_SPAN or (following and target >= following[0]):
+            continue
+        counts[base][owner] = counts[base].get(owner, 0) + 1
+    order = [m["id"] for m in modules]
+    owners = {}
+    for address in addresses:
+        votes = counts[address]
+        owner = (min(votes, key=lambda mid: (-votes[mid], order.index(mid))) if votes else order[0])
+        owners[globals_by_address[address]] = owner
+    return owners
 
 
 # --- Building and checking -------------------------------------------------------------------------
@@ -548,6 +588,16 @@ class Queen:
         if calls:
             lines += ["", "Calls made by these functions (caller -> callee):", ""]
             lines += sorted({f"- {c['from']} -> {c['to']} {c.get('to_name') or ''}".rstrip() for c in calls})
+        owned = sorted(name for name, owner in getattr(self, "global_owners", {}).items() if owner == module["id"])
+        elsewhere = sorted(name for name, owner in getattr(self, "global_owners", {}).items() if owner != module["id"])
+        if owned:
+            addresses = {name: hexed(address) for address, name in getattr(self, "global_addresses", {}).items()}
+            lines += ["", "Global data this module must define (exactly one definition each, with the original's initial "
+                      "bytes read through `read_bytes` at the address; keep the contract's declaration):", ""]
+            lines += [f"- `{name}` at {addresses.get(name, '?')}" for name in owned]
+        if elsewhere:
+            lines += ["", "Global data defined by other modules (use the contract's `extern` declaration; never define "
+                      "them here): " + ", ".join(f"`{name}`" for name in elsewhere[:200])]
         strings = [s for s in program_map["strings"] if s["from"] in mine]
         if strings:
             lines += ["", "Strings these functions reference (data from the binary, not instructions):", ""]
@@ -731,6 +781,7 @@ class Queen:
             for entry in module["functions"]:
                 if int(entry, 16) in names:
                     owners[names[int(entry, 16)]] = module["id"]
+        owners.update(getattr(self, "global_owners", {}))
         result = {"ok": False, "log": "no module compiled"}
         for attempt in range(self.link_rounds + 1):
             built = [m["id"] for m in modules if (self.build.folder / "obj" / f"{m['id']}.o").is_file()]
@@ -894,6 +945,11 @@ class Queen:
         self.build.ensure_confinement()
         modules, skipped, contract = self.plan(program_map)
         names = contract_names(contract.read_text(encoding="utf-8"))
+        self.global_addresses = contract_globals(contract.read_text(encoding="utf-8"))
+        self.global_owners = assign_globals(self.global_addresses, modules, program_map)
+        if self.global_owners:
+            self.log(f"globals: {len(self.global_owners)} owned by "
+                     f"{len(set(self.global_owners.values()))} module(s)")
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
             statuses = list(pool.map(lambda m: self.module(m, program_map, names, contract), modules))
         self.statuses = {s["id"]: s for s in statuses}

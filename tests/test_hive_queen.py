@@ -58,7 +58,9 @@ class FakeEngine:
                   "calls": ("code.export_calls", [{"index": 0, "from": 0x1000, "to": 0x1040, "to_name": "FUN_1040"},
                                                   {"index": 1, "from": 0x1040, "to": 0x9000, "to_name": "_printf"}]),
                   "strings": ("code.export_strings", [{"index": 0, "from": 0x1000, "address": 0x2000,
-                                                       "text": "usage: greet NAME\n"}])}
+                                                       "text": "usage: greet NAME\n"}]),
+                  "references": ("code.export_references", [{"index": 0, "from": 0x1000, "at": 0x1008, "to": 0x2000,
+                                                             "type": "data_read", "to_name": None}])}
         key, rows = tables[args["part"]]
         start = args["start"]
         return page(key, rows[start:start + 2], len(rows))  # two rows per page, to exercise paging

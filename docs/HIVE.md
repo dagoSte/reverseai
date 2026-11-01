@@ -31,7 +31,10 @@ Codex login. No API key is used.
    the map shows C++ (see [Languages](#languages)).
 3. **Plan.** The planner proposes modules and `contract.h`. The queen checks that every function
    is either skipped with a reason or in exactly one module, splits oversized modules, checks
-   that the contract compiles on its own, and freezes it read-only.
+   that the contract compiles on its own, and freezes it read-only. Every global the contract
+   declares (`extern ...; /* 0xADDRESS */`) gets exactly one owner module, the one whose functions
+   reference it most in the exported data references; that builder defines it from the original's
+   bytes and the others only use the declaration, so tables and settings are not left undefined.
 4. **Build.** Builders work in parallel, one folder each. Every module is compiled alone from a
    clean stage containing snapshots of its source and the frozen contract, with
    `-Wall -Wextra -fwrapv -fno-strict-aliasing`. This requires Clang with a closed virtual
