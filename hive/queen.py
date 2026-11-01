@@ -43,13 +43,12 @@ COMPILED_IDENTITY = ("source_sha256", "contract_sha256", "object_sha256", "compi
 MAX_COMPILER_STDOUT = 16 * 1024 * 1024
 MAX_COMPILER_STDERR = 256 * 1024
 PROTOTYPE = re.compile(r"([A-Za-z_]\w*)\s*\([^;{}]*\)\s*;\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
-EXTERN_DECLARATION = re.compile(r"\bextern\b([^;{}]*);\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
 POINTER_INNER = re.compile(r"\*\s*(?:(?:const|volatile|restrict)\s+)*([A-Za-z_]\w*)\s*(?:\[\]\s*)*")
 PLAIN_DECLARATOR = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[\]\s*)*$")
 LAST_NAME = re.compile(r"\b([A-Za-z_]\w*)$")
-INLINE_TYPE_EXTERN = re.compile(r"\bextern\b(?!\s*\"C(?:\+\+)?\")[^;{}]*\{")
-INLINE_TYPE_DECLARATOR = re.compile(r"\s*(?:\*\s*)*[A-Za-z_]\w*\s*(?:\[[^\]]*\]\s*)*;")  # `} name;` after a body
-ADDRESS_COMMENT = re.compile(r"\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
+ADDRESS_COMMENT = re.compile(r"/\*\s*0x([0-9a-fA-F]+)\s*\*/")
+BLOCK_HEAD = re.compile(r'(?:\bextern\s*"C(?:\+\+)?"|\bnamespace(?:\s+[A-Za-z_]\w*)?|\))\s*\Z')  # before a block's {
+NOT_CODE = re.compile(r"/\*.*?\*/|//[^\n]*|^[ \t]*#[^\n]*(?:\\\n[^\n]*)*", re.S | re.M)  # comments, preprocessor
 DATA_REFERENCE_TYPES = frozenset({"read", "write", "read_write", "data"})
 QUALIFIERS = frozenset({"const", "volatile", "restrict", "__restrict", "_Atomic"})
 # Words that can never be a global's or a function's name in a contract declaration.
@@ -254,29 +253,63 @@ def _extern_kind(body):
     return "unreadable", None
 
 
-def _global_declarations(text):
-    """(name or None, address, declaration) for every `extern ...; /* 0xADDRESS */` that declares data.
+def _code_only(text):
+    """The text with comments and preprocessor lines blanked out; same length, so positions still match."""
+    code = list(text)
+    for match in NOT_CODE.finditer(text):
+        for index in range(match.start(), match.end()):
+            if code[index] != "\n":
+                code[index] = " "
+    return "".join(code)
 
-    Function prototypes marked extern are not data; pointer declarators such as `(*callback)` or `(*handlers[4])` are.
-    A form outside the narrow grammar of _extern_kind, or an extern that defines its type inline, has no name, so
-    contract_global_problems sends it back to the planner instead of losing it."""
+
+def _annotated_statements(text):
+    """(statement, address) for every `...; /* 0xADDRESS */`: the whole statement the comment closes, braces included."""
+    code = _code_only(text)
+    for match in ADDRESS_COMMENT.finditer(text):
+        end = len(text[:match.start()].rstrip())
+        if end == 0 or text[end - 1] != ";":
+            continue
+        index = end - 2
+        while index >= 0:
+            character = code[index]
+            if character in ";{":
+                break  # the previous statement, or the start of an enclosing block such as extern "C" { ... }
+            if character == "}":
+                opening = _opening(code, index)
+                if opening < 0 or BLOCK_HEAD.search(code, 0, opening):
+                    break  # an earlier extern "C" block, namespace or function body ends here
+                index = opening  # an inline type's body belongs to this statement
+            index -= 1
+        yield " ".join(code[index + 1:end - 1].split()), int(match.group(1), 16)
+
+
+def _opening(code, closing):
+    """Index of the brace that opens the one closing at code[closing], or -1."""
+    depth = 0
+    for index in range(closing, -1, -1):
+        depth += code[index] == "}"
+        depth -= code[index] == "{"
+        if depth == 0:
+            return index
+    return -1
+
+
+def _global_declarations(text):
+    """(name or None, address, declaration) for every annotated `extern` statement that is not a function prototype.
+
+    Every `/* 0xADDRESS */` is traced back to the whole statement it closes, so no annotated extern can be missed
+    because of its shape: it is data with a name, a function prototype, or unreadable (name None). An inline type
+    (`extern struct { ... } name;`) is unreadable: the planner is asked for a typedef. contract_global_problems sends
+    every unreadable one back to the planner instead of losing it."""
     found = []
-    for body, address in EXTERN_DECLARATION.findall(text):
-        kind, name = _extern_kind(body)
+    for statement, address in _annotated_statements(text):
+        if not re.match(r"extern\b", statement):
+            continue
+        body = statement[len("extern"):].strip()
+        kind, name = ("unreadable", None) if "{" in body or "}" in body else _extern_kind(body)
         if kind != "function":
-            found.append((name, int(address, 16), " ".join(body.split())))
-    for match in INLINE_TYPE_EXTERN.finditer(text):
-        close, depth = match.end() - 1, 0
-        for close in range(match.end() - 1, len(text)):
-            depth += text[close] == "{"
-            depth -= text[close] == "}"
-            if depth == 0:
-                break
-        declarator = INLINE_TYPE_DECLARATOR.match(text, close + 1)
-        annotated = declarator and ADDRESS_COMMENT.match(text, declarator.end())
-        if annotated:
-            found.append((None, int(annotated.group(1), 16),
-                          " ".join(text[match.start() + 6:declarator.end() - 1].split())))
+            found.append((name, address, body))
     return found
 
 

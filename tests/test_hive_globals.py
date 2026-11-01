@@ -167,7 +167,11 @@ class NarrowGrammarTests(unittest.TestCase):
                   "extern int counter __attribute__((aligned(16))); /* 0x5000 */\n",
                   "extern struct { int a; int b; } settings; /* 0x5000 */\n",
                   "extern int first, second; /* 0x5000 */\n",
-                  "extern int counter = 1; /* 0x5000 */\n")
+                  "extern int counter = 1; /* 0x5000 */\n",
+                  "extern struct { int a; } (settings); /* 0x5000 */\n",
+                  "extern struct { int a; } * const settings; /* 0x5000 */\n",
+                  "extern struct tagged { int a; } settings; /* 0x5000 */\n",
+                  "extern union { int a; float b; } settings[2]; /* 0x5000 */\n")
 
     def test_unhandled_forms_are_problems_with_the_canonical_form(self):
         for text in self.UNREADABLE:
@@ -190,6 +194,15 @@ class NarrowGrammarTests(unittest.TestCase):
         self.assertEqual(queen.contract_globals(text), {0x5000: "counter", 0x5100: "table", 0x5200: "callback",
                                                         0x5300: "signals", 0x5400: "settings"})
 
+    def test_comments_preprocessor_lines_and_linkage_blocks_do_not_hide_a_global(self):
+        text = ("#include <stdint.h>\n#define LIMIT 4 /* not; a statement */\n"
+                "extern int /* a comment; with a semicolon */ counter; /* 0x5000 */\n"
+                "// a line comment; with a semicolon\n"
+                "extern \"C\" {\nextern int inside; /* 0x5100 */\nint helper(void); /* 0x1000 */\n}\n"
+                "extern \"C\" int main(int argc, char **argv); /* 0x1100 */\n")
+        self.assertEqual(queen.contract_global_problems(text), [])
+        self.assertEqual(queen.contract_globals(text), {0x5000: "counter", 0x5100: "inside"})
+
     def test_an_unannotated_inline_struct_is_not_a_problem(self):
         self.assertEqual(queen.contract_global_problems("extern struct { int a; } scratch;\n"), [])
 
@@ -200,7 +213,9 @@ class NarrowGrammarPlanTests(unittest.TestCase):
     def test_each_unhandled_form_goes_back_to_the_planner(self):
         good = "typedef _Atomic(int) AtomicInt;\nextern AtomicInt counter; /* 0x5000 */\nint f(void); /* 0x1000 */\n"
         for form in ("extern _Atomic(int) counter; /* 0x5000 */\n", "extern int (counter); /* 0x5000 */\n",
-                     "extern int counter __attribute__((aligned(16))); /* 0x5000 */\n"):
+                     "extern int counter __attribute__((aligned(16))); /* 0x5000 */\n",
+                     "extern struct { int a; } (counter); /* 0x5000 */\n",
+                     "extern struct { int a; } * const counter; /* 0x5000 */\n"):
             with self.subTest(form=form):
                 hive, program_map, written = self.plan_with([form + "int f(void); /* 0x1000 */\n", good])
                 modules, _, contract = hive.plan(program_map)
