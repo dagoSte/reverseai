@@ -802,6 +802,7 @@ class Queen:
         link = link if link is not None else {"ok": True, "binary": binary}
         folder = self.out / "tests"
         folder.mkdir(parents=True, exist_ok=True)
+        (folder / "fuzz.json").unlink(missing_ok=True)
         shutil.copyfile(self.out / "survey" / "map.json", folder / "map.json")
         for module in modules:
             brief = self.out / "modules" / module["id"] / "BRIEF.md"
@@ -854,13 +855,21 @@ class Queen:
             fuzz_rebuilt = run_cases(mutants, rebuilt_binary, runs) if mutants else {}
             summary = fuzz_module.summarise(mutants, fuzz_original, fuzz_rebuilt, seed, compare)
             fuzz_module.write_report(folder / "fuzz.json", summary, mutants)
+            result["plain"] = dict(result, different=list(result["different"]))
             result["fuzz"] = summary
+            result["completed"] = result["cases"] + summary["completed"]
             result["cases"] += summary["cases"]
             result["identical"] += summary["identical"]
-            result["different"] += summary["different"]
-            if mutants and not summary["ran"]:
-                result.update(ran=False, reason=summary["reason"])
-            self.log(f"fuzz: {summary['identical']}/{summary['cases']} identical")
+            result["different"] = result["different"] + summary["different"]
+            result["incomplete"] = list(summary["incomplete"])
+            if summary["incomplete"]:
+                reason = summary["reason"]
+                if result["different"]:
+                    reason += (f"; {len(result['different'])} conformance case(s) differ: "
+                               + ", ".join(result["different"]))
+                result.update(ran=False, reason=reason)
+            self.log(f"fuzz: {summary['identical']}/{summary['completed']} completed cases identical; "
+                     f"{len(summary['incomplete'])} incomplete")
         return result
 
     def behaviour_fix(self, round_number, cases, original, rebuilt, different, modules, contract):
@@ -1069,6 +1078,11 @@ def render(result):
     conformance = result["conformance"]
     proof = (f"{conformance['identical']}/{conformance['cases']} cases identical" if conformance.get("ran")
              else f"not run ({conformance.get('reason')})")
+    if not conformance.get("ran") and "plain" in conformance:
+        plain, extra = conformance["plain"], conformance["fuzz"]
+        proof = (f"{plain['identical']}/{plain['cases']} plain cases identical; "
+                 f"{extra['identical']}/{extra['completed']} completed fuzz cases identical; "
+                 f"{len(extra['incomplete'])} incomplete")
     if "fuzz" in conformance:
         proof += f" ({conformance['fuzz']['cases']} fuzz)"
     lines.append("- Conformance: " + proof)

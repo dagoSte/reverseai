@@ -9,6 +9,7 @@ import random
 import re
 
 MAX_MUTANTS = 500
+ATTEMPTS_PER_MUTANT = 20
 MUTATORS = ("bitflip", "insert", "delete", "truncate", "boundary", "splice")
 BOUNDARIES = (0x00, 0xff, 0x7f, 0x80)
 
@@ -51,6 +52,29 @@ def mutate(data, operation, rng, max_file_size, other=b""):
     return result[:max_file_size]
 
 
+def _written_name(name):
+    """A file's relative destination in the fresh case folder, or None when run_cases skips it."""
+    path = Path(name)
+    if path.is_absolute() or path.drive:
+        return None
+    parts = []
+    for part in path.parts:
+        if part == "..":
+            if not parts:
+                return None
+            parts.pop()
+        elif part != ".":
+            parts.append(part)
+    return str(Path(*parts)) if parts else None
+
+
+def _input_key(case):
+    # Later entries for the same destination overwrite earlier ones before any step runs.
+    files = {_written_name(item["name"]): item["base64"] for item in case["files"]}
+    steps = [{"args": step["args"], "stdin": step.get("stdin")} for step in case["steps"]]
+    return hashlib.sha256(json.dumps([files, steps], sort_keys=True, separators=(",", ":")).encode()).digest()
+
+
 def generate(cases, input_sha256, total, max_file_size):
     """At most total fresh case IDs, seeded by the input hash and each normalised source ID."""
     total = count(total)
@@ -60,7 +84,7 @@ def generate(cases, input_sha256, total, max_file_size):
         raise ValueError("fuzzing needs the input SHA-256")
     if type(max_file_size) is not int or max_file_size < 1:
         raise ValueError("fuzz file cap must be positive")
-    reserved, sources = set(), []
+    reserved, sources, seen = set(), [], set()
     for case in cases:
         if not isinstance(case.get("id"), str):
             raise ValueError("fuzz source cases need string IDs")
@@ -70,28 +94,46 @@ def generate(cases, input_sha256, total, max_file_size):
         reserved.add(name)
         source = copy.deepcopy(case)
         source["id"] = name
-        data = [(base64.b64decode(item["base64"]) if item.get("base64")
-                 else item.get("text", "").encode())[:max_file_size] for item in case.get("files", [])]
+        kept, data, destinations = [], [], {}
+        for item in case.get("files", []):
+            destination = _written_name(item["name"])
+            if destination is None:
+                continue  # Match run_cases: an escaping entry is not decoded or written.
+            destinations[destination] = len(kept)
+            kept.append(item)
+            data.append((base64.b64decode(item["base64"]) if item.get("base64")
+                         else item.get("text", "").encode())[:max_file_size])
         source["files"] = [{"name": item["name"], "base64": base64.b64encode(content).decode("ascii")}
-                           for item, content in zip(case.get("files", []), data)]
+                           for item, content in zip(kept, data)]
+        seen.add(_input_key(source))
         if data:
             seed = hashlib.sha256(f"hive-fuzz-v1\0{input_sha256.lower()}\0{name}".encode()).digest()
-            sources.append((source, data, random.Random(int.from_bytes(seed, "big"))))
+            sources.append((source, data, random.Random(int.from_bytes(seed, "big")), tuple(destinations.values())))
     sources.sort(key=lambda item: item[0]["id"])
     if not sources:
         return []
     operations = MUTATORS if len(sources) > 1 else MUTATORS[:-1]
     mutants, sequence = [], 1
-    for index in range(total):
-        source, files, rng = sources[index % len(sources)]
-        operation = operations[index % len(operations)]
-        at, other = rng.randrange(len(files)), b""
+    visits = list(range(len(sources)))
+    for attempt in range(total * ATTEMPTS_PER_MUTANT):
+        if len(mutants) == total:
+            break
+        index = attempt % len(sources)
+        source, files, rng, written = sources[index]
+        operation = operations[visits[index] % len(operations)]
+        visits[index] += 1  # An independent cycle for each source, including rejected attempts.
+        at, other = rng.choice(written), b""
         if operation == "splice":
-            donors = [data for case, contents, _ in sources if case["id"] != source["id"] for data in contents]
+            donors = [contents[index] for case, contents, _, active in sources
+                      if case["id"] != source["id"] for index in active]
             other = rng.choice(donors)
         mutant = copy.deepcopy(source)
         changed = mutate(files[at], operation, rng, max_file_size, other)
         mutant["files"][at]["base64"] = base64.b64encode(changed).decode("ascii")
+        identity = _input_key(mutant)
+        if identity in seen:
+            continue
+        seen.add(identity)
         while True:
             suffix = f"-{sequence}"
             name = "fz-" + source["id"][:64 - 3 - len(suffix)] + suffix
@@ -105,36 +147,33 @@ def generate(cases, input_sha256, total, max_file_size):
 
 
 def summarise(cases, original, rebuilt, seed, compare):
-    """No incomplete or timed-out execution counts as a successful fuzz proof."""
-    result = {"cases": len(cases), "identical": 0, "different": [], "seed": seed}
-    expected = {case["id"] for case in cases}
-    complete = bool(cases) and len(expected) == len(cases)
-    for executions in (original, rebuilt):
-        if not isinstance(executions, dict) or set(executions) != expected:
-            complete = False
-            continue
-        for case in cases:
-            row = executions[case["id"]]
-            steps = row.get("steps") if isinstance(row, dict) else None
-            if (not case.get("steps") or not isinstance(steps, list) or len(steps) != len(case["steps"])
-                    or not all(isinstance(step, dict) and type(step.get("code")) is int for step in steps)):
-                complete = False
-    result["ran"] = complete
-    if complete:
-        same, different = compare(original, rebuilt)
-        result.update(identical=len(same), different=different)
-    else:
-        result["reason"] = ("no case files to mutate" if not cases
-                            else "fuzz execution is incomplete or timed out")
+    """Compare every complete pair, keeping missing or timed-out mutants separate."""
+    def complete(case, executions):
+        row = executions.get(case["id"]) if isinstance(executions, dict) else None
+        steps = row.get("steps") if isinstance(row, dict) else None
+        return (bool(case.get("steps")) and isinstance(steps, list) and len(steps) == len(case["steps"])
+                and all(isinstance(step, dict) and type(step.get("code")) is int for step in steps))
+    unique = len({case["id"] for case in cases}) == len(cases)
+    completed, incomplete = [], []
+    for case in cases:
+        target = completed if unique and complete(case, original) and complete(case, rebuilt) else incomplete
+        target.append(case["id"])
+    same, different = compare({key: original[key] for key in completed}, {key: rebuilt[key] for key in completed})
+    result = {"cases": len(cases), "completed": len(completed), "identical": len(same), "different": different,
+              "incomplete": incomplete, "seed": seed, "ran": bool(cases) and not incomplete}
+    if incomplete:
+        result["reason"] = f"{len(incomplete)} fuzz mutant(s) incomplete or timed out: " + ", ".join(incomplete)
+    elif not cases:
+        result["reason"] = "no distinct mutants (no case files or attempts exhausted)"
     return result
 
 
 def write_report(path, summary, cases):
-    """Keep the complete, bounded input of every observed divergent mutant."""
+    """Keep bounded reproduction inputs for differing and incomplete mutants."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    different = set(summary["different"])
+    retained = set(summary["different"]) | set(summary.get("incomplete", []))
     with path.open("w", encoding="utf-8") as handle:
-        json.dump(dict(summary, inputs=[case for case in cases if case["id"] in different]), handle,
+        json.dump(dict(summary, inputs=[case for case in cases if case["id"] in retained]), handle,
                   indent=1, ensure_ascii=False)
         handle.write("\n")

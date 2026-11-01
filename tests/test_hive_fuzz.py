@@ -22,6 +22,62 @@ CASES = [{"id": "first", "files": [{"name": "input.bin", "text": "seed"}],
 
 
 class MutationTests(unittest.TestCase):
+    def test_each_source_exercises_every_mutator_without_cycle_aliasing(self):
+        for total_sources in (2, 3, 6, 12, 40):
+            sources = [{"id":f"c{index:02d}", "files":[{"name":"input","text":f"source-{index:02d}-"*8}],
+                        "steps":[{"args":["input"]}]} for index in range(total_sources)]
+            seen = {}
+            real = fuzz.mutate
+            def observe(data, operation, *args):
+                seen.setdefault(data,set()).add(operation)
+                return real(data,operation,*args)
+            with self.subTest(sources=total_sources), patch.object(fuzz,"mutate",side_effect=observe):
+                fuzz.generate(sources,SHA,500,queen.MAX_CASE_FILE)
+            self.assertEqual(len(seen),total_sources)
+            self.assertTrue(all(operations == set(fuzz.MUTATORS) for operations in seen.values()),seen)
+
+    def test_no_source_equivalent_or_duplicate_inputs_are_counted(self):
+        def effective(case):
+            files = {str(Path(item["name"])):base64.b64decode(item["base64"]) if item.get("base64")
+                     else item.get("text","").encode() for item in case["files"]}
+            return tuple(sorted(files.items())), json.dumps(case["steps"],sort_keys=True)
+        examples = [CASES, [{"id":"empty","files":[{"name":"f","text":""}],"steps":[{"args":["f"]}]}],
+                    [{"id":"alias","files":[{"name":"f","text":"hidden"},{"name":"./f","text":"live"}],
+                      "steps":[{"args":["./f"]}]}]]
+        for sources in examples:
+            with self.subTest(sources=sources):
+                mutants = fuzz.generate(sources,SHA,500,queen.MAX_CASE_FILE)
+                inputs = [effective(case) for case in mutants]
+                self.assertTrue(inputs)
+                self.assertFalse(set(inputs) & {effective(case) for case in sources})
+                self.assertEqual(len(inputs),len(set(inputs)))
+
+    def test_retries_are_bounded_when_every_mutation_is_a_noop(self):
+        calls = 0
+        def unchanged(data, *args):
+            nonlocal calls
+            calls += 1
+            if calls > 1000:
+                self.fail("unbounded retries for unchanged input")
+            return data
+        with patch.object(fuzz,"mutate",side_effect=unchanged):
+            self.assertEqual(fuzz.generate(CASES,SHA,3,queen.MAX_CASE_FILE),[])
+        self.assertLessEqual(calls,1000)
+
+    def test_skipped_file_entries_are_filtered_before_base64_decoding(self):
+        ignored = [{"name":"../escape","base64":"abc"}, {"name":".","base64":"abc"},
+                   {"name":"folder/../..","base64":"abc"}, {"name":"/outside","base64":"abc"}]
+        sources = [{"id":"only-skipped","files":ignored,"steps":[{"args":[]}]},
+                   {"id":"kept","files":[{"name":"in","text":"content"},*ignored],
+                    "steps":[{"args":["in"]}]}]
+        try:
+            mutants = fuzz.generate(sources,SHA,20,queen.MAX_CASE_FILE)
+        except Exception as error:
+            self.fail(f"a file run_cases skips was decoded: {type(error).__name__}: {error}")
+        self.assertTrue(mutants)
+        self.assertTrue(all(case["id"].startswith("fz-kept-") for case in mutants))
+        self.assertTrue(all([item["name"] for item in case["files"]] == ["in"] for case in mutants))
+
     def test_small_budget_includes_boundary_inputs_among_many_source_cases(self):
         cases = [{"id":str(index), "files":[{"name":"input","text":chr(65 + index)*64}],
                   "steps":[{"args":["input"]}]} for index in range(6)]
@@ -132,13 +188,51 @@ class DifferentialTests(unittest.TestCase):
     def test_incomplete_or_timed_out_results_never_count_as_a_fuzz_proof(self):
         mutants = fuzz.generate(CASES, SHA, 2, queen.MAX_CASE_FILE)
         good = {case["id"]:{"steps":[{"code":0}]} for case in mutants}
-        for broken in ({}, {mutants[0]["id"]:good[mutants[0]["id"]]},
-                       {case["id"]:{"steps":[{"code":"timeout"}]} for case in mutants},
-                       {case["id"]:{"steps":[]} for case in mutants}):
+        for broken, completed in (({},0), ({mutants[0]["id"]:good[mutants[0]["id"]]},1),
+                                  ({case["id"]:{"steps":[{"code":"timeout"}]} for case in mutants},0),
+                                  ({case["id"]:{"steps":[]} for case in mutants},0)):
             with self.subTest(broken=broken):
                 result = fuzz.summarise(mutants, good, broken, SHA, queen.compare)
                 self.assertFalse(result["ran"])
-                self.assertEqual(result["identical"], 0)
+                self.assertEqual(result["identical"],completed)
+                self.assertEqual(result["completed"],completed)
+                self.assertEqual(len(result["incomplete"]),len(mutants)-completed)
+
+    def test_partial_fuzz_compares_complete_pairs_and_keeps_incomplete_ids(self):
+        cases = [{"id":name,"steps":[{"args":[]}]} for name in
+                 ("equal","different","missing-right","missing-left","timeout","both-timeout")]
+        original = {case["id"]:{"steps":[{"code":0,"out":"original"}]} for case in cases}
+        rebuilt = copy.deepcopy(original)
+        rebuilt["different"]["steps"][0]["out"] = "changed"
+        del rebuilt["missing-right"]
+        del original["missing-left"]
+        rebuilt["timeout"]["steps"][0]["code"] = "timeout"
+        original["both-timeout"]["steps"][0]["code"] = "timeout"
+        rebuilt["both-timeout"]["steps"][0]["code"] = "timeout"
+        summary = fuzz.summarise(cases,original,rebuilt,SHA,queen.compare)
+        self.assertEqual(summary["different"],["different"])
+        self.assertEqual(summary["identical"],1)
+        self.assertEqual(summary.get("incomplete"),["missing-right","missing-left","timeout","both-timeout"])
+        self.assertEqual(summary.get("completed"),2)
+        self.assertFalse(summary["ran"])
+
+    def test_inputs_include_differing_and_incomplete_mutants(self):
+        cases = fuzz.generate(CASES,SHA,3,queen.MAX_CASE_FILE)
+        summary = {"cases":3,"identical":1,"different":[cases[1]["id"]],"incomplete":[cases[2]["id"]],
+                   "seed":SHA,"ran":False}
+        path = self.root/"fuzz.json"
+        fuzz.write_report(path,summary,cases)
+        report = json.loads(path.read_text())
+        self.assertEqual([case["id"] for case in report["inputs"]],[cases[1]["id"],cases[2]["id"]])
+
+    def test_both_sides_timeout_is_incomplete_even_when_the_rows_are_equal(self):
+        cases = fuzz.generate(CASES,SHA,2,queen.MAX_CASE_FILE)
+        timed = {case["id"]:{"steps":[{"code":"timeout"}],"files":{}} for case in cases}
+        summary = fuzz.summarise(cases,timed,copy.deepcopy(timed),SHA,queen.compare)
+        self.assertFalse(summary["ran"])
+        self.assertEqual(summary["identical"],0)
+        self.assertEqual(summary["different"],[])
+        self.assertEqual(summary.get("incomplete"),[case["id"] for case in cases])
 
 
 class QueenFuzzTests(unittest.TestCase):
@@ -216,6 +310,53 @@ class QueenFuzzTests(unittest.TestCase):
         self.assertFalse(result["ran"])
         self.assertIn("incomplete", result["reason"])
         self.assertFalse(result["fuzz"]["ran"])
+
+    def test_partial_fuzz_preserves_the_plain_result_and_every_reproduction_input(self):
+        q = self.make()
+        mutant_ids = []
+        def execute(cases, binary, folder):
+            answer = self.execution(cases,binary,folder)
+            if not cases[0]["id"].startswith("fz-"):
+                if binary == "first-rebuild":
+                    answer["first"]["steps"][0]["out"] = "plain difference"
+                return answer
+            mutant_ids[:] = [case["id"] for case in cases]
+            answer[mutant_ids[3]]["steps"][0]["code"] = "timeout"  # both sides
+            if binary == "first-rebuild":
+                answer[mutant_ids[0]]["steps"][0]["out"] = "fuzz difference"
+                answer[mutant_ids[1]]["steps"][0]["code"] = "timeout"
+                del answer[mutant_ids[2]]
+            return answer
+        result = self.conformance(q,execute)
+        self.assertFalse(result["ran"])
+        self.assertEqual(result["different"],["first",mutant_ids[0]])
+        self.assertEqual(result.get("incomplete"),mutant_ids[1:4])
+        self.assertEqual(result.get("plain",{}).get("different"),["first"])
+        self.assertEqual(result["identical"],9)
+        self.assertEqual(result.get("completed"),11)
+        verdict = q.verdict({"input_sha256":SHA,"functions":[]},[],[],[],{"ok":True,"binary":"fake"},
+                            {"claims":1,"confirmed":1,"rejected":0,"input_sha256":[SHA]},1,result)
+        self.assertEqual(verdict["verdict"],"not accepted")
+        for name in ["first",*mutant_ids[:4]]:
+            self.assertIn(name,verdict["reason"])
+        line = next(line for line in queen.render(verdict).splitlines() if line.startswith("- Conformance:"))
+        self.assertIn("1/2 plain",line)
+        self.assertIn("incomplete",line)
+        self.assertNotIn("not run",line)
+        report = json.loads((self.out/"tests/fuzz.json").read_text())
+        self.assertEqual({case["id"] for case in report["inputs"]},set(mutant_ids[:4]))
+
+    def test_stale_fuzz_report_is_removed_before_a_new_conformance_attempt(self):
+        path = self.out/"tests/fuzz.json"
+        path.parent.mkdir()
+        for failed_tester in (False, True):
+            with self.subTest(failed_tester=failed_tester):
+                path.write_text('{"old":true}')
+                q = self.make(total=0)
+                if failed_tester:
+                    q.bees = lambda *args: {"ok":False,"error":"no cases"}
+                self.conformance(q,self.execution)
+                self.assertFalse(path.exists())
 
     def test_plain_incomplete_conformance_never_starts_fuzzing(self):
         q = self.make()

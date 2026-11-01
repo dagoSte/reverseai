@@ -82,8 +82,12 @@ checks and repairs (`N` defaults to 0, off). They change only case-file bytes, i
 using bit flips, insertion, deletion, truncation, boundary bytes and splicing between cases; arguments
 stay unchanged and each file stays within the 64 KiB case limit. The input SHA-256 and source case ID
 seed each sequence. Mutants use the final rebuilt binary and extend the conformance totals; differences
-are reported without another repair round. `tests/fuzz.json` records the seed and each divergent
-mutant's complete bounded input as base64 for reproduction. Cases without files add no mutants.
+are reported without another repair round. No-op and duplicate inputs are discarded with bounded
+attempts; cases whose files the executor skips add no mutants. Complete mutant pairs are compared
+even if others time out or are missing: the report keeps the plain result, differing cases and a
+separate `incomplete` list. Any incomplete mutant prevents acceptance. `tests/fuzz.json` records the
+seed and bounded base64 inputs of both differing and incomplete mutants for reproduction, and is
+cleared at the start of each conformance attempt.
 
 ## Who has the final word
 
