@@ -190,8 +190,11 @@ decision. The authoritative decisions live outside bee folders, in `.hive/status
 ## Limits
 
 - The bees run on Claude Code (and optionally Codex), so the provider's usage policies and safety
-  classifiers apply: work on malware in particular may be refused. A refused bee fails its task;
-  the module is failed or incomplete and the run ends not accepted, never as a silent pass.
+  classifiers apply: work on malware in particular may be refused. The hive recognises a refusal
+  and records it as "refused by the model provider" in the log and the report: a refused planner
+  stops the run before any other bee, a refused builder leaves its module refused, and after three
+  refusals (`refusal_limit`) no further bee starts. The run then ends not accepted, never as a
+  silent pass.
 - C and C++ output only; Objective-C, Swift, Go and Rust programs are not handled specially.
 - The pre-flight recognises common packers and strong signs of obfuscation; it does not unpack,
   and it can miss custom packers or light obfuscation.
