@@ -113,7 +113,8 @@ class CodexBees:
     """One non-interactive Codex process and ReverseAI MCP server per named bee."""
 
     def __init__(self, *, engine, inputs, enabled=("ghidra",), codex="codex", model=None, effort=None,
-                 timeout=2400, python=sys.executable, config_dir, allow_network=False):
+                 timeout=2400, python=sys.executable, config_dir, allow_network=False, env=None):
+        self.env = env  # None inherits this process's environment; hive.selfhost sets a self-hosted one
         self.engine, self.inputs = str(Path(engine).resolve()), str(Path(inputs).resolve())
         self.enabled, self.codex, self.model = tuple(enabled), codex, model
         self.effort, self.timeout, self.python = effort, timeout, str(python)
@@ -153,7 +154,7 @@ class CodexBees:
         return [*argv, "-"]
 
     def _execute(self, role, name, task, folder, *, schema=None):
-        completed = subprocess.run(self.argv(role, name, folder, schema=schema), input=task, cwd=folder,
+        completed = subprocess.run(self.argv(role, name, folder, schema=schema), input=task, cwd=folder, env=self.env,
                                    capture_output=True, text=True, timeout=self.timeout, check=False)
         if completed.returncode:
             failures = failure_messages(completed.stdout)

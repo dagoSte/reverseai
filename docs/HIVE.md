@@ -155,8 +155,10 @@ probe.
 - Codex bees (`--bee-policy codex`, `--codex-model NAME`) need a server with the OpenAI Responses
   API (Ollama 0.13.3 or later, vLLM and others). The hive adds a `selfhost` model provider for them.
 - The server must be on this machine unless you add `--model-server-remote`, because the bees'
-  prompts carry program evidence. The subscription login never reaches the server: every Anthropic
-  or Claude credential variable is removed from the bee's environment and replaced by a placeholder.
+  prompts carry program evidence.
+- No login or key reaches a self-hosted bee. Its environment is an allowlist (system basics such as
+  `PATH` and `HOME`, locale, certificate paths) plus the server routing, with a placeholder token for
+  Claude bees. Subscription logins, cloud credentials and API or repository tokens are left out.
 
 ```bash
 OLLAMA_CONTEXT_LENGTH=65536 ollama serve &

@@ -8,8 +8,8 @@ network probe. Only the model behind the CLI changes:
   LM Studio 0.4.1 or later, llama.cpp `llama-server`), through ANTHROPIC_BASE_URL.
 - Codex bees talk to a server with the OpenAI Responses API through a `selfhost` model provider.
 
-The subscription login never reaches the model server: every Anthropic or Claude credential variable is
-removed from the bee's environment and replaced by a placeholder token. The queen's checks (council,
+No login or key reaches a self-hosted bee: it gets an allowlisted environment (system basics, locale,
+certificates) plus the server routing, with a placeholder token for Claude bees. The queen's checks (council,
 evidence checker, confined compiler, conformance) stay the gate whatever the model; nothing here claims
 that a self-hosted model is good enough for a long reverse-engineering run. Measure it first.
 """
@@ -22,9 +22,16 @@ import urllib.parse
 from hive.codex_bees import CodexBees
 
 PLACEHOLDER_TOKEN = "self-hosted"
-# Credentials and routing a bee must never inherit when it talks to a self-hosted server.
-DROPPED_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_USE_", "AWS_BEARER_TOKEN_BEDROCK", "VERTEX_", "CLOUD_ML_")
-DROPPED = frozenset({"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_SUBAGENT_MODEL", "OPENAI_API_KEY", "OPENAI_BASE_URL"})
+# A self-hosted bee gets an allowlist, not this process's environment: nothing else (subscription logins, cloud,
+# API or repository tokens of any family) can reach it or the model server.
+ALLOWED = frozenset({"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "LANG", "LANGUAGE",
+                     "TZ", "__CF_USER_TEXT_ENCODING", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+                     "CODEX_HOME", "SYSTEMROOT", "COMSPEC", "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA"})
+
+
+def base_environment(base):
+    """The allowlisted part of an environment: the system basics a CLI needs, and locale settings."""
+    return {key: value for key, value in base.items() if key in ALLOWED or key.startswith("LC_")}
 
 
 def server_url(url, *, allow_remote=False):
@@ -47,8 +54,7 @@ def server_url(url, *, allow_remote=False):
 
 def claude_environment(base, url, model):
     """Environment for `claude -p` against a self-hosted Anthropic Messages server."""
-    env = {key: value for key, value in base.items()
-           if key not in DROPPED and not key.startswith(DROPPED_PREFIXES)}
+    env = base_environment(base)
     env.update({
         "ANTHROPIC_BASE_URL": url,
         "ANTHROPIC_AUTH_TOKEN": PLACEHOLDER_TOKEN,
@@ -69,7 +75,7 @@ class SelfHostedCodexBees(CodexBees):
     """Codex bees whose model is served by a self-hosted OpenAI Responses server."""
 
     def __init__(self, *, server, **kwargs):
-        super().__init__(**kwargs)
+        super().__init__(**dict(kwargs, env=base_environment(os.environ)))
         if not self.model:
             raise ValueError("self-hosted Codex bees need --codex-model")
         self.server = server

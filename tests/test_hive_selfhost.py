@@ -33,6 +33,75 @@ class ServerUrlTests(unittest.TestCase):
                 selfhost.server_url(url)
 
 
+SENTINELS = {  # one owned sentinel per credential family; real credentials are never read
+    "CLAUDE_CODE_OAUTH_TOKEN": "sentinel-1", "ANTHROPIC_API_KEY": "sentinel-2", "ANTHROPIC_AUTH_TOKEN": "sentinel-3",
+    "AWS_ACCESS_KEY_ID": "sentinel-4", "AWS_SECRET_ACCESS_KEY": "sentinel-5", "AWS_SESSION_TOKEN": "sentinel-6",
+    "AWS_PROFILE": "sentinel-7", "GOOGLE_APPLICATION_CREDENTIALS": "sentinel-8", "AZURE_CLIENT_SECRET": "sentinel-9",
+    "OPENAI_API_KEY": "sentinel-10", "CODEX_API_KEY": "sentinel-11", "GITHUB_TOKEN": "sentinel-12",
+    "GH_TOKEN": "sentinel-13", "HF_TOKEN": "sentinel-14", "NPM_TOKEN": "sentinel-15", "SSH_AUTH_SOCK": "sentinel-16",
+    "DOCKER_AUTH_CONFIG": "sentinel-17", "MY_SERVICE_PASSWORD": "sentinel-18"}
+
+
+class ChildEnvironmentTests(unittest.TestCase):
+    """What the bee process receives, through the real build path, with every credential family present."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        parent = {"PATH": "/usr/bin:/bin", "HOME": str(self.tmp), "LANG": "C.UTF-8", "LC_ALL": "C", **SENTINELS}
+        patch = mock.patch.dict(os.environ, parent, clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.parser = argparse.ArgumentParser()
+        self.parser.add_argument("--model")
+        codex_bees.add_arguments(self.parser)
+
+    def assert_clean(self, env):
+        self.assertIsNotNone(env, "a self-hosted bee must not inherit the parent environment")
+        leaked = sorted(key for key, value in env.items() if value.startswith("sentinel-"))
+        self.assertEqual(leaked, [])
+        self.assertEqual((env["PATH"], env["LANG"], env["LC_ALL"]), ("/usr/bin:/bin", "C.UTF-8", "C"))
+
+    def test_claude_bee_process(self):
+        claude = bees.ClaudeBees(engine=self.tmp, inputs=self.tmp, config_dir=self.tmp / "cfg")
+        args = self.parser.parse_args(["--model-server", "http://127.0.0.1:11434", "--model", "m1"])
+        runner = codex_bees.build(args, claude, engine=self.tmp, inputs=self.tmp, config_dir=self.tmp / "codex")
+        done = subprocess.CompletedProcess([], 0, json.dumps({"structured_output": ANSWER}), "")
+        with mock.patch.object(bees.subprocess, "run", return_value=done) as run:
+            self.assertTrue(runner("councillor", "c", "task", self.tmp)["ok"])
+        env = run.call_args.kwargs["env"]
+        self.assert_clean(env)
+        self.assertEqual(env["ANTHROPIC_BASE_URL"], "http://127.0.0.1:11434")  # routing kept
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], selfhost.PLACEHOLDER_TOKEN)
+
+    def test_codex_bee_process_and_its_network_probe(self):
+        args = self.parser.parse_args(["--bee-policy", "codex", "--model-server", "http://127.0.0.1:11434",
+                                       "--codex-model", "gpt-oss:20b"])
+        claude = bees.ClaudeBees(engine=self.tmp, inputs=self.tmp, config_dir=self.tmp / "cfg")
+        runner = codex_bees.build(args, claude, engine=self.tmp, inputs=self.tmp, config_dir=self.tmp / "codex")
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(kwargs)
+            Path(argv[argv.index("-o") + 1]).write_text(json.dumps({"verdict": "accept", "defects": [], "summary": None}))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.object(codex_bees.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(runner, "_network_ok",  # a probe process like the real one, judged isolated
+                                  wraps=lambda role, folder: bool(runner._execute(role, "probe", "t", folder))) as probe:
+            answer = runner("councillor", "c", "task", self.tmp)
+        self.assertTrue(answer["ok"], answer)
+        self.assertTrue(probe.called)  # the network probe still decides
+        self.assertEqual(len(calls), 2)  # the probe's process and the bee's process
+        for kwargs in calls:
+            self.assert_clean(kwargs["env"])
+
+    def test_without_the_flag_the_parent_environment_is_inherited(self):
+        claude = bees.ClaudeBees(engine=self.tmp, inputs=self.tmp, config_dir=self.tmp / "cfg")
+        codex = codex_bees.build(self.parser.parse_args(["--bee-policy", "codex"]), claude, engine=self.tmp,
+                                 inputs=self.tmp, config_dir=self.tmp / "codex")
+        self.assertIsNone(claude.env)
+        self.assertIsNone(codex.env)
+
+
 class EnvironmentTests(unittest.TestCase):
     def test_no_subscription_or_cloud_credential_reaches_the_bee(self):
         base = {"PATH": "/usr/bin", "HOME": "/home/x", "CLAUDE_CODE_OAUTH_TOKEN": "secret-oauth",
