@@ -23,7 +23,8 @@ class IntegrationTests(unittest.TestCase):
 
     def queen(self, bees, verdict, **kwargs):
         def check(claims, out):
-            return {"claims": 1, "confirmed": 1, "rejected": 0, "questions": 1}, []
+            return {"claims": 1, "confirmed": 1, "rejected": 0, "questions": 1,
+                    "input_sha256": ["cd" * 32]}, []
         return queen.Queen(engine=FakeEngine(self.tmp / "inputs"), out=self.tmp / "run", bees=bees, slots=2,
                            check=check, preflight=lambda engine, program_map, folder: verdict, **kwargs)
 

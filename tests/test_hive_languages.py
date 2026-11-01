@@ -107,7 +107,9 @@ class CppBees:
                                            "skipped": [{"entry": "0x1070", "reason": "duplicate constructor"}]}}
         if role == "worker":
             (folder / f"{folder.name}.cpp").write_text(SOURCES[folder.name])
-            return {"ok": True, "output": {"status": "done", "functions": [{"entry": "0x1", "status": "rebuilt"}]}}
+            entries = {"m01": ["0x1040", "0x1060"], "m02": ["0x1000"]}[folder.name]
+            return {"ok": True, "output": {"status": "done", "functions": [
+                {"entry": entry, "status": "rebuilt"} for entry in entries]}}
         if role == "councillor":
             return {"ok": True, "output": {"verdict": "accept", "defects": []}}
         if role == "tester":
@@ -127,7 +129,8 @@ class CppRunTests(unittest.TestCase):
         bees = CppBees()
 
         def check(claims, out):
-            return {"claims": 1, "confirmed": 1, "rejected": 0, "questions": 1}, []
+            return {"claims": 1, "confirmed": 1, "rejected": 0, "questions": 1,
+                    "input_sha256": ["ef" * 32]}, []
 
         hive = queen.Queen(engine=CppEngine(inputs), out=tmp / "run", bees=bees, slots=2, check=check,
                            run_original=True, language="auto")

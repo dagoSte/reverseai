@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -31,11 +32,16 @@ from pathlib import Path
 
 from hive import bees as bees_module
 from hive import codex_bees, languages, preflight
+from reverseai import intake
 
 ROOT = Path(__file__).resolve().parents[1]
 WARNINGS = ("-O1", "-Wall", "-Wextra", "-Wno-unused-parameter", "-fwrapv", "-fno-strict-aliasing")
 CFLAGS = (languages.C.standard, *WARNINGS)
-FORBIDDEN = re.compile(r"\b(?:asm|__asm__|__asm)\b|\.incbin|#\s*embed\b|\bdlopen\b")
+FORBIDDEN = re.compile(r"\b(?:asm|__asm__|__asm)\b|\.incbin|#\s*embed\b|\bdlopen\b|#\s*pragma\s+comment\b")
+EXPANDED_FORBIDDEN = re.compile(r"\.(?:incbin|include)\b|#\s*embed\b|\bdlopen\b|#\s*pragma\s+comment\b")
+COMPILED_IDENTITY = ("source_sha256", "contract_sha256", "object_sha256", "compiler_sha256")
+MAX_COMPILER_STDOUT = 16 * 1024 * 1024
+MAX_COMPILER_STDERR = 256 * 1024
 PROTOTYPE = re.compile(r"([A-Za-z_]\w*)\s*\([^;{}]*\)\s*;\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
 LENSES = (
     ("control", "control flow and arithmetic: conditions, loops, integer widths, signedness, overflow, "
@@ -46,6 +52,7 @@ LENSES = (
              "buffer sizes, endianness and pointer arithmetic"),
 )
 MAX_CASE_FILE = 64 * 1024
+MIN_CASES = 2
 
 
 class HiveError(RuntimeError):
@@ -58,6 +65,19 @@ def hexed(value):
 
 def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write_file(path, data, mode=0o644):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as handle:
+        temporary = Path(handle.name)
+        handle.write(data)
+    try:
+        temporary.chmod(mode)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 # --- ReverseAI, run as its command line from an engine checkout -----------------------------------
@@ -169,8 +189,11 @@ def contract_names(text):
 
 class Build:
     def __init__(self, folder, cc=None, cflags=None, ldflags=("-lm",), language=languages.C):
-        self.folder, self._cc, self._cflags = Path(folder), cc, cflags
+        self.folder, self._cc = Path(folder).resolve(), cc
+        self._cflags = tuple(cflags) if cflags is not None else None
         self.language, self.ldflags = language, tuple(ldflags)
+        self.include_paths = {}
+        self.checked_compiler = None
         (self.folder / "obj").mkdir(parents=True, exist_ok=True)
 
     @property
@@ -179,40 +202,195 @@ class Build:
 
     @property
     def cflags(self):
-        return tuple(self._cflags) if self._cflags is not None else (self.language.standard, *WARNINGS)
+        return self._cflags if self._cflags is not None else (self.language.standard, *WARNINGS)
+
+    @property
+    def compiler_sha256(self):
+        policy = [str(self.cc), [str(flag) for flag in self.cflags], self.language.name, "no-inline-asm-v2"]
+        return hashlib.sha256(json.dumps(policy).encode()).hexdigest()
+
+    def _run(self, argv, stage):
+        env = {k: os.environ[k] for k in ("PATH", "SDKROOT", "DEVELOPER_DIR", "SystemRoot") if k in os.environ}
+        env.update(HOME=str(stage), TMPDIR=str(stage), LC_ALL="C")
+        process = None
+        buffers = [bytearray(), bytearray()]
+        overflow = threading.Event()
+        capture_error = threading.Event()
+        stopped = threading.Event()
+        stop_lock = threading.Lock()
+        def stop():
+            with stop_lock:
+                if stopped.is_set():
+                    return
+                stopped.set()
+                try:
+                    if os.name == "posix":
+                        os.killpg(process.pid, signal.SIGKILL)
+                    else:
+                        process.kill()
+                except ProcessLookupError:
+                    pass
+        def drain(pipe, buffer, limit):
+            try:
+                while chunk := os.read(pipe.fileno(), min(65536, limit + 1 - len(buffer))):
+                    if len(buffer) + len(chunk) > limit:
+                        overflow.set()
+                        stop()
+                        break
+                    buffer.extend(chunk)
+            except OSError:
+                capture_error.set()
+                stop()
+            finally:
+                pipe.close()
+        try:
+            process = subprocess.Popen(argv, cwd=stage, env=env, stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       start_new_session=os.name == "posix")
+            readers = [threading.Thread(target=drain, args=(pipe, buffer, limit), daemon=True)
+                       for pipe, buffer, limit in zip((process.stdout, process.stderr), buffers,
+                                                       (MAX_COMPILER_STDOUT, MAX_COMPILER_STDERR))]
+            for reader in readers:
+                reader.start()
+            deadline = time.monotonic() + 60
+            try:
+                # Drain before reaping so a limiting reader still owns the process-group identity.
+                for reader in readers:
+                    reader.join(timeout=max(0, deadline - time.monotonic()))
+                if any(reader.is_alive() for reader in readers):
+                    raise subprocess.TimeoutExpired(argv, 60)
+                code = process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                stop()
+                process.wait()
+                return subprocess.CompletedProcess(argv, 124, "", "compiler timed out")
+            finally:
+                for reader in readers:
+                    reader.join(timeout=1)
+            if overflow.is_set():
+                return subprocess.CompletedProcess(argv, 125, "", "compiler output limit exceeded")
+            if capture_error.is_set():
+                return subprocess.CompletedProcess(argv, 125, "", "compiler output could not be read")
+            if any(reader.is_alive() for reader in readers):
+                return subprocess.CompletedProcess(argv, 125, "", "compiler output streams did not close")
+            return subprocess.CompletedProcess(argv, code, buffers[0].decode("utf-8", errors="replace"),
+                                                buffers[1].decode("utf-8", errors="replace"))
+        except OSError as error:
+            return subprocess.CompletedProcess(argv, 127, "", f"compiler could not start: {type(error).__name__}")
+
+    def _stage(self, unit, source, contract):
+        stage = self.folder / "stage" / unit
+        shutil.rmtree(stage, ignore_errors=True)
+        stage.mkdir(parents=True)
+        for path, name in ((contract, self.language.header), (source, self.language.source(unit))):
+            if path is None:
+                continue
+            data, _ = intake.snapshot(path)
+            text = data.decode("utf-8")
+            # Reject location spoofing before inspecting the compiler's expanded source locations.
+            logical = text.replace("??=", "#").replace("??/", "\\").replace("%:", "#")
+            logical = re.sub(r"\\\r?\n|/\*.*?\*/", "", logical, flags=re.S)
+            if re.search(r"(?m)^\s*#\s*(?:line\b|\d)", logical):
+                raise HiveError("generated source may not override source locations")
+            if FORBIDDEN.search(logical):
+                raise HiveError("forbidden constructs in generated source or contract")
+            (stage / name).write_bytes(data)
+        if source is None:
+            (stage / self.language.source(unit)).write_text(f'#include "{self.language.header}"\n')
+        return stage
+
+    def _closed(self, stage, unit):
+        flags = [self.cc, *self.cflags, "--no-default-config", "-fno-modules",
+                 "-fno-gnu-inline-asm", "-fno-asm-blocks"]
+        key = (self.cc, self.cflags, self.language.name)
+        if key not in self.include_paths:
+            discovery = self._run([*flags, "-E", "-v", "-x", self.language.syntax_kind, "-"], stage)
+            match = re.search(r"#include <\.\.\.> search starts here:(.*?)End of search list\.",
+                              discovery.stderr, re.S)
+            if discovery.returncode or not match:
+                raise HiveError("a Clang compiler with a closed VFS is required")
+            self.include_paths[key] = [line.strip().removesuffix(" (framework directory)")
+                                       for line in match[1].splitlines() if line.strip()]
+        roots = [{"type": "directory-remap", "name": str(path), "external-contents": str(path)}
+                 for path in [stage, *self.include_paths[key]]]
+        control = self.folder / "vfs" / f"{unit}.json"
+        control.parent.mkdir(exist_ok=True)
+        control.write_text(json.dumps({"version": 0, "case-sensitive": "true", "fallthrough": False, "roots": roots}))
+        return [*flags, "-ivfsoverlay", str(control)]
+
+    def ensure_confinement(self):
+        if self.checked_compiler == self.compiler_sha256:
+            return
+        stage = self.folder / "stage" / "capability"
+        stage.mkdir(parents=True, exist_ok=True)
+        source = stage / self.language.source("capability")
+        closed = self._closed(stage, "capability")
+        outside = self.folder / "vfs" / "outside-capability.h"
+        outside.write_text("#error outside capability marker\n")
+        source.write_text('#include <stddef.h>\n#if __has_include(' + json.dumps(str(outside)) + ')\n'
+                          '#error compiler VFS is not closed\n#endif\nint main(void) { return 0; }\n')
+        positive = self._run([*closed, "-x", self.language.syntax_kind, "-c", source.name,
+                              "-o", str(stage / "positive.o")], stage)
+        if positive.returncode:
+            raise HiveError("compiler confinement unavailable: " + positive.stderr[-1000:])
+        source.write_text('#define J(a,b) a ## b\nJ(__as,m__)("nop");\n'
+                          'int main(void) { J(__as,m__)("nop"); return 0; }\n')
+        negative = self._run([*closed, "-x", self.language.syntax_kind, "-fsyntax-only", source.name], stage)
+        if negative.returncode == 0 or negative.stderr.count("GNU-style inline assembly is disabled") != 2:
+            raise HiveError("compiler does not refuse nonempty inline assembly")
+        self.checked_compiler = self.compiler_sha256
+
+    def _compile(self, stage, unit, *, syntax=False):
+        closed = self._closed(stage, unit)
+        expanded = self._run([*closed, "-E", "-x", self.language.syntax_kind, self.language.source(unit)], stage)
+        if expanded.returncode:
+            return expanded
+        # Symbol labels in system declarations are not assembly statements; the compiler disables those.
+        if EXPANDED_FORBIDDEN.search(expanded.stdout):
+            return subprocess.CompletedProcess(closed, 1, "", "forbidden constructs after preprocessing")
+        action = ["-fsyntax-only"] if syntax else ["-c", "-o", str(stage / "unit.o")]
+        return self._run([*closed, "-x", self.language.syntax_kind, *action, self.language.source(unit)], stage)
 
     def syntax(self, header):
-        done = subprocess.run([self.cc, *self.cflags, "-fsyntax-only", "-x", self.language.syntax_kind, str(header)],
-                              capture_output=True, text=True, check=False)
-        return done.returncode == 0, done.stderr
+        try:
+            stage = self._stage("syntax", None, header)
+            done = self._compile(stage, "syntax", syntax=True)
+            return done.returncode == 0, done.stderr[-4000:]
+        except (intake.IntakeError, UnicodeError, HiveError) as error:
+            return False, str(error)
 
     def compile(self, module_id, source, contract):
         """Compile one module from a clean stage holding only its source and the frozen contract."""
-        text = Path(source).read_text(encoding="utf-8", errors="replace") if Path(source).is_file() else None
-        if text is None:
-            return {"ok": False, "errors": f"{Path(source).name} was not written", "warnings": ""}
-        cheat = sorted(set(FORBIDDEN.findall(text)))
-        if cheat:
-            return {"ok": False, "errors": "forbidden constructs: " + ", ".join(cheat), "warnings": ""}
-        stage = self.folder / "stage" / module_id
-        shutil.rmtree(stage, ignore_errors=True)
-        stage.mkdir(parents=True)
-        shutil.copyfile(source, stage / self.language.source(module_id))
-        shutil.copyfile(contract, stage / self.language.header)
-        done = subprocess.run([self.cc, *self.cflags, "-c", self.language.source(module_id), "-o",
-                               str(self.folder / "obj" / f"{module_id}.o")],
-                              cwd=stage, capture_output=True, text=True, check=False)
-        errors = "\n".join(line for line in done.stderr.splitlines() if "error" in line)
-        return {"ok": done.returncode == 0, "errors": errors if done.returncode else "",
-                "warnings": done.stderr if done.returncode == 0 else "", "log": done.stderr[-4000:]}
+        obj = self.folder / "obj" / f"{module_id}.o"
+        obj.unlink(missing_ok=True)
+        try:
+            stage = self._stage(module_id, source, contract)
+            done = self._compile(stage, module_id)
+            identity = {"source_sha256": sha256(stage / self.language.source(module_id)),
+                        "contract_sha256": sha256(stage / self.language.header),
+                        "compiler_sha256": self.compiler_sha256}
+            if done.returncode == 0:
+                (stage / "unit.o").replace(obj)
+                identity["object_sha256"] = sha256(obj)
+            return {"ok": done.returncode == 0, "errors": done.stderr[-4000:] if done.returncode else "",
+                    "warnings": done.stderr[-4000:] if not done.returncode else "", "log": done.stderr[-4000:], **identity}
+        except (intake.IntakeError, UnicodeError, HiveError) as error:
+            return {"ok": False, "errors": str(error), "warnings": ""}
 
     def link(self, module_ids, name):
         output = self.folder / "bin" / name
         output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output.with_name(output.name + ".link")
+        output.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
         objects = [str(self.folder / "obj" / f"{m}.o") for m in module_ids]
-        done = subprocess.run([self.cc, *objects, "-o", str(output), *self.ldflags],
-                              capture_output=True, text=True, check=False)
-        return {"ok": done.returncode == 0, "log": done.stderr[-8000:], "binary": str(output)}
+        done = self._run([self.cc, "--no-default-config", *objects, "-o", str(temporary), *self.ldflags], self.folder)
+        if done.returncode == 0:
+            temporary.replace(output)
+        else:
+            temporary.unlink(missing_ok=True)
+        return {"ok": done.returncode == 0, "log": done.stderr[-8000:],
+                "binary": str(output) if done.returncode == 0 else None}
 
 
 def link_blame(log, owners, module_ids):
@@ -276,7 +454,7 @@ class Queen:
     def __init__(self, *, engine, out, bees, slots=4, max_functions=12, compile_rounds=3, council_rounds=2,
                  lenses=len(LENSES), link_rounds=3, behaviour_rounds=2, run_original=False, cases=40,
                  max_bees=400, build=None, check=None, language="c", preflight=None, allow_packed=False):
-        self.engine, self.out, self.bees = engine, Path(out), bees
+        self.engine, self.out, self.bees = engine, Path(out).resolve(), bees
         self.slots = threading.BoundedSemaphore(slots)
         self.workers = slots
         self.max_functions, self.compile_rounds, self.council_rounds = max_functions, compile_rounds, council_rounds
@@ -291,6 +469,7 @@ class Queen:
         self.lock = threading.RLock()
         self.spent = {"bees": 0, "seconds": 0.0, "cost_usd": 0.0}
         self.events = []
+        self.statuses = {}
 
     # bookkeeping
     def log(self, message):
@@ -345,8 +524,7 @@ class Queen:
                      f"answer with the same plan:\n```\n{errors[-4000:]}\n```", folder)
         frozen = self.out / "src" / self.lang.header
         frozen.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(contract, frozen)
-        frozen.chmod(0o444)
+        write_file(frozen, intake.snapshot(contract)[0], 0o444)
         (self.out / "plan" / "modules.json").write_text(json.dumps({"modules": modules, "skipped": skipped}, indent=1))
         self.log(f"plan: {len(modules)} modules, {len(skipped)} skipped functions, contract frozen "
                  f"(sha256 {sha256(frozen)[:12]})")
@@ -382,20 +560,20 @@ class Queen:
         mid = module["id"]
         folder = self.out / "modules" / mid
         status_file = folder / "status.json"
-        if status_file.is_file():
-            status = json.loads(status_file.read_text())
-            if status.get("state") in ("accepted", "disputed"):
+        cached_status = self.out / ".hive" / "status" / f"{mid}.json"
+        if cached_status.is_file():
+            status = json.loads(cached_status.read_text())
+            if (status.get("state") == "accepted" and status.get("input_sha256") == program_map["input_sha256"]
+                    and status.get("functions") == module["functions"] and self.approved(status, contract)):
                 self.log(f"{mid}: kept from an earlier run ({status['state']})")
                 return status
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "BRIEF.md").write_text(self.brief(module, program_map, names), encoding="utf-8")
         local = folder / self.lang.header
-        if local.exists():
-            local.chmod(0o644)
-        shutil.copyfile(contract, local)
-        local.chmod(0o444)
+        write_file(local, intake.snapshot(contract)[0], 0o444)
         source = folder / self.lang.source(mid)
-        status = {"id": mid, "title": module["title"], "functions": module["functions"], "rounds": []}
+        status = {"id": mid, "title": module["title"], "functions": module["functions"], "rounds": [],
+                  "input_sha256": program_map["input_sha256"]}
         answer = self.bee("worker", f"{mid}-build", f"Rebuild module {mid}. Read `BRIEF.md` first.", folder)
         status["worker"] = answer.get("output")
         compiled = self.compile_loop(mid, folder, source, contract, status)
@@ -404,10 +582,8 @@ class Queen:
             status["errors"] = compiled["errors"][-2000:]
             return self.finish(status_file, status)
         for round_number in range(1, self.council_rounds + 1):
-            defects = self.council(mid, folder, source, contract, round_number)
-            status["rounds"].append({"council": round_number, "defects": defects})
-            if not defects:
-                status["state"] = "accepted"
+            defects = self.review(status, folder, source, contract)
+            if status["state"] in ("accepted", "incomplete", "unreviewed"):
                 return self.finish(status_file, status)
             if round_number == self.council_rounds:
                 break
@@ -425,13 +601,16 @@ class Queen:
         return self.finish(status_file, status)
 
     def finish(self, status_file, status):
-        status_file.write_text(json.dumps(status, indent=1, ensure_ascii=False))
+        data = json.dumps(status, indent=1, ensure_ascii=False).encode("utf-8")
+        write_file(status_file, data)
+        write_file(self.out / ".hive" / "status" / f"{status['id']}.json", data)
         self.log(f"{status['id']}: {status['state']}")
         return status
 
     def compile_loop(self, mid, folder, source, contract, status):
         for attempt in range(self.compile_rounds + 1):
             result = self.build.compile(mid, source, contract)
+            status["compiled"] = {k: result[k] for k in COMPILED_IDENTITY if k in result}
             status.setdefault("compiles", []).append({"ok": result["ok"], "errors": result["errors"][-1000:]})
             if result["ok"] and not result["warnings"].strip():
                 return result
@@ -446,24 +625,91 @@ class Queen:
 
     def repair(self, status, name, task, folder):
         answer = self.bee("repair", name, task, folder)
-        if answer.get("ok") and answer["output"].get("functions"):
-            status["worker"] = answer["output"]
+        self.merge_worker(status, answer)
         return answer
+
+    def merge_worker(self, status, answer, *, all_functions=None):
+        report = answer.get("output") if answer.get("ok") else None
+        previous = status.get("worker") or {}
+        try:
+            if not isinstance(report, dict) or report.get("status") not in ("done", "partial", "blocked"):
+                raise ValueError
+            expected = {int(entry, 16) for entry in status["functions"]}
+            allowed = {int(entry, 16) for entry in all_functions} if all_functions is not None else expected
+            def rows(data, permitted):
+                result = {}
+                for row in data:
+                    entry = int(row["entry"], 0)
+                    if entry not in permitted or entry in result or row.get("status") not in ("rebuilt", "stub", "skipped"):
+                        raise ValueError
+                    result[entry] = row
+                return result
+            updates = {entry: row for entry, row in rows(report["functions"], allowed).items() if entry in expected}
+            merged = {} if set(updates) == expected else rows(previous.get("functions", []), expected)
+            for entry, row in updates.items():
+                merged[entry] = dict(merged.get(entry, {}), **row)
+            status["worker"] = {**previous, **report, "functions": list(merged.values())}
+        except (KeyError, TypeError, ValueError):
+            status["worker"] = None
+
+    def complete_worker(self, status):
+        report = status.get("worker") or {}
+        try:
+            rows = report["functions"]
+            expected = {int(entry, 16) for entry in status["functions"]}
+            entries = [int(row["entry"], 0) for row in rows if row["status"] == "rebuilt"]
+            return (report.get("status") == "done" and len(entries) == len(rows) == len(expected)
+                    and set(entries) == expected)
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    def identity(self, mid, contract):
+        try:
+            source = self.out / "modules" / mid / self.lang.source(mid)
+            return {"source_sha256": intake.snapshot(source)[1].sha256,
+                    "contract_sha256": intake.snapshot(contract)[1].sha256,
+                    "object_sha256": sha256(self.build.folder / "obj" / f"{mid}.o"),
+                    "compiler_sha256": self.build.compiler_sha256}
+        except (OSError, intake.IntakeError):
+            return None
+
+    def approved(self, status, contract):
+        identity = self.identity(status["id"], contract)
+        reviewed = status.get("reviewed")
+        return bool(identity and status.get("compiled") == identity and self.complete_worker(status)
+                    and reviewed == {k: identity[k] for k in ("source_sha256", "contract_sha256")})
+
+    def review(self, status, folder, source, contract):
+        status.pop("reviewed", None)
+        if not self.complete_worker(status):
+            status["state"] = "incomplete"
+            status["errors"] = "the builder did not report every assigned function rebuilt with status done"
+            return []
+        number = len(status["rounds"]) + 1
+        result = self.council(status["id"], folder, source, contract, number)
+        status["rounds"].append({"council": number, **result})
+        status["reviewed"] = result.get("reviewed")
+        status["state"] = ("incomplete" if not result["complete"] else "disputed" if result["defects"] else
+                           "accepted" if self.approved(status, contract) else "unreviewed")
+        return result["defects"]
 
     def council(self, mid, folder, source, contract, round_number):
         unit = f"unit-{hashlib.sha256((mid + str(round_number)).encode()).hexdigest()[:6]}"
+        source_bytes, source_ref = intake.snapshot(source)
+        contract_bytes, contract_ref = intake.snapshot(contract)
         def review(lens):
             seat = self.out / "council" / f"{mid}-r{round_number}-{lens[0]}"
             shutil.rmtree(seat, ignore_errors=True)
             seat.mkdir(parents=True)
-            shutil.copyfile(source, seat / f"{unit}{self.lang.extension}")
-            shutil.copyfile(contract, seat / self.lang.header)
+            (seat / f"{unit}{self.lang.extension}").write_bytes(source_bytes)
+            (seat / self.lang.header).write_bytes(contract_bytes)
             shutil.copyfile(folder / "BRIEF.md", seat / "BRIEF.md")
             answer = self.bee("councillor", f"{mid}-council-r{round_number}-{lens[0]}",
                               f"Review `{unit}{self.lang.extension}` ({self.lang.label}) against the original "
                               "functions listed in `BRIEF.md`. "
                               f"Your lens: {lens[1]}.", seat)
-            return answer.get("output") if answer.get("ok") else None
+            output = answer.get("output") if answer.get("ok") else None
+            return output if isinstance(output, dict) and output.get("verdict") in ("accept", "refute") else None
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.lenses)) as pool:
             verdicts = list(pool.map(review, self.lenses))
         defects = []
@@ -476,10 +722,8 @@ class Queen:
         missing = sum(v is None for v in verdicts)
         if missing:
             self.log(f"{mid}: {missing} councillor(s) gave no verdict in round {round_number}")
-            if missing == len(verdicts):
-                return [{"function": "-", "problem": "no councillor could review this module",
-                         "evidence": "0x0", "fix": "re-run the council"}]
-        return defects
+        return {"complete": missing == 0, "missing": missing, "defects": defects,
+                "reviewed": {"source_sha256": source_ref.sha256, "contract_sha256": contract_ref.sha256}}
 
     def integrate(self, modules, names, contract):
         owners = {}
@@ -487,9 +731,9 @@ class Queen:
             for entry in module["functions"]:
                 if int(entry, 16) in names:
                     owners[names[int(entry, 16)]] = module["id"]
-        built = [m["id"] for m in modules if (self.out / "build" / "obj" / f"{m['id']}.o").is_file()]
         result = {"ok": False, "log": "no module compiled"}
         for attempt in range(self.link_rounds + 1):
+            built = [m["id"] for m in modules if (self.build.folder / "obj" / f"{m['id']}.o").is_file()]
             if not built:
                 break
             result = self.build.link(built, self.engine.file)
@@ -502,16 +746,23 @@ class Queen:
             def repair(item):
                 mid, problems = item
                 folder = self.out / "modules" / mid
-                self.bee("repair", f"{mid}-repair-l{attempt + 1}",
+                status = self.statuses[mid]
+                self.repair(status, f"{mid}-repair-l{attempt + 1}",
                          "Linking the whole program failed because of this module. Fix these problems:\n"
                          + "\n".join("- " + p for p in problems), folder)
-                self.build.compile(mid, folder / self.lang.source(mid), contract)
+                compiled = self.compile_loop(mid, folder, folder / self.lang.source(mid), contract, status)
+                if compiled["ok"]:
+                    self.review(status, folder, folder / self.lang.source(mid), contract)
+                else:
+                    status["state"], status["errors"] = "failed", compiled["errors"]
+                self.finish(folder / "status.json", status)
             with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
                 list(pool.map(repair, sorted(blamed.items())))
         self.log(f"link: {'ok' if result['ok'] else 'FAILED'}")
         return result
 
-    def conformance(self, binary, modules, contract):
+    def conformance(self, binary, modules, contract, *, link=None):
+        link = link if link is not None else {"ok": True, "binary": binary}
         folder = self.out / "tests"
         folder.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(self.out / "survey" / "map.json", folder / "map.json")
@@ -523,16 +774,19 @@ class Queen:
                           f"`{self.engine.file}`.", folder)
         if not answer.get("ok"):
             return {"ran": False, "reason": "the tester bee gave no cases"}
-        cases = [c for c in answer["output"]["cases"] if c.get("id") and c.get("steps")][:200]
+        cases = answer["output"]["cases"][:200]
+        if len(cases) < MIN_CASES or any(not c.get("id") or not c.get("steps") for c in cases):
+            return {"ran": False, "reason": f"behaviour proof requires at least {MIN_CASES} nonempty cases"}
         for case in cases:
             case["id"] = re.sub(r"[^A-Za-z0-9_.-]", "_", case["id"])[:64]
+        if len({c["id"] for c in cases}) != len(cases):
+            return {"ran": False, "reason": "case IDs must be unique after normalisation"}
         (folder / "cases.json").write_text(json.dumps(cases, indent=1, ensure_ascii=False))
         runs = folder / "runs"
         runs.mkdir(exist_ok=True)
         stage = folder / "original" / self.engine.file
         stage.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(self.engine.path, stage)
-        stage.chmod(0o555)
+        write_file(stage, intake.snapshot(self.engine.path)[0], 0o555)
         original = run_cases(cases, str(stage), runs)
         rebuilt_binary = binary
         for round_number in range(self.behaviour_rounds + 1):
@@ -541,9 +795,20 @@ class Queen:
             self.log(f"conformance round {round_number}: {len(same)}/{len(cases)} identical")
             if not different or round_number == self.behaviour_rounds:
                 break
-            rebuilt_binary = self.behaviour_fix(round_number + 1, cases, original, rebuilt, different, modules,
-                                                contract) or rebuilt_binary
+            repaired = self.behaviour_fix(round_number + 1, cases, original, rebuilt, different, modules, contract)
+            link.clear()
+            link.update(repaired)
+            if not link["ok"]:
+                return {"ran": False, "reason": "the current objects failed to relink after a behaviour fix"}
+            rebuilt_binary = link["binary"]
         (folder / "results.json").write_text(json.dumps({"original": original, "rebuilt": rebuilt}, indent=1))
+        expected = {c["id"] for c in cases}
+        complete = set(original) == set(rebuilt) == expected and all(
+            len(results[c["id"]].get("steps", [])) == len(c["steps"])
+            and all(type(step.get("code")) is int for step in results[c["id"]]["steps"])
+            for results in (original, rebuilt) for c in cases if c["id"] in results)
+        if not complete:
+            return {"ran": False, "reason": "conformance execution is incomplete or timed out"}
         return {"ran": True, "cases": len(cases), "identical": len(same), "different": different}
 
     def behaviour_fix(self, round_number, cases, original, rebuilt, different, modules, contract):
@@ -553,8 +818,7 @@ class Queen:
             source = self.out / "modules" / module["id"] / self.lang.source(module["id"])
             if source.is_file():
                 shutil.copyfile(source, folder / source.name)
-        shutil.copyfile(contract, folder / self.lang.header)
-        (folder / self.lang.header).chmod(0o444)
+        write_file(folder / self.lang.header, intake.snapshot(contract)[0], 0o444)
         by_id = {c["id"]: c for c in cases}
         lines = []
         for case_id in different[:25]:
@@ -563,19 +827,31 @@ class Queen:
                          f"rebuild:  {json.dumps(rebuilt[case_id], ensure_ascii=False)[:1500]}\n")
         (folder / "FAILURES.md").write_text("\n".join(lines), encoding="utf-8")
         before = {p.name: sha256(p) for p in folder.glob(f"m*{self.lang.extension}")}
-        self.bee("repair", f"behaviour-fix-{round_number}",
+        answer = self.bee("repair", f"behaviour-fix-{round_number}",
                  "The rebuilt program behaves differently from the original in the cases listed in `FAILURES.md` "
                  "(stdout is compared by hash, with its first bytes shown). The module sources are in this "
                  "folder. Find the cause with the MCP tools and fix the modules; change nothing else.", folder)
         changed = [p for p in folder.glob(f"m*{self.lang.extension}") if before.get(p.name) != sha256(p)]
         for path in changed:
             mid = path.stem
-            if self.build.compile(mid, path, contract)["ok"]:
-                shutil.copyfile(path, self.out / "modules" / mid / path.name)
+            if mid not in self.statuses:
+                continue
+            status = self.statuses[mid]
+            self.merge_worker(status, answer, all_functions=[entry for module in modules for entry in module["functions"]])
+            compiled = self.build.compile(mid, path, contract)
+            status["compiled"] = {k: compiled[k] for k in COMPILED_IDENTITY if k in compiled}
+            module_folder = self.out / "modules" / mid
+            if compiled["ok"]:
+                write_file(module_folder / path.name,
+                           (self.build.folder / "stage" / mid / path.name).read_bytes())
+                self.review(status, module_folder, module_folder / path.name, contract)
+            else:
+                status["state"], status["errors"] = "failed", compiled["errors"]
+            self.finish(module_folder / "status.json", status)
         self.log(f"behaviour fix {round_number}: {len(changed)} module(s) changed")
         result = self.build.link([m["id"] for m in modules if (self.out / "build" / "obj" / f"{m['id']}.o").is_file()],
                                  self.engine.file)
-        return result["binary"] if result["ok"] else None
+        return result
 
     def claims(self, modules):
         merged = []
@@ -588,6 +864,10 @@ class Queen:
             for claim in data.get("claims", []) if isinstance(data, dict) else []:
                 if isinstance(claim, dict):
                     claim = dict(claim, id=f"{module['id']}.{claim.get('id', '')}"[:128])
+                    for citation in claim.get("citations", []):
+                        citation["file"] = self.engine.file
+                        if isinstance(citation.get("args"), dict):
+                            citation["args"].pop("file", None)
                     merged.append(claim)
         path = self.out / "check" / "claims.json"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -611,20 +891,27 @@ class Queen:
         self.build.language = self.lang
         self.language_reasons = reasons
         self.log(f"language: {self.lang.label} ({'; '.join(reasons)})")
+        self.build.ensure_confinement()
         modules, skipped, contract = self.plan(program_map)
         names = contract_names(contract.read_text(encoding="utf-8"))
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
             statuses = list(pool.map(lambda m: self.module(m, program_map, names, contract), modules))
+        self.statuses = {s["id"]: s for s in statuses}
         link = self.integrate(modules, names, contract)
+        conformance = {"ran": False, "reason": "not allowed: start with --run-original to run the original"}
+        if self.run_original and link["ok"]:
+            conformance = self.conformance(link["binary"], modules, contract, link=link)
         claims_path, claim_count = self.claims(modules)
         check = None
         if self.check and claim_count:
+            shutil.rmtree(self.out / "check" / "result", ignore_errors=True)
             summary, _ = self.check(claims_path, self.out / "check" / "result")
             check = summary
             self.log(f"checker: {summary['confirmed']}/{summary['claims']} claims confirmed")
-        conformance = {"ran": False, "reason": "not allowed: start with --run-original to run the original"}
-        if self.run_original and link["ok"]:
-            conformance = self.conformance(link["binary"], modules, contract)
+        for status in statuses:
+            if status["state"] == "accepted" and not self.approved(status, contract):
+                status["state"] = "unreviewed"
+                self.finish(self.out / "modules" / status["id"] / "status.json", status)
         result = self.verdict(program_map, modules, skipped, statuses, link, check, claim_count, conformance)
         result["seconds"] = round(time.monotonic() - started)
         result["spent"] = self.spent
@@ -659,10 +946,20 @@ class Queen:
             reasons.append(f"modules not accepted by the council: {', '.join(bad)}")
         if stubs:
             reasons.append(f"{stubs} function(s) reported as stub or skipped by their builder")
+        incomplete = sorted(s["id"] for s in statuses if not self.complete_worker(s))
+        if incomplete:
+            reasons.append("incomplete builder reports: " + ", ".join(incomplete))
         if check is None:
             reasons.append("no claim was checked" if claim_count == 0 else "claims were not checked")
         elif check["rejected"]:
             reasons.append(f"{check['rejected']} claim(s) rejected by the evidence checker")
+        if check is not None and check.get("input_sha256") != [program_map["input_sha256"]]:
+            reasons.append("the evidence checker did not bind every question to the target input hash")
+        if self.run_original and not conformance.get("ran"):
+            reasons.append("behaviour proof incomplete: " + conformance.get("reason", "no results"))
+        if conformance.get("ran") and (conformance.get("cases", 0) < MIN_CASES
+                                       or conformance.get("identical", 0) != conformance.get("cases")):
+            reasons.append("behaviour proof has too few or incomplete cases")
         if conformance.get("ran") and conformance["different"]:
             reasons.append(f"{len(conformance['different'])} conformance case(s) differ")
         return {

@@ -33,24 +33,44 @@ Codex login. No API key is used.
    is either skipped with a reason or in exactly one module, splits oversized modules, checks
    that the contract compiles on its own, and freezes it read-only.
 4. **Build.** Builders work in parallel, one folder each. Every module is compiled alone from a
-   clean stage that holds only its source and the frozen contract, with
-   `-Wall -Wextra -fwrapv -fno-strict-aliasing`. Inline assembly, `#embed`, `.incbin` and
-   `dlopen` fail the module outright. Compiler messages go back to the builder, at most three
-   times.
+   clean stage containing snapshots of its source and the frozen contract, with
+   `-Wall -Wextra -fwrapv -fno-strict-aliasing`. This requires Clang with a closed virtual
+   filesystem (`-ivfsoverlay`, no fallthrough): generated includes and include-existence queries
+   can see only that stage and the compiler's system header directories. Other compilers are
+   refused. Before the planner starts, a native positive/negative probe checks the selected
+   compiler once: the outside-file query must fail and nonempty inline assembly must be disabled
+   in the selected C or C++ mode. The compiler receives `-fno-gnu-inline-asm` and `-fno-asm-blocks`;
+   the preprocessor VFS alone does not confine the assembler. Symlinked or hard-linked sources
+   and contracts are refused. The queen scans the whole expanded output for file-loading
+   constructs, without trusting source line markers, then compiles the original source in the
+   same confinement so macro context is kept. Generated source-location overrides are refused.
+   Each compiler command has a 60-second deadline and captured-output limits of 16 MiB stdout
+   and 256 KiB stderr; crossing a limit stops the command (the owned process group on POSIX).
+   Compiler messages go back to the builder, at most three times. A builder must report every
+   assigned function rebuilt and status `done`; repair reports update the entries they touch
+   while preserving the other functions' reported state.
 5. **Council.** Three councillors, each with a fresh context, review a renamed copy of the module
    without the builder's notes. Only behavioural differences with evidence (an address in the
    original or a finding ID) count. The builder must fix them or disprove them with evidence; a
    fresh council reviews again. A module still refuted after two rounds is **disputed**, never
-   silently accepted.
+   silently accepted. Every configured seat must return a valid verdict; a missing or failed
+   seat leaves the module **incomplete**, including a refused Codex seat in a mixed council.
 6. **Link.** The queen links all modules and routes undefined or duplicate symbols to the module
-   that owns them, at most three rounds.
+   that owns them, at most three rounds. Each repaired module returns to council on its new
+   source; a missing or refuting verdict prevents acceptance.
 7. **Evidence check.** `tools/hive_check.py` re-runs every question that a claim cites, through
    ReverseAI itself, and keeps a claim only if each cited finding ID comes back with a
    `supported` or `derived` verdict. Finding IDs are bound to the file's hash and the result's
-   content, so a made-up ID, an ID from another file or a stale ID is rejected.
+   content, so a made-up ID, an ID from another file or a stale ID is rejected. The queen binds
+   every citation to the target file and requires the checker's input hash to match the survey.
+   These checks run after the last repair, including behaviour repairs.
 8. **Behaviour (optional).** With `--run-original`, the tester writes cases; the queen runs the
    original and the rebuild on each case in a fresh folder and compares stdout, stderr, exit
-   code and every file created. Differences go to one fixer bee, at most two rounds.
+   code and every file created. At least **two nonempty cases**, with unique IDs after filename
+   normalisation, must complete; empty suites, colliding IDs and timeouts cannot prove behaviour.
+   Differences go to one fixer bee, at most two rounds; changed modules return to council.
+   A failed relink removes the older binary, invalidates the link result and stops the behaviour
+   proof; the queen never falls back to a binary built from earlier objects.
 9. **Verdict.** Code computes it: **accepted** only if the program links, every module is
    accepted by its council, no function is a stub, the checker rejected no claim and every
    conformance case is identical. Without `--run-original` the best verdict is
@@ -147,8 +167,10 @@ python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-h
 python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-hive-run --run-original
 ```
 
-Run the same command again with the same `--out` to resume: the survey and the modules that a
-council already decided are kept.
+Run the same command again with the same `--out` to resume. Accepted modules are kept only when
+their input, assignment, source, contract, compiled object and compiler policy still match the queen's saved
+decision. The authoritative decisions live outside bee folders, in `.hive/status/`; module
+`status.json` files are informational copies. Frozen contracts can be replaced on a resumed run.
 
 ## Workspace
 
