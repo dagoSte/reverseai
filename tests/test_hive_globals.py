@@ -23,7 +23,7 @@ MODULES = [{"id": "m01", "title": "decoder", "functions": ["0x1000"]},
 
 
 def ref(source, target):
-    return {"from": source, "to": hex(target), "type": "data_read"}
+    return {"from": source, "to": hex(target), "type": "read"}
 
 
 class ParseAndAssignTests(unittest.TestCase):
@@ -86,9 +86,74 @@ class RunTests(unittest.TestCase):
         hive = queen.Queen(engine=FakeEngine(tmp / "inputs"), out=tmp / "run", bees=FakeBees(GOOD), slots=2, check=check)
         hive.run()
         program_map = json.loads((tmp / "run" / "survey" / "map.json").read_text())
-        self.assertEqual(program_map["references"], [{"from": "0x1000", "to": "0x2000", "type": "data_read"}])
+        self.assertEqual(program_map["references"], [{"from": "0x1000", "to": "0x2000", "type": "read"}])
         self.assertEqual(hive.global_owners, {})  # the fake contract declares no globals; nothing is invented
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeclarationFormTests(unittest.TestCase):
+    """No declared global may be lost: pointer declarators are read, shared addresses and unreadable forms are refused."""
+
+    def test_pointer_declarators_are_globals_and_extern_functions_are_not(self):
+        text = ("extern int (*callback)(int); /* 0x5000 */\nextern int (*handlers[4])(void); /* 0x5100 */\n"
+                "extern int (*matrix)[8]; /* 0x5200 */\nextern int helper(void); /* 0x1000 */\n")
+        self.assertEqual(queen.contract_globals(text), {0x5000: "callback", 0x5100: "handlers", 0x5200: "matrix"})
+        self.assertEqual(queen.contract_global_problems(text), [])
+
+    def test_two_names_at_one_address_are_refused_before_the_builders(self):
+        problems = queen.contract_global_problems("extern int original; /* 0x5000 */\nextern int alias; /* 0x5000 */\n")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("original, alias share the address 0x5000", problems[0])
+
+    def test_an_unreadable_pointer_declaration_is_refused(self):
+        problems = queen.contract_global_problems("extern int (* const)(void); /* 0x5000 */\n")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("cannot read the name", problems[0])
+
+    def test_jumps_do_not_count_as_data_use(self):
+        program_map = {"references": [{"from": "0x1000", "to": "0x5000", "type": "read"},
+                                      {"from": "0x1100", "to": "0x5008", "type": "jump"},
+                                      {"from": "0x1100", "to": "0x5010", "type": "jump"}]}
+        owners = queen.assign_globals({0x5000: "table"}, MODULES, program_map)
+        self.assertEqual(owners, {"table": "m01"})
+
+
+@unittest.skipUnless(confined("c"), "needs a Clang compiler the hive can confine")
+class PlanRefusalTests(unittest.TestCase):
+    """A contract whose globals cannot all get an owner goes back to the planner, and is refused if never fixed."""
+
+    def plan_with(self, contracts):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "inputs").mkdir()
+        (tmp / "inputs" / "greet").write_bytes(b"x")
+        (tmp / "run" / "survey").mkdir(parents=True)
+        program_map = {"functions": [{"hex": "0x1000", "entry": 0x1000, "name": "f", "size": 8}], "imports": [],
+                       "calls": [], "strings": [], "references": [], "input_sha256": "cd" * 32}
+        (tmp / "run" / "survey" / "map.json").write_text(json.dumps(program_map))
+        written = []
+
+        def bees(role, name, task, folder):
+            text = contracts[min(len(written), len(contracts) - 1)]
+            written.append(name)
+            (Path(folder) / "contract.h").write_text(text)
+            return {"ok": True, "output": {"modules": [{"id": "a", "title": "t", "functions": ["0x1000"]}], "skipped": []}}
+        hive = queen.Queen(engine=FakeEngine(tmp / "inputs"), out=tmp / "run", bees=bees)
+        return hive, program_map, written
+
+    def test_the_planner_fixes_a_shared_address(self):
+        bad = "extern int original; /* 0x5000 */\nextern int alias; /* 0x5000 */\nint f(void); /* 0x1000 */\n"
+        good = "extern int original; /* 0x5000 */\nint f(void); /* 0x1000 */\n"
+        hive, program_map, written = self.plan_with([bad, good])
+        modules, _, contract = hive.plan(program_map)
+        self.assertEqual(written, ["planner", "planner-fix1"])
+        self.assertEqual(queen.contract_globals(contract.read_text()), {0x5000: "original"})
+
+    def test_a_contract_that_stays_unusable_is_refused(self):
+        bad = "extern int original; /* 0x5000 */\nextern int alias; /* 0x5000 */\nint f(void); /* 0x1000 */\n"
+        hive, program_map, written = self.plan_with([bad])
+        with self.assertRaises(queen.HiveError) as raised:
+            hive.plan(program_map)
+        self.assertIn("share the address", str(raised.exception))

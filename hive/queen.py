@@ -43,7 +43,11 @@ COMPILED_IDENTITY = ("source_sha256", "contract_sha256", "object_sha256", "compi
 MAX_COMPILER_STDOUT = 16 * 1024 * 1024
 MAX_COMPILER_STDERR = 256 * 1024
 PROTOTYPE = re.compile(r"([A-Za-z_]\w*)\s*\([^;{}]*\)\s*;\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
-GLOBAL = re.compile(r"\bextern\b[^;(){}]*?\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*;\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
+EXTERN_DECLARATION = re.compile(r"\bextern\b([^;{}]*);\s*/\*\s*0x([0-9a-fA-F]+)\s*\*/")
+POINTER_DECLARATOR = re.compile(r"\(\s*\*\s*(?:const\s+)?([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*\)")
+PLAIN_DECLARATOR = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\]\s*)*$")
+DATA_REFERENCE_TYPES = frozenset({"read", "write", "read_write", "data"})
+QUALIFIERS = frozenset({"const", "volatile", "restrict", "__restrict", "_Atomic"})  # export reference kinds that touch data
 GLOBAL_SPAN = 64 * 1024  # a reference this far past a global's address still counts as using it (tables)
 LENSES = (
     ("control", "control flow and arithmetic: conditions, loops, integer widths, signedness, overflow, "
@@ -188,9 +192,45 @@ def contract_names(text):
     return {int(entry, 16): name for name, entry in PROTOTYPE.findall(text)}
 
 
+def _global_declarations(text):
+    """(name or None, address, declaration) for every `extern ...; /* 0xADDRESS */` that declares data.
+
+    Function prototypes marked extern are not data; pointer declarators such as `(*callback)` or `(*handlers[4])` are."""
+    found = []
+    for body, address in EXTERN_DECLARATION.findall(text):
+        body = " ".join(body.split())
+        pointer = POINTER_DECLARATOR.search(body)
+        if pointer and pointer.group(1) not in QUALIFIERS:
+            found.append((pointer.group(1), int(address, 16), body))
+        elif "(*" in body.replace(" ", ""):
+            found.append((None, int(address, 16), body))  # a pointer declarator whose name could not be read
+        elif "(" in body:
+            continue  # an extern function prototype; contract_names handles functions
+        else:
+            plain = PLAIN_DECLARATOR.search(body)
+            found.append((plain.group(1) if plain else None, int(address, 16), body))
+    return found
+
+
 def contract_globals(text):
-    """Global data the contract declares as `extern ...; /* 0xADDRESS */`: {address: name}."""
-    return {int(address, 16): name for name, address in GLOBAL.findall(text)}
+    """Global data the contract declares as `extern ...; /* 0xADDRESS */`: {address: name}.
+
+    Call contract_global_problems first: a declaration it cannot read, or two names at one address, is refused there."""
+    return {address: name for name, address, _ in _global_declarations(text) if name}
+
+
+def contract_global_problems(text):
+    """Declarations the queen could not give an owner without losing one: unreadable ones and shared addresses."""
+    problems, names_at = [], {}
+    for name, address, body in _global_declarations(text):
+        if not name:
+            problems.append(f"cannot read the name of `extern {body};` at {hexed(address)}")
+        else:
+            names_at.setdefault(address, []).append(name)
+    for address, names in sorted(names_at.items()):
+        if len(names) > 1:
+            problems.append(f"{', '.join(names)} share the address {hexed(address)}: declare one global per address")
+    return problems
 
 
 def assign_globals(globals_by_address, modules, program_map):
@@ -205,16 +245,15 @@ def assign_globals(globals_by_address, modules, program_map):
     module_of = {entry: m["id"] for m in modules for entry in m["functions"]}
     counts = {address: {} for address in addresses}
     for ref in program_map.get("references", []):
+        if ref.get("type") is not None and ref["type"] not in DATA_REFERENCE_TYPES:
+            continue  # jumps and other control flow do not use data
         target, owner = int(ref["to"], 16), module_of.get(ref["from"])
         if owner is None:
             continue
         below = [a for a in addresses if a <= target]
-        if not below:
+        if not below or target - below[-1] >= GLOBAL_SPAN:
             continue
-        base = below[-1]
-        following = [a for a in addresses if a > base]
-        if target - base >= GLOBAL_SPAN or (following and target >= following[0]):
-            continue
+        base = below[-1]  # the nearest global at or below the target; the next one starts above it
         counts[base][owner] = counts[base].get(owner, 0) + 1
     order = [m["id"] for m in modules]
     owners = {}
@@ -556,11 +595,16 @@ class Queen:
             ok, errors = (self.build.syntax(contract) if contract.is_file()
                           else (False, f"{self.lang.header} was not written"))
             if ok:
+                problems = contract_global_problems(contract.read_text(encoding="utf-8", errors="replace"))
+                if problems:
+                    ok, errors = False, ("Every global needs exactly one owner: declare each one once as "
+                                         "`extern TYPE NAME; /* 0xADDRESS */`, one name per address.\n" + "\n".join(problems))
+            if ok:
                 break
             if attempt == self.compile_rounds:
-                raise HiveError(f"{self.lang.header} does not compile: " + errors[-1000:])
+                raise HiveError(f"{self.lang.header} is not usable: " + errors[-1000:])
             self.bee("planner", f"planner-fix{attempt + 1}",
-                     f"Your `{self.lang.header}` does not compile on its own. Fix only these errors, keep the plan, and "
+                     f"Your `{self.lang.header}` is not usable yet. Fix only these problems, keep the plan, and "
                      f"answer with the same plan:\n```\n{errors[-4000:]}\n```", folder)
         frozen = self.out / "src" / self.lang.header
         frozen.parent.mkdir(parents=True, exist_ok=True)

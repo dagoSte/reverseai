@@ -60,7 +60,7 @@ class FakeEngine:
                   "strings": ("code.export_strings", [{"index": 0, "from": 0x1000, "address": 0x2000,
                                                        "text": "usage: greet NAME\n"}]),
                   "references": ("code.export_references", [{"index": 0, "from": 0x1000, "at": 0x1008, "to": 0x2000,
-                                                             "type": "data_read", "to_name": None}])}
+                                                             "type": "read", "to_name": None}])}
         key, rows = tables[args["part"]]
         start = args["start"]
         return page(key, rows[start:start + 2], len(rows))  # two rows per page, to exercise paging
