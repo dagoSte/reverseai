@@ -269,6 +269,27 @@ class NarrowGrammarTests(unittest.TestCase):
                 self.assertEqual(len(problems), 1, problems)
                 self.assertIn("at 0x5000", problems[0])
 
+    def test_round_five_forms_are_refused(self):
+        forms = ("namespace hive " + " " * 300 + '__attribute__((visibility("default"))) { inline int settings; /* 0x5000 */ }\n',
+                 "#define NS(n) namespace n\nNS(hive) { inline int settings; /* 0x5000 */ }\n",
+                 "inline int settings(1); /* 0x5000 */\n",
+                 "#define ATOMIC(T) _Atomic(T)\n#define SETTINGS settings\nextern const ATOMIC(int) SETTINGS; /* 0x5000 */\n",
+                 "#define SETTINGS settings\nextern int __attribute((aligned(8))) SETTINGS; /* 0x5000 */\n",
+                 "#define SETTINGS settings\nextern unsigned _BitInt(32) SETTINGS; /* 0x5000 */\n")
+        for text in forms:
+            with self.subTest(text=text[:70]):
+                problems = queen.contract_global_problems(text)
+                self.assertTrue(any("at 0x5000" in problem for problem in problems), problems)
+
+    def test_a_literal_does_not_change_the_kind_of_a_block(self):
+        for text in ('struct __attribute__((annotate("namespace"))) Record { int field; /* 0x4 */ };\n'
+                     "extern int settings; /* 0x5000 */\n",
+                     'inline int example(const char *p = "namespace") { int local; /* 0x4 */ return 0; }\n'
+                     "extern int settings; /* 0x5000 */\n"):
+            with self.subTest(text=text[:50]):
+                self.assertEqual(queen.contract_global_problems(text), [])
+                self.assertEqual(queen.contract_globals(text), {0x5000: "settings"})
+
     def test_prototypes_methods_and_fields_are_not_globals(self):
         text = ("#include <stddef.h>\n"
                 "int plain(void); /* 0x1000 */\n"

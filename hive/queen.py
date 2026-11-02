@@ -48,18 +48,15 @@ POINTER_INNER = re.compile(r"\*\s*(?:(?:const|volatile|restrict)\s+)*([A-Za-z_]\
 PLAIN_DECLARATOR = re.compile(r"\b([A-Za-z_]\w*)\s*(?:\[\]\s*)*$")
 LAST_NAME = re.compile(r"\b([A-Za-z_]\w*)$")
 ADDRESS_COMMENT = re.compile(r"/\*\s*0x([0-9a-fA-F]+)\s*\*/")
-BLOCK_HEAD = re.compile(r'(?:\bextern\s*"C(?:\+\+)?"|\b(?:inline\s+)?namespace(?:\s+[A-Za-z_][\w:]*)?|\))\s*\Z')  # before a block's {
 NOT_CODE = re.compile(r'(?<![A-Za-z0-9_])(?:u8|[uUL])?R"([^()\\\s"]{0,16})\(.*?\)\1"'  # C++ raw strings
                       r'|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'|/\*.*?\*/|//[^\n]*|^[ \t]*#(?:\\\r?\n|[^\n])*',
                       re.S | re.M)  # literals, comments, preprocessor lines (with continuations)
-HEAD_WINDOW = 256  # a block's head (extern "C", namespace, a parameter list) sits just before its brace
 # Blocks whose annotated statements are not globals: a struct, union, class or enum body (field offsets), a function body.
 TYPE_HEAD = re.compile(r"\b(?:struct|union|class|enum)\b[^;{}=]*\Z")
-FUNCTION_HEAD = re.compile(r"\)\s*(?:const|noexcept|override|final|mutable|->\s*[\w:<>*& ]+|\s)*\Z")
 # What may follow a prototype's parameter list: qualifiers, pure/defaulted/deleted, trailing return, attributes, macros.
 FUNCTION_TRAILER = re.compile(r"(?:\s*(?:const|volatile|noexcept(?:\s*\([^()]*\))?|override|final|&&?|throw\s*\(\s*\)"
                               r"|=\s*(?:0|default|delete)|->\s*[^;{}=]+|__attribute__\s*\(\(.*?\)\)|\[\[.*?\]\]"
-                              r"|[A-Z_][A-Z0-9_]*(?:\s*\([^()]*\))?))*\s*")
+                              r"|[A-Z_][A-Z0-9_]*\s*\([^()]*\)))*\s*")  # an attribute macro needs its own parentheses
 UNREADABLE_TOKENS = re.compile(r"<%|%>|%:|\?\?[=/'()!<>-]")  # digraphs and trigraphs for braces and directives
 DATA_REFERENCE_TYPES = frozenset({"read", "write", "read_write", "data"})
 QUALIFIERS = frozenset({"const", "volatile", "restrict", "__restrict", "_Atomic"})
@@ -236,6 +233,46 @@ def _top_level(text, character):
     return False
 
 
+def _reserved(name):
+    """A word that cannot name a global or a function in a contract: a keyword, or an implementation-reserved
+    identifier (two leading underscores, or an underscore and a capital: __attribute, _BitInt, _Atomic)."""
+    return name in RESERVED or name.startswith("__") or bool(re.match(r"_[A-Z]", name))
+
+
+def _parameters(text):
+    """True when text reads as a parameter list (each declaration starts with a type word, an attribute or ...),
+    not as a C++ direct initialiser such as (1) or ("x")."""
+    text = text.strip()
+    if not text or text == "void":
+        return True
+    parts, depth, current = [], 0, ""
+    for character in text:
+        depth += character in "(["
+        depth -= character in ")]"
+        if character == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += character
+    parts.append(current)
+    return all(re.match(r"\s*(?:[A-Za-z_]|\[\[|\.\.\.)", part) for part in parts)
+
+
+def _strip_literals(text):
+    """The text with the contents of string and character literals removed, for keyword checks."""
+    return re.sub(r'"[^"\n]*"|\'[^\'\n]*\'', '""', text)
+
+
+def _block_kind(head):
+    """What a block's own head opens: "linkage" (namespace or extern "C", attributes and all), "type" (struct, union,
+    class or enum body), "function" (a body whose head parses as a function), or "unknown"."""
+    if re.search(r'\bextern\s*"C', head) or re.search(r"\bnamespace\b", _strip_literals(head)):
+        return "linkage"
+    if TYPE_HEAD.search(_strip_literals(head)):
+        return "type"
+    return "function" if _extern_kind(head)[0] == "function" else "unknown"
+
+
 def _extern_kind(body):
     """("data", name), ("function", None) or ("unreadable", None) for the text between `extern` and `;`.
 
@@ -248,22 +285,22 @@ def _extern_kind(body):
     if first >= 0:
         prefix, close = body[:first].strip(), _closing(body, first)
         name = LAST_NAME.search(prefix)
-        if (close >= 0 and name and name.group(1) not in RESERVED and prefix[:name.start()].strip()
-                and "=" not in prefix and not _top_level(prefix, ",")
+        if (close >= 0 and name and not _reserved(name.group(1)) and prefix[:name.start()].strip()
+                and "=" not in prefix and not _top_level(prefix, ",") and _parameters(body[first + 1:close])
                 and FUNCTION_TRAILER.fullmatch(body[close + 1:])):
             return "function", None
     if "=" in body or _top_level(body, ","):
         return "unreadable", None  # initialisers and several names in one declaration
     if first < 0:
         plain = PLAIN_DECLARATOR.search(body)
-        named = plain and plain.group(1) not in RESERVED and body[:plain.start()].strip()
+        named = plain and not _reserved(plain.group(1)) and body[:plain.start()].strip()
         return ("data", plain.group(1)) if named and ")" not in body else ("unreadable", None)
     prefix, close = body[:first].strip(), _closing(body, first)
     if not prefix or close < 0:
         return "unreadable", None
     inner, rest = body[first + 1:close].strip(), body[close + 1:].strip()
     pointer = POINTER_INNER.fullmatch(inner)
-    if pointer and pointer.group(1) not in RESERVED and LAST_NAME.search(prefix):
+    if pointer and not _reserved(pointer.group(1)) and LAST_NAME.search(prefix):
         follows_array = re.fullmatch(r"(?:\[\]\s*)*", rest)
         follows_parameters = rest.startswith("(") and _closing(rest, 0) == len(rest) - 1
         if follows_array or follows_parameters:
@@ -308,7 +345,8 @@ def _annotated_statements(text):
                 if opening < 0:
                     readable = False
                     break
-                if BLOCK_HEAD.search(code, max(0, opening - HEAD_WINDOW), opening):
+                start = max(code.rfind(";", 0, opening), code.rfind("{", 0, opening), code.rfind("}", 0, opening)) + 1
+                if _block_kind(code[start:opening]) in ("linkage", "function"):
                     break  # an earlier extern "C" block, namespace or function body ends here
                 index = opening  # an inline type's body belongs to this statement
             index -= 1
@@ -323,13 +361,13 @@ def _file_scopes(code):
 
     Only a block positively recognised as a struct, union, class or enum body (fields), or a function body, is exempt;
     file scope, extern "C" blocks, namespaces of any form and every block the scan does not recognise are checked."""
-    positions, flags, exempt = [0], [True], []
+    positions, flags, exempt, boundary = [0], [True], [], -1
     for index, character in enumerate(code):
+        if character not in ";{}":
+            continue
+        head, boundary = code[boundary + 1:index], index  # this block's own head: since the previous ; { or }
         if character == "{":
-            head = re.split(r"[;{}]", code[max(0, index - HEAD_WINDOW):index])[-1]  # this block's own head only
-            # A namespace or an extern "C" block is never exempt, whatever follows its name (attributes included).
-            linkage = re.search(r'\bnamespace\b|\bextern\s*"C', head)
-            exempt.append(not linkage and bool(TYPE_HEAD.search(head) or FUNCTION_HEAD.search(head)))
+            exempt.append(_block_kind(head) in ("type", "function"))
         elif character == "}" and exempt:
             exempt.pop()
         else:
