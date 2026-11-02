@@ -11,12 +11,22 @@ The default runner drives Claude Code in print mode on the user's own login (no 
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 ROLES = Path(__file__).with_name("roles")
+# Texts with which model providers and their CLIs report a refusal by usage policy or safety classifiers.
+REFUSAL = re.compile(r"(?i)usage polic|safeguards? (?:flagged|blocked|prevented)|flagged (?:this|the) (?:message|request)"
+                     r"|cybersecurity topic|cyber safeguard|unable to respond to this request|violat\w* (?:our|the) "
+                     r"(?:usage|acceptable)|content (?:policy|filter)|refused by the model|stop_reason.{0,4}refusal")
+
+
+def is_refusal(*texts):
+    """True when any text carries a provider refusal rather than an ordinary failure."""
+    return any(isinstance(t, str) and REFUSAL.search(t) for t in texts)
 COMMON = "common.md"
 
 # Built-in tools per role; every role also gets the read-only ReverseAI MCP tools. Claude Code governs
@@ -108,10 +118,11 @@ class ClaudeBees:
     """Run each bee as `claude -p` in its own folder with its own ReverseAI MCP server."""
 
     def __init__(self, *, engine, inputs, enabled=("ghidra",), claude="claude", model=None, effort=None,
-                 timeout=2400, python=sys.executable, config_dir):
+                 timeout=2400, python=sys.executable, config_dir, env=None):
         self.engine, self.inputs, self.enabled = str(engine), str(inputs), tuple(enabled)
         self.claude, self.model, self.effort, self.timeout, self.python = claude, model, effort, timeout, python
         self.config_dir = Path(config_dir)
+        self.env = env  # None inherits this process's environment; hive.selfhost sets a self-hosted one
 
     def _mcp_config(self, name):
         self.config_dir.mkdir(parents=True, exist_ok=True)
@@ -137,7 +148,7 @@ class ClaudeBees:
     def __call__(self, role, name, task, folder):
         started = time.monotonic()
         try:
-            completed = subprocess.run(self.argv(role, name), input=brief(role, task), cwd=folder,
+            completed = subprocess.run(self.argv(role, name), input=brief(role, task), cwd=folder, env=self.env,
                                        capture_output=True, text=True, timeout=self.timeout, check=False)
         except subprocess.TimeoutExpired:
             return {"ok": False, "error": f"no answer within {self.timeout} s", "seconds": self.timeout}
@@ -148,7 +159,8 @@ class ClaudeBees:
             data = json.loads(completed.stdout)
         except json.JSONDecodeError:
             tail = (completed.stderr or completed.stdout or "").strip()[-300:]
-            return {"ok": False, "error": f"exit {completed.returncode}: {tail}", "seconds": seconds}
+            return {"ok": False, "error": f"exit {completed.returncode}: {tail}", "seconds": seconds,
+                    **({"refused": True} if is_refusal(completed.stderr, completed.stdout) else {})}
         output = data.get("structured_output")
         if output is None and isinstance(data.get("result"), str):
             try:
@@ -156,9 +168,12 @@ class ClaudeBees:
             except json.JSONDecodeError:
                 output = None
         ok = not data.get("is_error") and isinstance(output, dict)
+        refused = not ok and (data.get("stop_reason") == "refusal"
+                              or is_refusal(data.get("result"), data.get("subtype"), completed.stderr))
         return {"ok": ok, "output": output, "seconds": seconds, "turns": data.get("num_turns"),
                 "cost_usd": data.get("total_cost_usd"),
-                **({} if ok else {"error": str(data.get("result") or data.get("subtype"))[:300]})}
+                **({} if ok else {"error": str(data.get("result") or data.get("subtype"))[:300]}),
+                **({"refused": True} if refused else {})}
 
 
 def environment_ok(claude="claude"):

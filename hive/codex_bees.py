@@ -18,7 +18,7 @@ import threading
 import time
 from pathlib import Path
 
-from hive.bees import SCHEMAS, brief
+from hive.bees import REFUSAL, SCHEMAS, brief, is_refusal
 
 NETWORK_REFUSAL = "Codex sandbox allowed network access; Codex bees refused"
 NETWORK_WARNING = "Codex bees ran without network isolation"
@@ -78,11 +78,43 @@ def _matches(value, schema):
     return kind == "null" and value is None
 
 
+class ProviderRefusal(ValueError):
+    """Codex ended because the model provider refused the request."""
+
+
+def failure_messages(stdout):
+    """Messages of the error events in `codex exec --json` output; tool output never counts."""
+    messages = []
+    for line in (stdout or "").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "error":
+            messages.append(str(event.get("message", "")))
+        elif event.get("type") == "turn.failed":
+            error = event.get("error")
+            messages.append(str(error.get("message", "") if isinstance(error, dict) else error))
+    return messages
+
+
+def refusal_excerpt(*texts):
+    """The text around the first provider refusal in any of the texts, or an empty string."""
+    for text in texts:
+        match = REFUSAL.search(text) if isinstance(text, str) else None
+        if match:
+            return " ".join(text[max(0, match.start() - 120):match.end() + 120].split())
+    return ""
+
+
 class CodexBees:
     """One non-interactive Codex process and ReverseAI MCP server per named bee."""
 
     def __init__(self, *, engine, inputs, enabled=("ghidra",), codex="codex", model=None, effort=None,
-                 timeout=2400, python=sys.executable, config_dir, allow_network=False):
+                 timeout=2400, python=sys.executable, config_dir, allow_network=False, env=None):
+        self.env = env  # None inherits this process's environment; hive.selfhost sets a self-hosted one
         self.engine, self.inputs = str(Path(engine).resolve()), str(Path(inputs).resolve())
         self.enabled, self.codex, self.model = tuple(enabled), codex, model
         self.effort, self.timeout, self.python = effort, timeout, str(python)
@@ -122,10 +154,15 @@ class CodexBees:
         return [*argv, "-"]
 
     def _execute(self, role, name, task, folder, *, schema=None):
-        completed = subprocess.run(self.argv(role, name, folder, schema=schema), input=task, cwd=folder,
+        completed = subprocess.run(self.argv(role, name, folder, schema=schema), input=task, cwd=folder, env=self.env,
                                    capture_output=True, text=True, timeout=self.timeout, check=False)
         if completed.returncode:
-            diagnostic = (completed.stderr or completed.stdout or "no diagnostic").strip()[-240:]
+            failures = failure_messages(completed.stdout)
+            # Classify the whole diagnostic before shortening it: a refusal may sit far from the tail.
+            refusal = refusal_excerpt(completed.stderr, *failures)
+            if refusal:
+                raise ProviderRefusal(f"exit {completed.returncode}: refused by the model provider: {refusal}")
+            diagnostic = (completed.stderr or "\n".join(failures) or completed.stdout or "no diagnostic").strip()[-240:]
             raise ValueError(f"exit {completed.returncode}: {diagnostic}")
         _, output_path = self._paths(name)
         output = json.loads(output_path.read_text(encoding="utf-8"))
@@ -177,6 +214,9 @@ class CodexBees:
             return {"ok": False, "output": None, "error": f"no answer within {self.timeout} s",
                     "seconds": self.timeout, **warning}
         except Exception as error:
+            if isinstance(error, ProviderRefusal) or is_refusal(str(error)):
+                return {"ok": False, "output": None, "error": str(error)[:300], "refused": True,
+                        "seconds": round(time.monotonic() - started, 1), **warning}
             return {"ok": False, "output": None, "error": str(error)[:300],
                     "seconds": round(time.monotonic() - started, 1), **warning}
 
@@ -217,12 +257,16 @@ def add_arguments(parser):
     parser.add_argument("--codex-effort", help="Reasoning effort for Codex bees")
     parser.add_argument("--codex-allow-network", action="store_true",
                         help="Accept Codex network access: skip the isolation probe and warn on every bee result")
+    from hive import selfhost
+    selfhost.add_arguments(parser)
 
 
 def build(args, claude_runner, **runner_kwargs):
     """Build from CLI options; kwargs are CodexBees' shared engine/input/config settings."""
+    from hive import selfhost
+    runner, extra = selfhost.apply(args, claude_runner)
     if args.bee_policy == "claude":
         return claude_runner
-    codex = CodexBees(**dict(runner_kwargs, codex=args.codex, model=args.codex_model, effort=args.codex_effort,
-                             allow_network=args.codex_allow_network))
+    codex = runner(**dict(runner_kwargs, codex=args.codex, model=args.codex_model, effort=args.codex_effort,
+                          allow_network=args.codex_allow_network), **extra)
     return codex if args.bee_policy == "codex" else MixedBees(claude_runner, codex, args.bee_policy)

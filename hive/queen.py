@@ -33,6 +33,7 @@ from pathlib import Path
 
 from hive import bees as bees_module
 from hive import codex_bees, languages, preflight
+from hive import fuzz as fuzz_module
 from reverseai import intake
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -81,6 +82,10 @@ MIN_CASES = 2
 
 class HiveError(RuntimeError):
     pass
+
+
+class ProviderRefused(HiveError):
+    """The model provider refused the planner, so no other bee can start."""
 
 
 def hexed(value):
@@ -750,7 +755,8 @@ def compare(original, rebuilt):
 class Queen:
     def __init__(self, *, engine, out, bees, slots=4, max_functions=12, compile_rounds=3, council_rounds=2,
                  lenses=len(LENSES), link_rounds=3, behaviour_rounds=2, run_original=False, cases=40,
-                 max_bees=400, build=None, check=None, language="c", preflight=None, allow_packed=False):
+                 max_bees=400, build=None, check=None, language="c", preflight=None, allow_packed=False,
+                 refusal_limit=3, fuzz=0):
         self.engine, self.out, self.bees = engine, Path(out).resolve(), bees
         self.slots = threading.BoundedSemaphore(slots)
         self.workers = slots
@@ -758,6 +764,7 @@ class Queen:
         self.lenses = LENSES[:max(1, min(lenses, len(LENSES)))]
         self.link_rounds, self.behaviour_rounds = link_rounds, behaviour_rounds
         self.run_original, self.case_target, self.max_bees = run_original, cases, max_bees
+        self.fuzz = fuzz_module.count(fuzz)
         self.build = build or Build(self.out / "build")
         self.requested_language = language
         self.preflight, self.allow_packed, self.preflight_result = preflight, allow_packed, None
@@ -766,6 +773,7 @@ class Queen:
         self.lock = threading.RLock()
         self.spent = {"bees": 0, "seconds": 0.0, "cost_usd": 0.0}
         self.events = []
+        self.refusals, self.refusal_limit, self.stopped = [], refusal_limit, None
         self.statuses = {}
 
     # bookkeeping
@@ -779,17 +787,37 @@ class Queen:
 
     def bee(self, role, name, task, folder):
         with self.lock:
+            if self.stopped:
+                self.log(f"{name}: not started, the run stopped: {self.stopped}")
+                return {"ok": False, "error": "run stopped: " + self.stopped}
             if self.spent["bees"] >= self.max_bees:
                 self.log(f"budget: {name} not started, the run's limit of {self.max_bees} bees is reached")
                 return {"ok": False, "error": "bee budget exhausted"}
             self.spent["bees"] += 1
         with self.slots:
+            # A bee queued for a slot while the limit was reached must not start: check again with the slot held.
+            with self.lock:
+                if self.stopped:
+                    self.spent["bees"] -= 1
+                    self.log(f"{name}: not started, the run stopped: {self.stopped}")
+                    return {"ok": False, "error": "run stopped: " + self.stopped}
             self.log(f"{name}: {role} started")
             answer = self.bees(role, name, task, folder)
-        with self.lock:
-            self.spent["seconds"] += answer.get("seconds") or 0
-            self.spent["cost_usd"] += answer.get("cost_usd") or 0
+            # Record a refusal before the slot is released, so the next queued bee sees the stop.
+            with self.lock:
+                self.spent["seconds"] += answer.get("seconds") or 0
+                self.spent["cost_usd"] += answer.get("cost_usd") or 0
+                if answer.get("refused"):
+                    self.refusals.append({"bee": name, "role": role, "text": answer.get("error", "")[:300]})
+                    if len(self.refusals) >= self.refusal_limit and not self.stopped:
+                        self.stopped = (f"the model provider refused {len(self.refusals)} bees (usage policy or "
+                                        "safety classifiers); no further bee is started")
         (Path(folder) / f".answer-{name}.json").write_text(json.dumps(answer, indent=1, ensure_ascii=False))
+        if answer.get("refused"):
+            self.log(f"{name}: REFUSED by the model provider: {answer.get('error', '')[:160]}")
+            if self.stopped:
+                self.log("stop: " + self.stopped)
+            return answer
         self.log(f"{name}: {'done' if answer.get('ok') else 'FAILED ' + answer.get('error', '')[:160]} "
                  f"in {answer.get('seconds', 0)} s")
         return answer
@@ -805,6 +833,11 @@ class Queen:
                 f"interface as `{self.lang.header}` (it replaces `contract.h` in your role card) and `PLAN.md` in "
                 "this folder and answer with the plan.")
         answer = self.bee("planner", "planner", task, folder)
+        if answer.get("refused"):
+            raise ProviderRefused("the model provider refused the planner (usage policy or safety classifiers), so the run "
+                            "stopped before any other bee: " + answer.get("error", "")[:300] + ". For legitimate security "
+                            "work, see the provider's programme for verified security use; Codex bees are an option only "
+                            "where their sandbox passes the network probe")
         if not answer.get("ok"):
             raise HiveError("the planner did not produce a plan: " + answer.get("error", ""))
         modules, skipped = normalise_plan(answer["output"], program_map, self.max_functions)
@@ -887,6 +920,10 @@ class Queen:
         status = {"id": mid, "title": module["title"], "functions": module["functions"], "rounds": [],
                   "input_sha256": program_map["input_sha256"]}
         answer = self.bee("worker", f"{mid}-build", f"Rebuild module {mid}. Read `BRIEF.md` first.", folder)
+        if answer.get("refused") or (self.stopped and not answer.get("ok")):
+            status["state"] = "refused" if answer.get("refused") else "not started"
+            status["errors"] = answer.get("error", "")[:2000]
+            return self.finish(status_file, status)
         status["worker"] = answer.get("output")
         compiled = self.compile_loop(mid, folder, source, contract, status)
         if not compiled["ok"]:
@@ -1078,6 +1115,7 @@ class Queen:
         link = link if link is not None else {"ok": True, "binary": binary}
         folder = self.out / "tests"
         folder.mkdir(parents=True, exist_ok=True)
+        (folder / "fuzz.json").unlink(missing_ok=True)
         shutil.copyfile(self.out / "survey" / "map.json", folder / "map.json")
         for module in modules:
             brief = self.out / "modules" / module["id"] / "BRIEF.md"
@@ -1122,7 +1160,30 @@ class Queen:
             for results in (original, rebuilt) for c in cases if c["id"] in results)
         if not complete:
             return {"ran": False, "reason": "conformance execution is incomplete or timed out"}
-        return {"ran": True, "cases": len(cases), "identical": len(same), "different": different}
+        result = {"ran": True, "cases": len(cases), "identical": len(same), "different": different}
+        if self.fuzz and self.run_original:
+            seed = sha256(stage)
+            mutants = fuzz_module.generate(cases, seed, self.fuzz, MAX_CASE_FILE)
+            fuzz_original = run_cases(mutants, str(stage), runs) if mutants else {}
+            fuzz_rebuilt = run_cases(mutants, rebuilt_binary, runs) if mutants else {}
+            summary = fuzz_module.summarise(mutants, fuzz_original, fuzz_rebuilt, seed, compare)
+            fuzz_module.write_report(folder / "fuzz.json", summary, mutants)
+            result["plain"] = dict(result, different=list(result["different"]))
+            result["fuzz"] = summary
+            result["completed"] = result["cases"] + summary["completed"]
+            result["cases"] += summary["cases"]
+            result["identical"] += summary["identical"]
+            result["different"] = result["different"] + summary["different"]
+            result["incomplete"] = list(summary["incomplete"])
+            if summary["incomplete"]:
+                reason = summary["reason"]
+                if result["different"]:
+                    reason += (f"; {len(result['different'])} conformance case(s) differ: "
+                               + ", ".join(result["different"]))
+                result.update(ran=False, reason=reason)
+            self.log(f"fuzz: {summary['identical']}/{summary['completed']} completed cases identical; "
+                     f"{len(summary['incomplete'])} incomplete")
+        return result
 
     def behaviour_fix(self, round_number, cases, original, rebuilt, different, modules, contract):
         folder = self.out / "fixes" / f"b{round_number}"
@@ -1205,7 +1266,11 @@ class Queen:
         self.language_reasons = reasons
         self.log(f"language: {self.lang.label} ({'; '.join(reasons)})")
         self.build.ensure_confinement()
-        modules, skipped, contract = self.plan(program_map)
+        try:
+            modules, skipped, contract = self.plan(program_map)
+        except ProviderRefused as error:
+            self.stop_refused(program_map, started, error)
+            raise
         names = contract_names(contract.read_text(encoding="utf-8"))
         self.global_addresses = contract_globals(contract.read_text(encoding="utf-8"))
         self.global_owners = assign_globals(self.global_addresses, modules, program_map)
@@ -1253,6 +1318,20 @@ class Queen:
         self.log(f"verdict: {result['verdict']} — {result['reason']}")
         return result
 
+    def stop_refused(self, program_map, started, error):
+        """Write the verdict of a run the provider stopped at the planner, replacing any earlier verdict."""
+        result = {"file": self.engine.file, "input_sha256": program_map["input_sha256"],
+                  "language": self.lang.label, "language_reasons": getattr(self, "language_reasons", []),
+                  "functions": len(program_map["functions"]), "skipped": 0, "modules": {}, "link": False,
+                  "binary": None, "check": None, "claims": 0, "preflight": self.preflight_result,
+                  "conformance": {"ran": False, "reason": "the run stopped at the planner"},
+                  "refusals": list(self.refusals), "verdict": "not started", "reason": str(error),
+                  "seconds": round(time.monotonic() - started), "spent": self.spent}
+        (self.out / "result.json").write_text(json.dumps(result, indent=1, ensure_ascii=False))
+        (self.out / "REPORT.md").write_text(render(result), encoding="utf-8")
+        self.log(f"verdict: {result['verdict']} — {result['reason']}")
+        return result
+
     def verdict(self, program_map, modules, skipped, statuses, link, check, claim_count, conformance):
         states = {s["id"]: s["state"] for s in statuses}
         stubs = sum(1 for s in statuses for f in (s.get("worker") or {}).get("functions", []) if f.get("status") != "rebuilt")
@@ -1280,7 +1359,13 @@ class Queen:
             reasons.append("behaviour proof has too few or incomplete cases")
         if conformance.get("ran") and conformance["different"]:
             reasons.append(f"{len(conformance['different'])} conformance case(s) differ")
+        if self.refusals:
+            roles = sorted({r["role"] for r in self.refusals})
+            reasons.append(f"the model provider refused {len(self.refusals)} bee(s) ({', '.join(roles)})")
+        if self.stopped:
+            reasons.append("stopped early: " + self.stopped)
         return {
+            "refusals": list(self.refusals),
             "file": self.engine.file, "input_sha256": program_map["input_sha256"],
             "language": self.lang.label, "language_reasons": getattr(self, "language_reasons", []),
             "preflight": self.preflight_result,
@@ -1309,9 +1394,20 @@ def render(result):
     lines.append(f"- Evidence checker: {check['confirmed']}/{check['claims']} claims confirmed" if check
                  else f"- Evidence checker: not run ({result['claims']} claims)")
     conformance = result["conformance"]
-    lines.append(f"- Conformance: {conformance['identical']}/{conformance['cases']} cases identical"
-                 if conformance.get("ran") else f"- Conformance: not run ({conformance.get('reason')})")
+    proof = (f"{conformance['identical']}/{conformance['cases']} cases identical" if conformance.get("ran")
+             else f"not run ({conformance.get('reason')})")
+    if not conformance.get("ran") and "plain" in conformance:
+        plain, extra = conformance["plain"], conformance["fuzz"]
+        proof = (f"{plain['identical']}/{plain['cases']} plain cases identical; "
+                 f"{extra['identical']}/{extra['completed']} completed fuzz cases identical; "
+                 f"{len(extra['incomplete'])} incomplete")
+    if "fuzz" in conformance:
+        proof += f" ({conformance['fuzz']['cases']} fuzz)"
+    lines.append("- Conformance: " + proof)
     spent = result.get("spent", {})
+    if result.get("refusals"):
+        lines.append(f"- Provider refusals: {len(result['refusals'])} (" + ", ".join(
+            sorted({r['bee'] for r in result['refusals']})) + ")")
     lines += [f"- Bees: {spent.get('bees', 0)}, agent time {round(spent.get('seconds', 0) / 60)} min, "
               f"wall time {round(result.get('seconds', 0) / 60)} min", "", "| Module | State |", "| --- | --- |"]
     lines += [f"| {m} | {s} |" for m, s in sorted(result["modules"].items())]
@@ -1337,6 +1433,9 @@ def main(argv=None):
     run.add_argument("--run-original", action="store_true",
                      help="Allow running the original program on the conformance cases (benign software only)")
     run.add_argument("--cases", type=int, default=40, help="Conformance cases to ask for (default 40)")
+    run.add_argument("--fuzz", type=fuzz_module.count, default=0,
+                     help="Extra file-mutating conformance cases after behaviour repairs "
+                          "(0-500, default 0; needs --run-original)")
     run.add_argument("--language", choices=("auto", "c", "cpp"), default="auto",
                      help="Language to rebuild in (default: detected from the program)")
     run.add_argument("--allow-packed", action="store_true",
@@ -1359,7 +1458,8 @@ def main(argv=None):
         return hive_check.check(inputs, claims, out, enabled=frozenset({"ghidra"}), jobs=args.check_jobs)
     queen = Queen(engine=engine, out=args.out, bees=bees, slots=args.bees, max_functions=args.max_functions,
                   lenses=args.council, run_original=args.run_original, cases=args.cases, max_bees=args.max_bees,
-                  check=check, language=args.language, preflight=preflight.run, allow_packed=args.allow_packed)
+                  check=check, language=args.language, preflight=preflight.run, allow_packed=args.allow_packed,
+                  fuzz=args.fuzz)
     try:
         result = queen.run()
     except HiveError as error:

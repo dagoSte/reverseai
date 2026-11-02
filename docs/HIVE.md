@@ -83,6 +83,18 @@ Codex login. No API key is used.
    conformance case is identical. Without `--run-original` the best verdict is
    **accepted without behaviour proof**.
 
+With `--run-original --fuzz N`, add up to 500 deterministic mutants after the ordinary behaviour
+checks and repairs (`N` defaults to 0, off). They change only case-file bytes, including stdin files,
+using bit flips, insertion, deletion, truncation, boundary bytes and splicing between cases; arguments
+stay unchanged and each file stays within the 64 KiB case limit. The input SHA-256 and source case ID
+seed each sequence. Mutants use the final rebuilt binary and extend the conformance totals; differences
+are reported without another repair round. No-op and duplicate inputs are discarded with bounded
+attempts; cases whose files the executor skips add no mutants. Complete mutant pairs are compared
+even if others time out or are missing: the report keeps the plain result, differing cases and a
+separate `incomplete` list. Any incomplete mutant prevents acceptance. `tests/fuzz.json` records the
+seed and bounded base64 inputs of both differing and incomplete mutants for reproduction, and is
+cleared at the start of each conformance attempt.
+
 ## Who has the final word
 
 - A failed check cannot be overruled by any agent. The council can only add a veto.
@@ -147,6 +159,37 @@ it. The hive therefore probes the Codex sandbox before its first Codex bee and r
 while the probe reaches the network. `--codex-allow-network` skips that refusal for operators who
 accept the risk on software they would run anyway; never use Codex bees on malware.
 
+### Self-hosted models (experimental)
+
+`--model-server URL` runs the bees on a model you host yourself, for teams that cannot send program
+evidence to a cloud provider or want the analysis to stay on their own network. The bees keep their
+agent CLI, so nothing about the fences depends on the model: Claude Code still enforces each role's
+tools, the folder-scoped writes and `dontAsk`, and Codex still runs in its sandbox behind the network
+probe.
+
+- Claude bees (`--model NAME`) need a server with the Anthropic Messages API, for example Ollama 0.14
+  or later, LM Studio 0.4.1 or later or llama.cpp's `llama-server`. Give it a large context: Claude
+  Code's prompt and tool definitions are long, and Ollama recommends 64k tokens or more.
+- Codex bees (`--bee-policy codex`, `--codex-model NAME`) need a server with the OpenAI Responses
+  API (Ollama 0.13.3 or later, vLLM and others). The hive adds a `selfhost` model provider for them.
+- The server must be on this machine unless you add `--model-server-remote`, because the bees'
+  prompts carry program evidence.
+- No login or key reaches a self-hosted bee. Its environment is an allowlist (system basics such as
+  `PATH` and `HOME`, locale, certificate paths) plus the server routing, with a placeholder token for
+  Claude bees. Subscription logins, cloud credentials and API or repository tokens are left out.
+
+```bash
+OLLAMA_CONTEXT_LENGTH=65536 ollama serve &
+python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-hive-run \
+  --model-server http://127.0.0.1:11434 --model qwen3.6:35b
+```
+
+This is plumbing, not a quality claim. A test drives a real Claude Code bee through a stand-in server
+that speaks the Messages API; no self-hosted model has yet been measured on a whole run. Long
+reverse-engineering runs are hard for local models (many tool calls, long decompiler output), so
+expect smaller models to manage narrow roles at best. The queen's checks stay the gate whatever the
+model: councils, the evidence checker, the confined compiler and the conformance cases.
+
 ## Safety
 
 - Bees read text that comes from untrusted binaries. No Claude bee has a shell, the web or the
@@ -195,6 +238,12 @@ decision. The authoritative decisions live outside bee folders, in `.hive/status
 
 ## Limits
 
+- The bees run on Claude Code (and optionally Codex), so the provider's usage policies and safety
+  classifiers apply: work on malware in particular may be refused. The hive recognises a refusal
+  and records it as "refused by the model provider" in the log and the report: a refused planner
+  stops the run before any other bee, a refused builder leaves its module refused, and after three
+  refusals (`refusal_limit`) no further bee starts. The run then ends not accepted, never as a
+  silent pass.
 - C and C++ output only; Objective-C, Swift, Go and Rust programs are not handled specially.
 - The pre-flight recognises common packers and strong signs of obfuscation; it does not unpack,
   and it can miss custom packers or light obfuscation.
