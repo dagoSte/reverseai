@@ -89,7 +89,7 @@ class CppEngine:
                  {"index": 1, "from": 0x1000, "to": 0x9000, "to_name": "___cxa_throw"},
                  {"index": 2, "from": 0x1000, "to": 0x9010, "to_name": "__Znwm"}]
         key, rows = {"functions": ("code.export_functions", functions), "calls": ("code.export_calls", calls),
-                     "strings": ("code.export_strings", [])}[args["part"]]
+                     "strings": ("code.export_strings", []), "references": ("code.export_references", [])}[args["part"]]
         return {"input": {"sha256": "ef" * 32}, "results": [{"findings": [
             {"claim_key": key, "verdict": "derived", "value": {"rows": rows, "total": len(rows)}}]}]}
 
