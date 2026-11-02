@@ -326,8 +326,10 @@ def _file_scopes(code):
     positions, flags, exempt = [0], [True], []
     for index, character in enumerate(code):
         if character == "{":
-            head = code[max(0, index - HEAD_WINDOW):index]
-            exempt.append(bool(TYPE_HEAD.search(head) or FUNCTION_HEAD.search(head)))
+            head = re.split(r"[;{}]", code[max(0, index - HEAD_WINDOW):index])[-1]  # this block's own head only
+            # A namespace or an extern "C" block is never exempt, whatever follows its name (attributes included).
+            linkage = re.search(r'\bnamespace\b|\bextern\s*"C', head)
+            exempt.append(not linkage and bool(TYPE_HEAD.search(head) or FUNCTION_HEAD.search(head)))
         elif character == "}" and exempt:
             exempt.pop()
         else:

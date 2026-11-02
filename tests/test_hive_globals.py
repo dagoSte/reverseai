@@ -260,7 +260,10 @@ class NarrowGrammarTests(unittest.TestCase):
                      "inline namespace v1 { int settings; /* 0x5000 */ }\n",
                      "namespace { int settings; /* 0x5000 */ }\n",
                      "#define JOIN(a,b) a##b\n#define DECL(n) JOIN(ex,tern) int n\nDECL(settings); /* 0x5000 */\n",
-                     "EXPORT(int) settings; /* 0x5000 */\n"):
+                     "EXPORT(int) settings; /* 0x5000 */\n",
+                     'namespace hive __attribute__((visibility("default"))) {\n  inline int settings; /* 0x5000 */\n}\n',
+                     'namespace [[deprecated("x")]] hive { int settings; /* 0x5000 */ }\n',
+                     'extern "C" __attribute__((visibility("default"))) {\n  int settings; /* 0x5000 */\n}\n'):
             with self.subTest(text=text):
                 problems = queen.contract_global_problems(text)
                 self.assertEqual(len(problems), 1, problems)
