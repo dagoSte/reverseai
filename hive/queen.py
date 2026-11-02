@@ -33,6 +33,7 @@ from pathlib import Path
 from hive import bees as bees_module
 from hive import codex_bees, languages, preflight
 from hive import fuzz as fuzz_module
+from hive import suite as suite_module
 from reverseai import intake
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -459,7 +460,7 @@ class Queen:
     def __init__(self, *, engine, out, bees, slots=4, max_functions=12, compile_rounds=3, council_rounds=2,
                  lenses=len(LENSES), link_rounds=3, behaviour_rounds=2, run_original=False, cases=40,
                  max_bees=400, build=None, check=None, language="c", preflight=None, allow_packed=False,
-                 refusal_limit=3, fuzz=0):
+                 refusal_limit=3, fuzz=0, suite=None):
         self.engine, self.out, self.bees = engine, Path(out).resolve(), bees
         self.slots = threading.BoundedSemaphore(slots)
         self.workers = slots
@@ -468,6 +469,7 @@ class Queen:
         self.link_rounds, self.behaviour_rounds = link_rounds, behaviour_rounds
         self.run_original, self.case_target, self.max_bees = run_original, cases, max_bees
         self.fuzz = fuzz_module.count(fuzz)
+        self.suite = suite
         self.build = build or Build(self.out / "build")
         self.requested_language = language
         self.preflight, self.allow_packed, self.preflight_result = preflight, allow_packed, None
@@ -870,6 +872,31 @@ class Queen:
                 result.update(ran=False, reason=reason)
             self.log(f"fuzz: {summary['identical']}/{summary['completed']} completed cases identical; "
                      f"{len(summary['incomplete'])} incomplete")
+        if self.suite is not None and self.run_original:
+            result.setdefault("plain", dict(result, different=list(result["different"])))
+            try:
+                suite_out = Path(tempfile.mkdtemp(prefix="suite-", dir=folder))
+                result["suite"] = suite_module.run(self.suite, stage, rebuilt_binary, suite_out, allowed=True)
+            except (suite_module.SuiteError, OSError) as error:
+                result["suite"] = {"ran": False, "complete": False, "passed": False, "reason": str(error)}
+            proof = result["suite"]
+            checked, regressions = proof.get("checked", 0), proof.get("regressions", [])
+            before, after = proof.get("original", {}).get("tests", {}), proof.get("rebuilt", {}).get("tests", {})
+            completed = sum(state == "pass" and after.get(ident) in ("pass", "fail", "skip")
+                            for ident, state in before.items())
+            result["completed"] = result.get("completed", result["cases"]) + completed
+            result["cases"] += checked
+            result["identical"] += checked - len(regressions)
+            result["different"] += ["suite:" + ident for ident in regressions]
+            complete = proof.get("ran") and proof.get("complete") and checked > 0
+            if not complete or not result["ran"]:
+                reasons = [result.get("reason", "")]
+                if not complete:
+                    reasons.append("project suite incomplete: " + (proof.get("reason") or "no passing baseline tests"))
+                if result["different"]:
+                    reasons.append(f"{len(result['different'])} conformance case(s) differ")
+                result.update(ran=False, reason="; ".join(filter(None, reasons)))
+            self.log(f"project suite: {'passed' if result['suite'].get('passed') else 'not passed'}")
         return result
 
     def behaviour_fix(self, round_number, cases, original, rebuilt, different, modules, contract):
@@ -966,6 +993,9 @@ class Queen:
         conformance = {"ran": False, "reason": "not allowed: start with --run-original to run the original"}
         if self.run_original and link["ok"]:
             conformance = self.conformance(link["binary"], modules, contract, link=link)
+        if self.suite is not None:
+            conformance.setdefault("suite", {"ran": False, "complete": False, "passed": False,
+                                            "reason": conformance.get("reason", "normal conformance did not finish")})
         claims_path, claim_count = self.claims(modules)
         check = None
         if self.check and claim_count:
@@ -1079,13 +1109,26 @@ def render(result):
     proof = (f"{conformance['identical']}/{conformance['cases']} cases identical" if conformance.get("ran")
              else f"not run ({conformance.get('reason')})")
     if not conformance.get("ran") and "plain" in conformance:
-        plain, extra = conformance["plain"], conformance["fuzz"]
-        proof = (f"{plain['identical']}/{plain['cases']} plain cases identical; "
-                 f"{extra['identical']}/{extra['completed']} completed fuzz cases identical; "
-                 f"{len(extra['incomplete'])} incomplete")
+        plain = conformance["plain"]
+        proof = f"{plain['identical']}/{plain['cases']} plain cases identical"
+        if "fuzz" in conformance:
+            extra = conformance["fuzz"]
+            proof += (f"; {extra['identical']}/{extra['completed']} completed fuzz cases identical; "
+                      f"{len(extra['incomplete'])} incomplete")
     if "fuzz" in conformance:
         proof += f" ({conformance['fuzz']['cases']} fuzz)"
+    if "suite" in conformance:
+        extra = conformance["suite"]
+        proof += f" ({extra.get('checked', 0)} suite baseline tests; {len(extra.get('regressions', []))} regressions)"
     lines.append("- Conformance: " + proof)
+    if "suite" in conformance:
+        suite = conformance["suite"]
+        summary = (f"{suite.get('checked', 0)} passing baseline tests; "
+                   f"{len(suite.get('regressions', []))} regressions; "
+                   f"{len(suite.get('both_fail', []))} failing on both")
+        if not suite.get("complete"):
+            summary += "; incomplete: " + suite.get("reason", "no complete results")
+        lines.append("- Project suite: " + summary)
     spent = result.get("spent", {})
     if result.get("refusals"):
         lines.append(f"- Provider refusals: {len(result['refusals'])} (" + ", ".join(
@@ -1118,12 +1161,19 @@ def main(argv=None):
     run.add_argument("--fuzz", type=fuzz_module.count, default=0,
                      help="Extra file-mutating conformance cases after behaviour repairs "
                           "(0-500, default 0; needs --run-original)")
+    run.add_argument("--suite", type=Path, help="Project test-suite description JSON (requires --run-original)")
     run.add_argument("--language", choices=("auto", "c", "cpp"), default="auto",
                      help="Language to rebuild in (default: detected from the program)")
     run.add_argument("--allow-packed", action="store_true",
                      help="Continue even when the pre-flight finds a packed program")
     codex_bees.add_arguments(run)
     args = parser.parse_args(argv)
+    if args.suite and not args.run_original:
+        parser.error("--suite requires --run-original to permit program execution")
+    try:
+        suite = suite_module.load(args.suite) if args.suite else None
+    except suite_module.SuiteError as error:
+        parser.error(str(error))
     if not args.inputs.is_dir() or not (args.inputs / args.file).is_file():
         parser.error("--file must name a regular file inside --inputs")
     if not bees_module.environment_ok(args.claude):
@@ -1141,7 +1191,7 @@ def main(argv=None):
     queen = Queen(engine=engine, out=args.out, bees=bees, slots=args.bees, max_functions=args.max_functions,
                   lenses=args.council, run_original=args.run_original, cases=args.cases, max_bees=args.max_bees,
                   check=check, language=args.language, preflight=preflight.run, allow_packed=args.allow_packed,
-                  fuzz=args.fuzz)
+                  fuzz=args.fuzz, suite=suite)
     try:
         result = queen.run()
     except HiveError as error:
