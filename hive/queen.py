@@ -78,6 +78,7 @@ LENSES = (
 )
 MAX_CASE_FILE = 64 * 1024
 MIN_CASES = 2
+GROUP_THRESHOLD = 256  # above this many functions the plan is made group by group (hive.partition, hive.fragments)
 
 
 class HiveError(RuntimeError):
@@ -823,7 +824,115 @@ class Queen:
         return answer
 
     # phases
+    def settle_contract(self, folder, contract, fixer, instruction, problems=()):
+        """Bounded rounds: the contract must compile on its own and give every global one owner; a fixer bee repairs it."""
+        for attempt in range(1 + self.compile_rounds):
+            if problems:
+                ok, errors = False, "\n".join(problems)
+                problems = ()
+            else:
+                ok, errors = (self.build.syntax(contract) if contract.is_file()
+                              else (False, f"{self.lang.header} was not written"))
+            if ok:
+                found = contract_global_problems(contract.read_text(encoding="utf-8", errors="replace"))
+                if found:
+                    ok, errors = False, ("Every global needs exactly one owner: declare each one once as "
+                                         "`extern TYPE NAME; /* 0xADDRESS */`, one name per address.\n" + "\n".join(found))
+            if ok:
+                return
+            if attempt == self.compile_rounds:
+                raise HiveError(f"{self.lang.header} is not usable: " + errors[-1000:])
+            self.bee("planner", f"{fixer}{attempt + 1}",
+                     f"Your `{self.lang.header}` is not usable yet. {instruction}:\n```\n{errors[-4000:]}\n```", folder)
+
+    def plan_groups(self, program_map):
+        """Plan a large program group by group: one planner bee per partition group writes a contract fragment for its
+        own functions, code merges the fragments, and the merged contract goes through the usual bounded checks.
+        Data structures stay opaque in the contract (the owner's fast route); modules use local views at the offsets."""
+        from hive import fragments as fragments_module
+        from hive import partition as partition_module
+        folder = self.out / "plan"
+        groups_folder = folder / "groups"
+        groups_folder.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.out / "survey" / "map.json", folder / "map.json")
+        split = partition_module.partition(program_map)
+        partition_module.write_side_files(split, groups_folder)
+        (folder / "groups.json").write_text(json.dumps(split["summary"], indent=1, ensure_ascii=False))
+        fragment_name = "fragment" + Path(self.lang.header).suffix
+        self.log(f"plan: {len(program_map['functions'])} functions in {len(split['groups'])} groups, "
+                 f"one planner each")
+
+        def plan_one(group):
+            gid, own = group["id"], set(group["functions"])
+            gfolder = groups_folder / gid
+            gfolder.mkdir(parents=True, exist_ok=True)
+            (gfolder / "map.json").write_text(json.dumps(group["map"], indent=1, ensure_ascii=False))
+            (gfolder / "summary.json").write_text(json.dumps(split["summary"], indent=1, ensure_ascii=False))
+            overflow = group.get("overflow") or {}
+            for side in overflow.values():  # a bee reads only inside its own folder
+                shutil.copyfile(groups_folder / side["file"], gfolder / side["file"])
+            task = (f"Program file: `{self.engine.file}`, {len(program_map['functions'])} functions planned in "
+                    f"{len(split['groups'])} groups. You plan group `{gid}` only: its {len(own)} functions are in "
+                    "`map.json` (the same shape as a whole-program map); `summary.json` shows every group and the "
+                    "calls between groups. " + (f"Some rows of this group are summarised; the full lists are in "
+                    f"`{', '.join(sorted(v['file'] for v in overflow.values()))}` in this folder. " if overflow
+                    else "") + f"Target language: {self.lang.label}. {self.lang.guidance} Write `{fragment_name}` "
+                    "instead of a whole contract, with only: system `#include <...>` lines; data structures as opaque "
+                    "names (`struct NAME;` or `typedef struct NAME NAME;`, never a body: modules read fields at the "
+                    "original offsets); scalar, pointer and function-pointer typedefs and enums; one prototype per "
+                    "function of this group, `TYPE NAME(PARAMS); /* 0xENTRY */`, with the parameters the assembly and "
+                    "pseudocode show (read them with the MCP tools); for every call this group makes into another group, "
+                    "the callee's prototype marked `/* 0xENTRY callee */`; and every global this group's functions use, "
+                    "`extern TYPE NAME; /* 0xADDRESS */`. Split only this group's functions into modules of at most "
+                    f"{self.max_functions} functions and answer with that plan.")
+            answer = self.bee("planner", f"planner-{gid}", task, gfolder)
+            if answer.get("refused"):
+                raise ProviderRefused(f"the model provider refused the planner of {gid}: " + answer.get("error", "")[:300])
+            if not answer.get("ok"):
+                raise HiveError(f"the planner of {gid} did not produce a plan: " + answer.get("error", ""))
+            fragment = gfolder / fragment_name
+            for attempt in range(1 + self.compile_rounds):
+                text = fragment.read_text(encoding="utf-8", errors="replace") if fragment.is_file() else None
+                problems = ([f"{fragment_name} was not written"] if text is None
+                            else fragments_module.fragment_problems(text, gid, own))
+                if not problems:
+                    break
+                if attempt == self.compile_rounds:
+                    raise HiveError(f"the fragment of {gid} is not usable: " + "; ".join(problems)[-1000:])
+                self.bee("planner", f"planner-{gid}-fix{attempt + 1}",
+                         f"Your `{fragment_name}` is not usable yet. Fix only these problems, keep the plan, and answer "
+                         "with the same plan:\n```\n" + "\n".join(problems)[-4000:] + "\n```", gfolder)
+            group_modules, group_skipped = normalise_plan(answer["output"], group["map"], self.max_functions)
+            return gid, text, group_modules, group_skipped
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as pool:
+            planned = sorted(pool.map(plan_one, split["groups"]), key=lambda item: item[0])
+        merged, problems = fragments_module.merge_fragments({gid: text for gid, text, _, _ in planned})
+        contract = folder / self.lang.header
+        contract.write_text(merged, encoding="utf-8")
+        modules, skipped = [], {}
+        for gid, _, group_modules, group_skipped in planned:
+            for module in group_modules:
+                modules.append({**module, "group": gid})
+            skipped.update(group_skipped)
+        for number, module in enumerate(modules, 1):
+            module["id"] = f"m{number:03d}"
+        self.opaque = True
+        self.settle_contract(folder, contract, "contract-fix",
+                             "It was merged from the groups' fragments. Fix only these problems with targeted edits (read "
+                             "the lines named; do not rewrite the file), keep structures opaque, and answer with an empty "
+                             "plan", problems)
+        frozen = self.out / "src" / self.lang.header
+        frozen.parent.mkdir(parents=True, exist_ok=True)
+        write_file(frozen, intake.snapshot(contract)[0], 0o444)
+        (folder / "modules.json").write_text(json.dumps({"modules": modules, "skipped": skipped}, indent=1))
+        self.log(f"plan: {len(modules)} modules from {len(planned)} groups, {len(skipped)} skipped functions, "
+                 f"contract frozen (sha256 {sha256(frozen)[:12]})")
+        return modules, skipped, frozen
+
     def plan(self, program_map):
+        if len(program_map["functions"]) > GROUP_THRESHOLD:
+            return self.plan_groups(program_map)
         folder = self.out / "plan"
         folder.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(self.out / "survey" / "map.json", folder / "map.json")
@@ -842,21 +951,8 @@ class Queen:
             raise HiveError("the planner did not produce a plan: " + answer.get("error", ""))
         modules, skipped = normalise_plan(answer["output"], program_map, self.max_functions)
         contract = folder / self.lang.header
-        for attempt in range(1 + self.compile_rounds):
-            ok, errors = (self.build.syntax(contract) if contract.is_file()
-                          else (False, f"{self.lang.header} was not written"))
-            if ok:
-                problems = contract_global_problems(contract.read_text(encoding="utf-8", errors="replace"))
-                if problems:
-                    ok, errors = False, ("Every global needs exactly one owner: declare each one once as "
-                                         "`extern TYPE NAME; /* 0xADDRESS */`, one name per address.\n" + "\n".join(problems))
-            if ok:
-                break
-            if attempt == self.compile_rounds:
-                raise HiveError(f"{self.lang.header} is not usable: " + errors[-1000:])
-            self.bee("planner", f"planner-fix{attempt + 1}",
-                     f"Your `{self.lang.header}` is not usable yet. Fix only these problems, keep the plan, and "
-                     f"answer with the same plan:\n```\n{errors[-4000:]}\n```", folder)
+        self.settle_contract(folder, contract, "planner-fix", "Fix only these problems, keep the plan, and answer with "
+                                                              "the same plan")
         frozen = self.out / "src" / self.lang.header
         frozen.parent.mkdir(parents=True, exist_ok=True)
         write_file(frozen, intake.snapshot(contract)[0], 0o444)
@@ -878,6 +974,12 @@ class Queen:
             f = by_hex[entry]
             lines.append(f"| {entry} | {f['entry']} | {names.get(f['entry'], '?')} | {f['name']} | {f['size']} | "
                          f"{(f.get('signature') or '').replace('|', '/')} |")
+        if getattr(self, "opaque", False):
+            lines += ["", "Data structures are opaque in the contract (only their names). Where a function reads or writes "
+                      "fields, declare in your source a local view struct (a module-specific name such as "
+                      f"`{module['id']}_easy_view`) with every field at the exact offset the assembly uses (fill gaps with "
+                      "char arrays and pin each offset with static_assert(offsetof(...))), cast the contract's pointer to "
+                      "it, and never put a structure body in the contract."]
         mine = set(module["functions"])
         calls = [c for c in program_map["calls"] if c["from"] in mine]
         if calls:
