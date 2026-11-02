@@ -89,6 +89,18 @@ separate `incomplete` list. Any incomplete mutant prevents acceptance. `tests/fu
 seed and bounded base64 inputs of both differing and incomplete mutants for reproduction, and is
 cleared at the start of each conformance attempt.
 
+With `--run-original --suite FILE`, also run a trusted project test suite after ordinary conformance
+and fuzzing, using the final rebuilt binary. The JSON description names `folder` (relative to the
+JSON file), an `argv` list containing `{program}` and optionally `{workdir}`, a positive `timeout`
+in seconds, `format` (`tap` or `curl`), and optional `tests` IDs as numeric strings appended as arguments.
+Each side gets a fresh suite copy and HOME with a minimal environment; suite code is executable
+code and these copies are not a sandbox. Raw stdout/stderr are retained, capped at 1 MiB each.
+Every test passing on the original must pass on the rebuild and extends the conformance totals;
+tests failing on both and skips are reported separately. Missing results, timeouts, output overflow,
+regressions or no passing baseline
+tests prevent acceptance. The summary and log paths are kept in `conformance.suite` and in a fresh
+`tests/suite-*` folder. No suite or program is run without `--run-original`.
+
 ## Who has the final word
 
 - A failed check cannot be overruled by any agent. The council can only add a veto.
