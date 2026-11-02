@@ -535,6 +535,20 @@ class PartitionTests(unittest.TestCase):
         self.assertTrue(all(row["meta"]["values"] == [1] for row in result["cut_edges"]))
         self.assertTrue(all(row["meta"]["values"] == [1] for row in source["calls"]))
 
+    def test_many_self_calls_are_sampled_without_aborting(self):
+        source = program(1)
+        source["calls"] = [{"from": "0x1000", "to": "0x1000", "at": i} for i in range(2000)]
+        source["calls"] += [{"from": "0x1000", "to": "0x0001", "at": -i - 1} for i in range(1000)]
+        result = self.valid_partition(source)
+        group = result["groups"][0]
+        self.assertTrue(group["oversized"])
+        self.assertLessEqual(group["bytes"], 65536)
+        manifest = group["overflow"]["outgoing_calls"]
+        self.assertEqual((manifest["total"], manifest["retained"], manifest["deferred"]), (3000, 128, 2872))
+        self.assertEqual(manifest["by_group"], {group["id"]: 1872, "unknown_target": 1000})
+        self.assertTrue(all(row["to"] == "0x1000" for row in group["map"]["calls"]))
+        self.assertEqual(len(result["side_files"][manifest["file"]]["rows"]), 3000)
+
     def test_writer_removes_only_stale_files_it_owns(self):
         source = program(1)
         source["strings"] = [{"from": "0x1000", "address": "0x9000", "text": "x" * 70000},

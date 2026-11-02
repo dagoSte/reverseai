@@ -146,10 +146,10 @@ def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=
 
     Entry hints include entry/main/start names and functions without callers;
     these are not proven entry points. Oversized singletons stay isolated. Their
-    bounded map view samples incoming/outgoing non-self calls, references,
+    bounded map view samples incoming/outgoing calls, references,
     data_refs and strings up to their limits (fewer if needed for bytes).
-    reference_limit applies separately to references and data_refs. Self calls
-    remain in the core. The manifest's by_group counts only deferred rows; side
+    reference_limit applies separately to references and data_refs. Outgoing
+    samples prefer self calls. The manifest's by_group counts only deferred rows; side
     files keep complete rows and complete counts. Unknown call sources use
     unknown_caller; unknown reference sources/targets have their own buckets.
     Side files are independent JSON objects. Only views shorten, never evidence.
@@ -230,8 +230,8 @@ def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=
         return (("incoming_calls", incoming_limit,
                  [(key, i) for key, i in ordered if key == "calls" and _address(tables[key][i]["from"]) != e]),
                 ("outgoing_calls", outgoing_limit,
-                 [(key, i) for key, i in ordered if key == "calls" and _address(tables[key][i]["from"]) == e
-                  and _address(tables[key][i]["to"]) != e]),
+                 sorted([(key, i) for key, i in ordered if key == "calls" and _address(tables[key][i]["from"]) == e],
+                        key=lambda item: (_address(tables[item[0]][item[1]]["to"]) != e, item))),
                 ("references", reference_limit, [item for item in ordered if item[0] == "references"]),
                 ("data_refs", reference_limit, [item for item in ordered if item[0] == "data_refs"]),
                 ("strings", string_limit, [item for item in ordered if item[0] == "strings"]))
