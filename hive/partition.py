@@ -1,8 +1,9 @@
 """Deterministic, model-free map partitioning for the first planning stage.
 
-``partition`` returns lossless map slices, all directed cut calls, and a bounded
-summary. Count/byte caps take precedence over affinity: a connected component may
-be split. No function is classified or skipped; library/runtime metadata survives.
+``partition`` returns bounded map views, complete side-file evidence, all directed
+cut calls, and a bounded summary. Count/byte caps take precedence over affinity:
+a connected component may be split. No function is classified or skipped;
+library/runtime metadata survives.
 Byte limits refer to ``encode(slice)`` (compact, sorted-key UTF-8 JSON). Oversized
 singletons have bounded views and complete side-file payloads; write_side_files
 materializes them. No program execution or model invocation is performed.
@@ -10,6 +11,7 @@ materializes them. No program execution or model invocation is performed.
 
 import hashlib
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -74,13 +76,21 @@ def _validate(source):
 
 
 def write_side_files(result, folder):
-    """Write the complete JSON payloads referenced by oversized/orphan manifests."""
+    """Write current payloads and remove only stale JSON names this writer owns."""
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
+    prepared = {}
     for name, payload in result["side_files"].items():
         if Path(name).name != name or not name.endswith(".json"):
             raise ValueError("invalid side-file name")
-        (folder / name).write_bytes(encode(payload))
+        prepared[name] = encode(payload)
+    for old in folder.iterdir():
+        owned = old.name == "unattached.json" or re.fullmatch(
+            r"g[0-9]{4,}-(incoming_calls|outgoing_calls|strings|references|data_refs)\.json", old.name)
+        if owned and old.name not in prepared and (old.is_file() or old.is_symlink()):
+            old.unlink()
+    for name, data in prepared.items():
+        (folder / name).write_bytes(data)
 
 
 def _summary(groups, cuts, declared, hints, named_hints, unattached, budget):
@@ -118,7 +128,7 @@ def _summary(groups, cuts, declared, hints, named_hints, unattached, budget):
 
 
 def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=8192,
-              incoming_limit=128, string_limit=128):
+              incoming_limit=128, string_limit=128, outgoing_limit=128, reference_limit=128):
     """Group related functions within hard caps; return groups/cut_edges/summary.
 
     Function rows must have consistent unique numeric entry/hex addresses. Call
@@ -136,15 +146,19 @@ def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=
 
     Entry hints include entry/main/start names and functions without callers;
     these are not proven entry points. Oversized singletons stay isolated. Their
-    bounded map view retains up to incoming_limit incoming calls and string_limit
-    strings (fewer if needed for bytes). The overflow manifest references complete
-    rows in side_files, with incoming counts per calling group. Unattached rows
-    also survive explicitly. Only the views are shortened, never the evidence.
+    bounded map view samples incoming/outgoing calls, references,
+    data_refs and strings up to their limits (fewer if needed for bytes).
+    reference_limit applies separately to references and data_refs. Outgoing
+    samples prefer self calls. The manifest's by_group counts only deferred rows; side
+    files keep complete rows and complete counts. Unknown call sources use
+    unknown_caller; unknown reference sources/targets have their own buckets.
+    Side files are independent JSON objects. Only views shorten, never evidence.
     Call write_side_files on the result to materialize the referenced JSON files.
     """
     for name, value in (("max_functions", max_functions), ("max_bytes", max_bytes),
                         ("summary_bytes", summary_bytes), ("incoming_limit", incoming_limit),
-                        ("string_limit", string_limit)):
+                        ("string_limit", string_limit), ("outgoing_limit", outgoing_limit),
+                        ("reference_limit", reference_limit)):
         if type(value) is not int or value < 1:
             raise ValueError(f"{name} must be a positive integer")
     # Detach every output from the caller, while rejecting non-JSON/NaN inputs.
@@ -211,6 +225,17 @@ def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=
             result["entry_points"] = sorted((e for e in source["entry_points"] if _entry(e) in entries), key=encode)
         return result
 
+    def overflow_parts(e, row_ids):
+        ordered = sorted(row_ids)
+        return (("incoming_calls", incoming_limit,
+                 [(key, i) for key, i in ordered if key == "calls" and _address(tables[key][i]["from"]) != e]),
+                ("outgoing_calls", outgoing_limit,
+                 sorted([(key, i) for key, i in ordered if key == "calls" and _address(tables[key][i]["from"]) == e],
+                        key=lambda item: (_address(tables[item[0]][item[1]]["to"]) != e, item))),
+                ("references", reference_limit, [item for item in ordered if item[0] == "references"]),
+                ("data_refs", reference_limit, [item for item in ordered if item[0] == "data_refs"]),
+                ("strings", string_limit, [item for item in ordered if item[0] == "strings"]))
+
     parent = {e: e for e in known}
     members = {e: {e} for e in known}
     rows = {e: attached[e] for e in known}
@@ -244,15 +269,13 @@ def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=
             continue
         oversized.add(e)
         full_rows[e], original_bytes[e] = rows[e], needed
-        incoming = sorted((key, i) for key, i in rows[e] if key == "calls"
-                          and _address(tables[key][i]["from"]) != e)
-        strings = sorted((key, i) for key, i in rows[e] if key == "strings")
-        retained = rows[e] - set(incoming) - set(strings)
+        parts = overflow_parts(e, rows[e])
+        retained = rows[e] - {item for _, _, items in parts for item in items}
         core_bytes = len(encode(slice_map({e}, retained)))
         if core_bytes > max_bytes:
             offenders.append(f"{hex(e)} needs {core_bytes} core bytes (original {needed})")
             continue
-        for candidates, limit in ((incoming, incoming_limit), (strings, string_limit)):
+        for _, limit, candidates in parts:
             lo, hi = 0, min(len(candidates), limit)
             while lo < hi:
                 mid = (lo + hi + 1) // 2
@@ -289,28 +312,38 @@ def partition(program_map, *, max_functions=128, max_bytes=65536, summary_bytes=
     side_files = {}
     if any(unattached.values()):
         side_files["unattached.json"] = unattached
+
+    def group_counts(items, kind, entry):
+        counts = defaultdict(int)
+        for table, i in items:
+            row = tables[table][i]
+            if kind == "strings":
+                counterpart, unknown = entry, "unknown_source"
+            elif _address(row["from"]) == entry:
+                counterpart, unknown = _address(row["to"]), "unknown_target"
+            else:
+                counterpart = _address(row["from"])
+                unknown = "unknown_caller" if table == "calls" else "unknown_source"
+            counts[owners.get(counterpart, unknown)] += 1
+        return dict(sorted(counts.items()))
+
     for group in groups:
         e = _address(group["functions"][0])
         if e not in oversized:
             continue
         group["original_bytes"], group["overflow"] = original_bytes[e], {}
-        for kind, table in (("incoming_calls", "calls"), ("strings", "strings")):
-            selected = [(key, i) for key, i in sorted(full_rows[e]) if key == table
-                        and (table != "calls" or _address(tables[key][i]["from"]) != e)]
+        for kind, _, selected in overflow_parts(e, full_rows[e]):
             retained = sum(item in rows[e] for item in selected)
             if retained == len(selected):
                 continue
-            payload = {"rows": [tables[key][i] for key, i in selected]}
-            if kind == "incoming_calls":
-                counts = defaultdict(int)
-                for row in payload["rows"]:
-                    counts[owners.get(_address(row["from"]), "unattached")] += 1
-                payload["by_group"] = dict(sorted(counts.items()))
+            payload = {"rows": [tables[key][i] for key, i in selected],
+                       "by_group": group_counts(selected, kind, e)}
             filename = f"{group['id']}-{kind}.json"
             side_files[filename] = payload
             group["overflow"][kind] = {"file": filename, "total": len(selected), "retained": retained,
                                        "deferred": len(selected) - retained,
+                                       "by_group": group_counts([item for item in selected if item not in rows[e]], kind, e),
                                        "sha256": hashlib.sha256(encode(payload)).hexdigest()}
     summary = _summary(groups, cuts, declared, hints, named_hints, unattached, summary_bytes)
     return {"groups": groups, "cut_edges": cuts, "summary": summary, "summary_bytes": len(encode(summary)),
-            "unattached": unattached, "side_files": side_files}
+            "unattached": unattached, "side_files": json.loads(encode(side_files))}

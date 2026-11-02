@@ -425,6 +425,170 @@ class PartitionTests(unittest.TestCase):
                 else:
                     self.fail("malformed input was accepted")
 
+    def test_manifest_counts_only_deferred_incoming_rows_by_caller_group(self):
+        from collections import Counter
+        source = program(1301)
+        hub = source["functions"][-1]["hex"]
+        source["calls"] = [{"from": f["hex"], "to": hub, "at": f["entry"]}
+                           for f in source["functions"][:-1]]
+        source["calls"] += [{"from": "0x0001", "to": hub, "at": i} for i in range(400)]
+        result = self.valid_partition(source)
+        group = next(g for g in result["groups"] if hub in g["functions"])
+        manifest = group["overflow"]["incoming_calls"]
+        self.assertIn("by_group", manifest)
+        owners = owner(result)
+        deferred = Counter(map(encoded, source["calls"])) - Counter(map(encoded, group["map"]["calls"]))
+        expected = Counter()
+        for row, count in deferred.items():
+            expected[owners.get(json.loads(row)["from"], "unknown_caller")] += count
+        self.assertEqual(manifest["by_group"], dict(expected))
+        self.assertEqual(sum(manifest["by_group"].values()), manifest["deferred"])
+        self.assertLessEqual(len(manifest["by_group"]), len(result["groups"]) + 1)
+        self.assertEqual(result["unattached"]["calls"], [])
+        payload = result["side_files"][manifest["file"]]
+        self.assertNotIn("unattached", payload["by_group"])
+        self.assertEqual(payload["by_group"]["unknown_caller"], 400)
+        self.assertEqual(sum(payload["by_group"].values()), manifest["total"])
+
+    def test_large_outgoing_call_list_has_a_complete_side_file(self):
+        from collections import Counter
+        source = program(1301)
+        source["calls"] = [{"from": "0x1000", "to": f["hex"], "at": i, "to_name": "callee"}
+                           for i, f in enumerate(source["functions"][1:])]
+        result = self.valid_partition(source)
+        self.check_bounds(source, result, 128, 65536, 8192)
+        group = next(g for g in result["groups"] if "0x1000" in g["functions"])
+        self.assertEqual(group["functions"], ["0x1000"])
+        self.assertTrue(group["oversized"])
+        self.assertIn("outgoing_calls", group["overflow"])
+        manifest = group["overflow"]["outgoing_calls"]
+        payload = result["side_files"][manifest["file"]]
+        self.assertEqual(Counter(map(encoded, payload["rows"])), Counter(map(encoded, source["calls"])))
+        self.assertLessEqual(manifest["retained"], 128)
+        self.assertEqual(manifest["retained"] + manifest["deferred"], 1300)
+        self.assertEqual(sum(manifest["by_group"].values()), manifest["deferred"])
+        self.assertEqual(len(result["cut_edges"]), 1300)
+
+    def test_large_references_and_data_refs_are_sampled_in_both_directions(self):
+        from collections import Counter
+        for table in ("references", "data_refs"):
+            for direction in ("incoming", "outgoing"):
+                with self.subTest(table=table, direction=direction):
+                    source = program(3)
+                    if direction == "incoming":
+                        source[table] = [{"from": hex(0x90000 + i * 16), "to": "0x1000", "type": "READ"}
+                                         for i in range(1900)]
+                        bucket = "unknown_source"
+                    else:
+                        source[table] = [{"from": "0x1000", "to": hex(0x90000 + i * 16), "type": "WRITE"}
+                                         for i in range(1900)]
+                        bucket = "unknown_target"
+                    result = self.valid_partition(source)
+                    self.check_bounds(source, result, 128, 65536, 8192)
+                    group = next(g for g in result["groups"] if "0x1000" in g["functions"])
+                    manifest = group["overflow"][table]
+                    self.assertTrue(group["oversized"])
+                    self.assertLessEqual(manifest["retained"], 128)
+                    self.assertEqual(manifest["total"], 1900)
+                    self.assertEqual(manifest["by_group"], {bucket: manifest["deferred"]})
+                    payload = result["side_files"][manifest["file"]]
+                    self.assertEqual(Counter(map(encoded, payload["rows"])), Counter(map(encoded, source[table])))
+                    self.assertEqual(len(group["map"][table]), manifest["retained"])
+
+    def test_oversized_view_keeps_strings_that_fit_and_its_self_call(self):
+        source = program(1)
+        source["calls"] = [{"from": "0x0001", "to": "0x1000", "at": i} for i in range(1800)]
+        self_call = {"from": "0x1000", "to": "0x1000", "at": 4097}
+        source["calls"].append(self_call)
+        source["strings"] = [{"from": "0x1000", "address": "0x9000", "text": "usage"},
+                             {"from": "0x1000", "address": "0x9010", "text": "help"}]
+        result = self.valid_partition(source)
+        group = result["groups"][0]
+        self.assertTrue(group["oversized"])
+        self.assertEqual(group["original_bytes"], len(encoded(source)))
+        self.assertEqual(sorted(map(encoded, group["map"]["strings"])), sorted(map(encoded, source["strings"])))
+        self.assertIn(self_call, group["map"]["calls"])
+        self.assertEqual(group["overflow"]["incoming_calls"]["total"], 1800)
+        self.assertNotIn("strings", group["overflow"])
+        self.assertNotIn("outgoing_calls", group["overflow"])
+        summarized = next(g for g in result["summary"]["groups"] if g["id"] == group["id"])
+        self.assertIs(summarized.get("oversized"), True)
+
+    def test_side_file_objects_are_independent_of_every_result_container(self):
+        source = program(1)
+        source["calls"] = [{"from": "0xbeef", "to": "0xdead", "meta": {"values": [1]}}]
+        source["strings"] = [{"from": "0xbeef", "address": "0x9000", "text": "orphan"}]
+        result = partition.partition(source)
+        result["unattached"]["calls"][0]["meta"]["values"].append(2)
+        self.assertEqual(result["side_files"]["unattached.json"]["calls"][0]["meta"]["values"], [1])
+        result["side_files"]["unattached.json"]["strings"][0]["text"] = "side"
+        self.assertEqual(result["unattached"]["strings"][0]["text"], "orphan")
+        self.assertEqual(source["calls"][0]["meta"]["values"], [1])
+        source = program(2)
+        source["calls"] = [{"from": "0x1000", "to": "0x1010", "at": i, "meta": {"values": [1]}}
+                           for i in range(1300)]
+        result = self.valid_partition(source)
+        names = list(result["side_files"])
+        self.assertEqual(len(names), 2)
+        result["side_files"][names[0]]["rows"][0]["meta"]["values"].append(2)
+        self.assertEqual(result["side_files"][names[1]]["rows"][0]["meta"]["values"], [1])
+        self.assertTrue(all(row["meta"]["values"] == [1] for row in result["cut_edges"]))
+        self.assertTrue(all(row["meta"]["values"] == [1] for row in source["calls"]))
+
+    def test_many_self_calls_are_sampled_without_aborting(self):
+        source = program(1)
+        source["calls"] = [{"from": "0x1000", "to": "0x1000", "at": i} for i in range(2000)]
+        source["calls"] += [{"from": "0x1000", "to": "0x0001", "at": -i - 1} for i in range(1000)]
+        result = self.valid_partition(source)
+        group = result["groups"][0]
+        self.assertTrue(group["oversized"])
+        self.assertLessEqual(group["bytes"], 65536)
+        manifest = group["overflow"]["outgoing_calls"]
+        self.assertEqual((manifest["total"], manifest["retained"], manifest["deferred"]), (3000, 128, 2872))
+        self.assertEqual(manifest["by_group"], {group["id"]: 1872, "unknown_target": 1000})
+        self.assertTrue(all(row["to"] == "0x1000" for row in group["map"]["calls"]))
+        self.assertEqual(len(result["side_files"][manifest["file"]]["rows"]), 3000)
+
+    def test_writer_removes_only_stale_files_it_owns(self):
+        source = program(1)
+        source["strings"] = [{"from": "0x1000", "address": "0x9000", "text": "x" * 70000},
+                             {"from": "0xbeef", "address": "0x9010", "text": "orphan"}]
+        result = self.valid_partition(source)
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            partition.write_side_files(result, folder)
+            created = set(result["side_files"])
+            self.assertTrue(created)
+            self.assertTrue(all((folder / name).is_file() for name in created))
+            protected = ["notes.json", "g0001-custom.json", "g1234x-strings.json", "README"]
+            for name in protected:
+                (folder / name).write_text("keep")
+            (folder / "g10000-data_refs.json").write_text("stale")
+            (folder / "g0009-incoming_calls.json").mkdir()
+            partition.write_side_files(partition.partition(program(1)), folder)
+            self.assertTrue(all(not (folder / name).exists() for name in created))
+            self.assertFalse((folder / "g10000-data_refs.json").exists())
+            self.assertTrue((folder / "g0009-incoming_calls.json").is_dir())
+            self.assertTrue(all((folder / name).read_text() == "keep" for name in protected))
+
+    def test_new_relation_limits_validate_and_keep_deferred_counts_exact(self):
+        import inspect
+        self.assertIn("outgoing_limit", inspect.signature(partition.partition).parameters)
+        self.assertIn("reference_limit", inspect.signature(partition.partition).parameters)
+        source = program(1)
+        source["calls"] = [{"from": "0x1000", "to": "0x9000", "at": i} for i in range(80)]
+        source["references"] = [{"from": "0xbeef", "to": "0x1000", "at": i} for i in range(80)]
+        source["data_refs"] = [{"from": "0x1000", "to": "0xa000", "at": i} for i in range(80)]
+        result = self.valid_partition(source, max_bytes=1000, outgoing_limit=2, reference_limit=2)
+        self.assertLessEqual(result["groups"][0]["bytes"], 1000)
+        for kind in ("outgoing_calls", "references", "data_refs"):
+            manifest = result["groups"][0]["overflow"][kind]
+            self.assertLessEqual(manifest["retained"], 2)
+            self.assertEqual(sum(manifest["by_group"].values()), manifest["deferred"])
+        for limits in ({"outgoing_limit": 0}, {"reference_limit": True}):
+            with self.subTest(limits=limits), self.assertRaises(ValueError):
+                partition.partition(program(1), **limits)
+
 
 if __name__ == "__main__":
     unittest.main()
