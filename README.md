@@ -6,7 +6,7 @@ https://github.com/user-attachments/assets/884cff5d-e37e-49c3-9bb7-8fbcf118e2ee
 
 <p align="center">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square">
-  <img alt="Version 0.8.0" src="https://img.shields.io/badge/version-0.8.0-38bdf8?style=flat-square">
+  <img alt="Version 0.9.0" src="https://img.shields.io/badge/version-0.9.0-38bdf8?style=flat-square">
   <img alt="Python 3.12 or later" src="https://img.shields.io/badge/python-3.12%2B-3776ab?style=flat-square&logo=python&logoColor=white">
   <img alt="No Python dependencies" src="https://img.shields.io/badge/dependencies-none-22c55e?style=flat-square">
   <img alt="Platforms: macOS, Linux, Windows (experimental)" src="https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows%20(experimental)-64748b?style=flat-square">
@@ -181,14 +181,14 @@ in the [security guide](docs/SECURITY.md).
 ## AI analyst team (the hive)
 
 <p align="center">
-  <img src="media/hive.svg" width="100%" alt="The hive: a program is prepared once with Ghidra and exported as a map; a pre-flight stops packed programs before any agent is spent; the queen, which is code and not a model, plans with one planner agent, freezes the shared contract header and schedules builder bees in parallel, one module each, each with its own ReverseAI MCP server and a folder it alone can write; an independent council of three non-authors per module tries to refute each module against the assembly; the queen compiles and links from a clean stage, a deterministic evidence checker re-runs every cited question, and, only when allowed, the original and the rebuild run the same conformance cases; code computes the verdict.">
+  <img src="media/hive.svg" width="100%" alt="The hive: a program is prepared once with Ghidra and exported as a map; a pre-flight stops packed programs before any agent is spent; the queen, which is code and not a model, plans bounded groups of functions, freezes the shared contract header and schedules builder bees in parallel, one module each, each with its own ReverseAI MCP server and a folder it alone can write; an independent council of three non-authors per module tries to refute each module against the assembly; the queen compiles and links from a clean stage, a deterministic evidence checker re-runs every cited question, and, only when allowed, the original and the rebuild run the same conformance cases; code computes the verdict.">
 </p>
 
-The hive turns ReverseAI's evidence into a rebuilt program, fast and with every step
-checked by someone or something other than its author:
+The hive rebuilds native programs from ReverseAI's evidence. Code computes the verdict
+from the following checks:
 
-- **The queen is code, not a model.** She exports the program map, asks one planner
-  agent to split the functions into modules and freeze a shared contract header,
+- **The queen is code, not a model.** She exports the program map, plans functions
+  in bounded groups and freezes a shared contract header before builders start,
   schedules the bees, compiles, links and computes the verdict. She cannot write code,
   vote or overrule a check.
 - **Bees work in parallel**, one module each, each with its own ReverseAI MCP server
@@ -206,19 +206,27 @@ checked by someone or something other than its author:
   and, only if you allow it, the original and the rebuild run the same conformance cases
   and must give the same exit code, the same stdout and files (compared by hash) and the
   same stderr once the program's own path is masked (its first 2,000 characters).
+- **Bounded, resumable runs.** `--max-bees` limits physical CLI starts, including
+  probes; the forecast reports the minimum and a recommended reserve. Saved runs
+  reuse their frozen plan on resume. Provider refusals stay separate from timeouts,
+  quota errors and malformed output. `--max-tool-rejections` stops an agent after
+  consecutive MCP argument-schema rejections (default 8); an MCP result without a
+  schema error resets the streak. Reports retain the observed count and tool name.
 - **Before spending anything**, a pre-flight stops packed programs (UPX, VMProtect,
   Themida and others, high-entropy code, loader-only imports). The hive rebuilds in C,
   or in C++ when the program shows C++. Codex bees and mixed Claude/Codex councils are
   available and are refused automatically while the Codex sandbox lets a probe reach the
   network.
 
-It runs on your own Claude Code (and optionally Codex) subscription, with no API key,
-and the ReverseAI engine itself stays model-free.
-Because the bees run on Claude Code, Anthropic's usage policies and cyber safeguards apply to
-them. The hive recognises a refusal and reports it as such: a refused planner stops the run before
-anything else is spent, after three refusals no further bee starts, and the run ends not accepted
-rather than passing silently.
-The engine, its command line and its MCP server use no model and are not affected.
+You choose the model and server; Hive keeps its agent CLIs, tool permissions and checks.
+Cloud subscriptions remain available. A primary self-hosted server can be configured
+with `--model-server`; an optional local fallback requires explicit `--fallback-*`
+consent for the run, selected roles or named bees. Only a provider refusal activates
+that fallback. `--resume-refused` retries unresolved refusals with the authorized
+routing, while the saved plan remains frozen. The default stop limit is three
+unresolved provider refusals. Provenance records `server_kind` as `cloud`, `local` or
+`remote`; a local endpoint alone does not prove local inference.
+The ReverseAI engine, its command line and its MCP server use no model.
 ReverseAI was built for defensive security work; rebuilding is for software whose licence
 permits it or whose copyright you hold, not for recompiling proprietary software (see the
 [responsible-use notice](#responsible-use-and-legal-notice)).
@@ -232,6 +240,11 @@ permits it or whose copyright you hold, not for recompiling proprietary software
 corrupt frames) and catches a one-character change in an error message. Both runs used the queen as it was before the review of
 2026-11-01, which let 13 lz4 modules be changed after their council read (link and behaviour repairs) without a new read; the
 current queen sends such modules back to the council. Both behaviour batteries ran on the final binary.
+
+During development, a blind local pilot passed the earlier startup check but stopped
+in the first planner: all 143 observed `export_function` calls were rejected for their argument schema. No
+local reconstruction was accepted. This is a diagnosis of the orchestration and its
+checks, not a completion or performance benchmark for a chosen model.
 
 ```sh
 python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-hive-run --bees 5
@@ -273,7 +286,7 @@ Other local installation paths:
 | Path | Command |
 | --- | --- |
 | uv, if already installed | `uv tool install --offline --no-python-downloads --python python3 /path/to/reverseai` |
-| An approved wheel, inside the dedicated venv | `python -m pip install --no-index --no-deps /approved/reverseai-0.8.0-py3-none-any.whl` |
+| An approved wheel, inside the dedicated venv | `python -m pip install --no-index --no-deps /approved/reverseai-0.9.0-py3-none-any.whl` |
 | Editable development install, inside the dedicated venv and trusted checkout | `python -m pip install --no-index --no-deps -e .` |
 
 The uv path creates a tool environment; use the executable location it prints.
