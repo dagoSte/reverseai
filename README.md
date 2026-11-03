@@ -475,6 +475,10 @@ facts against the same file later.
 - AI analyst team (the hive): a queen in code, parallel builder bees, an independent
   council and a deterministic evidence checker that rebuild native programs as C or
   C++; a pre-flight for packed programs; optional Codex bees and mixed councils.
+  Models and servers are your choice: cloud or self-hosted (Ollama or vLLM), with
+  group planning, resume from a frozen plan and startup capability checks for self-hosted
+  targets. Local fallback requires explicit consent and a provider refusal; consecutive
+  MCP argument-schema rejections stop the agent early.
 
 **Next**
 
