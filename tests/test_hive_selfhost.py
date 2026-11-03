@@ -363,6 +363,18 @@ class RouterTests(RouterFixture, unittest.TestCase):
         runner.model = "changed"
         self.assertTrue(router.describe("worker", "m02-build")["probe_required"])
 
+    def test_server_kind_distinguishes_remote_loopback_and_cloud(self):
+        for policy in ("claude", "codex"):
+            with self.subTest(client=policy):
+                router = self.router(["--bee-policy", policy, "--model-server", "https://inference.example.test",
+                                      "--model-server-remote", "--model", "chosen", "--codex-model", "chosen"])
+                self.assertEqual(router.describe("planner", "planner-g0001")["server_kind"], "remote")
+        for url in ("http://localhost:11434", "http://127.0.0.1:11434", "http://[::1]:11434"):
+            with self.subTest(url=url):
+                router = self.router(["--model-server", url, "--model", "chosen"])
+                self.assertEqual(router.describe("planner", "planner-g0001")["server_kind"], "local")
+        self.assertEqual(self.router().describe("planner", "planner-g0001")["server_kind"], "cloud")
+
     def test_fallback_environment_drops_cloud_credentials(self):
         with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "SECRET", "ANTHROPIC_API_KEY": "SECRET", "GITHUB_TOKEN": "SECRET"}):
             router = self.router(self.fallback_flags())

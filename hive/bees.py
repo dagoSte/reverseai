@@ -9,6 +9,7 @@ questions from different bees run in parallel instead of queueing on one stdio s
 The default runner drives Claude Code in print mode on the user's own login (no API key).
 """
 
+import ipaddress
 import json
 import math
 import os
@@ -17,13 +18,14 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 
 ROLES = Path(__file__).with_name("roles")
 # Texts with which model providers and their CLIs report a refusal by usage policy or safety classifiers.
 REFUSAL = re.compile(r"(?i)usage polic|safeguards? (?:flagged|blocked|prevented)|flagged (?:this|the) (?:message|request)"
-                     r"|I (?:cannot|can't|am unable to) (?:help|assist)(?: with| you)?|cybersecurity topic|cyber safeguard|unable to respond to this request|violat\w* (?:our|the) "
+                     r"|I (?:cannot|can't|am unable to) (?:help(?!\s+(?:but|thinking)\b)|assist)(?: with| you)?|cybersecurity topic|cyber safeguard|unable to respond to this request|violat\w* (?:our|the) "
                      r"(?:usage|acceptable)|content (?:policy|filter)|refused by the model|stop_reason.{0,4}refusal")
 
 COMMON = "common.md"
@@ -327,9 +329,17 @@ def classify_result(*, terminal, assistant_text="", diagnostic="", output=None, 
 def provenance(runner, role, name, attempt_id=None):
     env = runner.env or {}
     server = getattr(runner, "server", None) or env.get("ANTHROPIC_BASE_URL")
+    server_kind = "cloud"
+    if server:
+        host = urllib.parse.urlsplit(server).hostname
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = host == "localhost"
+        server_kind = "local" if loopback else "remote"
     return {"attempt_id": attempt_id, "logical_id": name, "kind": "bee", "role": role, "bee": name,
             "client": "codex" if hasattr(runner, "codex") else "claude",
-            "server_kind": "local" if server else "cloud", "server": server,
+            "server_kind": server_kind, "server": server,
             "requested_model": runner.model, "observed_model": None, "model_digest": None,
             "context_id": str(uuid.uuid4()), "origin": getattr(runner, "origin", "primary")}
 

@@ -80,6 +80,16 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(self.classify(assistant_text="I can't assist with that request.")["outcome"], "ok")
         self.assertTrue(bees.is_refusal("No usage policy violation was found, but I cannot help with that request."))
 
+    def test_idioms_are_not_provider_refusals(self):
+        for text in ("I cannot help but notice this function returns zero.",
+                     "I can't help thinking this is an off-by-one error."):
+            with self.subTest(text=text):
+                self.assertFalse(bees.is_refusal(text))
+                self.assertEqual(self.classify(output=None, assistant_text=text)["outcome"], "invalid_schema")
+        refusal = "I cannot help with reverse engineering this software."
+        self.assertTrue(bees.is_refusal(refusal))
+        self.assertEqual(self.classify(output=None, assistant_text=refusal)["outcome"], "provider_refusal")
+
     def test_diagnostics_are_trusted_but_success_text_is_not_a_terminal_error(self):
         for text, outcome in (("HTTP 429", "rate_limit"), ("context_window_exceeded", "context_limit")):
             self.assertEqual(self.classify(diagnostic=text)["outcome"], outcome)
