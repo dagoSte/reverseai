@@ -91,7 +91,7 @@ class RealSeamTests(unittest.TestCase):
             stub = patch.object(queen.Build, target, return_value=value)
             stub.start()
             self.addCleanup(stub.stop)
-        for target, operation in (("subprocess.run", self.cli), ("urllib.request.urlopen", self.metadata)):
+        for target, operation in (("hive.bees.run_cli", self.cli), ("urllib.request.urlopen", self.metadata)):
             stub = patch(target, side_effect=operation)
             stub.start()
             self.addCleanup(stub.stop)

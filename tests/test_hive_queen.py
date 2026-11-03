@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from tests.hive_compiler import confined
@@ -338,6 +339,27 @@ class PlanAndLinkTests(unittest.TestCase):
 
 
 class BeeCommandTests(unittest.TestCase):
+    def test_main_passes_tool_rejection_limit_to_primary_and_fallback_runners(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "greet").write_bytes(b"inert fixture")
+            flags = ["run", "--inputs", folder, "--file", "greet", "--out", str(root / "out"),
+                     "--bee-policy", "mixed", "--fallback-model-server", "http://127.0.0.1:11434",
+                     "--fallback-model", "local-claude", "--fallback-codex-model", "local-codex", "--fallback-scope", "run"]
+            for extra, expected in (([], 8), (["--max-tool-rejections", "3"], 3)):
+                with patch.object(queen, "Engine"), patch.object(bees, "environment_ok", return_value=True), \
+                     patch.object(queen, "Queen") as make:
+                    make.return_value.run.return_value = {"verdict": "accepted"}
+                    self.assertEqual(queen.main(flags + extra), 0)
+                    router = make.call_args.kwargs["bees"]
+                    for name in ("m01-build", "m02-build"):
+                        self.assertEqual(router.primary("worker", name).max_tool_rejections, expected)
+                        self.assertEqual(router.fallback("worker", name).max_tool_rejections, expected)
+            for value in ("0", "-1"):
+                with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                    queen.main(flags + ["--max-tool-rejections", value])
+                self.assertEqual(error.exception.code, 2)
+
     def test_no_role_gets_a_shell_or_the_web_and_each_bee_has_its_own_server(self):
         tmp = Path(tempfile.mkdtemp())
         runner = bees.ClaudeBees(engine="/engine", inputs="/inputs", config_dir=tmp)
@@ -438,6 +460,14 @@ class DurableAttemptTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(q.spent["bees"], 1)
 
+    def test_report_declares_missing_native_tool_monitor(self):
+        q = self.make(lambda *args: {"ok": True, "output": {}, "tool_rejections": None})
+        self.call(q)
+        q._stopped_result("fixture stop")
+        report = (self.out / "REPORT.md").read_text()
+        self.assertIn("MCP rejection monitor unavailable", report)
+        self.assertIsNone(next(iter(q.state.data["attempts"].values()))["result"]["tool_rejections"])
+
     def test_timeout_does_not_activate_local_routing(self):
         calls = []
         q = self.make(FakeRouter(lambda *a: {"ok": False, "outcome": "timeout"},
@@ -445,6 +475,28 @@ class DurableAttemptTests(unittest.TestCase):
         self.assertEqual(self.call(q)["outcome"], "timeout")
         self.assertEqual(calls, [])
         self.assertEqual(q.state.data["activated"], [])
+
+    def test_tool_schema_failure_is_recorded_without_fallback_or_refusal_threshold(self):
+        calls = []
+        failure = {"ok": False, "outcome": "tool_schema_failure", "tool_rejections": 9,
+                   "consecutive_tool_rejections": 8, "tool_name": "mcp__reverseai__export_function",
+                   "error": "Stopped after 8 consecutive MCP argument/schema rejections"}
+        q = self.make(FakeRouter(lambda *a: failure, fallback=lambda *a: calls.append("local")), refusal_limit=1)
+        answer = self.call(q)
+        self.assertEqual(answer["outcome"], "tool_schema_failure")
+        self.assertFalse(answer["refused"])
+        self.assertEqual(answer["tool_name"], failure["tool_name"])
+        self.assertEqual(calls, [])
+        self.assertEqual(q.refusals, [])
+        self.assertEqual(q.state.data["unresolved_refusals"], {})
+        self.assertEqual(q.state.data["activated"], [])
+        self.assertIsNone(q.stopped)
+        self.assertEqual(q.spent["bees"], 1)
+        q._stopped_result("fixture failure")
+        report = (self.out / "REPORT.md").read_text()
+        self.assertIn("8 consecutive MCP argument/schema rejections", report)
+        self.assertIn("mcp__reverseai__export_function", report)
+        self.assertIn("total observed 9", report)
 
     def test_refused_attempt_cannot_contaminate_local_attempt_files(self):
         source = self.folder / "m01.c"

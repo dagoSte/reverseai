@@ -734,7 +734,7 @@ class Queen:
         result = dict(answer)
         outcome = result.get("outcome")
         if outcome not in {"ok", "provider_refusal", "timeout", "rate_limit", "invalid_schema",
-                           "context_limit", "failure", "not_started"}:
+                           "context_limit", "failure", "not_started", "tool_schema_failure"}:
             outcome = "failure"
             result.update(error="runner did not return a contracted outcome", code="runner_protocol")
         ok = outcome == "ok" and result.get("ok") is True and isinstance(result.get("output"), dict)
@@ -1015,6 +1015,8 @@ class Queen:
                 if error.bee_result and error.bee_result["outcome"] == "provider_refusal":
                     raise ProviderRefused("the model provider refused the planner: "
                                           + (error.bee_result.get("error") or "")) from None
+                if error.bee_result and error.bee_result["outcome"] == "tool_schema_failure":
+                    raise HiveError("planning failed: " + error.bee_result["error"]) from None
                 raise HiveError(f"planning failed ({error.code})") from None
             self._validate_bundle(bundle, program_map)
             contract = self._bundle_path(bundle["contract_path"])
@@ -1755,6 +1757,16 @@ def render(result):
         lines.append(f"- Budget forecast at phase start: minimum {forecast['remaining_min']}; recommended total "
                      f"{forecast['recommended_total']}; cap {forecast['limit']} (heuristic margin)")
     if result.get("attempts"):
+        for attempt in result["attempts"]:
+            answer = attempt.get("result", {})
+            if answer.get("outcome") == "tool_schema_failure" or answer.get("probe_outcome") == "tool_schema_failure":
+                lines.append(f"- {attempt['bee']}: stopped after {answer.get('consecutive_tool_rejections')} "
+                             f"consecutive MCP argument/schema rejections; tool "
+                             f"{answer.get('tool_name') or 'unknown'}; total observed {answer.get('tool_rejections')}.")
+        unavailable = [attempt["bee"] for attempt in result["attempts"]
+                       if attempt.get("result", {}).get("tool_rejections") is None]
+        if unavailable:
+            lines.append("- MCP rejection monitor unavailable (CLI exposes no tool results): " + ", ".join(unavailable))
         lines += ["", "| Attempt | Bee / role | Kind | Outcome | Client / target | Model |",
                   "| --- | --- | --- | --- | --- | --- |"]
         def cell(value):
@@ -1792,6 +1804,8 @@ def main(argv=None):
     run.add_argument("--model", help="Model for every bee (default: the agent CLI's default)")
     run.add_argument("--required-context", type=int, default=65536,
                      help="Minimum active context for mandatory self-hosted model checks (default 65536)")
+    run.add_argument("--max-tool-rejections", type=int, default=8,
+                     help="Stop a bee after this many consecutive MCP schema rejections (default 8)")
     run.add_argument("--claude", default="claude", help="Claude Code executable")
     run.add_argument("--check-jobs", type=int, default=2, help="Questions the evidence checker runs at once")
     run.add_argument("--run-original", action="store_true",
@@ -1810,14 +1824,17 @@ def main(argv=None):
         parser.error("--file must name a regular file inside --inputs")
     if args.required_context < 1:
         parser.error("--required-context must be a positive integer")
+    if args.max_tool_rejections < 1:
+        parser.error("--max-tool-rejections must be a positive integer")
     sys.path.insert(0, str(ROOT))
     from tools import hive_check
     inputs = args.inputs.resolve()
     engine = Engine(root=ROOT, inputs=inputs, file=args.file)
     config_dir = args.out.resolve() / ".hive" / "mcp"
     claude = bees_module.ClaudeBees(engine=ROOT, inputs=inputs, claude=args.claude, model=args.model,
-                                    config_dir=config_dir)
-    bees = codex_bees.build_router(args, claude, engine=ROOT, inputs=inputs, config_dir=config_dir.parent / "codex")
+                                    config_dir=config_dir, max_tool_rejections=args.max_tool_rejections)
+    bees = codex_bees.build_router(args, claude, engine=ROOT, inputs=inputs, config_dir=config_dir.parent / "codex",
+                                   max_tool_rejections=args.max_tool_rejections)
     policy = bees.policy()
     for destination in ("primary", "fallback_targets"):
         for client, config in policy[destination].items():

@@ -66,7 +66,7 @@ class ChildEnvironmentTests(unittest.TestCase):
         args = self.parser.parse_args(["--model-server", "http://127.0.0.1:11434", "--model", "m1"])
         runner = codex_bees.build(args, claude, engine=self.tmp, inputs=self.tmp, config_dir=self.tmp / "codex")
         done = subprocess.CompletedProcess([], 0, json.dumps({"structured_output": ANSWER}), "")
-        with mock.patch.object(bees.subprocess, "run", return_value=done) as run:
+        with mock.patch.object(bees, "run_cli", return_value=done) as run:
             self.assertTrue(runner("councillor", "c", "task", self.tmp)["ok"])
         env = run.call_args.kwargs["env"]
         self.assert_clean(env)
@@ -84,7 +84,7 @@ class ChildEnvironmentTests(unittest.TestCase):
             calls.append(kwargs)
             Path(argv[argv.index("-o") + 1]).write_text(json.dumps({"verdict": "accept", "defects": [], "summary": None}))
             return subprocess.CompletedProcess(argv, 0, '{"type":"turn.completed"}', "")
-        with mock.patch.object(codex_bees.subprocess, "run", side_effect=fake_run), \
+        with mock.patch.object(bees, "run_cli", side_effect=fake_run), \
                 mock.patch.object(runner, "_network_ok",  # a probe process like the real one, judged isolated
                                   wraps=lambda role, folder: bool(runner._execute(role, "probe", "t", folder))) as probe:
             answer = runner("councillor", "c", "task", self.tmp)
@@ -121,11 +121,11 @@ class EnvironmentTests(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp())
         runner = bees.ClaudeBees(engine=tmp, inputs=tmp, config_dir=tmp / "cfg", env={"PATH": "/usr/bin"})
         done = subprocess.CompletedProcess([], 0, json.dumps({"structured_output": ANSWER}), "")
-        with mock.patch.object(bees.subprocess, "run", return_value=done) as run:
+        with mock.patch.object(bees, "run_cli", return_value=done) as run:
             self.assertTrue(runner("councillor", "c", "task", tmp)["ok"])
         self.assertEqual(run.call_args.kwargs["env"], {"PATH": "/usr/bin"})
         default = bees.ClaudeBees(engine=tmp, inputs=tmp, config_dir=tmp / "cfg")
-        with mock.patch.object(bees.subprocess, "run", return_value=done) as run:
+        with mock.patch.object(bees, "run_cli", return_value=done) as run:
             default("councillor", "c", "task", tmp)
         self.assertIsNone(run.call_args.kwargs["env"])  # unchanged default: inherit
 
@@ -282,7 +282,7 @@ class RouterFixture:
 
 class RouterTests(RouterFixture, unittest.TestCase):
     def test_construction_and_describe_are_pure_policy_copies_are_isolated(self):
-        with mock.patch("subprocess.run") as run, mock.patch("urllib.request.urlopen") as network:
+        with mock.patch("hive.bees.run_cli") as run, mock.patch("urllib.request.urlopen") as network:
             router = self.router(self.fallback_flags())
             first = router.describe("planner", "planner-g0001")
             second = router.describe("planner", "planner-g0001", local=True)
@@ -499,7 +499,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
         from tests.test_hive_bees import Hooks
         router = self.router(self.fallback_flags())
         hooks = Hooks()
-        with mock.patch("subprocess.run", side_effect=self.fake_claude) as run:
+        with mock.patch("hive.bees.run_cli", side_effect=self.fake_claude) as run:
             report = selfhost.check_model(router, "claude", local=True, required_context=64000,
                                           before_start=hooks, context_query=lambda server, model: 65536, mcp_probe=MCP_PROBE)
         self.assertTrue(report["ok"], report)
@@ -513,12 +513,12 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
     def test_context_check_rejects_insufficient_unknown_and_failing_metadata(self):
         router = self.router(self.fallback_flags())
         for declared, status in ((8192, "error"), (None, "unsupported"), ("65536", "unsupported")):
-            with self.subTest(declared=declared), mock.patch("subprocess.run", side_effect=self.fake_claude):
+            with self.subTest(declared=declared), mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
                 report = selfhost.check_model(router, "claude", local=True, context_query=lambda server, model: declared)
             self.assertFalse(report["ok"])
             self.assertEqual(report["checks"]["context"]["status"], status)
             self.assertTrue(report["checks"]["context"]["suggestion"])
-        with mock.patch("subprocess.run", side_effect=self.fake_claude):
+        with mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
             report = selfhost.check_model(router, "claude", local=True, context_query=mock.Mock(side_effect=OSError("metadata unavailable")))
         self.assertEqual(report["checks"]["context"]["status"], "error")
 
@@ -526,7 +526,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
         def fake(argv, **kwargs):
             nonce = json.loads(Path(kwargs["cwd"], "capability-input.json").read_text())["nonce"]
             return subprocess.CompletedProcess(argv, 0, json.dumps({"type": "result", "structured_output": {"nonce": nonce}}), "")
-        with mock.patch("subprocess.run", side_effect=fake):
+        with mock.patch("hive.bees.run_cli", side_effect=fake):
             report = selfhost.check_model(self.router(), "claude", context_query=lambda s, m: 65536)
         self.assertFalse(report["ok"])
         self.assertEqual(report["checks"]["structured_output"]["status"], "ok")
@@ -534,7 +534,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
 
     def test_capability_budget_denial_propagates_without_network_or_process(self):
         from tests.test_hive_bees import Hooks
-        with mock.patch("subprocess.run") as run, mock.patch("urllib.request.urlopen") as network, self.assertRaises(bees.AttemptNotStarted):
+        with mock.patch("hive.bees.run_cli") as run, mock.patch("urllib.request.urlopen") as network, self.assertRaises(bees.AttemptNotStarted):
             selfhost.check_model(self.router(), "claude", before_start=Hooks("budget_exhausted"))
         run.assert_not_called()
         network.assert_not_called()
@@ -551,7 +551,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
             events = [{"type": "item.completed", "item": {"type": "command_execution", "command": "cat capability-input.json", "exit_code": 0, "aggregated_output": nonce}}, {"type": "turn.completed"}]
             events[1:1] = accepted_mcp_events("codex")
             return subprocess.CompletedProcess(argv, 0, "\n".join(json.dumps(e) for e in events), "")
-        with mock.patch("subprocess.run", side_effect=fake):
+        with mock.patch("hive.bees.run_cli", side_effect=fake):
             report = selfhost.check_model(router, "codex", before_start=hooks, context_query=lambda s, m: 65536, mcp_probe=MCP_PROBE)
         self.assertTrue(report["ok"], report)
         self.assertEqual(hooks.started, [("attempt-1", "network_probe")])
