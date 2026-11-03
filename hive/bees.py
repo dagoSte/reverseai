@@ -359,7 +359,7 @@ def run_attempt(runner, role, name, operation, before_start=None, *, kind="bee")
 
 def json_events(stdout):
     try:
-        value = json.loads(stdout)
+        value = json.loads(stdout or "")
         if isinstance(value, dict):
             return [value]
     except ValueError:
@@ -377,6 +377,12 @@ def json_events(stdout):
 
 def tool_rejections(events, *, client):
     """Count observed MCP argument/schema errors, never infer missing tool traces."""
+    def schema_error(error):
+        if isinstance(error, dict) and error.get("code") == -32602:
+            return True
+        return bool(re.search(r"(?i)invalid (?:arguments|params|parameters)|arguments must match.{0,80}schema"
+                              r"|(?:input|argument|parameter) (?:schema|validation)|validation error"
+                              r"|does not match.{0,80}schema", str(error)))
     observed, rejected = False, 0
     names = {}
     for event in events:
@@ -391,14 +397,14 @@ def tool_rejections(events, *, client):
                     names[block.get("id")] = block.get("name", "")
                 if (block.get("type") == "tool_result" and block.get("is_error")
                         and names.get(block.get("tool_use_id"), "").startswith("mcp__")
-                        and re.search(r"(?i)invalid (?:arguments|params)|schema|validation error", str(block.get("content", "")))):
+                        and schema_error(block.get("content", ""))):
                     rejected += 1
         elif event.get("type", "").startswith("item."):
             item = event.get("item", {})
             if item.get("type") == "mcp_tool_call":
                 observed = True
                 if (event.get("type") == "item.completed" and item.get("error")
-                        and re.search(r"(?i)invalid (?:arguments|params)|schema|validation error", str(item["error"]))):
+                        and schema_error(item["error"])):
                     rejected += 1
     return rejected if observed else None
 

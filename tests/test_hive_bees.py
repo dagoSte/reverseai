@@ -255,6 +255,12 @@ class RunnerContractTests(unittest.TestCase):
         self.assertEqual(result["outcome"], "ok")
         self.assertEqual(result["tool_rejections"], 1)
         self.assertFalse(result["refused"])
+        events[0]["item"]["error"] = {"message": "database schema file not found"}
+        result, _ = self.codex_call(events, '{"value":"yes"}')
+        self.assertEqual(result["tool_rejections"], 0)
+        events[0]["item"]["error"] = {"code": -32602, "message": "bad params"}
+        result, _ = self.codex_call(events, '{"value":"yes"}')
+        self.assertEqual(result["tool_rejections"], 1)
 
     def test_probe_hooks_and_destination_model_cache_keys(self):
         self.codex.allow_network = False
