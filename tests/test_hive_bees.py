@@ -90,6 +90,16 @@ class LiveToolStopTests(unittest.TestCase):
             self.transport([], client="codex", after="time.sleep(30)", timeout=.2)
         self.assertIsNone(error.exception.tool_rejections)
 
+    def test_cli_already_exited_after_last_rejection_keeps_schema_failure(self):
+        original = bees.ToolRejectionMonitor.feed
+        def feed(monitor, event):
+            original(monitor, event)
+            if monitor.stop:
+                time.sleep(.1)  # Force natural CLI exit before signalling, without reaping it.
+        with patch.object(bees.ToolRejectionMonitor, "feed", feed):
+            done = self.transport(self.event("codex", "1"), client="codex", limit=1)
+        self.assertEqual(bees.tool_schema_result(done)["outcome"], "tool_schema_failure")
+
     def test_stops_owned_descendant_that_ignores_term_and_leaves_other_session_alive(self):
         with tempfile.TemporaryDirectory() as folder:
             heartbeat = Path(folder) / "heartbeat"

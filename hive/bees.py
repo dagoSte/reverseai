@@ -471,8 +471,8 @@ def run_cli(argv, *, input, cwd, env, capture_output, text, timeout, check,
                 pass
             except PermissionError:
                 # Darwin reports EPERM for a group containing only zombies.
-                # Accept it only after TERM and an unreaped, exited leader.
-                if signum != signal.SIGKILL or os.waitid(
+                # Accept it only with an unreaped, exited leader.
+                if os.waitid(
                         os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
                     raise
             if signum == signal.SIGTERM:
