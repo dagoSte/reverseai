@@ -9,6 +9,7 @@ An explicit --codex-allow-network opt-out warns on every result. Use Codex bees 
 for software the operator would run anyway, never for malware.
 """
 
+import hashlib
 import json
 import re
 import shlex
@@ -18,7 +19,9 @@ import threading
 import time
 from pathlib import Path
 
-from hive.bees import REFUSAL, SCHEMAS, brief, is_refusal
+from hive.bees import (REFUSAL, SCHEMAS, brief, is_refusal, AttemptNotStarted, classify_result,
+                       matches_schema, parse_output, json_events, tool_rejections, run_attempt,
+                       provenance, _text_outcome, capability_roundtrip, terminal_signals)
 
 NETWORK_REFUSAL = "Codex sandbox allowed network access; Codex bees refused"
 NETWORK_WARNING = "Codex bees ran without network isolation"
@@ -38,7 +41,7 @@ def strict_schema(schema):
     if not isinstance(schema, dict):
         return schema
     result = {key: strict_schema(value) for key, value in schema.items()}
-    if schema.get("type") == "object":
+    if schema.get("type") == "object" or isinstance(schema.get("type"), list) and "object" in schema["type"]:
         required = schema.get("required", [])
         result["properties"] = {
             key: value if key in required else {"anyOf": [value, {"type": "null"}]}
@@ -59,23 +62,29 @@ def drop_nulls(value):
 
 
 def _matches(value, schema):
-    """Validate the small schema vocabulary used by bees and the network probe."""
-    if "anyOf" in schema:
-        return any(_matches(value, alternative) for alternative in schema["anyOf"])
-    if "enum" in schema and value not in schema["enum"]:
-        return False
-    kind = schema["type"]
-    if kind == "object":
-        properties = schema["properties"]
-        return (isinstance(value, dict) and value.keys() == properties.keys()
-                and all(_matches(value[key], child) for key, child in properties.items()))
-    if kind == "array":
-        return isinstance(value, list) and all(_matches(item, schema["items"]) for item in value)
-    if kind == "string":
-        return isinstance(value, str)
-    if kind == "integer":
-        return type(value) is int
-    return kind == "null" and value is None
+    return matches_schema(value, schema)
+
+
+def restore_optionals(value, schema):
+    """Remove only null placeholders introduced for optional fields in the wire schema."""
+    for keyword in ("anyOf", "oneOf"):
+        if keyword in schema:
+            branch = next((s for s in schema[keyword] if matches_schema(value, strict_schema(s))), None)
+            if branch is not None:
+                return restore_optionals(value, branch)
+    if isinstance(value, dict):
+        properties, required = schema.get("properties", {}), schema.get("required", [])
+        return {key: restore_optionals(item, properties.get(key, {})) for key, item in value.items()
+                if item is not None or key in required}
+    if isinstance(value, list):
+        return [restore_optionals(item, schema.get("items", {})) for item in value]
+    return value
+
+
+class BeeExecutionError(ValueError):
+    def __init__(self, result):
+        self.result = result
+        super().__init__(result["error"])
 
 
 class ProviderRefusal(ValueError):
@@ -122,6 +131,7 @@ class CodexBees:
         self.allow_network = allow_network
         self._network_checks = {}
         self._network_lock = threading.Lock()
+        self._network_local = threading.local()
 
     def _paths(self, name):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
@@ -154,71 +164,136 @@ class CodexBees:
         return [*argv, "-"]
 
     def _execute(self, role, name, task, folder, *, schema=None):
-        completed = subprocess.run(self.argv(role, name, folder, schema=schema), input=task, cwd=folder, env=self.env,
-                                   capture_output=True, text=True, timeout=self.timeout, check=False)
-        if completed.returncode:
-            failures = failure_messages(completed.stdout)
-            # Classify the whole diagnostic before shortening it: a refusal may sit far from the tail.
-            refusal = refusal_excerpt(completed.stderr, *failures)
-            if refusal:
-                raise ProviderRefusal(f"exit {completed.returncode}: refused by the model provider: {refusal}")
-            diagnostic = (completed.stderr or "\n".join(failures) or completed.stdout or "no diagnostic").strip()[-240:]
-            raise ValueError(f"exit {completed.returncode}: {diagnostic}")
+        expected = SCHEMAS[role] if schema is None else schema
+        wire_schema = strict_schema(expected) if schema is None else schema
+        completed = subprocess.run(self.argv(role, name, folder, schema=wire_schema), input=task, cwd=folder,
+                                   env=self.env, capture_output=True, text=True, timeout=self.timeout, check=False)
+        events = json_events(completed.stdout)
+        errors = failure_messages(completed.stdout)
+        signals = []
+        for event in events:
+            if event.get("type") in ("error", "turn.failed"):
+                signals.extend(terminal_signals(event))
+                error = event.get("error", event)
+                if isinstance(error, dict):
+                    native_code = str(error.get("code") or error.get("type") or "")
+                    signal = _text_outcome(native_code)
+                    if signal:
+                        signals.append(signal)
+        finished = any(e.get("type") == "turn.completed" for e in events)
+        failed = any(e.get("type") == "turn.failed" for e in events)
+        terminal = {"completed": finished and not errors, "returncode": completed.returncode,
+                    "signals": signals, "inconsistent": finished and failed}
+        native = "\n".join(filter(None, [completed.stderr, *errors]))
+        if errors or completed.returncode:
+            terminal["error"] = f"exit {completed.returncode}: {native or 'agent failed'}" if completed.returncode else native
+        assistant = "\n".join(str(e.get("item", {}).get("text", "")) for e in events
+                              if e.get("type") == "item.completed" and e.get("item", {}).get("type") == "agent_message")
         _, output_path = self._paths(name)
-        output = json.loads(output_path.read_text(encoding="utf-8"))
-        if not _matches(output, strict_schema(SCHEMAS[role]) if schema is None else schema):
-            raise ValueError("answer does not match the bee's output schema")
+        output = None
+        try:
+            output = parse_output(output_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            pass
+        result = classify_result(terminal=terminal, assistant_text=assistant, diagnostic=native,
+                                 output=output, schema=wire_schema)
+        result["tool_rejections"] = tool_rejections(events, client="codex")
+        if hasattr(self, "_capability_nonce"):
+            result["capability_tool_roundtrip"] = capability_roundtrip(events, "codex", self._capability_nonce)
+        if not result["ok"]:
+            raise BeeExecutionError(result)
+        completed.bee_result = result
         return completed, output
 
-    def _network_ok(self, role, folder):
+    def probe_key(self, role):
+        mode = "read-only" if role == "councillor" else "workspace-write"
+        payload = {"client": "codex", "server": getattr(self, "server", None), "model": self.model,
+                   "executable": self.codex, "mode": mode, "network_access": False,
+                   "writable_roots": [], "exclude_tmpdir_env_var": True, "exclude_slash_tmp": True,
+                   "web_search": "disabled", "effort": self.effort}
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def _network_ok(self, role, folder, *, before_start=None):
+        key = self.probe_key(role)
         mode = "read-only" if role == "councillor" else "workspace-write"
         with self._network_lock:
-            if mode not in self._network_checks:
-                self._network_checks[mode] = False
-                try:
-                    completed, output = self._execute(role, f"network-probe-{mode}", NETWORK_TASK,
-                                                      folder, schema=NETWORK_SCHEMA)
-                    events = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+            self._network_local.result = None
+            if key not in self._network_checks:
+                def probe():
+                    try:
+                        completed, output = self._execute(role, f"network-probe-{mode}", NETWORK_TASK,
+                                                          folder, schema=NETWORK_SCHEMA)
+                    except BeeExecutionError as error:
+                        return error.result
+                    events = json_events(completed.stdout)
                     commands = [event["item"] for event in events if event.get("type") == "item.completed"
                                 and event.get("item", {}).get("type") == "command_execution"]
+                    isolated = False
                     if len(commands) == 1:
                         command = commands[0]
                         argv = shlex.split(command["command"])
                         if (len(argv) == 3 and Path(argv[0]).name in ("sh", "bash", "zsh")
                                 and argv[1] in ("-c", "-lc")):
                             argv = shlex.split(argv[2])
-                        # DNS/connect refusals qualify; TLS, local errors and timeouts do not.
-                        self._network_checks[mode] = (
-                            argv == shlex.split(NETWORK_COMMAND)
-                            and type(command.get("exit_code")) is int and command["exit_code"] in (6, 7)
-                            and output["exit_code"] == command["exit_code"]
-                            and any(event.get("type") == "turn.completed" for event in events))
-                except Exception:
-                    pass  # Missing or inconsistent native evidence leaves this mode refused.
-            return self._network_checks[mode]
+                        isolated = (argv == shlex.split(NETWORK_COMMAND)
+                                    and type(command.get("exit_code")) is int and command["exit_code"] in (6, 7)
+                                    and output["exit_code"] == command["exit_code"]
+                                    and any(event.get("type") == "turn.completed" for event in events))
+                    if not isolated:
+                        return classify_result(terminal={"signals": ["failure"], "code": "network_isolation",
+                                                        "error": NETWORK_REFUSAL}, schema={})
+                    return getattr(completed, "bee_result", classify_result(
+                        terminal={"completed": True}, output=output, schema=NETWORK_SCHEMA))
+                result = run_attempt(self, role, f"network-probe-{mode}", probe, before_start, kind="network_probe")
+                self._network_local.result = result
+                self._network_checks[key] = result["ok"]
+            return self._network_checks[key]
 
-    def __call__(self, role, name, task, folder):
-        started = time.monotonic()
-        warning = {"warning": NETWORK_WARNING} if self.allow_network else {}
+    def __call__(self, role, name, task, folder, *, schema=None, before_start=None):
         try:
             self._paths(name)
             if role not in SCHEMAS:
                 raise ValueError(f"unknown bee role: {role}")
-            if not self.allow_network and not self._network_ok(role, folder):
-                return {"ok": False, "output": None, "error": NETWORK_REFUSAL,
-                        "seconds": round(time.monotonic() - started, 1)}
-            _, output = self._execute(role, name, brief(role, task), folder)
-            return {"ok": True, "output": drop_nulls(output),
-                    "seconds": round(time.monotonic() - started, 1), **warning}
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "output": None, "error": f"no answer within {self.timeout} s",
-                    "seconds": self.timeout, **warning}
-        except Exception as error:
-            if isinstance(error, ProviderRefusal) or is_refusal(str(error)):
-                return {"ok": False, "output": None, "error": str(error)[:300], "refused": True,
-                        "seconds": round(time.monotonic() - started, 1), **warning}
-            return {"ok": False, "output": None, "error": str(error)[:300],
-                    "seconds": round(time.monotonic() - started, 1), **warning}
+        except ValueError as error:
+            result = classify_result(terminal={"error": str(error), "code": "configuration", "returncode": 1}, schema={})
+            result["provenance"] = provenance(self, role, name)
+            return result
+        if not self.allow_network:
+            # Keep the isolated adapter's historical two-argument probe seam.
+            allowed = (self._network_ok(role, folder) if before_start is None else
+                       self._network_ok(role, folder, before_start=before_start))
+            if not allowed:
+                result = classify_result(terminal={"signals": ["failure"], "code": "network_isolation",
+                                                   "error": NETWORK_REFUSAL}, schema={})
+                probe = getattr(self._network_local, "result", None)
+                if probe is not None:
+                    result["provenance"] = dict(probe["provenance"])
+                    result["probe_outcome"] = probe["outcome"]
+                    result["seconds"] = probe["seconds"]
+                else:
+                    result["provenance"] = provenance(self, role, name)
+                    result["provenance"]["context_id"] = None
+                return result
+        def execute():
+            try:
+                kwargs = {} if schema is None else {"schema": schema}
+                completed, output = self._execute(role, name, brief(role, task), folder, **kwargs)
+                result = getattr(completed, "bee_result", classify_result(
+                    terminal={"completed": True}, output=output,
+                    schema=strict_schema(SCHEMAS[role]) if schema is None else schema))
+                if result["ok"] and schema is None:
+                    result["output"] = restore_optionals(output, SCHEMAS[role])
+            except BeeExecutionError as error:
+                result = error.result
+            except ProviderRefusal as error:
+                result = classify_result(terminal={"signals": ["provider_refusal"], "error": str(error)}, schema={})
+            if self.allow_network:
+                result["warning"] = NETWORK_WARNING
+            return result
+        result = run_attempt(self, role, name, execute, before_start)
+        if self.allow_network:
+            result["warning"] = NETWORK_WARNING
+        return result
 
 
 class MixedBees:
@@ -229,7 +304,7 @@ class MixedBees:
             raise ValueError("bee policy must be claude, codex or mixed")
         self.claude, self.codex, self.policy = claude, codex, policy
 
-    def __call__(self, role, name, task, folder):
+    def runner(self, role, name):
         if self.policy != "mixed":
             runner = self.claude if self.policy == "claude" else self.codex
         elif role in ("planner", "tester") or (role == "repair" and re.fullmatch(r"behaviour-fix-\d+", name)):
@@ -240,13 +315,24 @@ class MixedBees:
                        r"m(\d+)-repair-[bcl]\d+" if role == "repair" else "")
             match = re.fullmatch(pattern, name) if pattern else None
             if not match or int(match[1]) < 1:
-                return {"ok": False, "output": None, "seconds": 0,
-                        "error": "cannot route bee role/name in mixed policy"}
+                raise ValueError("cannot route bee role/name in mixed policy")
             use_claude = int(match[1]) % 2 == 1
             if role == "councillor" and match[2] in ("control", "io"):
                 use_claude = not use_claude
             runner = self.claude if use_claude else self.codex
-        return runner(role, name, task, folder)
+        return runner
+
+    def __call__(self, role, name, task, folder, *, schema=None, before_start=None):
+        try:
+            runner = self.runner(role, name)
+        except ValueError as error:
+            return classify_result(terminal={"error": str(error), "returncode": 1}, schema={})
+        kwargs = {}
+        if schema is not None:
+            kwargs["schema"] = schema
+        if before_start is not None:
+            kwargs["before_start"] = before_start
+        return runner(role, name, task, folder, **kwargs)
 
 
 def add_arguments(parser):
@@ -270,3 +356,9 @@ def build(args, claude_runner, **runner_kwargs):
     codex = runner(**dict(runner_kwargs, codex=args.codex, model=args.codex_model, effort=args.codex_effort,
                           allow_network=args.codex_allow_network), **extra)
     return codex if args.bee_policy == "codex" else MixedBees(claude_runner, codex, args.bee_policy)
+
+
+def build_router(args, claude_runner, **runner_kwargs):
+    """Configure routing only. The queen owns fallback activation and attempts."""
+    from hive.selfhost import BeeRouter
+    return BeeRouter(args, claude_runner, runner_kwargs)
