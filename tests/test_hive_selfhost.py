@@ -457,6 +457,87 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
         self.assertTrue(report["ok"], report)
         self.assertEqual(hooks.started, [("attempt-1", "network_probe")])
 
+    def metadata_server(self, routes):
+        """A simulated metadata server; no HTTP request leaves this process."""
+        def respond(request, **kwargs):
+            path = selfhost.urllib.parse.urlsplit(request.full_url).path
+            payload = routes.get(path, 404)
+            if type(payload) is int:
+                raise selfhost.urllib.error.HTTPError(request.full_url, payload, "metadata unavailable", {}, None)
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = json.dumps(payload).encode()
+            return response
+        return mock.patch("urllib.request.urlopen", side_effect=respond)
+
+    def test_vllm_context_metadata_passes_the_capability_check(self):
+        router = self.router(self.fallback_flags())
+        routes = {"/v1/models": {"object": "list", "data": [
+            {"id": "another", "max_model_len": 999999},
+            {"id": "configured-local", "max_model_len": 65536}]}}
+        with self.metadata_server(routes) as network, mock.patch("subprocess.run", side_effect=self.fake_claude):
+            report = selfhost.check_model(router, "claude", local=True, required_context=65536)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["declared_context"], 65536)
+        self.assertEqual([call.args[0].full_url for call in network.call_args_list],
+                         ["http://localhost:11434/api/ps", "http://localhost:11434/v1/models"])
+        self.assertTrue(all(call.kwargs["timeout"] == 5 for call in network.call_args_list))
+
+    def test_vllm_context_below_requirement_remains_an_error(self):
+        routes = {"/v1/models": {"data": [{"id": "configured-local", "max_model_len": 8192}]}}
+        with self.metadata_server(routes), mock.patch("subprocess.run", side_effect=self.fake_claude):
+            report = selfhost.check_model(self.router(self.fallback_flags()), "claude", local=True, required_context=65536)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["declared_context"], 8192)
+        self.assertEqual(report["checks"]["context"]["status"], "error")
+        self.assertIn("smaller than required", report["checks"]["context"]["message"])
+
+    def test_vllm_context_requires_exact_model_and_a_positive_integer(self):
+        cards = [{"id": "another", "max_model_len": 999999}, {"id": "configured-local"}]
+        cards += [{"id": "configured-local", "max_model_len": value} for value in (None, True, "65536", 0, -1)]
+        for card in cards:
+            with self.subTest(card=card), self.metadata_server({"/v1/models": {"data": [card]}}), \
+                    mock.patch("subprocess.run", side_effect=self.fake_claude):
+                report = selfhost.check_model(self.router(self.fallback_flags()), "claude", local=True)
+            self.assertFalse(report["ok"])
+            self.assertIsNone(report["declared_context"])
+            self.assertEqual(report["checks"]["context"]["status"], "unsupported")
+            self.assertIn("not verifiable on this server", report["checks"]["context"]["message"])
+
+    def test_server_without_either_metadata_api_remains_unsupported(self):
+        with self.metadata_server({}) as network, mock.patch("subprocess.run", side_effect=self.fake_claude):
+            report = selfhost.check_model(self.router(self.fallback_flags()), "claude", local=True)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["checks"]["context"]["status"], "unsupported")
+        self.assertIn("not verifiable on this server", report["checks"]["context"]["message"])
+        self.assertEqual(network.call_count, 2)
+
+    def test_active_ollama_context_takes_precedence_over_other_metadata(self):
+        routes = {"/api/ps": {"models": [{"name": "configured-local", "context_length": 8192}]},
+                  "/v1/models": {"data": [{"id": "configured-local", "max_model_len": 65536}]}}
+        with self.metadata_server(routes) as network, mock.patch("subprocess.run", side_effect=self.fake_claude):
+            report = selfhost.check_model(self.router(self.fallback_flags()), "claude", local=True, required_context=65536)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["declared_context"], 8192)
+        self.assertEqual(report["checks"]["context"]["status"], "error")
+        self.assertEqual(network.call_count, 1)
+
+    def test_unrecognized_metadata_shapes_do_not_invent_context(self):
+        for payload in ({}, [], {"data": {}}, {"data": [None, "configured-local", 65536]}):
+            with self.subTest(payload=payload), self.metadata_server({"/v1/models": payload}), \
+                    mock.patch("subprocess.run", side_effect=self.fake_claude):
+                report = selfhost.check_model(self.router(self.fallback_flags()), "claude", local=True)
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["checks"]["context"]["status"], "unsupported")
+
+    def test_metadata_auth_and_server_errors_are_not_hidden_by_api_discovery(self):
+        for endpoint in ("/api/ps", "/v1/models"):
+            for status in (401, 403, 500):
+                with self.subTest(endpoint=endpoint, status=status), self.metadata_server({endpoint: status}), \
+                        mock.patch("subprocess.run", side_effect=self.fake_claude):
+                    report = selfhost.check_model(self.router(self.fallback_flags()), "claude", local=True)
+                self.assertFalse(report["ok"])
+                self.assertEqual(report["checks"]["context"]["status"], "error")
+
     def test_active_context_metadata_matches_configured_model_only(self):
         response = mock.MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps({"models": [
