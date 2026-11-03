@@ -258,24 +258,35 @@ class _ProbeHooks:
 
 
 def _server_context(server, model):
-    """Read active context metadata. Unsupported APIs are reported, never guessed.
+    """Read serving context metadata for the exact configured model, never guess.
 
     Ollama /api/ps reports loaded context_length; /api/show's architecture limit
-    alone does not establish the active serving context.
+    alone does not establish the active serving context. vLLM /v1/models reports
+    max_model_len from its serving model configuration (not the model name):
+    https://docs.vllm.ai/en/latest/api/vllm/entrypoints/openai/models/serving/
     """
     if not server:
         return None
-    request = urllib.request.Request(server + "/api/ps", headers={"Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            data = json.loads(response.read(1024 * 1024 + 1))
-    except urllib.error.HTTPError as error:
-        if error.code in (404, 405, 501):
-            return None
-        raise
-    candidates = [m for m in data.get("models", []) if m.get("name") == model or m.get("model") == model]
-    values = [m.get("context_length") for m in candidates]
-    return min(values) if values and all(type(v) is int and v > 0 for v in values) else None
+    sources = (("/api/ps", "models", ("name", "model"), "context_length"),
+               ("/v1/models", "data", ("id",), "max_model_len"))
+    for endpoint, collection, names, field in sources:
+        request = urllib.request.Request(server + endpoint, headers={"Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                data = json.loads(response.read(1024 * 1024 + 1))
+        except urllib.error.HTTPError as error:
+            if error.code in (404, 405, 501):
+                continue
+            raise
+        if not isinstance(data, dict) or not isinstance(data.get(collection), list):
+            continue
+        candidates = [row for row in data[collection] if isinstance(row, dict)
+                      and any(row.get(name) == model for name in names)]
+        values = [row.get(field) for row in candidates]
+        # A recognized API with missing/invalid model metadata is not permission
+        # to substitute another model or a larger limit from another API.
+        return min(values) if values and all(type(value) is int and value > 0 for value in values) else None
+    return None
 
 
 def check_model(router, client, *, before_start=None, required_context=32768, local=False,
