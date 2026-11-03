@@ -12,6 +12,8 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 
+from tests.test_hive_queen import FakePlanning, FakeRouter, make_queen
+
 from hive import fuzz, queen
 
 SHA = "ab" * 32
@@ -250,7 +252,7 @@ class QueenFuzzTests(unittest.TestCase):
         def tester(role, name, task, folder):
             self.assertEqual(role, "tester")
             return {"ok":True,"output":{"cases":copy.deepcopy(CASES)}}
-        return queen.Queen(engine=SimpleNamespace(path=self.input,file="owned-input"), out=self.out, bees=tester,
+        return make_queen(engine=SimpleNamespace(path=self.input,file="owned-input"), out=self.out, bees=tester,
                            run_original=permission, fuzz=total, behaviour_rounds=rounds)
 
     def execution(self, cases, binary, folder):
@@ -354,7 +356,7 @@ class QueenFuzzTests(unittest.TestCase):
                 path.write_text('{"old":true}')
                 q = self.make(total=0)
                 if failed_tester:
-                    q.bees = lambda *args: {"ok":False,"error":"no cases"}
+                    q.bees = FakeRouter(lambda *args: {"ok":False,"error":"no cases"})
                 self.conformance(q,self.execution)
                 self.assertFalse(path.exists())
 
@@ -377,7 +379,7 @@ class QueenFuzzTests(unittest.TestCase):
     def test_cases_without_files_report_zero_mutants_and_do_not_mutate_arguments(self):
         q = self.make()
         plain = [{"id":"a","steps":[{"args":["literal"]}]}, {"id":"b","steps":[{"args":[]}]}]
-        q.bees = lambda *args: {"ok":True,"output":{"cases":copy.deepcopy(plain)}}
+        q.bees = FakeRouter(lambda *args: {"ok":True,"output":{"cases":copy.deepcopy(plain)}})
         with patch.object(queen,"run_cases",side_effect=self.execution) as execute, \
              contextlib.redirect_stdout(io.StringIO()):
             result = q.conformance("first-rebuild",[],self.root/"unused")
@@ -389,6 +391,9 @@ class QueenFuzzTests(unittest.TestCase):
 
     def test_cli_forwards_the_bound_and_original_permission(self):
         with patch.object(queen.bees_module,"environment_ok",return_value=True), \
+             patch.object(queen.codex_bees,"build_router",return_value=FakeRouter(lambda *a: None),create=True), \
+             patch.object(queen.bees_module,"AttemptNotStarted",queen.StartDenied,create=True), \
+             patch.object(queen.importlib,"import_module",return_value=FakePlanning()), \
              patch.object(queen,"Queen") as factory:
             factory.return_value.run.return_value={"verdict":"accepted"}
             self.assertEqual(queen.main(["run","--inputs",str(self.root),"--file",self.input.name,

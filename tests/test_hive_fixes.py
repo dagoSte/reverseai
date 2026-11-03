@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from tests.hive_compiler import confined
 from hive import codex_bees, languages, queen
-from tests.test_hive_queen import CONTRACT, GOOD, WRONG_EXIT, FakeBees, FakeEngine
+from tests.test_hive_queen import CONTRACT, GOOD, WRONG_EXIT, FakeBees, FakeEngine, FakeRouter, make_queen
 
 
 class RecordedBees(FakeBees):
@@ -63,7 +63,7 @@ class QueenFixTests(unittest.TestCase):
             return {"claims": count, "confirmed": count, "rejected": 0, "questions": 1,
                     "input_sha256": ["cd" * 32]}, []
         self.run_number += 1
-        q = queen.Queen(engine=FakeEngine(self.inputs), out=self.root / f"run{self.run_number}", bees=bees,
+        q = make_queen(engine=FakeEngine(self.inputs), out=self.root / f"run{self.run_number}", bees=bees,
                         check=check, slots=2, compile_rounds=0, **kwargs)
         return q, bees
 
@@ -84,7 +84,7 @@ class QueenFixTests(unittest.TestCase):
             if role == "councillor":
                 return {"ok": False, "output": None, "error": codex_bees.NETWORK_REFUSAL}
             return bees(role, name, task, folder)
-        q.bees = codex_bees.MixedBees(bees, refused)
+        q.bees = FakeRouter(codex_bees.MixedBees(bees, refused))
         result = self.run_quietly(q)
         self.assertEqual(result["modules"]["m01"], "incomplete")
         self.assertEqual(result["verdict"], "not accepted")
@@ -277,12 +277,16 @@ class QueenFixTests(unittest.TestCase):
     def test_frozen_contract_resume(self):
         q, _ = self.make()
         first = self.run_quietly(q)
+        planner_calls = q.planning.calls
+        spent = q.spent["bees"]
         try:
             second = self.run_quietly(q)
         except PermissionError as error:
             self.fail(f"resume overwrites the frozen contract: {error}")
         self.assertEqual(first["verdict"], "accepted without behaviour proof")
         self.assertEqual(second["verdict"], first["verdict"])
+        self.assertEqual(q.planning.calls, planner_calls)
+        self.assertEqual(q.spent["bees"], spent)
 
     def test_relative_output_path(self):
         source, header = self.root / "m.c", self.root / "contract.h"
@@ -397,9 +401,14 @@ class CompilerBoundaryTests(unittest.TestCase):
         def repair(role, name, task, folder):
             prompts.append(task)
             return {"ok": False, "output": None}
-        q = queen.Queen(engine=None, out=self.root / "repair-run", bees=repair, compile_rounds=1)
+        q = make_queen(engine=None, out=self.root / "repair-run", bees=repair, compile_rounds=1)
+        folder = q.out / "modules/m01"
+        folder.mkdir(parents=True)
+        source, header = folder / self.source.name, folder / self.header.name
+        shutil.copyfile(self.source, source)
+        shutil.copyfile(self.header, header)
         with contextlib.redirect_stdout(io.StringIO()):
-            result = q.compile_loop("m01", self.root, self.source, self.header, {})
+            result = q.compile_loop("m01", folder, source, header, {})
         self.assertFalse(result["ok"])
         self.assertTrue(prompts)
         self.assertNotIn(self.token, "\n".join(prompts))

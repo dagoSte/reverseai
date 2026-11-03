@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from tests.hive_compiler import confined
+from tests.test_hive_queen import FakePlanning, make_queen
 from hive import languages, queen
 
 CXX = shutil.which("c++")
@@ -133,7 +134,7 @@ class CppRunTests(unittest.TestCase):
             return {"claims": 1, "confirmed": 1, "rejected": 0, "questions": 1,
                     "input_sha256": ["ef" * 32]}, []
 
-        hive = queen.Queen(engine=CppEngine(inputs), out=tmp / "run", bees=bees, slots=2, check=check,
+        hive = make_queen(engine=CppEngine(inputs), out=tmp / "run", bees=bees, slots=2, check=check, planning=FakePlanning(header=CONTRACT),
                            run_original=True, language="auto")
         (tmp / "run" / "modules" / "m01").mkdir(parents=True)
         (tmp / "run" / "modules" / "m01" / "claims.json").write_text(json.dumps({"claims": [

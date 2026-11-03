@@ -8,7 +8,7 @@ from pathlib import Path
 
 from tests.hive_compiler import confined
 from hive import codex_bees, preflight, queen
-from tests.test_hive_queen import FakeBees, FakeEngine, GOOD
+from tests.test_hive_queen import FakeBees, FakeEngine, GOOD, make_queen
 
 PACKED = {"verdict": "packed", "packers": ["UPX"], "signals": [
     {"strength": "strong", "signal": "packer section", "detail": "segment named 'UPX1' belongs to UPX"}],
@@ -26,7 +26,7 @@ class IntegrationTests(unittest.TestCase):
         def check(claims, out):
             return {"claims": 1, "confirmed": 1, "rejected": 0, "questions": 1,
                     "input_sha256": ["cd" * 32]}, []
-        return queen.Queen(engine=FakeEngine(self.tmp / "inputs"), out=self.tmp / "run", bees=bees, slots=2,
+        return make_queen(engine=FakeEngine(self.tmp / "inputs"), out=self.tmp / "run", bees=bees, slots=2,
                            check=check, preflight=lambda engine, program_map, folder: verdict, **kwargs)
 
     def test_a_packed_program_stops_before_any_bee(self):
