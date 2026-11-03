@@ -6,9 +6,10 @@ an **independent council** plus a deterministic **evidence checker** decide what
 The ReverseAI engine itself stays model-free: the hive is a separate layer in `hive/` that
 talks to the engine only through its MCP server and command line.
 
-Status: experimental. It needs prepared Ghidra exports (`reverseai prepare`, ReverseAI 0.8.0)
-and Claude Code logged in with your own subscription; Codex bees, if you choose them, use your
-Codex login. No API key is used.
+Status: experimental. It needs prepared Ghidra exports (`reverseai prepare`, ReverseAI 0.8.0).
+The default path uses your Claude Code subscription, or your Codex login for Codex bees.
+An explicitly configured self-hosted server is an alternative (see [Self-hosted models](#self-hosted-models-experimental));
+the agent CLIs and the queen's checks still apply.
 
 ## Roles
 
@@ -89,6 +90,46 @@ separate `incomplete` list. Any incomplete mutant prevents acceptance. `tests/fu
 seed and bounded base64 inputs of both differing and incomplete mutants for reproduction, and is
 cleared at the start of each conformance attempt.
 
+## Group planning: phase A and the 0.9.0 lane
+
+Phase A is implemented in `hive/partition.py`: it splits the map deterministically into
+bounded groups while keeping every function exactly once. Functions that call each other,
+share strings or touch the same data tend to stay together, but count and byte caps take
+precedence. Calls across groups remain explicit. A singleton that is still too large keeps
+an inline sample plus complete overflow side files with hashes and counts; unattached rows
+are retained too. The global summary declares its omissions and cannot prove coverage.
+
+The phase B API in `hive/planning.py` proposes a plan from those groups. Each planner receives
+only its own `map.json`, a bounded `summary.json` and an `interfaces.json` index. Large inputs
+are paged inside that group's readable folder; every page has a count and SHA-256, and no
+individual page exceeds `max_prompt_bytes`. The same limit bounds the combined task and
+initial map/summary/index bytes. It does not measure the agent CLI's system prompt, tool
+definitions or total token context. An indivisible record above the cap stops planning
+with `planning_payload_too_large`, rather than being silently truncated.
+
+Every group function must be assigned or skipped with a reason and evidence. The queen's
+planning code checks exact coverage, shared declarations, dependencies and global owners.
+Conflicting declarations get a bounded interface task that can select only an existing
+variant. Unknown layouts or unresolved conflicts stop the plan; opaque types cross module
+interfaces only through pointers/references. Final modules use `m01`, `m02`, etc., separately
+from partition groups `g0001`, `g0002`, etc. A global definition belongs to the module that
+contains its `owner_entry`, including after a large module is split.
+
+The output is `plan/manifest.json`, `plan/interfaces.json` and `plan/contract.h` (or `.hpp`).
+The manifest binds input, map, partition, planning policy, declarations and assignments by
+hash. `validate_bundle` rechecks those bindings without a planner. Partial verified proposals
+and interface decisions can be resumed from `plan/progress.json`; prior failed attempts
+remain in the queen's history. The caller must still compile and freeze the contract before
+builders start. Planning alone does not accept a module or prove that the rebuild behaves
+like the original.
+
+**Integration status:** this lane supplies the phase B API and tests; the command-line queen
+in this checkout still follows the older planning path until the companion queen lane is
+integrated. The fallback and refusal-resume changes specified by the
+[0.9.0 contract](design/0.9.0-contratto.md) likewise need their companion lanes. They are not
+available merely because this planning module is present. Group planning has not demonstrated
+a complete reconstruction of curl or a whole run on a local model.
+
 ## Who has the final word
 
 - A failed check cannot be overruled by any agent. The council can only add a veto.
@@ -162,8 +203,8 @@ tools, the folder-scoped writes and `dontAsk`, and Codex still runs in its sandb
 probe.
 
 - Claude bees (`--model NAME`) need a server with the Anthropic Messages API, for example Ollama 0.14
-  or later, LM Studio 0.4.1 or later or llama.cpp's `llama-server`. Give it a large context: Claude
-  Code's prompt and tool definitions are long, and Ollama recommends 64k tokens or more.
+  or later, LM Studio 0.4.1 or later or llama.cpp's `llama-server`. Measure the complete prompt,
+  including the agent's system prompt and tools, against the chosen model's actual context.
 - Codex bees (`--bee-policy codex`, `--codex-model NAME`) need a server with the OpenAI Responses
   API (Ollama 0.13.3 or later, vLLM and others). The hive adds a `selfhost` model provider for them.
 - The server must be on this machine unless you add `--model-server-remote`, because the bees'
@@ -175,14 +216,65 @@ probe.
 ```bash
 OLLAMA_CONTEXT_LENGTH=65536 ollama serve &
 python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-hive-run \
-  --model-server http://127.0.0.1:11434 --model qwen3.6:35b
+  --model-server http://127.0.0.1:11434 --model local-model
 ```
 
-This is plumbing, not a quality claim. A test drives a real Claude Code bee through a stand-in server
-that speaks the Messages API; no self-hosted model has yet been measured on a whole run. Long
-reverse-engineering runs are hard for local models (many tool calls, long decompiler output), so
-expect smaller models to manage narrow roles at best. The queen's checks stay the gate whatever the
-model: councils, the evidence checker, the confined compiler and the conformance cases.
+The example assumes you have already chosen and prepared the server and model; it is not a
+recommendation for a particular model size or machine. The 65536 context setting is an example,
+not a measured requirement or a guarantee that the CLI's complete prompt fits.
+
+A test drives a real Claude Code bee through a stand-in Messages server. That test establishes
+routing, not a complete local reconstruction. API compatibility alone does not establish a
+multi-turn agent run: tool-call, tool-result, the following turn and schema-conforming output
+must be tested on the actual client/server/model combination. No complete curl reconstruction
+or local end-to-end performance result is claimed here. The queen's checks remain required:
+councils, the evidence checker, the confined compiler and conformance cases.
+
+### Refusal fallback and resume: 0.9.0 integration contract
+
+These flags belong to the companion adapter and queen lanes. They are listed here as the
+0.9.0 integration contract; they are not implemented by the isolated planning API in this
+checkout. Check the integrated CLI's help before using them.
+
+| Flag | Meaning after integration |
+| --- | --- |
+| `--fallback-model-server URL` | Explicitly authorize a fallback server on loopback; no implicit model download or server start. |
+| `--fallback-model NAME` | Model served to Claude-client bees through Messages. |
+| `--fallback-codex-model NAME` | Model served to Codex-client bees through Responses. |
+| `--fallback-scope run\|role\|bee` | Required with the fallback server; define the extent of authorization. |
+| `--fallback-role ROLE` | Repeat for role scope only: planner, worker, repair, councillor or tester. |
+| `--fallback-bee NAME` | Repeat for bee scope only; match an exact logical bee name. |
+| `--resume-refused` | Explicit recovery of a run stopped by unresolved refusals, with local selectors/target for the work to recover. |
+
+Without fallback flags, a provider refusal stops work as documented below. With explicit
+authorization, only a provider refusal permits one additional local attempt for that logical
+call, within the persisted budget. Timeout, rate limit, invalid output, context limit and a
+failed isolation probe do not activate fallback. The failed attempt's partial files do not
+become the local attempt's baseline. There is no automatic prompt rewrite or return to cloud.
+For run scope, the first selected refusal activates the local target for new calls; role
+scope activates only the refused selected role; bee scope selects only that name. Calls
+already active finish on their original target.
+
+Claude receives the server root as its base URL; only Codex appends `/v1`. A root already
+ending in `/v1` is rejected by the 0.9.0 adapters. A remote primary-server setting does not
+authorize a remote fallback. Both model names are needed when the client policy can use both
+clients. A Chat Completions-only endpoint does not establish Messages or Responses support.
+Loopback alone does not prove that a server keeps all processing local.
+
+The 0.9.0 queen keeps raw refusal history separately from unresolved logical work. A valid
+local replacement resolves only that work and retains both attempts. On restart, counters
+and history remain consumed; a verified plan is loaded without a planner call. Recovering a
+refusal stop requires `--resume-refused` and the explicit local configuration; recovering a
+budget stop also requires a sufficient explicitly increased limit. Omitting an active local
+configuration stops the resume. A failed network-isolation probe is not recoverable with
+`--resume-refused`. Changed input, map, planning policy or damaged manifests require a new
+output directory rather than an implicit replan over the previous run.
+
+In this integration contract, `--max-bees` counts physical agent starts, including probes,
+fallback, repairs and councillors. It does not cap tokens, money or each HTTP request inside
+a CLI. Before planning, the queen reports the group count and the minimum number of planner
+calls; groups are not modules. Its remaining-call estimate is a lower bound and its 25%
+reserve is a stated heuristic, not a runtime or completion guarantee.
 
 ## Safety
 
