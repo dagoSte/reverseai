@@ -91,7 +91,7 @@ class RealSeamTests(unittest.TestCase):
             stub = patch.object(queen.Build, target, return_value=value)
             stub.start()
             self.addCleanup(stub.stop)
-        for target, operation in (("subprocess.run", self.cli), ("urllib.request.urlopen", self.metadata)):
+        for target, operation in (("hive.bees.run_cli", self.cli), ("urllib.request.urlopen", self.metadata)):
             stub = patch(target, side_effect=operation)
             stub.start()
             self.addCleanup(stub.stop)
@@ -127,6 +127,25 @@ class RealSeamTests(unittest.TestCase):
                     {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "read",
                         "name": "Read", "input": {"file_path": "capability-input.json"}}]}},
                     {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "read", "content": nonce}]}}])
+            if self.tool_evidence:
+                marker = "using these structured arguments: "
+                self.assertIn(marker, kwargs["input"])
+                arguments, _ = json.JSONDecoder().raw_decode(kwargs["input"].split(marker, 1)[1])
+                self.assertEqual(arguments["file"], "greet")
+                self.assertEqual(arguments["entry"], 0x1000)
+                self.assertIs(type(arguments["entry"]), int)
+                self.assertEqual(arguments["part"], "info")
+                if codex:
+                    events.append({"type": "item.completed", "item": {"type": "mcp_tool_call", "id": "export",
+                        "server": "reverseai", "tool": "export_function", "arguments": arguments,
+                        "status": "completed", "error": None,
+                        "result": {"content": [{"type": "text", "text": "Derived function metadata"}]}}})
+                else:
+                    events.extend([
+                        {"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "export",
+                            "name": "mcp__reverseai__export_function", "input": arguments}]}},
+                        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "export",
+                            "content": [{"type": "text", "text": "Derived function metadata"}]}]}}])
         elif self.refuse_second and name == "planner-g0002" and server is None:
             events = [{"type": "result", "is_error": True, "error": {"type": "refusal"},
                        "result": "I cannot assist with this request."}]
@@ -314,7 +333,7 @@ class RealSeamTests(unittest.TestCase):
         q = self.make(router)
         q._ensure_state()
         with contextlib.redirect_stdout(io.StringIO()):
-            q.check_models()
+            q.check_models(queen.survey(q.engine, q.out / "survey", lambda _: None))
         self.assertEqual([(r["client"], r["attempt"]["provenance"]["origin"]) for r in q.model_checks],
                          [("claude", "primary"), ("codex", "primary"), ("claude", "fallback"), ("codex", "fallback")])
         self.assertEqual(q.spent["bees"], 6)

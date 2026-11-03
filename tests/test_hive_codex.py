@@ -88,7 +88,7 @@ class CodexRunnerTests(unittest.TestCase):
                 Path(argv[argv.index("-o") + 1]).write_text(json.dumps(ANSWERS[role] if answer is None else answer))
             return subprocess.CompletedProcess(argv, returncode, stdout='{"type":"turn.completed"}', stderr=stderr)
 
-        with patch("hive.codex_bees.subprocess.run", side_effect=run) as process:
+        with patch("hive.bees.run_cli", side_effect=run) as process:
             result = self.runner(role, "bee-1", "TASK", self.folder)
         return result, process.call_args
 
@@ -176,25 +176,25 @@ class CodexRunnerTests(unittest.TestCase):
                 def run(argv, **kwargs):
                     Path(argv[argv.index("-o") + 1]).write_text(json.dumps(value))
                     return subprocess.CompletedProcess(argv, 0, '{"type":"turn.completed"}', "")
-                with patch("hive.codex_bees.subprocess.run", side_effect=run):
+                with patch("hive.bees.run_cli", side_effect=run):
                     self.assertFalse(self.runner("worker", "bad", "TASK", self.folder)["ok"])
         def malformed(argv, **kwargs):
             Path(argv[argv.index("-o") + 1]).write_text("{broken")
             return subprocess.CompletedProcess(argv, 0, '{"type":"turn.completed"}', "")
-        with patch("hive.codex_bees.subprocess.run", side_effect=malformed):
+        with patch("hive.bees.run_cli", side_effect=malformed):
             self.assertFalse(self.runner("worker", "bad", "TASK", self.folder)["ok"])
 
     def test_timeout_startup_io_and_invalid_role_fail_without_raising(self):
         for error in (subprocess.TimeoutExpired("codex", 7), FileNotFoundError("missing codex"),
                       OSError("native failure")):
-            with self.subTest(error=error), patch("hive.codex_bees.subprocess.run", side_effect=error):
+            with self.subTest(error=error), patch("hive.bees.run_cli", side_effect=error):
                 result = self.runner("worker", "failure", "TASK", self.folder)
                 self.assertFalse(result["ok"])
                 self.assertTrue(result["error"])
                 if isinstance(error, subprocess.TimeoutExpired):
                     self.assertEqual(result["seconds"], 7)
         self.assertFalse(self.runner("unknown", "failure", "TASK", self.folder)["ok"])
-        with patch("hive.codex_bees.subprocess.run") as process:
+        with patch("hive.bees.run_cli") as process:
             self.assertFalse(self.runner("worker", "../escape", "TASK", self.folder)["ok"])
             process.assert_not_called()
         self.runner.config_dir = self.folder / "not-a-directory"
@@ -209,6 +209,24 @@ class CodexRunnerTests(unittest.TestCase):
 
 
 class NetworkGateTests(unittest.TestCase):
+    def test_codex_stops_before_timeout_after_consecutive_mcp_schema_errors(self):
+        import sys
+        events = [{"type": "item.completed", "item": {"id": str(i), "type": "mcp_tool_call",
+                   "tool": "export_function", "error": {"code": -32602, "message": "Invalid arguments"}}}
+                  for i in range(2)]
+        script = "import sys,time; sys.stdin.read(); print(" + repr("\n".join(map(json.dumps, events))) + ",flush=True); time.sleep(30)"
+        runner = CodexBees(engine=self.root, inputs=self.root, config_dir=self.root / "stop-config",
+                           allow_network=True, timeout=1)
+        runner.max_tool_rejections = 2
+        with patch.object(runner, "argv", return_value=[sys.executable, "-u", "-c", script]):
+            result = runner("planner", "planner", "prompt", self.folder, schema={"type": "object"})
+        self.assertEqual(result["outcome"], "tool_schema_failure")
+        self.assertFalse(result["refused"])
+        self.assertIsNone(result["output"])
+        self.assertEqual(result["tool_rejections"], 2)
+        self.assertEqual(result["consecutive_tool_rejections"], 2)
+        self.assertEqual(result["tool_name"], "export_function")
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -250,7 +268,7 @@ class NetworkGateTests(unittest.TestCase):
 
     def test_network_success_refuses_worker_before_its_task(self):
         self.probe_exit = 0
-        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+        with patch("hive.bees.run_cli", side_effect=self.fake_codex):
             result = self.runner("worker", "m02-build", "PRIVATE TASK", self.folder)
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "Codex sandbox allowed network access; Codex bees refused")
@@ -260,7 +278,7 @@ class NetworkGateTests(unittest.TestCase):
 
     def test_native_network_refusal_allows_the_worker_with_identical_sandbox_config(self):
         self.runner.model, self.runner.effort = "chosen-model", "high"
-        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+        with patch("hive.bees.run_cli", side_effect=self.fake_codex):
             result = self.runner("worker", "m02-build", "PRIVATE TASK", self.folder)
         self.assertTrue(result["ok"], result)
         self.assertNotIn("warning", result)
@@ -277,7 +295,7 @@ class NetworkGateTests(unittest.TestCase):
         self.assertIsNotNone(result["output"])
 
     def test_probe_outcomes_are_cached_per_sandbox_mode(self):
-        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+        with patch("hive.bees.run_cli", side_effect=self.fake_codex):
             for name in ("m02-build", "m04-build"):
                 self.assertTrue(self.runner("worker", name, "TASK", self.folder)["ok"])
             self.probe_exit = 0
@@ -289,13 +307,13 @@ class NetworkGateTests(unittest.TestCase):
         self.assertEqual(sum(not probe for probe, _, _ in self.calls), 3)
 
     def test_read_only_probe_can_allow_councillors(self):
-        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+        with patch("hive.bees.run_cli", side_effect=self.fake_codex):
             result = self.runner("councillor", "m01-council-r1-io", "TASK", self.folder)
         self.assertTrue(result["ok"], result)
         self.assertTrue(all(argv[argv.index("--sandbox") + 1] == "read-only" for _, argv, _ in self.calls))
 
     def test_concurrent_workers_share_one_probe(self):
-        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+        with patch("hive.bees.run_cli", side_effect=self.fake_codex):
             with ThreadPoolExecutor(max_workers=4) as pool:
                 results = list(pool.map(lambda n: self.runner("worker", f"m{n:02}-build", "TASK", self.folder),
                                         (2, 4, 6, 8)))
@@ -309,7 +327,7 @@ class NetworkGateTests(unittest.TestCase):
                 self.runner._network_checks.clear()
                 self.calls.clear()
                 self.probe_error = error
-                with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+                with patch("hive.bees.run_cli", side_effect=self.fake_codex):
                     for name in ("m02-build", "m04-build"):
                         result = self.runner("worker", name, "TASK", self.folder)
                         self.assertFalse(result["ok"])
@@ -320,7 +338,7 @@ class NetworkGateTests(unittest.TestCase):
             self.runner._network_checks.clear()
             self.calls.clear()
             self.probe_write, self.probe_cli_rc = write, rc
-            with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+            with patch("hive.bees.run_cli", side_effect=self.fake_codex):
                 self.assertFalse(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
             self.assertEqual(len(self.calls), 1)
 
@@ -337,7 +355,7 @@ class NetworkGateTests(unittest.TestCase):
                 self.runner._network_checks.clear()
                 self.calls.clear()
                 self.probe_events = events
-                with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+                with patch("hive.bees.run_cli", side_effect=self.fake_codex):
                     self.assertFalse(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
                 self.assertEqual(len(self.calls), 1)
 
@@ -347,12 +365,12 @@ class NetworkGateTests(unittest.TestCase):
                 self.runner._network_checks.clear()
                 self.calls.clear()
                 self.probe_exit = code
-                with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+                with patch("hive.bees.run_cli", side_effect=self.fake_codex):
                     self.assertFalse(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
                 self.assertEqual(len(self.calls), 1)
         self.runner._network_checks.clear()
         self.probe_exit = 7
-        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+        with patch("hive.bees.run_cli", side_effect=self.fake_codex):
             self.assertTrue(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
 
     def test_invalid_probe_report_extra_commands_and_broken_jsonl_are_refused(self):
@@ -361,20 +379,20 @@ class NetworkGateTests(unittest.TestCase):
             with self.subTest(report=report):
                 self.runner._network_checks.clear()
                 self.probe_report = report
-                with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+                with patch("hive.bees.run_cli", side_effect=self.fake_codex):
                     self.assertFalse(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
         self.probe_report = None
         for stdout in ("{broken", "[]", "null"):
             self.runner._network_checks.clear()
             self.probe_stdout = stdout
-            with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+            with patch("hive.bees.run_cli", side_effect=self.fake_codex):
                 self.assertFalse(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
         self.probe_stdout = None
         self.runner._network_checks.clear()
         command = "curl --max-time 5 --silent --show-error --output /dev/null https://example.com"
         self.probe_events = [{"type": "item.completed", "item": {"type": "command_execution", "command": command,
                               "exit_code": code}} for code in (0, 6)] + [{"type": "turn.completed"}]
-        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+        with patch("hive.bees.run_cli", side_effect=self.fake_codex):
             self.assertFalse(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
 
     def test_shell_wrapped_exact_probe_command_is_recognized(self):
@@ -382,22 +400,22 @@ class NetworkGateTests(unittest.TestCase):
             {"type": "item.completed", "item": {"type": "command_execution", "exit_code": 6,
              "command": "/bin/zsh -lc 'curl --max-time 5 --silent --show-error --output /dev/null https://example.com'"}},
             {"type": "turn.completed"}]
-        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+        with patch("hive.bees.run_cli", side_effect=self.fake_codex):
             self.assertTrue(self.runner("worker", "m02-build", "TASK", self.folder)["ok"])
 
     def test_opt_out_skips_probe_and_warns_on_success_and_failure(self):
         self.runner.allow_network = True
-        with patch("hive.codex_bees.subprocess.run", side_effect=self.fake_codex):
+        with patch("hive.bees.run_cli", side_effect=self.fake_codex):
             result = self.runner("worker", "m02-build", "TASK", self.folder)
         self.assertTrue(result["ok"])
         self.assertEqual(result["warning"], "Codex bees ran without network isolation")
         self.assertEqual([probe for probe, _, _ in self.calls], [False])
         self.assertEqual(self.runner._network_checks, {})
-        with patch("hive.codex_bees.subprocess.run", side_effect=OSError("cannot start")):
+        with patch("hive.bees.run_cli", side_effect=OSError("cannot start")):
             result = self.runner("worker", "m04-build", "TASK", self.folder)
         self.assertFalse(result["ok"])
         self.assertEqual(result["warning"], "Codex bees ran without network isolation")
-        with patch("hive.codex_bees.subprocess.run", side_effect=subprocess.TimeoutExpired("codex", 7)):
+        with patch("hive.bees.run_cli", side_effect=subprocess.TimeoutExpired("codex", 7)):
             result = self.runner("worker", "m06-build", "TASK", self.folder)
         self.assertFalse(result["ok"])
         self.assertEqual(result["warning"], "Codex bees ran without network isolation")

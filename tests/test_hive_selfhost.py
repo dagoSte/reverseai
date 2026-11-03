@@ -66,7 +66,7 @@ class ChildEnvironmentTests(unittest.TestCase):
         args = self.parser.parse_args(["--model-server", "http://127.0.0.1:11434", "--model", "m1"])
         runner = codex_bees.build(args, claude, engine=self.tmp, inputs=self.tmp, config_dir=self.tmp / "codex")
         done = subprocess.CompletedProcess([], 0, json.dumps({"structured_output": ANSWER}), "")
-        with mock.patch.object(bees.subprocess, "run", return_value=done) as run:
+        with mock.patch.object(bees, "run_cli", return_value=done) as run:
             self.assertTrue(runner("councillor", "c", "task", self.tmp)["ok"])
         env = run.call_args.kwargs["env"]
         self.assert_clean(env)
@@ -84,7 +84,7 @@ class ChildEnvironmentTests(unittest.TestCase):
             calls.append(kwargs)
             Path(argv[argv.index("-o") + 1]).write_text(json.dumps({"verdict": "accept", "defects": [], "summary": None}))
             return subprocess.CompletedProcess(argv, 0, '{"type":"turn.completed"}', "")
-        with mock.patch.object(codex_bees.subprocess, "run", side_effect=fake_run), \
+        with mock.patch.object(bees, "run_cli", side_effect=fake_run), \
                 mock.patch.object(runner, "_network_ok",  # a probe process like the real one, judged isolated
                                   wraps=lambda role, folder: bool(runner._execute(role, "probe", "t", folder))) as probe:
             answer = runner("councillor", "c", "task", self.tmp)
@@ -121,11 +121,11 @@ class EnvironmentTests(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp())
         runner = bees.ClaudeBees(engine=tmp, inputs=tmp, config_dir=tmp / "cfg", env={"PATH": "/usr/bin"})
         done = subprocess.CompletedProcess([], 0, json.dumps({"structured_output": ANSWER}), "")
-        with mock.patch.object(bees.subprocess, "run", return_value=done) as run:
+        with mock.patch.object(bees, "run_cli", return_value=done) as run:
             self.assertTrue(runner("councillor", "c", "task", tmp)["ok"])
         self.assertEqual(run.call_args.kwargs["env"], {"PATH": "/usr/bin"})
         default = bees.ClaudeBees(engine=tmp, inputs=tmp, config_dir=tmp / "cfg")
-        with mock.patch.object(bees.subprocess, "run", return_value=done) as run:
+        with mock.patch.object(bees, "run_cli", return_value=done) as run:
             default("councillor", "c", "task", tmp)
         self.assertIsNone(run.call_args.kwargs["env"])  # unchanged default: inherit
 
@@ -282,7 +282,7 @@ class RouterFixture:
 
 class RouterTests(RouterFixture, unittest.TestCase):
     def test_construction_and_describe_are_pure_policy_copies_are_isolated(self):
-        with mock.patch("subprocess.run") as run, mock.patch("urllib.request.urlopen") as network:
+        with mock.patch("hive.bees.run_cli") as run, mock.patch("urllib.request.urlopen") as network:
             router = self.router(self.fallback_flags())
             first = router.describe("planner", "planner-g0001")
             second = router.describe("planner", "planner-g0001", local=True)
@@ -383,6 +383,103 @@ class RouterTests(RouterFixture, unittest.TestCase):
         self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], selfhost.PLACEHOLDER_TOKEN)
 
 
+MCP_PROBE = {"file": "greet", "entry": "0x1000"}
+
+
+def accepted_mcp_events(client, arguments=None):
+    arguments = {"file": "greet", "entry": 4096, "select": "entry", "part": "info"} if arguments is None else arguments
+    if client == "claude":
+        return [{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "export",
+                    "name": "mcp__reverseai__export_function", "input": arguments}]}},
+                {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "export",
+                    "content": [{"type": "text", "text": "Derived function metadata"}]}]}}]
+    return [{"type": "item.completed", "item": {"type": "mcp_tool_call", "id": "export",
+                "server": "reverseai", "tool": "export_function", "arguments": arguments,
+                "status": "completed", "result": {"content": [{"type": "text", "text": "Derived function metadata"}]},
+                "error": None}}]
+
+
+class MCPNativeEvidenceTests(unittest.TestCase):
+    def test_native_acceptance_for_both_clis_and_integer_schema(self):
+        from reverseai.mcp_tools import catalog
+        schema = next(tool["inputSchema"] for tool in catalog(frozenset({"ghidra"})) if tool["name"] == "export_function")
+        arguments = {"file": "greet", "entry": 4096, "part": "info"}
+        self.assertTrue(bees.matches_schema(arguments, schema))
+        self.assertFalse(bees.matches_schema(dict(arguments, entry="0x1000"), schema))
+        for client in ("claude", "codex"):
+            with self.subTest(client=client):
+                self.assertTrue(selfhost.mcp_tool_accepted(accepted_mcp_events(client, arguments), client, MCP_PROBE))
+
+    def test_prose_and_final_json_do_not_establish_mcp_acceptance(self):
+        claims = [{"type": "result", "structured_output": {"mcp_tool": "ok"}, "result": "export_function accepted"},
+                  {"type": "assistant", "message": {"content": [{"type": "text", "text": json.dumps(accepted_mcp_events("claude"))}]}},
+                  {"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(accepted_mcp_events("codex"))}}]
+        for client in ("claude", "codex"):
+            self.assertFalse(selfhost.mcp_tool_accepted(claims, client, MCP_PROBE))
+
+    def test_acceptance_must_match_the_surveyed_function_and_selector(self):
+        variants = [{"file": "other", "entry": 4096}, {"file": "greet", "entry": 8192},
+                    {"file": "greet", "entry": "0x1000"}, {"file": "greet", "entry": True},
+                    {"file": "greet", "entry": 4096, "select": "name"},
+                    {"file": "greet", "entry": 4096, "name": "other"},
+                    {"file": "greet", "entry": 4096, "part": "pseudocode"}]
+        for client in ("claude", "codex"):
+            for arguments in variants:
+                with self.subTest(client=client, arguments=arguments):
+                    self.assertFalse(selfhost.mcp_tool_accepted(accepted_mcp_events(client, arguments), client, MCP_PROBE))
+
+    def test_claude_requires_correlated_nonerror_result_from_reverseai(self):
+        for mutation in ("error", "wrong_id", "wrong_server", "missing_result", "result_first", "empty_content"):
+            events = accepted_mcp_events("claude")
+            call, result = events[0]["message"]["content"][0], events[1]["message"]["content"][0]
+            if mutation == "error":
+                result.update(is_error=True, content="Arguments must match this tool's input schema.")
+            elif mutation == "wrong_id":
+                result["tool_use_id"] = "other"
+            elif mutation == "wrong_server":
+                call["name"] = "mcp__other__export_function"
+            elif mutation == "missing_result":
+                events.pop()
+            elif mutation == "result_first":
+                events.reverse()
+            else:
+                result["content"] = []
+            with self.subTest(mutation=mutation):
+                self.assertFalse(selfhost.mcp_tool_accepted(events, "claude", MCP_PROBE))
+
+    def test_codex_requires_completed_native_mcp_result_without_errors(self):
+        for mutation in ("error", "isError", "is_error", "wrong_server", "wrong_tool", "started", "failed", "missing_result"):
+            events = accepted_mcp_events("codex")
+            call = events[0]["item"]
+            if mutation == "error":
+                call["error"] = {"code": -32602, "message": "Invalid arguments"}
+            elif mutation in ("isError", "is_error"):
+                call["result"][mutation] = True
+            elif mutation == "wrong_server":
+                call["server"] = "other"
+            elif mutation == "wrong_tool":
+                call["tool"] = "export_program"
+            elif mutation == "started":
+                events[0]["type"] = "item.started"
+            elif mutation == "failed":
+                call["status"] = "failed"
+            else:
+                call["result"] = None
+            with self.subTest(mutation=mutation):
+                self.assertFalse(selfhost.mcp_tool_accepted(events, "codex", MCP_PROBE))
+        encoded = accepted_mcp_events("codex")
+        encoded[0]["item"]["arguments"] = json.dumps(encoded[0]["item"]["arguments"])
+        self.assertTrue(selfhost.mcp_tool_accepted(encoded, "codex", MCP_PROBE))
+
+    def test_missing_target_and_malformed_events_never_pass(self):
+        for target in (None, {}, {"file": "greet", "entry": 4096}, {"file": "greet", "entry": "0x10000000000000000"}):
+            self.assertFalse(selfhost.mcp_tool_accepted(accepted_mcp_events("claude"), "claude", target))
+        malformed = [None, {}, {"type": "assistant", "message": None}, {"type": "user", "message": {"content": "bad"}},
+                     {"type": "item.completed", "item": None}]
+        for client in ("claude", "codex", "unknown"):
+            self.assertFalse(selfhost.mcp_tool_accepted(malformed, client, MCP_PROBE))
+
+
 class CapabilityTests(RouterFixture, unittest.TestCase):
     def setUp(self):
         super().setUp()
@@ -393,6 +490,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
         events = [{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "read", "name": "Read", "input": {"file_path": "capability-input.json"}}]}},
                   {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "read", "content": nonce}]}},
                   {"type": "result", "structured_output": {"nonce": nonce}}]
+        events[2:2] = accepted_mcp_events("claude")
         self.assertEqual(kwargs["timeout"], 45)
         self.assertIn("--json-schema", argv)
         return subprocess.CompletedProcess(argv, 0, "\n".join(json.dumps(e) for e in events), "")
@@ -401,9 +499,9 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
         from tests.test_hive_bees import Hooks
         router = self.router(self.fallback_flags())
         hooks = Hooks()
-        with mock.patch("subprocess.run", side_effect=self.fake_claude) as run:
+        with mock.patch("hive.bees.run_cli", side_effect=self.fake_claude) as run:
             report = selfhost.check_model(router, "claude", local=True, required_context=64000,
-                                          before_start=hooks, context_query=lambda server, model: 65536)
+                                          before_start=hooks, context_query=lambda server, model: 65536, mcp_probe=MCP_PROBE)
         self.assertTrue(report["ok"], report)
         self.assertEqual(run.call_count, 1)
         self.assertEqual(hooks.started, [("attempt-1", "network_probe")])
@@ -415,12 +513,12 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
     def test_context_check_rejects_insufficient_unknown_and_failing_metadata(self):
         router = self.router(self.fallback_flags())
         for declared, status in ((8192, "error"), (None, "unsupported"), ("65536", "unsupported")):
-            with self.subTest(declared=declared), mock.patch("subprocess.run", side_effect=self.fake_claude):
+            with self.subTest(declared=declared), mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
                 report = selfhost.check_model(router, "claude", local=True, context_query=lambda server, model: declared)
             self.assertFalse(report["ok"])
             self.assertEqual(report["checks"]["context"]["status"], status)
             self.assertTrue(report["checks"]["context"]["suggestion"])
-        with mock.patch("subprocess.run", side_effect=self.fake_claude):
+        with mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
             report = selfhost.check_model(router, "claude", local=True, context_query=mock.Mock(side_effect=OSError("metadata unavailable")))
         self.assertEqual(report["checks"]["context"]["status"], "error")
 
@@ -428,7 +526,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
         def fake(argv, **kwargs):
             nonce = json.loads(Path(kwargs["cwd"], "capability-input.json").read_text())["nonce"]
             return subprocess.CompletedProcess(argv, 0, json.dumps({"type": "result", "structured_output": {"nonce": nonce}}), "")
-        with mock.patch("subprocess.run", side_effect=fake):
+        with mock.patch("hive.bees.run_cli", side_effect=fake):
             report = selfhost.check_model(self.router(), "claude", context_query=lambda s, m: 65536)
         self.assertFalse(report["ok"])
         self.assertEqual(report["checks"]["structured_output"]["status"], "ok")
@@ -436,7 +534,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
 
     def test_capability_budget_denial_propagates_without_network_or_process(self):
         from tests.test_hive_bees import Hooks
-        with mock.patch("subprocess.run") as run, mock.patch("urllib.request.urlopen") as network, self.assertRaises(bees.AttemptNotStarted):
+        with mock.patch("hive.bees.run_cli") as run, mock.patch("urllib.request.urlopen") as network, self.assertRaises(bees.AttemptNotStarted):
             selfhost.check_model(self.router(), "claude", before_start=Hooks("budget_exhausted"))
         run.assert_not_called()
         network.assert_not_called()
@@ -451,9 +549,10 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
             self.assertEqual(schema["required"], ["nonce"])
             Path(argv[argv.index("-o") + 1]).write_text(json.dumps({"nonce": nonce}))
             events = [{"type": "item.completed", "item": {"type": "command_execution", "command": "cat capability-input.json", "exit_code": 0, "aggregated_output": nonce}}, {"type": "turn.completed"}]
+            events[1:1] = accepted_mcp_events("codex")
             return subprocess.CompletedProcess(argv, 0, "\n".join(json.dumps(e) for e in events), "")
-        with mock.patch("subprocess.run", side_effect=fake):
-            report = selfhost.check_model(router, "codex", before_start=hooks, context_query=lambda s, m: 65536)
+        with mock.patch("hive.bees.run_cli", side_effect=fake):
+            report = selfhost.check_model(router, "codex", before_start=hooks, context_query=lambda s, m: 65536, mcp_probe=MCP_PROBE)
         self.assertTrue(report["ok"], report)
         self.assertEqual(hooks.started, [("attempt-1", "network_probe")])
 
@@ -474,8 +573,8 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
         routes = {"/v1/models": {"object": "list", "data": [
             {"id": "another", "max_model_len": 999999},
             {"id": "configured-local", "max_model_len": 65536}]}}
-        with self.metadata_server(routes) as network, mock.patch("subprocess.run", side_effect=self.fake_claude):
-            report = selfhost.check_model(router, "claude", local=True, required_context=65536)
+        with self.metadata_server(routes) as network, mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
+            report = selfhost.check_model(router, "claude", local=True, required_context=65536, mcp_probe=MCP_PROBE)
         self.assertTrue(report["ok"], report)
         self.assertEqual(report["declared_context"], 65536)
         self.assertEqual([call.args[0].full_url for call in network.call_args_list],
@@ -484,7 +583,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
 
     def test_vllm_context_below_requirement_remains_an_error(self):
         routes = {"/v1/models": {"data": [{"id": "configured-local", "max_model_len": 8192}]}}
-        with self.metadata_server(routes), mock.patch("subprocess.run", side_effect=self.fake_claude):
+        with self.metadata_server(routes), mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
             report = selfhost.check_model(self.router(self.fallback_flags()), "claude", local=True, required_context=65536)
         self.assertFalse(report["ok"])
         self.assertEqual(report["declared_context"], 8192)
@@ -496,7 +595,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
         cards += [{"id": "configured-local", "max_model_len": value} for value in (None, True, "65536", 0, -1)]
         for card in cards:
             with self.subTest(card=card), self.metadata_server({"/v1/models": {"data": [card]}}), \
-                    mock.patch("subprocess.run", side_effect=self.fake_claude):
+                    mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
                 report = selfhost.check_model(self.router(self.fallback_flags()), "claude", local=True)
             self.assertFalse(report["ok"])
             self.assertIsNone(report["declared_context"])
@@ -504,7 +603,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
             self.assertIn("not verifiable on this server", report["checks"]["context"]["message"])
 
     def test_server_without_either_metadata_api_remains_unsupported(self):
-        with self.metadata_server({}) as network, mock.patch("subprocess.run", side_effect=self.fake_claude):
+        with self.metadata_server({}) as network, mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
             report = selfhost.check_model(self.router(self.fallback_flags()), "claude", local=True)
         self.assertFalse(report["ok"])
         self.assertEqual(report["checks"]["context"]["status"], "unsupported")
@@ -514,7 +613,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
     def test_active_ollama_context_takes_precedence_over_other_metadata(self):
         routes = {"/api/ps": {"models": [{"name": "configured-local", "context_length": 8192}]},
                   "/v1/models": {"data": [{"id": "configured-local", "max_model_len": 65536}]}}
-        with self.metadata_server(routes) as network, mock.patch("subprocess.run", side_effect=self.fake_claude):
+        with self.metadata_server(routes) as network, mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
             report = selfhost.check_model(self.router(self.fallback_flags()), "claude", local=True, required_context=65536)
         self.assertFalse(report["ok"])
         self.assertEqual(report["declared_context"], 8192)
@@ -524,7 +623,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
     def test_unrecognized_metadata_shapes_do_not_invent_context(self):
         for payload in ({}, [], {"data": {}}, {"data": [None, "configured-local", 65536]}):
             with self.subTest(payload=payload), self.metadata_server({"/v1/models": payload}), \
-                    mock.patch("subprocess.run", side_effect=self.fake_claude):
+                    mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
                 report = selfhost.check_model(self.router(self.fallback_flags()), "claude", local=True)
             self.assertFalse(report["ok"])
             self.assertEqual(report["checks"]["context"]["status"], "unsupported")
@@ -533,10 +632,43 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
         for endpoint in ("/api/ps", "/v1/models"):
             for status in (401, 403, 500):
                 with self.subTest(endpoint=endpoint, status=status), self.metadata_server({endpoint: status}), \
-                        mock.patch("subprocess.run", side_effect=self.fake_claude):
+                        mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
                     report = selfhost.check_model(self.router(self.fallback_flags()), "claude", local=True)
                 self.assertFalse(report["ok"])
                 self.assertEqual(report["checks"]["context"]["status"], "error")
+
+    def test_read_only_without_a_real_survey_target_is_unsupported(self):
+        with mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
+            report = selfhost.check_model(self.router(), "claude", context_query=lambda s, m: 65536)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["checks"]["tool_roundtrip"]["status"], "ok")
+        self.assertEqual(report["checks"]["mcp_tool"]["status"], "unsupported")
+        self.assertIn("survey", report["checks"]["mcp_tool"]["suggestion"])
+
+    def test_mcp_probe_does_not_reconfigure_the_original_runner(self):
+        router = self.router()
+        source = router.primary("councillor", "check")
+        def inspect(argv, **kwargs):
+            self.assertIn('"entry": 4096', kwargs["input"])
+            self.assertIn('"file": "greet"', kwargs["input"])
+            self.assertIn("export_function", kwargs["input"])
+            return self.fake_claude(argv, **kwargs)
+        with mock.patch("hive.bees.run_cli", side_effect=inspect) as run:
+            selfhost.check_model(router, "claude", mcp_probe=MCP_PROBE, context_query=lambda s, m: 65536)
+        self.assertEqual(run.call_count, 1)
+        self.assertFalse(hasattr(source, "_capability_mcp"))
+        self.assertFalse(hasattr(source, "_capability_nonce"))
+        self.assertEqual(source.timeout, 2400)
+
+    def test_mcp_probe_requires_ghidra_enabled_in_the_actual_runner(self):
+        router = self.router()
+        router.primary("councillor", "check").enabled = ()
+        with mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
+            report = selfhost.check_model(router, "claude", mcp_probe=MCP_PROBE, context_query=lambda s, m: 65536)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["checks"]["mcp_tool"]["status"], "unsupported")
+        self.assertIn("Ghidra", report["checks"]["mcp_tool"]["suggestion"])
+
 
     def test_active_context_metadata_matches_configured_model_only(self):
         response = mock.MagicMock()

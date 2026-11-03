@@ -34,17 +34,17 @@ class RecogniseTests(unittest.TestCase):
              False),
         ]
         for stdout, refused in cases:
-            with self.subTest(stdout=stdout[:60]), mock.patch.object(bees.subprocess, "run", return_value=completed(stdout)):
+            with self.subTest(stdout=stdout[:60]), mock.patch.object(bees, "run_cli", return_value=completed(stdout)):
                 answer = self.runner(tmp)("councillor", "c", "task", tmp)
             self.assertEqual(bool(answer.get("refused")), refused)
             self.assertEqual(answer["ok"], not refused and "structured_output" in stdout)
 
     def test_a_refusal_on_stderr_without_json_is_marked(self):
         tmp = Path(tempfile.mkdtemp())
-        with mock.patch.object(bees.subprocess, "run", return_value=completed("", USAGE_POLICY, 1)):
+        with mock.patch.object(bees, "run_cli", return_value=completed("", USAGE_POLICY, 1)):
             answer = self.runner(tmp)("worker", "w", "task", tmp)
         self.assertTrue(answer["refused"])
-        with mock.patch.object(bees.subprocess, "run", return_value=completed("", "segmentation fault", 1)):
+        with mock.patch.object(bees, "run_cli", return_value=completed("", "segmentation fault", 1)):
             self.assertFalse(self.runner(tmp)("worker", "w", "task", tmp)["refused"])
 
     def test_codex_refusals_are_marked(self):
@@ -62,7 +62,7 @@ class CodexDiagnosticTests(unittest.TestCase):
     def call(self, stdout="", stderr=""):
         tmp = Path(tempfile.mkdtemp())
         runner = codex_bees.CodexBees(engine=tmp, inputs=tmp, config_dir=tmp / "cfg", allow_network=True)
-        with mock.patch.object(codex_bees.subprocess, "run", return_value=completed(stdout, stderr, 1)):
+        with mock.patch.object(bees, "run_cli", return_value=completed(stdout, stderr, 1)):
             return runner("worker", "w", "task", tmp)
 
     def test_a_refusal_far_from_the_tail_of_stderr_is_marked(self):
