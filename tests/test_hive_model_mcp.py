@@ -81,7 +81,7 @@ class ModelMCPStartupTests(unittest.TestCase):
 
         q = queen.Queen(engine=FakeEngine(self.inputs), out=self.root / "run", bees=self.router(client),
                         model_check=check, attempt_not_started=bees.AttemptNotStarted)
-        with patch("subprocess.run", side_effect=self.cli), \
+        with patch("hive.bees.run_cli", side_effect=self.cli), \
              patch.object(queen.Build, "ensure_confinement"), \
              patch.object(q, "plan", side_effect=AssertionError("planner reached after rejected MCP arguments")) as planner, \
              patch("urllib.request.urlopen", side_effect=AssertionError("network forbidden")), \
@@ -122,7 +122,7 @@ class ModelMCPStartupTests(unittest.TestCase):
                     return selfhost.check_model(router, selected, context_query=lambda s, m: 65536, **kwargs)
                 q = queen.Queen(engine=FakeEngine(self.inputs), out=self.root / client, bees=self.router(client),
                                 model_check=check, attempt_not_started=bees.AttemptNotStarted)
-                with patch("subprocess.run", side_effect=self.cli), patch.object(queen.Build, "ensure_confinement"), \
+                with patch("hive.bees.run_cli", side_effect=self.cli), patch.object(queen.Build, "ensure_confinement"), \
                      patch.object(q, "plan", side_effect=PlanningReached) as planner, \
                      patch("urllib.request.urlopen", side_effect=AssertionError("network forbidden")), \
                      contextlib.redirect_stdout(io.StringIO()), self.assertRaises(PlanningReached):

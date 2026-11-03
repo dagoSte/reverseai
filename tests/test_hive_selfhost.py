@@ -557,7 +557,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
         self.assertEqual(hooks.started, [("attempt-1", "network_probe")])
 
     def test_read_only_without_a_real_survey_target_is_unsupported(self):
-        with mock.patch("subprocess.run", side_effect=self.fake_claude):
+        with mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
             report = selfhost.check_model(self.router(), "claude", context_query=lambda s, m: 65536)
         self.assertFalse(report["ok"])
         self.assertEqual(report["checks"]["tool_roundtrip"]["status"], "ok")
@@ -572,7 +572,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
             self.assertIn('"file": "greet"', kwargs["input"])
             self.assertIn("export_function", kwargs["input"])
             return self.fake_claude(argv, **kwargs)
-        with mock.patch("subprocess.run", side_effect=inspect) as run:
+        with mock.patch("hive.bees.run_cli", side_effect=inspect) as run:
             selfhost.check_model(router, "claude", mcp_probe=MCP_PROBE, context_query=lambda s, m: 65536)
         self.assertEqual(run.call_count, 1)
         self.assertFalse(hasattr(source, "_capability_mcp"))
@@ -582,7 +582,7 @@ class CapabilityTests(RouterFixture, unittest.TestCase):
     def test_mcp_probe_requires_ghidra_enabled_in_the_actual_runner(self):
         router = self.router()
         router.primary("councillor", "check").enabled = ()
-        with mock.patch("subprocess.run", side_effect=self.fake_claude):
+        with mock.patch("hive.bees.run_cli", side_effect=self.fake_claude):
             report = selfhost.check_model(router, "claude", mcp_probe=MCP_PROBE, context_query=lambda s, m: 65536)
         self.assertFalse(report["ok"])
         self.assertEqual(report["checks"]["mcp_tool"]["status"], "unsupported")
