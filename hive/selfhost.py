@@ -278,12 +278,76 @@ def _server_context(server, model):
     return min(values) if values and all(type(v) is int and v > 0 for v in values) else None
 
 
+def _mcp_target(probe):
+    if (not isinstance(probe, dict) or not isinstance(probe.get("file"), str) or not probe["file"]
+            or not isinstance(probe.get("entry"), str) or not re.fullmatch(r"0x[0-9a-fA-F]{1,16}", probe["entry"])):
+        return None
+    return {"file": probe["file"], "entry": int(probe["entry"], 16)}
+
+
+def mcp_tool_accepted(events, client, expected):
+    """Match a real export_function call and its successful native MCP result.
+
+    Assistant prose and final structured output never establish tool acceptance.
+    The target comes from the input survey; MCP's entry argument is an integer.
+    """
+    target = _mcp_target(expected)
+    if target is None:
+        return False
+
+    def matches(arguments):
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                return False
+        return (isinstance(arguments, dict) and arguments.get("file") == target["file"]
+                and type(arguments.get("entry")) is int and arguments["entry"] == target["entry"]
+                and arguments.get("select", "entry") == "entry" and arguments.get("name", "") == ""
+                and arguments.get("part", "info") == "info")
+
+    pending = {}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if client == "claude" and event.get("type") in ("assistant", "user"):
+            message = event.get("message")
+            blocks = message.get("content") if isinstance(message, dict) else None
+            for block in blocks if isinstance(blocks, list) else []:
+                if not isinstance(block, dict):
+                    continue
+                if event["type"] == "assistant" and block.get("type") == "tool_use":
+                    call_id = block.get("id")
+                    if isinstance(call_id, str) and call_id:
+                        pending[call_id] = (block.get("name") == "mcp__reverseai__export_function"
+                                            and matches(block.get("input")))
+                elif (event["type"] == "user" and block.get("type") == "tool_result"
+                      and isinstance(block.get("tool_use_id"), str)
+                      and pending.pop(block["tool_use_id"], False)
+                      and not block.get("is_error") and block.get("content")):
+                    return True
+        elif client == "codex" and event.get("type") == "item.completed":
+            call = event.get("item")
+            if not isinstance(call, dict):
+                continue
+            result = call.get("result")
+            if (call.get("type") == "mcp_tool_call" and call.get("server") == "reverseai"
+                    and call.get("tool") == "export_function" and call.get("status") == "completed"
+                    and matches(call.get("arguments")) and not call.get("error")
+                    and isinstance(result, dict) and result.get("content")
+                    and not result.get("isError") and not result.get("is_error")):
+                return True
+    return False
+
+
 def check_model(router, client, *, before_start=None, required_context=32768, local=False,
-                context_query=None, timeout=45):
+                context_query=None, timeout=45, mcp_probe=None):
     """Brief capability probe through the configured CLI, without selecting/loading a model.
 
-    Checks tool result round-trip and the same CLI structured-output path in one
-    process. Metadata is read from the configured server; context_query(server,
+    Checks Read, an actual ReverseAI MCP export_function and CLI structured output
+    in one process. mcp_probe identifies a real surveyed function as {file, entry}
+    with entry in hexadecimal; missing target/configuration is never a success.
+    Metadata is read from the configured server; context_query(server,
     model) can supply another server's *active* declared context. Unknown is not ok.
     The caller must explicitly invoke this function; construction never calls it.
     """
@@ -295,6 +359,10 @@ def check_model(router, client, *, before_start=None, required_context=32768, lo
     runner = copy.copy(source)
     runner.timeout = min(timeout, source.timeout)
     runner._capability_nonce = secrets.token_hex(24)
+    target = _mcp_target(mcp_probe)
+    mcp_configured = target is not None and "ghidra" in source.enabled
+    if mcp_configured:
+        runner._capability_mcp = dict(mcp_probe)
     hooks = _ProbeHooks(before_start) if before_start is not None else None
     schema = {"type": "object", "properties": {"nonce": {"type": "string"}},
               "required": ["nonce"], "additionalProperties": False}
@@ -305,6 +373,12 @@ def check_model(router, client, *, before_start=None, required_context=32768, lo
         task = ("Capability probe: read capability-input.json using the Read tool (Claude) or a single "
                 "read-only cat command (Codex). Return the nonce from the tool result as the JSON instance "
                 "requested by the output schema. Do not return the schema or Markdown. Do not change files.")
+        if mcp_configured:
+            arguments = {**target, "select": "entry", "part": "info"}
+            task += (" Before the final answer, call the real ReverseAI MCP export_function tool once "
+                     "on this surveyed function, using these structured arguments: " + json.dumps(arguments)
+                     + ". entry is an integer, not a hexadecimal string. Observe the MCP result; "
+                     "do not substitute a command or describe a hypothetical tool call.")
         name = "model-check-" + secrets.token_hex(6)
         result = runner("councillor", name, task, folder, schema=schema, before_start=hooks)
     result["provenance"]["kind"] = "network_probe"
@@ -315,6 +389,17 @@ def check_model(router, client, *, before_start=None, required_context=32768, lo
               "tool_roundtrip": item("ok" if structured and result.get("capability_tool_roundtrip") else "unsupported" if result["ok"] else "error",
                     "Observed tool call, result and final answer." if structured and result.get("capability_tool_roundtrip") else "Tool round-trip was not demonstrated by native CLI events.",
                     None if structured and result.get("capability_tool_roundtrip") else "Configure a model and API that support tool calling and tool results through this CLI.")}
+    if not mcp_configured:
+        checks["mcp_tool"] = item("unsupported",
+            "A real surveyed function and the ReverseAI Ghidra MCP configuration are required.",
+            "Provide the input survey and enable the same ReverseAI Ghidra MCP server used by the bees.")
+    elif result.get("capability_mcp_tool") is True:
+        checks["mcp_tool"] = item("ok",
+            "Native MCP events confirm export_function accepted the surveyed function's arguments.")
+    else:
+        checks["mcp_tool"] = item("unsupported" if result["ok"] and result.get("tool_rejections") is None else "error",
+            "Native CLI events did not demonstrate an accepted ReverseAI export_function call with the requested arguments.",
+            "Check the MCP configuration; use reliable tool calling or a larger context if the model does not follow tool argument schemas.")
     server = getattr(source, "server", None) or (source.env or {}).get("ANTHROPIC_BASE_URL")
     declared = None
     try:

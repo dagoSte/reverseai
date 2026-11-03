@@ -935,7 +935,7 @@ class Queen:
             return answer
 
     # phases
-    def check_models(self):
+    def check_models(self, program_map=None):
         if self.model_check is None:
             return
         policy = self.bees.policy()
@@ -944,6 +944,10 @@ class Queen:
             for client, config in sorted(configs.items()) if config.get("server")]
         if not targets:
             return
+        function = next((row for row in (program_map or {}).get("functions", [])
+                         if type(row.get("entry")) is int and 0 <= row["entry"] < 2**64), None)
+        mcp_probe = ({"file": self.engine.file, "entry": hex(function["entry"])}
+                     if function is not None else None)
         # Each Codex capability process may need an isolation process first.
         costs = [1 + int(client == "codex" and not config.get("allow_network"))
                  for _, client, config in targets]
@@ -956,7 +960,7 @@ class Queen:
                 target.codex = config["executable"]
             descriptor = bees_module.provenance(target, "councillor", name)
             logical_id = digest({"run_id": self.state.data["run_id"], "check": name,
-                                 "target": config, "required_context": self.required_context})
+                                 "target": config, "required_context": self.required_context, "mcp_probe": mcp_probe})
             hooks = AttemptHooks(self, logical_id, "councillor", name, local, descriptor, bool(self._recovering))
             with self.slots:
                 with self.lock:
@@ -964,7 +968,7 @@ class Queen:
                     self.reserved += cost
                 try:
                     report = self.model_check(self.bees, client, local=local, before_start=hooks,
-                                              required_context=self.required_context)
+                                              required_context=self.required_context, mcp_probe=mcp_probe)
                 except (StartDenied, self.attempt_not_started) as error:
                     raise StartDenied(getattr(error, "code", str(error))) from None
                 finally:
@@ -1594,7 +1598,7 @@ class Queen:
         self.language_reasons = reasons
         self.log(f"language: {self.lang.label} ({'; '.join(reasons)})")
         self.build.ensure_confinement()
-        self.check_models()
+        self.check_models(program_map)
         try:
             modules, skipped, contract = self.plan(program_map)
         except ProviderRefused as error:
