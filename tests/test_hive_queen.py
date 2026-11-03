@@ -123,8 +123,18 @@ class FakePlanning:
     def __init__(self, header=CONTRACT):
         self.header, self.calls = header, 0
 
+    @staticmethod
+    def validate_saved(out, saved):
+        if saved is not None and not (
+                type(saved) is dict and set(saved) == {"schema", "bindings", "groups", "resolutions"}
+                and saved["schema"] == "hive.planning-progress/1"
+                and all(type(saved[key]) is dict for key in ("bindings", "groups", "resolutions"))
+                and saved == json.loads((Path(out) / "plan/progress.json").read_bytes())):
+            raise FakePlanningError("resume_mismatch")
+
     def plan(self, program_map, partitioned, *, out, invoke, language, max_functions,
              max_prompt_bytes, interface_rounds, saved):
+        self.validate_saved(out, saved)
         self.calls += 1
         folder = Path(out) / "plan"
         folder.mkdir(parents=True, exist_ok=True)
@@ -587,6 +597,86 @@ class FrozenPlanTests(unittest.TestCase):
         self.assertEqual(second.plan_bundle["plan_id"], first.plan_bundle["plan_id"])
         self.assertEqual(second.spent["bees"], 1)
         self.assertEqual(second.max_bees, 30)
+
+    def test_partial_planning_resume_passes_saved_content_and_skips_completed_group(self):
+        class PartialPlanning(FakePlanning):
+            def plan(backend, program_map, partitioned, *, out, invoke, saved, **kwargs):
+                backend.validate_saved(out, saved)
+                progress = saved or {"schema": "hive.planning-progress/1", "bindings": {
+                    "map_sha256": queen.digest(program_map)}, "groups": {}, "resolutions": {}}
+                path = Path(out) / "plan/progress.json"
+                queen.write_file(path, queen.canonical(progress))
+                for index, row in enumerate(program_map["functions"], 1):
+                    gid = f"g{index:04d}"
+                    if gid in progress["groups"]:
+                        continue
+                    answer = invoke("planner", "planner-" + gid, "Plan " + row["hex"],
+                                    Path(out) / "plan/groups" / gid)
+                    if not answer["ok"]:
+                        raise FakePlanningError(answer["outcome"], answer,
+                                                {"progress_path": "plan/progress.json"})
+                    progress["groups"][gid] = answer
+                    queen.write_file(path, queen.canonical(progress))
+                answers = list(progress["groups"].values())
+                aggregate = copy.deepcopy(answers[-1])
+                aggregate["output"] = {"modules": [], "skipped": [
+                    item for answer in answers for item in answer["output"]["skipped"]]}
+                aggregate["provenance"]["prior_attempt_ids"] = [
+                    answer["provenance"]["attempt_id"] for answer in answers[:-1]]
+                return super().plan(program_map, partitioned, out=out, saved=saved,
+                                    invoke=lambda *args, **kw: aggregate, **kwargs)
+
+        calls = []
+        def primary(role, name, task, folder):
+            calls.append(("primary", name))
+            if name == "planner-g0002":
+                return {"ok": False, "refused": True, "error": "fixture refusal"}
+            return {"ok": True, "output": {"modules": [], "skipped": [
+                {"entry": task.split()[-1], "reason": "fixture library"}]}}
+        def local(role, name, task, folder):
+            calls.append(("local", name))
+            return {"ok": True, "output": {"modules": [], "skipped": [
+                {"entry": task.split()[-1], "reason": "fixture library"}]}}
+
+        first = self.make(primary, planning=PartialPlanning())
+        with self.assertRaises(queen.ProviderRefused):
+            self.run_quietly(first)
+        saved = json.loads((self.out / "plan/progress.json").read_bytes())
+        self.assertEqual(list(saved["groups"]), ["g0001"])
+        completed = copy.deepcopy(saved["groups"]["g0001"])
+        second = self.make(FakeRouter(primary, fallback=local, scope="bee", names=["planner-g0002"]),
+                           planning=PartialPlanning(), resume_refused=True)
+        self.run_quietly(second)
+        self.assertIsNotNone(second.plan_bundle)
+        self.assertEqual(calls, [("primary", "planner-g0001"), ("primary", "planner-g0002"),
+                                 ("local", "planner-g0002"), ("primary", "planner-g0003")])
+        self.assertEqual(json.loads((self.out / "plan/progress.json").read_bytes())["groups"]["g0001"], completed)
+        self.assertEqual(second.spent["bees"], 4)
+        self.assertFalse(second.state.data["unresolved_refusals"])
+
+    def test_planning_fake_rejects_a_path_wrapper_as_saved_content(self):
+        with self.assertRaisesRegex(FakePlanningError, "resume_mismatch"):
+            FakePlanning().plan({}, {}, out=self.out, invoke=None, language="c", max_functions=12,
+                                max_prompt_bytes=65536, interface_rounds=2,
+                                saved={"progress_path": "plan/progress.json"})
+
+    def test_planning_resume_rejects_escaped_or_linked_progress_before_invoking(self):
+        outside = self.root / "outside.json"
+        outside.write_text('{}')
+        for index, relative in enumerate(("../outside.json", "plan/../../outside.json",
+                                           str(outside), "plan/progress.json")):
+            with self.subTest(path=relative):
+                self.out = self.root / f"run-{index}"
+                (self.out / "plan").mkdir(parents=True)
+                if relative == "plan/progress.json":
+                    (self.out / relative).symlink_to(outside)
+                q = self.make()
+                q._ensure_state()
+                q.state.append("planning_progress", {"progress_path": relative})
+                with self.assertRaisesRegex(queen.HiveError, "plan path"):
+                    self.run_quietly(q)
+                self.assertEqual(q.planning.calls, 0)
+                self.assertEqual(q.spent["bees"], 0)
 
     def test_changed_input_stops_before_any_new_attempt(self):
         self.run_quietly(self.make())

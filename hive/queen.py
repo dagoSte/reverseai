@@ -936,11 +936,14 @@ class Queen:
         else:
             partitioned = partition.partition(program_map)
             self.check_budget(P=len(partitioned["groups"]), Q=self._pending_probes([("planner", "planner-g0001")]))
+            progress = self.state.data["planning_progress"]
+            saved_progress = (read_json(self._bundle_path(progress["progress_path"]))
+                              if progress is not None else None)
             try:
                 bundle = self.planning.plan(program_map, partitioned, out=self.out, invoke=self.bee,
                                             language=self.lang.name, max_functions=self.max_functions,
                                             max_prompt_bytes=65536, interface_rounds=2,
-                                            saved=self.state.data["planning_progress"])
+                                            saved=saved_progress)
             except self.planning.PlanningError as error:
                 progress = error.details.get("progress_path")
                 if progress:
