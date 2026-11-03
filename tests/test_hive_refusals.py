@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from hive import bees, codex_bees, queen
-from tests.test_hive_queen import FakeEngine
+from tests.test_hive_queen import FakeEngine, FakeRouter, make_queen
 
 USAGE_POLICY = ("API Error: Claude Code is unable to respond to this request, which appears to violate our Usage Policy "
                 "(https://www.anthropic.com/legal/aup). Try rephrasing the request or attempting a different approach.")
@@ -104,7 +104,7 @@ class QueenTests(unittest.TestCase):
                                 {"id": "b", "functions": ["0x1000"], "title": "b"}],
                     "skipped": [{"entry": "0x1080", "reason": "stub"}]}}
             raise AssertionError(f"unexpected bee {role} {name}")
-        hive = queen.Queen(engine=FakeEngine(self.tmp / "inputs"), out=self.tmp / "run", bees=fake, slots=1,
+        hive = make_queen(engine=FakeEngine(self.tmp / "inputs"), out=self.tmp / "run", bees=fake, slots=1,
                            check=lambda claims, out: ({"claims": 0, "confirmed": 0, "rejected": 0, "questions": 0,
                                                        "input_sha256": []}, []), **kwargs)
         patches = [mock.patch.object(queen.Build, "ensure_confinement", return_value=None),
@@ -122,14 +122,15 @@ class QueenTests(unittest.TestCase):
 
     def test_a_refused_planner_writes_a_not_started_verdict(self):
         run = self.tmp / "run"
-        run.mkdir()
+        hive = self.hive({"planner"})
+        with self.assertRaises(queen.ProviderRefused):
+            hive.run()
         (run / "result.json").write_text(json.dumps({"verdict": "accepted"}))  # an earlier, accepted run
         (run / "REPORT.md").write_text("**Verdict: accepted.** every check passed.\n")
-        with self.assertRaises(queen.ProviderRefused):
-            self.hive({"planner"}).run()
+        hive.run()  # a stopped run never starts another planner without explicit recovery consent
         result = json.loads((run / "result.json").read_text())
         self.assertEqual(result["verdict"], "not started")
-        self.assertIn("refused the planner", result["reason"])
+        self.assertIn("planner_refused", result["reason"])
         self.assertEqual([r["bee"] for r in result["refusals"]], ["planner"])
         report = (run / "REPORT.md").read_text()
         self.assertIn("Verdict: not started", report)
@@ -138,27 +139,30 @@ class QueenTests(unittest.TestCase):
 
     def test_a_bee_queued_for_a_slot_does_not_start_after_the_limit(self):
         hive = self.hive(set())  # default limit: 3 refusals
-        folder = self.tmp / "bees"
-        folder.mkdir()
-        (self.tmp / "run").mkdir(exist_ok=True)
+        folder = self.tmp / "run" / "bees"
+        folder.mkdir(parents=True)
         calls = []
+        last_started, finish_last = threading.Event(), threading.Event()
 
         def provider(role, name, task, where):
             calls.append(name)
             if name == "last":  # hold the only slot until the next bee is queued behind it
-                deadline = time.monotonic() + 5
-                while hive.spent["bees"] < 4 and time.monotonic() < deadline:
-                    time.sleep(0.01)
+                last_started.set()
+                self.assertTrue(finish_last.wait(5))
             return {"ok": False, "refused": True, "error": USAGE_POLICY, "seconds": 1}
-        hive.bees = provider
+        hive.bees = FakeRouter(provider)
         hive.bee("worker", "first", "t", folder)
         hive.bee("worker", "second", "t", folder)
         holder = threading.Thread(target=hive.bee, args=("worker", "last", "t", folder))
         holder.start()
-        while "last" not in calls:
-            time.sleep(0.01)
-        queued = hive.bee("worker", "queued", "t", folder)
+        self.assertTrue(last_started.wait(5))
+        answers = []
+        waiting = threading.Thread(target=lambda: answers.append(hive.bee("worker", "queued", "t", folder)))
+        waiting.start()
+        finish_last.set()
+        waiting.join(5)
         holder.join()
+        queued = answers[0]
         self.assertEqual(calls, ["first", "second", "last"])
         self.assertIn("run stopped", queued["error"])
         self.assertEqual(hive.spent["bees"], 3)  # a bee that never started is not counted
