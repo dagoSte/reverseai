@@ -6,7 +6,8 @@ an **independent council** plus a deterministic **evidence checker** decide what
 The ReverseAI engine itself stays model-free: the hive is a separate layer in `hive/` that
 talks to the engine only through its MCP server and command line.
 
-Status: experimental. It needs prepared Ghidra exports (`reverseai prepare`, ReverseAI 0.8.0).
+Status: experimental. This guide describes the integrated 0.9.0 hive; it needs prepared Ghidra
+exports (`reverseai prepare`).
 The default path uses your Claude Code subscription, or your Codex login for Codex bees.
 An explicitly configured self-hosted server is an alternative (see [Self-hosted models](#self-hosted-models-experimental));
 the agent CLIs and the queen's checks still apply.
@@ -16,7 +17,7 @@ the agent CLIs and the queen's checks still apply.
 | Role | Who | Does | Never does |
 | --- | --- | --- | --- |
 | Queen | Python code (`hive/queen.py`) | Exports the program map, freezes the plan, schedules bees, compiles and links, runs the checks, computes the verdict | Write code, review, vote, or override a check |
-| Planner | One bee | Splits functions into modules, marks library and runtime code to skip, writes the frozen interface `contract.h` | Rebuild or judge |
+| Planner | One bee per bounded group, plus interface reconciliation when needed | Proposes modules, evidence-backed skips and declarations; the queen validates and freezes the interface | Rebuild or judge |
 | Builder | One bee per module, in parallel | Rebuilds its module's functions as C from the evidence; writes claims citing finding IDs | Edit the contract or another module |
 | Councillor | Three per module, one lens each | Tries to refute the module against the original's assembly: control flow and arithmetic, input/output, data and memory | Write anything; see the author's notes |
 | Tester | One bee, only with `--run-original` | Designs conformance cases from strings and logic | Run anything |
@@ -30,9 +31,11 @@ the agent CLIs and the queen's checks still apply.
    obfuscated (see [Pre-flight](#pre-flight)). A packed program stops the run with the reasons,
    unless you start it with `--allow-packed`. Then the queen chooses the language: C, or C++ when
    the map shows C++ (see [Languages](#languages)).
-3. **Plan.** The planner proposes modules and `contract.h`. The queen checks that every function
-   is either skipped with a reason or in exactly one module, splits oversized modules, checks
-   that the contract compiles on its own, and freezes it read-only.
+3. **Plan.** Phase A partitions the map deterministically. In phase B, planners propose modules
+   and declarations from bounded groups; interface tasks reconcile conflicting declarations. The queen
+   checks exact function coverage and evidence-backed skips, splits oversized modules, checks that
+   the assembled contract compiles on its own, and freezes it read-only (see [Group planning](#group-planning-phases-a-and-b)).
+   Configured self-hosted targets must pass their [capability checks](#automatic-capability-checks) first.
 4. **Build.** Builders work in parallel, one folder each. Every module is compiled alone from a
    clean stage containing snapshots of its source and the frozen contract, with
    `-Wall -Wextra -fwrapv -fno-strict-aliasing`. This requires Clang with a closed virtual
@@ -90,7 +93,7 @@ separate `incomplete` list. Any incomplete mutant prevents acceptance. `tests/fu
 seed and bounded base64 inputs of both differing and incomplete mutants for reproduction, and is
 cleared at the start of each conformance attempt.
 
-## Group planning: phase A and the 0.9.0 lane
+## Group planning: phases A and B
 
 Phase A is implemented in `hive/partition.py`: it splits the map deterministically into
 bounded groups while keeping every function exactly once. Functions that call each other,
@@ -99,7 +102,7 @@ precedence. Calls across groups remain explicit. A singleton that is still too l
 an inline sample plus complete overflow side files with hashes and counts; unattached rows
 are retained too. The global summary declares its omissions and cannot prove coverage.
 
-The phase B API in `hive/planning.py` proposes a plan from those groups. Each planner receives
+The queen uses phase B in `hive/planning.py` to propose a plan from those groups. Each planner receives
 only its own `map.json`, a bounded `summary.json` and an `interfaces.json` index. Large inputs
 are paged inside that group's readable folder; every page has a count and SHA-256, and no
 individual page exceeds `max_prompt_bytes`. The same limit bounds the combined task and
@@ -119,16 +122,15 @@ The output is `plan/manifest.json`, `plan/interfaces.json` and `plan/contract.h`
 The manifest binds input, map, partition, planning policy, declarations and assignments by
 hash. `validate_bundle` rechecks those bindings without a planner. Partial verified proposals
 and interface decisions can be resumed from `plan/progress.json`; prior failed attempts
-remain in the queen's history. The caller must still compile and freeze the contract before
-builders start. Planning alone does not accept a module or prove that the rebuild behaves
-like the original.
+remain in the queen's history. The queen compiles and freezes the contract before builders
+start. Planning alone does not accept a module or prove that the rebuild behaves like the original.
 
-**Integration status:** this lane supplies the phase B API and tests; the command-line queen
-in this checkout still follows the older planning path until the companion queen lane is
-integrated. The fallback and refusal-resume changes specified by the
-[0.9.0 contract](design/0.9.0-contratto.md) likewise need their companion lanes. They are not
-available merely because this planning module is present. Group planning has not demonstrated
-a complete reconstruction of curl or a whole run on a local model.
+If a group fails or is refused before the plan is frozen, resume validates the saved progress
+and retains completed groups and interface decisions. Only unfinished work is planned again;
+[refusal recovery](#explicit-local-recovery-after-a-refusal) requires explicit local consent.
+Once frozen, the verified plan is reused without another planner. The integrated tests use
+simulated agent processes and servers; they do not demonstrate a complete curl reconstruction
+or measure a whole run on a local model.
 
 ## Who has the final word
 
@@ -182,9 +184,18 @@ apps, ports to Rust, Go or Python) are not handled yet.
 `--bee-policy claude` (the default) runs every bee on Claude Code. `--bee-policy codex` runs every
 bee on the Codex CLI (`codex exec`), and `--bee-policy mixed` alternates: odd-numbered modules are
 built by Claude and even ones by Codex, repairs stay with the module's builder, and each council
-gives two of its three seats to the model that did not build the module, so the majority of every
-council is non-author. The planner, the tester and the behaviour fixer stay on Claude. Different
-models make fewer of the same mistakes, which is why mixed councils are worth having.
+gives two of its three seats to the other client. The planner, the tester and the behaviour
+fixer stay on Claude. These flags select agent clients; each user chooses the models behind them.
+Every council seat still needs a fresh context independent of the author. Running Claude and
+Codex against the same local model does not establish model diversity.
+
+Each attempt records `provenance.client`, the requested model, any observed model/digest, a
+context ID and `origin` (`primary` or `fallback`). `provenance.server_kind` distinguishes
+`cloud` (the default provider path), `local` (a configured loopback server) and `remote` (a
+configured non-loopback server). These describe routing, not where a server ultimately performs
+inference. Unknown observed identities stay null. The per-module `model_diversity` result is
+true/false only when all relevant author/reviewer identities are observed; otherwise it is null.
+Client names and requested model aliases alone do not prove diversity.
 
 Codex bees are less fenced than Claude bees, and this was measured on 2026-10-31 with
 codex-cli 0.165.0 on macOS: writes outside the bee's folder were denied, but a Codex bee could read
@@ -194,87 +205,196 @@ it. The hive therefore probes the Codex sandbox before its first Codex bee and r
 while the probe reaches the network. `--codex-allow-network` skips that refusal for operators who
 accept the risk on software they would run anyway; never use Codex bees on malware.
 
+## Configure your own model
+
+Hive is independent of a particular model. Choose a model and server that support all three:
+
+- **Tools:** a native tool call, its result, and a following answer through the selected agent CLI.
+- **Structured output:** a JSON instance conforming to Hive's schema through Claude Code's
+  `--json-schema` or Codex's `--output-schema` path. Returning the schema itself, a wrapper or
+  prose containing JSON is insufficient.
+- **Active context:** at least `--required-context` tokens (default **65536**). Allow space for
+  the CLI's system prompt, tools, evidence, history and output. The planning byte cap is separate
+  from token context, and this minimum does not guarantee completion of a particular program.
+
+Install/configure the agent CLIs and prepare your chosen server and model before invoking Hive.
+Configured fallback clients must also be installed before startup. Hive's routing flags do not
+install a server, download a model or start a server process.
+
 ### Self-hosted models (experimental)
 
-`--model-server URL` runs the bees on a model you host yourself, for teams that cannot send program
-evidence to a cloud provider or want the analysis to stay on their own network. The bees keep their
-agent CLI, so nothing about the fences depends on the model: Claude Code still enforces each role's
-tools, the folder-scoped writes and `dontAsk`, and Codex still runs in its sandbox behind the network
-probe.
+`--model-server URL` selects a primary server. Claude bees need Anthropic Messages support and
+`--model NAME`; Codex bees need OpenAI Responses support and `--codex-model NAME`. Mixed policy
+needs both names and both API paths. A Chat Completions endpoint alone is insufficient. Pass the
+server root URL without `/v1`: Claude uses that base; Codex appends `/v1` for Responses.
 
-- Claude bees (`--model NAME`) need a server with the Anthropic Messages API, for example Ollama 0.14
-  or later, LM Studio 0.4.1 or later or llama.cpp's `llama-server`. Measure the complete prompt,
-  including the agent's system prompt and tools, against the chosen model's actual context.
-- Codex bees (`--bee-policy codex`, `--codex-model NAME`) need a server with the OpenAI Responses
-  API (Ollama 0.13.3 or later, vLLM and others). The hive adds a `selfhost` model provider for them.
-- The server must be on this machine unless you add `--model-server-remote`, because the bees'
-  prompts carry program evidence.
-- No login or key reaches a self-hosted bee. Its environment is an allowlist (system basics such as
-  `PATH` and `HOME`, locale, certificate paths) plus the server routing, with a placeholder token for
-  Claude bees. Subscription logins, cloud credentials and API or repository tokens are left out.
+The primary must be on loopback unless you add `--model-server-remote`, explicitly consenting to
+send prompts and program evidence to another machine. This consent does not authorize a remote
+fallback. Loopback addresses also do not prove that a server performs inference locally.
 
-```bash
-OLLAMA_CONTEXT_LENGTH=65536 ollama serve &
-python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-hive-run \
-  --model-server http://127.0.0.1:11434 --model local-model
+The bees retain their CLI, role tools and checks: Claude uses folder-scoped writes and `dontAsk`;
+Codex keeps its sandbox and isolation probe. Self-hosted bees receive an allowlisted environment
+(system basics, locale and certificate paths) and routing, with a placeholder token for Claude.
+Subscription logins, cloud credentials and API/repository tokens are excluded.
+
+### Server settings
+
+Set these on the server process or its service, then verify the **active** configuration. Select
+parallelism against available memory and measure latency before increasing Hive's `--bees`.
+A longer context and more concurrent requests consume more memory; no machine-size or throughput
+estimate is implied by these examples.
+
+| Setting | Ollama | vLLM |
+| --- | --- | --- |
+| Listen locally | `OLLAMA_HOST=127.0.0.1:11434` | `--host 127.0.0.1 --port 8000` |
+| Context | `OLLAMA_CONTEXT_LENGTH=65536`; inspect `ollama ps` and `/api/ps` for the chosen loaded model | `--max-model-len 65536` bounds prompt plus output; the model and available memory must support it |
+| Parallelism | Start with `OLLAMA_NUM_PARALLEL=1`; coordinate it with Hive's `--bees` | `--max-num-seqs` bounds sequences per iteration; start small and coordinate it with Hive's `--bees` |
+| Tools | Choose a model/API path supporting tool calls and tool results | Configure `--enable-auto-tool-choice`, a `--tool-call-parser` for the chosen model and a tool-compatible chat template; set `--chat-template` if needed |
+| Structured output | Schema support must work through the selected Messages/Responses client, beyond native `/api/chat`'s `format` option | Structured outputs default to backend `auto`; `--structured-outputs-config.backend` selects it explicitly. Verify the required API/client path, not just Chat Completions |
+
+For a manually managed Ollama server, an example in a separate terminal is:
+
+```sh
+OLLAMA_HOST=127.0.0.1:11434 OLLAMA_CONTEXT_LENGTH=65536 OLLAMA_NUM_PARALLEL=1 ollama serve
 ```
 
-The example assumes you have already chosen and prepared the server and model; it is not a
-recommendation for a particular model size or machine. The 65536 context setting is an example,
-not a measured requirement or a guarantee that the CLI's complete prompt fits.
+If Ollama already runs as an app or service, configure and restart that instance instead. Use
+an already installed model name in the Hive command, from another terminal:
 
-A test drives a real Claude Code bee through a stand-in Messages server. That test establishes
-routing, not a complete local reconstruction. API compatibility alone does not establish a
-multi-turn agent run: tool-call, tool-result, the following turn and schema-conforming output
-must be tested on the actual client/server/model combination. No complete curl reconstruction
-or local end-to-end performance result is claimed here. The queen's checks remain required:
-councils, the evidence checker, the confined compiler and conformance cases.
+```sh
+python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-hive-run \
+  --model-server http://127.0.0.1:11434 --model your-installed-model \
+  --required-context 65536 --bees 1
+```
 
-### Refusal fallback and resume: 0.9.0 integration contract
+Ollama settings and diagnostics: [context length](https://docs.ollama.com/context-length),
+[server configuration and concurrency](https://docs.ollama.com/faq),
+[structured outputs](https://docs.ollama.com/capabilities/structured-outputs),
+[loaded-model metadata](https://docs.ollama.com/api/ps).
+vLLM settings: [serve options](https://docs.vllm.ai/en/latest/cli/serve/),
+[tool calling](https://docs.vllm.ai/en/latest/features/tool_calling/),
+[structured outputs](https://docs.vllm.ai/en/latest/features/structured_outputs/).
+Use the documentation and help matching your installed server version.
 
-These flags belong to the companion adapter and queen lanes. They are listed here as the
-0.9.0 integration contract; they are not implemented by the isolated planning API in this
-checkout. Check the integrated CLI's help before using them.
+**Current vLLM/context limitation:** Hive's standard CLI reads active context only from
+Ollama-compatible `/api/ps` metadata, matched to the configured model name. A vLLM server without
+that metadata will stop as **unsupported**, even with `--max-model-len` set correctly. The Python
+`selfhost.check_model` API accepts a `context_query(server, model)` reader for other server APIs,
+but the CLI does not expose a flag to configure one. These server settings alone do not provide
+a working vLLM run through the standard CLI.
 
-| Flag | Meaning after integration |
+### Automatic capability checks
+
+Before planning or workers, Hive checks every configured self-hosted primary and authorized
+fallback target, once per client, including fallback targets not yet activated. The default
+cloud path, with no `--model-server`, keeps its existing behavior without these capability probes.
+A configured local fallback is still checked when the primary uses cloud.
+
+A short call through the actual selected CLI reads a random nonce from a private file with a
+tool and returns it under a small schema. Hive requires native events showing tool call, result
+and final answer; the model's claim that it used a tool is insufficient. It separately compares
+the server's declared **active** context with `--required-context`. It does not measure effective
+context retention, peak memory, inference speed or whether a long reconstruction will succeed.
+
+`.hive/model-checks.json` records `tool_roundtrip`, `structured_output` and `context`, each with
+status `ok`, `unsupported` or `error`, a message and a configuration suggestion. All must be `ok`:
+
+| Result | Meaning and action |
 | --- | --- |
-| `--fallback-model-server URL` | Explicitly authorize a fallback server on loopback; no implicit model download or server start. |
-| `--fallback-model NAME` | Model served to Claude-client bees through Messages. |
-| `--fallback-codex-model NAME` | Model served to Codex-client bees through Responses. |
-| `--fallback-scope run\|role\|bee` | Required with the fallback server; define the extent of authorization. |
-| `--fallback-role ROLE` | Repeat for role scope only: planner, worker, repair, councillor or tester. |
-| `--fallback-bee NAME` | Repeat for bee scope only; match an exact logical bee name. |
-| `--resume-refused` | Explicit recovery of a run stopped by unresolved refusals, with local selectors/target for the work to recover. |
+| `ok` | This small capability check passed; normal compiler, council, evidence and behavior checks remain required. |
+| `unsupported` | A capability was not demonstrated. For context, **“Active context is not verifiable on this server”** means *non verificabile su questo server*, not a measured small context. Expose active metadata for the exact model; another API needs a context reader as described above. |
+| `error` | The probe or metadata query failed, or the declared context is below the required minimum. Read the message: configure tools/schema support, increase the server's active context, or fix the metadata connection as appropriate. |
 
-Without fallback flags, a provider refusal stops work as documented below. With explicit
-authorization, only a provider refusal permits one additional local attempt for that logical
-call, within the persisted budget. Timeout, rate limit, invalid output, context limit and a
-failed isolation probe do not activate fallback. The failed attempt's partial files do not
-become the local attempt's baseline. There is no automatic prompt rewrite or return to cloud.
-For run scope, the first selected refusal activates the local target for new calls; role
-scope activates only the refused selected role; bee scope selects only that name. Calls
-already active finish on their original target.
+An `unsupported` or `error` stops the run as `model_capability`. There is no CLI flag to skip
+these checks for configured servers. After correcting the server, resume repeats them and
+retains the already consumed budget. Raising `--required-context` raises the requirement; it
+does not enlarge the server's context. Passing the checks is a minimum compatibility result,
+not a complete local reconstruction or a curl performance result.
 
-Claude receives the server root as its base URL; only Codex appends `/v1`. A root already
-ending in `/v1` is rejected by the 0.9.0 adapters. A remote primary-server setting does not
-authorize a remote fallback. Both model names are needed when the client policy can use both
-clients. A Chat Completions-only endpoint does not establish Messages or Responses support.
-Loopback alone does not prove that a server keeps all processing local.
+### Read failed attempts
 
-The 0.9.0 queen keeps raw refusal history separately from unresolved logical work. A valid
-local replacement resolves only that work and retains both attempts. On restart, counters
-and history remain consumed; a verified plan is loaded without a planner call. Recovering a
-refusal stop requires `--resume-refused` and the explicit local configuration; recovering a
-budget stop also requires a sufficient explicitly increased limit. Omitting an active local
-configuration stops the resume. A failed network-isolation probe is not recoverable with
-`--resume-refused`. Changed input, map, planning policy or damaged manifests require a new
-output directory rather than an implicit replan over the previous run.
+The attempt's `outcome` and `code`, saved in the report/state, distinguish causes:
 
-In this integration contract, `--max-bees` counts physical agent starts, including probes,
-fallback, repairs and councillors. It does not cap tokens, money or each HTTP request inside
-a CLI. Before planning, the queen reports the group count and the minimum number of planner
-calls; groups are not modules. Its remaining-call estimate is a lower bound and its 25%
-reserve is a stated heuristic, not a runtime or completion guarantee.
+| Outcome or code | Meaning | Activates local fallback? |
+| --- | --- | --- |
+| `provider_refusal` | The provider declined this logical call. | Only with explicit matching consent, for one additional local attempt. |
+| `invalid_schema` | No completed schema-conforming response; this includes returning a schema instead of its JSON instance. | No; check schema/API/client compatibility. |
+| `context_limit` | The prompt exceeded the available context. | No; fix active context or size the work appropriately. |
+| `timeout`, `rate_limit`, `failure` | Process deadline, provider quota/rate limit, or another failure. | No; diagnose the reported cause. |
+| `failure` with `network_isolation` | The Codex isolation probe failed. A cached negative probe starts no process and creates no new attempt ID. | No; `--resume-refused` does not bypass it. |
+| `not_started` | No agent process was started, for example because the persisted budget or a run stop denied it. | No; resolve the stop/budget first. |
+
+These outcomes differ from the capability report's per-check statuses. For example, a server
+whose context cannot be verified is not a provider refusal. Diagnostics and observed rejected
+MCP arguments (`tool_rejections`, null when no tool trace is available) help diagnose compatibility;
+they do not establish the correctness of generated code.
+
+### Explicit local recovery after a refusal
+
+Without fallback configuration, Hive records refusals without switching servers. A refused planner
+stops planning; a refused worker leaves that module refused. To authorize a local alternative:
+
+```sh
+python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-hive-run \
+  --fallback-model-server http://127.0.0.1:11434 \
+  --fallback-model your-installed-model --fallback-scope role --fallback-role planner
+```
+
+`--fallback-model-server` and an explicit `--fallback-scope` provide consent. Claude needs
+`--fallback-model`; Codex needs `--fallback-codex-model`; mixed policy needs both. The server
+must be loopback and its URL must be the root without `/v1`. The chosen fallback must differ
+from the primary client/server/model destination; identical destinations provide no alternative.
+
+| Scope | Selection and activation |
+| --- | --- |
+| `run` | After the first refusal, all newly starting calls use the local target. |
+| `role` | Repeat `--fallback-role` for planner, worker, repair, councillor or tester. Each selected role switches after its own first refusal. |
+| `bee` | Repeat `--fallback-bee` with exact logical names, such as `planner-g0001` or `m01-build`; each selected name switches after its refusal. Wildcards are not accepted. |
+
+Only `provider_refusal` activates the switch, for one additional local attempt for that logical
+call. Timeouts, rate limits, invalid schemas, context limits and isolation failures do not.
+Already active calls finish on their original destination. Hive does not rewrite the prompt or
+switch back to cloud after a local failure. Each attempt keeps its own files; the refused
+attempt's partial writes are not used as the local retry's starting point. All attempts and
+historical refusals remain visible; a successful replacement resolves only that logical work.
+Independent council contexts and all acceptance checks remain required.
+
+### Resume a frozen plan and retain the budget
+
+Run the same command with the same `--out` to resume. A verified frozen plan and contract are
+loaded without another planner call. Before freezing, validated partial group proposals and
+interface decisions are retained. Accepted modules are kept only while their input, assignment,
+source, contract, compiled object, compiler policy and review bindings still match. Changed
+inputs/maps/planning policy or damaged plan artifacts stop resume; use a new output directory
+to make a different plan. Old workspaces without authoritative 0.9.0 state are not silently
+accepted as verified resumptions. Do not replace the frozen contract in an existing run.
+
+After a refusal stop, add `--resume-refused` and explicitly configure the local fallback matching
+the work to recover. For example, repeat the role-scoped fallback command above with
+`--resume-refused` appended. This preserves refusal history and consumed starts. Keep the explicit
+local configuration on subsequent resumptions: omitting it after local routing was activated
+stops resume rather than restoring cloud routing. Failed isolation probes are not bypassed.
+
+`--max-bees` caps physical agent CLI starts: planners, builders, councillors, repairs, local
+alternatives and capability/isolation probes. It does not cap tokens, money or HTTP requests
+inside an agent CLI. A new run defaults to **400**; a resume keeps the saved cap when the flag
+is absent. Starts interrupted by a crash remain consumed. A budget stop requires an explicit,
+sufficiently larger `--max-bees`; rerunning the command does not reset the counter.
+
+Before capability checks, planning and module work, `hive.log` reports a call forecast: probes,
+group planners, then
+unfinished module builds/reviews, the optional tester and pending probes. Group count is not
+module count; interface reconciliation and repairs can add calls. If the minimum exceeds the
+remaining allowance, the phase does not start and completed work is retained. The recommended
+total adds a **heuristic** reserve of `max(8, ceil(25% of remaining_min))` to spent calls plus
+the minimum. That margin is not a completion or time guarantee. Size curl from its plan and
+measure the chosen server/model; multiplying lz4's elapsed time is not a reliable forecast.
+
+Keep `.hive/run.json`, `.hive/attempts.jsonl`, the frozen plan and the workspace together.
+They retain routing activation, consumed starts, refusal history and provenance. Each bee result
+carries `provenance.attempt_id`; `provenance.prior_attempt_ids` preserves earlier attempts of the
+same call. If no process started, an attempt ID can be null; Hive does not invent one.
+The plan's `planner_attempts` retains those IDs rather than deriving them from model or bee names.
 
 ## Safety
 
@@ -295,26 +415,30 @@ reserve is a stated heuristic, not a runtime or completion guarantee.
 
 ## Run it
 
-From a ReverseAI 0.8.0 checkout, with Docker running, the pinned Ghidra image present and
-Claude Code logged in:
+From the integrated 0.9.0 checkout, with Docker running, the pinned Ghidra image present and
+the selected agent CLI configured (subscription login for the default cloud path):
 
 ```sh
 python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-hive-run --bees 4
 python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-hive-run --run-original
 ```
 
-Run the same command again with the same `--out` to resume. Accepted modules are kept only when
-their input, assignment, source, contract, compiled object and compiler policy still match the queen's saved
-decision. The authoritative decisions live outside bee folders, in `.hive/status/`; module
-`status.json` files are informational copies. Frozen contracts can be replaced on a resumed run.
+Run the same command again with the same `--out` to [resume](#resume-a-frozen-plan-and-retain-the-budget).
+The queen verifies the frozen plan and saved decisions outside bee folders; module `status.json`
+files are informational copies. Inspect the available options with `python3 -m hive run --help`.
 
 ## Workspace
 
 | Path | Contents |
 | --- | --- |
 | `survey/map.json` | Functions, calls, strings and imports exported from the prepared project |
-| `plan/` | The planner's `contract.h`, `PLAN.md` and the normalised `modules.json` |
-| `src/contract.h` | The frozen interface, read-only |
+| `plan/manifest.json`, `plan/interfaces.json`, `plan/contract.h` or `.hpp` | Verified plan bundle, declarations and assembled interface |
+| `plan/groups/`, `plan/interfaces/` | Bounded planner inputs/pages and interface reconciliation work |
+| `plan/progress.json`, `plan/policy.json`, `plan/partition.json` | Resumable planning work and the policy/partition bound by the manifest |
+| `src/contract.h` or `.hpp` | The frozen interface, read-only |
+| `.hive/run.json`, `.hive/attempts.jsonl` | Authoritative run state and attempt journal: counters, routing, refusals and provenance |
+| `.hive/attempts/`, `.hive/status/` | Isolated attempt files and queen-owned module decisions |
+| `.hive/model-checks.json` | Capability checks for configured self-hosted targets |
 | `modules/mNN/` | One builder's folder: `BRIEF.md`, `mNN.c`, `claims.json`, `NOTES.md`, `status.json` |
 | `council/` | One read-only seat per councillor and round |
 | `build/` | Objects, the linked rebuild in `build/bin/` |
@@ -326,10 +450,10 @@ decision. The authoritative decisions live outside bee folders, in `.hive/status
 
 - The bees run on Claude Code (and optionally Codex), so the provider's usage policies and safety
   classifiers apply: work on malware in particular may be refused. The hive recognises a refusal
-  and records it as "refused by the model provider" in the log and the report: a refused planner
-  stops the run before any other bee, a refused builder leaves its module refused, and after three
-  refusals (`refusal_limit`) no further bee starts. The run then ends not accepted, never as a
-  silent pass.
+  and records it in the log and report. Without a successful authorized replacement, a refused
+  planner stops planning and a refused builder leaves its module refused. Three unresolved logical
+  refusals (`refusal_limit`) stop new bees; historical refusals resolved by local recovery remain
+  recorded without counting toward that threshold. Unresolved work prevents acceptance.
 - C and C++ output only; Objective-C, Swift, Go and Rust programs are not handled specially.
 - The pre-flight recognises common packers and strong signs of obfuscation; it does not unpack,
   and it can miss custom packers or light obfuscation.
