@@ -45,7 +45,7 @@ class RecogniseTests(unittest.TestCase):
             answer = self.runner(tmp)("worker", "w", "task", tmp)
         self.assertTrue(answer["refused"])
         with mock.patch.object(bees.subprocess, "run", return_value=completed("", "segmentation fault", 1)):
-            self.assertNotIn("refused", self.runner(tmp)("worker", "w", "task", tmp))
+            self.assertFalse(self.runner(tmp)("worker", "w", "task", tmp)["refused"])
 
     def test_codex_refusals_are_marked(self):
         tmp = Path(tempfile.mkdtemp())
@@ -53,7 +53,7 @@ class RecogniseTests(unittest.TestCase):
         with mock.patch.object(runner, "_execute", side_effect=ValueError("exit 1: this request violates our usage policy")):
             self.assertTrue(runner("worker", "w", "task", tmp)["refused"])
         with mock.patch.object(runner, "_execute", side_effect=ValueError("exit 1: rate limited")):
-            self.assertNotIn("refused", runner("worker", "w", "task", tmp))
+            self.assertFalse(runner("worker", "w", "task", tmp)["refused"])
 
 
 class CodexDiagnosticTests(unittest.TestCase):
@@ -80,7 +80,7 @@ class CodexDiagnosticTests(unittest.TestCase):
                                                        "aggregated_output": "strings: content filter, usage policy"}},
                   {"type": "turn.failed", "error": {"message": "rate limited"}}]
         answer = self.call(stdout="\n".join(json.dumps(e) for e in events))
-        self.assertNotIn("refused", answer)
+        self.assertFalse(answer["refused"])
         self.assertIn("rate limited", answer["error"])
 
 

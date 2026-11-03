@@ -14,12 +14,20 @@ evidence checker, confined compiler, conformance) stay the gate whatever the mod
 that a self-hosted model is good enough for a long reverse-engineering run. Measure it first.
 """
 
+import copy
 import ipaddress
 import json
 import os
+import re
+import secrets
+import tempfile
+import urllib.error
 import urllib.parse
+import urllib.request
+from pathlib import Path
 
 from hive.codex_bees import CodexBees
+from hive.bees import TOOLSETS, provenance, redact
 
 PLACEHOLDER_TOKEN = "self-hosted"
 # A self-hosted bee gets an allowlist, not this process's environment: nothing else (subscription logins, cloud,
@@ -41,7 +49,13 @@ def server_url(url, *, allow_remote=False):
         raise ValueError("--model-server must be an http:// or https:// URL")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError("--model-server must not carry credentials, a query or a fragment")
-    host = parsed.hostname
+    try:
+        parsed.port
+    except ValueError:
+        raise ValueError("invalid model server port") from None
+    if parsed.path.rstrip("/").endswith("/v1"):
+        raise ValueError("model server must be a root URL without /v1")
+    host = parsed.hostname.lower()
     try:
         loopback = ipaddress.ip_address(host).is_loopback
     except ValueError:
@@ -93,6 +107,12 @@ def add_arguments(parser):
                              "API; Codex bees: OpenAI Responses API). Needs --model or --codex-model")
     parser.add_argument("--model-server-remote", action="store_true",
                         help="Allow a --model-server on another machine (the bees' prompts and evidence go there)")
+    parser.add_argument("--fallback-model-server", metavar="URL", help="Explicit loopback model server for refusal fallback")
+    parser.add_argument("--fallback-model", help="Fallback model for Claude client")
+    parser.add_argument("--fallback-codex-model", help="Fallback model for Codex client")
+    parser.add_argument("--fallback-scope", choices=("run", "role", "bee"))
+    parser.add_argument("--fallback-role", choices=tuple(TOOLSETS), action="append")
+    parser.add_argument("--fallback-bee", action="append", help="Exact logical bee name, repeatable")
 
 
 def apply(args, claude_runner):
@@ -113,3 +133,204 @@ def apply(args, claude_runner):
     if args.bee_policy in ("codex", "mixed") and not args.codex_model:
         raise SystemExit("hive: --model-server needs --codex-model, the model name your server serves to Codex bees")
     return SelfHostedCodexBees, {"server": url}
+
+
+def _destination(runner):
+    env = runner.env or {}
+    url = getattr(runner, "server", None) or env.get("ANTHROPIC_BASE_URL")
+    if url:
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.hostname.lower()
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            loopback = host == "localhost"
+        if loopback:
+            host = "loopback"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        url = (parsed.scheme.lower(), host, port, parsed.path.rstrip("/"))
+    return ("codex" if hasattr(runner, "codex") else "claude", url, runner.model)
+
+
+class BeeRouter:
+    """Immutable routing configuration; fallback activation belongs to the queen."""
+    def __init__(self, args, claude_runner, runner_kwargs):
+        from hive.codex_bees import MixedBees, build
+        policy = args.bee_policy
+        server = getattr(args, "fallback_model_server", None)
+        scope = getattr(args, "fallback_scope", None)
+        roles = sorted(set(getattr(args, "fallback_role", None) or []))
+        bees = sorted(set(getattr(args, "fallback_bee", None) or []))
+        model = getattr(args, "fallback_model", None)
+        codex_model = getattr(args, "fallback_codex_model", None)
+        if not server and any((scope, roles, bees, model, codex_model)):
+            raise SystemExit("hive: fallback selectors/models need --fallback-model-server")
+        self._fallback_selector = None
+        self._fallback_clients = {}
+        if server:
+            try:
+                server = server_url(server)  # A remote-primary opt-in never authorizes remote fallback.
+            except ValueError as error:
+                raise SystemExit(f"hive: fallback: {error}") from None
+            if scope not in ("run", "role", "bee"):
+                raise SystemExit("hive: --fallback-model-server needs --fallback-scope")
+            if (scope == "role") != bool(roles) or (scope == "bee") != bool(bees):
+                raise SystemExit("hive: fallback roles/bees must match --fallback-scope exactly")
+            if set(roles) - set(TOOLSETS) or any(not re.fullmatch(r"[A-Za-z0-9_-]+", b) for b in bees):
+                raise SystemExit("hive: invalid fallback role or exact bee name")
+            if policy in ("claude", "mixed") and not model:
+                raise SystemExit("hive: fallback Claude bees need --fallback-model")
+            if policy in ("codex", "mixed") and not codex_model:
+                raise SystemExit("hive: fallback Codex bees need --fallback-codex-model")
+            if policy == "claude" and codex_model or policy == "codex" and model:
+                raise SystemExit("hive: fallback model configured for an unused client")
+            self._fallback_selector = {"scope": scope, "roles": roles, "bees": bees}
+        primary = build(args, claude_runner, **runner_kwargs)
+        self._primary = primary
+        self._primary_clients = ({"claude": primary.claude, "codex": primary.codex} if isinstance(primary, MixedBees)
+                                 else {policy: primary})
+        if server:
+            if policy in ("claude", "mixed"):
+                local = copy.copy(claude_runner)
+                local.model, local.env = model, claude_environment(os.environ, server, model)
+                local.config_dir = Path(claude_runner.config_dir) / "fallback-claude"
+                local.origin = "fallback"
+                self._fallback_clients["claude"] = local
+            if policy in ("codex", "mixed"):
+                kwargs = dict(runner_kwargs, codex=args.codex, model=codex_model, effort=args.codex_effort,
+                              allow_network=args.codex_allow_network)
+                kwargs["config_dir"] = Path(kwargs["config_dir"]) / "fallback-codex"
+                local = SelfHostedCodexBees(server=server, **kwargs)
+                local.origin = "fallback"
+                self._fallback_clients["codex"] = local
+        def config(runner):
+            client, _, _ = _destination(runner)
+            return {"client": client, "server": getattr(runner, "server", None) or (runner.env or {}).get("ANTHROPIC_BASE_URL"),
+                    "requested_model": runner.model, "effort": runner.effort,
+                    "executable": runner.codex if client == "codex" else runner.claude,
+                    "allow_network": getattr(runner, "allow_network", False)}
+        self._policy = {"bee_policy": policy,
+                        "primary": {k: config(v) for k, v in self._primary_clients.items()},
+                        "fallback": self._fallback_selector,
+                        "fallback_targets": {k: config(v) for k, v in self._fallback_clients.items()}}
+
+    def primary(self, role, name):
+        from hive.codex_bees import MixedBees
+        return self._primary.runner(role, name) if isinstance(self._primary, MixedBees) else self._primary
+
+    def fallback(self, role, name):
+        selection = self._fallback_selector
+        if selection is None:
+            return None
+        if selection["scope"] == "role" and role not in selection["roles"]:
+            return None
+        if selection["scope"] == "bee" and name not in selection["bees"]:
+            return None
+        primary = self.primary(role, name)
+        client = "codex" if hasattr(primary, "codex") else "claude"
+        local = self._fallback_clients[client]
+        return None if _destination(primary) == _destination(local) else local
+
+    def describe(self, role, name, *, local=False):
+        runner = self.fallback(role, name) if local else self.primary(role, name)
+        if runner is None:
+            return None
+        result = provenance(runner, role, name)
+        result["context_id"] = None  # No invocation has been created by this pure query.
+        key = runner.probe_key(role) if isinstance(runner, CodexBees) and not runner.allow_network else None
+        result.update(probe_key=key, probe_required=key is not None and key not in runner._network_checks)
+        return result
+
+    def policy(self):
+        return copy.deepcopy(self._policy)
+
+
+class _ProbeHooks:
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+
+    def __call__(self, kind):
+        return self.wrapped("network_probe")
+
+    def finished(self, attempt_id, result):
+        result["provenance"]["kind"] = "network_probe"
+        self.wrapped.finished(attempt_id, result)
+
+
+def _server_context(server, model):
+    """Read active context metadata. Unsupported APIs are reported, never guessed.
+
+    Ollama /api/ps reports loaded context_length; /api/show's architecture limit
+    alone does not establish the active serving context.
+    """
+    if not server:
+        return None
+    request = urllib.request.Request(server + "/api/ps", headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            data = json.loads(response.read(1024 * 1024 + 1))
+    except urllib.error.HTTPError as error:
+        if error.code in (404, 405, 501):
+            return None
+        raise
+    candidates = [m for m in data.get("models", []) if m.get("name") == model or m.get("model") == model]
+    values = [m.get("context_length") for m in candidates]
+    return min(values) if values and all(type(v) is int and v > 0 for v in values) else None
+
+
+def check_model(router, client, *, before_start=None, required_context=32768, local=False,
+                context_query=None, timeout=45):
+    """Brief capability probe through the configured CLI, without selecting/loading a model.
+
+    Checks tool result round-trip and the same CLI structured-output path in one
+    process. Metadata is read from the configured server; context_query(server,
+    model) can supply another server's *active* declared context. Unknown is not ok.
+    The caller must explicitly invoke this function; construction never calls it.
+    """
+    if client not in ("claude", "codex") or type(required_context) is not int or required_context < 1:
+        raise ValueError("client must be claude/codex and required_context a positive integer")
+    source = (router._fallback_clients if local else router._primary_clients).get(client)
+    if source is None:
+        raise ValueError("client is not configured for this destination")
+    runner = copy.copy(source)
+    runner.timeout = min(timeout, source.timeout)
+    runner._capability_nonce = secrets.token_hex(24)
+    hooks = _ProbeHooks(before_start) if before_start is not None else None
+    schema = {"type": "object", "properties": {"nonce": {"type": "string"}},
+              "required": ["nonce"], "additionalProperties": False}
+    def item(status, message, suggestion=None):
+        return {"status": status, "message": message, "suggestion": suggestion}
+    with tempfile.TemporaryDirectory(prefix="hive-model-check-") as folder:
+        Path(folder, "capability-input.json").write_text(json.dumps({"nonce": runner._capability_nonce}), encoding="utf-8")
+        task = ("Capability probe: read capability-input.json using the Read tool (Claude) or a single "
+                "read-only cat command (Codex). Return the nonce from the tool result as the JSON instance "
+                "requested by the output schema. Do not return the schema or Markdown. Do not change files.")
+        name = "model-check-" + secrets.token_hex(6)
+        result = runner("councillor", name, task, folder, schema=schema, before_start=hooks)
+    result["provenance"]["kind"] = "network_probe"
+    structured = (result["ok"] and result["output"]["nonce"] == runner._capability_nonce)
+    checks = {"structured_output": item("ok" if structured else "error",
+                    "CLI output matches the probe schema." if structured else result.get("error") or "The CLI returned an incorrect nonce.",
+                    None if structured else "Configure schema support through this CLI; the JSON instance must satisfy its schema."),
+              "tool_roundtrip": item("ok" if structured and result.get("capability_tool_roundtrip") else "unsupported" if result["ok"] else "error",
+                    "Observed tool call, result and final answer." if structured and result.get("capability_tool_roundtrip") else "Tool round-trip was not demonstrated by native CLI events.",
+                    None if structured and result.get("capability_tool_roundtrip") else "Configure a model and API that support tool calling and tool results through this CLI.")}
+    server = getattr(source, "server", None) or (source.env or {}).get("ANTHROPIC_BASE_URL")
+    declared = None
+    try:
+        declared = (context_query or _server_context)(server, source.model)
+        if type(declared) is not int or declared < 1:
+            declared = None
+            checks["context"] = item("unsupported", "Active context is not verifiable on this server for the configured model.",
+                                     "Expose active context metadata, or supply context_query for this server API.")
+        elif declared < required_context:
+            checks["context"] = item("error", f"Declared context {declared} is smaller than required {required_context}.",
+                                     f"Configure the server's active context to at least {required_context} tokens.")
+        else:
+            checks["context"] = item("ok", f"Declared context {declared} meets required {required_context}.")
+    except Exception as error:
+        checks["context"] = item("error", redact(str(error))[:300], "Check the configured server's context metadata endpoint.")
+    return {"schema": "hive.model-check/1", "ok": all(c["status"] == "ok" for c in checks.values()),
+            "client": client, "requested_model": source.model, "server": server,
+            "required_context": required_context, "declared_context": declared,
+            "checks": checks, "attempt": result}

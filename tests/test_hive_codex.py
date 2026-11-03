@@ -86,7 +86,7 @@ class CodexRunnerTests(unittest.TestCase):
         def run(argv, **kwargs):
             if write:
                 Path(argv[argv.index("-o") + 1]).write_text(json.dumps(ANSWERS[role] if answer is None else answer))
-            return subprocess.CompletedProcess(argv, returncode, stdout="not the final answer", stderr=stderr)
+            return subprocess.CompletedProcess(argv, returncode, stdout='{"type":"turn.completed"}', stderr=stderr)
 
         with patch("hive.codex_bees.subprocess.run", side_effect=run) as process:
             result = self.runner(role, "bee-1", "TASK", self.folder)
@@ -175,12 +175,12 @@ class CodexRunnerTests(unittest.TestCase):
             with self.subTest(value=value):
                 def run(argv, **kwargs):
                     Path(argv[argv.index("-o") + 1]).write_text(json.dumps(value))
-                    return subprocess.CompletedProcess(argv, 0, "", "")
+                    return subprocess.CompletedProcess(argv, 0, '{"type":"turn.completed"}', "")
                 with patch("hive.codex_bees.subprocess.run", side_effect=run):
                     self.assertFalse(self.runner("worker", "bad", "TASK", self.folder)["ok"])
         def malformed(argv, **kwargs):
             Path(argv[argv.index("-o") + 1]).write_text("{broken")
-            return subprocess.CompletedProcess(argv, 0, "", "")
+            return subprocess.CompletedProcess(argv, 0, '{"type":"turn.completed"}', "")
         with patch("hive.codex_bees.subprocess.run", side_effect=malformed):
             self.assertFalse(self.runner("worker", "bad", "TASK", self.folder)["ok"])
 
@@ -246,7 +246,7 @@ class NetworkGateTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, self.probe_cli_rc, stdout, "")
         role = "councillor" if "verdict" in schema["properties"] else "worker"
         output.write_text(json.dumps(ANSWERS[role]))
-        return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 0, '{"type":"turn.completed"}', "")
 
     def test_network_success_refuses_worker_before_its_task(self):
         self.probe_exit = 0

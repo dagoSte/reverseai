@@ -83,7 +83,7 @@ class ChildEnvironmentTests(unittest.TestCase):
         def fake_run(argv, **kwargs):
             calls.append(kwargs)
             Path(argv[argv.index("-o") + 1]).write_text(json.dumps({"verdict": "accept", "defects": [], "summary": None}))
-            return subprocess.CompletedProcess(argv, 0, "", "")
+            return subprocess.CompletedProcess(argv, 0, '{"type":"turn.completed"}', "")
         with mock.patch.object(codex_bees.subprocess, "run", side_effect=fake_run), \
                 mock.patch.object(runner, "_network_ok",  # a probe process like the real one, judged isolated
                                   wraps=lambda role, folder: bool(runner._execute(role, "probe", "t", folder))) as probe:
@@ -258,6 +258,202 @@ class LiveClaudeTests(unittest.TestCase):
                             "a credential other than the placeholder reached the model server")
         self.assertEqual({request["model"] for request in posts if request["model"]}, {"local-test-model"})
 
+
+
+class RouterFixture:
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.parser = argparse.ArgumentParser()
+        codex_bees.add_arguments(self.parser)
+        self.parser.add_argument("--model")
+
+    def router(self, flags=()):
+        args = self.parser.parse_args(flags)
+        claude = bees.ClaudeBees(engine=self.root, inputs=self.root, config_dir=self.root / "claude", model=args.model)
+        return codex_bees.build_router(args, claude, engine=self.root, inputs=self.root, config_dir=self.root / "codex")
+
+    def fallback_flags(self, scope="run"):
+        return ["--fallback-model-server", "http://localhost:11434", "--fallback-model", "configured-local",
+                "--fallback-scope", scope]
+
+
+
+class RouterTests(RouterFixture, unittest.TestCase):
+    def test_construction_and_describe_are_pure_policy_copies_are_isolated(self):
+        with mock.patch("subprocess.run") as run, mock.patch("urllib.request.urlopen") as network:
+            router = self.router(self.fallback_flags())
+            first = router.describe("planner", "planner-g0001")
+            second = router.describe("planner", "planner-g0001", local=True)
+            self.assertIsNone(first["context_id"])
+            self.assertIsNone(second["observed_model"])
+            self.assertEqual(second["origin"], "fallback")
+            self.assertEqual(second["server"], "http://localhost:11434")
+            policy = router.policy()
+            policy["fallback"]["roles"].append("worker")
+            policy["primary"]["claude"]["requested_model"] = "changed"
+            self.assertEqual(router.policy()["fallback"]["roles"], [])
+            self.assertIsNone(router.policy()["primary"]["claude"]["requested_model"])
+        run.assert_not_called()
+        network.assert_not_called()
+        self.assertIsNone(self.router().policy()["fallback"])
+        self.assertIsNone(self.router().fallback("planner", "planner-g0001"))
+
+    def test_selectors_are_exact_and_never_activate_themselves(self):
+        router = self.router(self.fallback_flags("role") + ["--fallback-role", "planner"])
+        self.assertIsNotNone(router.fallback("planner", "planner-g0001"))
+        self.assertIsNone(router.fallback("worker", "m01-build"))
+        router = self.router(self.fallback_flags("bee") + ["--fallback-bee", "planner-g0001"])
+        self.assertIsNotNone(router.fallback("planner", "planner-g0001"))
+        self.assertIsNone(router.fallback("planner", "planner-g00010"))
+        self.assertIs(router.primary("planner", "planner-g0001"), router.primary("planner", "planner-g0002"))
+
+    def test_inconsistent_flags_remote_fallback_and_v1_roots_are_rejected(self):
+        bad = [["--fallback-model", "x"], ["--fallback-role", "worker"],
+               self.fallback_flags("run") + ["--fallback-role", "worker"],
+               self.fallback_flags("role"), self.fallback_flags("bee"),
+               self.fallback_flags("bee") + ["--fallback-bee", "m*-build"],
+               self.fallback_flags() + ["--fallback-codex-model", "unused"],
+               ["--fallback-model-server", "http://host.example", "--fallback-model", "x", "--fallback-scope", "run", "--model-server-remote", "--model-server", "http://host.example", "--model", "x"],
+               ["--fallback-model-server", "http://localhost:11434/v1", "--fallback-model", "x", "--fallback-scope", "run"]]
+        for flags in bad:
+            with self.subTest(flags=flags), self.assertRaises(SystemExit):
+                self.router(flags)
+        for url in ("http://localhost/v1", "http://localhost/v1/", "http://localhost:bad", "http://u:p@localhost", "http://localhost/?token=secret", "http://localhost/#secret"):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                selfhost.server_url(url)
+        with self.assertRaises(SystemExit):
+            self.router(["--model-server", "http://localhost/v1", "--model", "x"])
+
+    def test_duplicate_normalized_target_model_client_is_not_an_alternative(self):
+        flags = self.fallback_flags() + ["--model-server", "http://127.0.0.1:11434/", "--model", "configured-local"]
+        router = self.router(flags)
+        self.assertIsNone(router.fallback("planner", "planner-g0001"))
+        self.assertIsNone(router.describe("planner", "planner-g0001", local=True))
+        flags[-1] = "different"
+        self.assertIsNotNone(self.router(flags).fallback("planner", "planner-g0001"))
+
+    def test_mixed_client_mapping_and_models_are_explicit_on_both_destinations(self):
+        flags = ["--bee-policy", "mixed", "--fallback-model-server", "http://localhost:11434", "--fallback-scope", "run"]
+        for suffix in ([], ["--fallback-model", "local-c"], ["--fallback-codex-model", "local-x"]):
+            with self.assertRaises(SystemExit):
+                self.router(flags + suffix)
+        router = self.router(flags + ["--fallback-model", "local-c", "--fallback-codex-model", "local-x"])
+        for role, name, client in (("planner", "planner-g0001", "claude"), ("worker", "m01-build", "claude"),
+                                  ("worker", "m02-build", "codex"), ("councillor", "m01-council-r1-io", "codex")):
+            self.assertEqual(router.describe(role, name)["client"], client)
+            self.assertEqual(router.describe(role, name, local=True)["client"], client)
+        local = router.fallback("worker", "m02-build")
+        argv = local.argv("worker", "m02-build", self.root)
+        self.assertIn('base_url="http://localhost:11434/v1"', " ".join(argv))
+        self.assertEqual(router.fallback("worker", "m01-build").env["ANTHROPIC_BASE_URL"], "http://localhost:11434")
+
+    def test_probe_description_tracks_actual_pending_cache_without_running_it(self):
+        router = self.router(["--bee-policy", "codex"])
+        runner = router.primary("worker", "m02-build")
+        first = router.describe("worker", "m02-build")
+        same = router.describe("repair", "m02-repair-b1")
+        council = router.describe("councillor", "m02-council-r1-io")
+        self.assertEqual(first["probe_key"], same["probe_key"])
+        self.assertNotEqual(first["probe_key"], council["probe_key"])
+        self.assertTrue(first["probe_required"])
+        runner._network_checks[first["probe_key"]] = False
+        self.assertFalse(router.describe("worker", "m02-build")["probe_required"])
+        runner.model = "changed"
+        self.assertTrue(router.describe("worker", "m02-build")["probe_required"])
+
+    def test_fallback_environment_drops_cloud_credentials(self):
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "SECRET", "ANTHROPIC_API_KEY": "SECRET", "GITHUB_TOKEN": "SECRET"}):
+            router = self.router(self.fallback_flags())
+        env = router.fallback("planner", "planner-g0001").env
+        self.assertNotIn("SECRET", repr(env))
+        self.assertEqual(env["ANTHROPIC_AUTH_TOKEN"], selfhost.PLACEHOLDER_TOKEN)
+
+
+class CapabilityTests(RouterFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.hooks = []
+
+    def fake_claude(self, argv, **kwargs):
+        nonce = json.loads(Path(kwargs["cwd"], "capability-input.json").read_text())["nonce"]
+        events = [{"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "read", "name": "Read", "input": {"file_path": "capability-input.json"}}]}},
+                  {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "read", "content": nonce}]}},
+                  {"type": "result", "structured_output": {"nonce": nonce}}]
+        self.assertEqual(kwargs["timeout"], 45)
+        self.assertIn("--json-schema", argv)
+        return subprocess.CompletedProcess(argv, 0, "\n".join(json.dumps(e) for e in events), "")
+
+    def test_capabilities_through_actual_runner_cli_parser_with_budgeted_probe(self):
+        from tests.test_hive_bees import Hooks
+        router = self.router(self.fallback_flags())
+        hooks = Hooks()
+        with mock.patch("subprocess.run", side_effect=self.fake_claude) as run:
+            report = selfhost.check_model(router, "claude", local=True, required_context=64000,
+                                          before_start=hooks, context_query=lambda server, model: 65536)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(hooks.started, [("attempt-1", "network_probe")])
+        self.assertEqual(len(hooks.results), 1)
+        self.assertEqual(hooks.results[0][1]["provenance"]["kind"], "network_probe")
+        self.assertTrue(all(c["status"] == "ok" for c in report["checks"].values()))
+        self.assertEqual(router.fallback("councillor", "check").timeout, 2400)
+
+    def test_context_check_rejects_insufficient_unknown_and_failing_metadata(self):
+        router = self.router(self.fallback_flags())
+        for declared, status in ((8192, "error"), (None, "unsupported"), ("65536", "unsupported")):
+            with self.subTest(declared=declared), mock.patch("subprocess.run", side_effect=self.fake_claude):
+                report = selfhost.check_model(router, "claude", local=True, context_query=lambda server, model: declared)
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["checks"]["context"]["status"], status)
+            self.assertTrue(report["checks"]["context"]["suggestion"])
+        with mock.patch("subprocess.run", side_effect=self.fake_claude):
+            report = selfhost.check_model(router, "claude", local=True, context_query=mock.Mock(side_effect=OSError("metadata unavailable")))
+        self.assertEqual(report["checks"]["context"]["status"], "error")
+
+    def test_claimed_tool_call_without_native_result_does_not_pass(self):
+        def fake(argv, **kwargs):
+            nonce = json.loads(Path(kwargs["cwd"], "capability-input.json").read_text())["nonce"]
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"type": "result", "structured_output": {"nonce": nonce}}), "")
+        with mock.patch("subprocess.run", side_effect=fake):
+            report = selfhost.check_model(self.router(), "claude", context_query=lambda s, m: 65536)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["checks"]["structured_output"]["status"], "ok")
+        self.assertEqual(report["checks"]["tool_roundtrip"]["status"], "unsupported")
+
+    def test_capability_budget_denial_propagates_without_network_or_process(self):
+        from tests.test_hive_bees import Hooks
+        with mock.patch("subprocess.run") as run, mock.patch("urllib.request.urlopen") as network, self.assertRaises(bees.AttemptNotStarted):
+            selfhost.check_model(self.router(), "claude", before_start=Hooks("budget_exhausted"))
+        run.assert_not_called()
+        network.assert_not_called()
+
+    def test_codex_tool_roundtrip_uses_cli_schema_and_native_command_evidence(self):
+        from tests.test_hive_bees import Hooks
+        router = self.router(["--bee-policy", "codex", "--codex-allow-network", "--codex-model", "chosen"])
+        hooks = Hooks()
+        def fake(argv, **kwargs):
+            nonce = json.loads(Path(kwargs["cwd"], "capability-input.json").read_text())["nonce"]
+            schema = json.loads(Path(argv[argv.index("--output-schema") + 1]).read_text())
+            self.assertEqual(schema["required"], ["nonce"])
+            Path(argv[argv.index("-o") + 1]).write_text(json.dumps({"nonce": nonce}))
+            events = [{"type": "item.completed", "item": {"type": "command_execution", "command": "cat capability-input.json", "exit_code": 0, "aggregated_output": nonce}}, {"type": "turn.completed"}]
+            return subprocess.CompletedProcess(argv, 0, "\n".join(json.dumps(e) for e in events), "")
+        with mock.patch("subprocess.run", side_effect=fake):
+            report = selfhost.check_model(router, "codex", before_start=hooks, context_query=lambda s, m: 65536)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(hooks.started, [("attempt-1", "network_probe")])
+
+    def test_active_context_metadata_matches_configured_model_only(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({"models": [
+            {"name": "another", "context_length": 999999}, {"name": "chosen", "context_length": 65536}]}).encode()
+        with mock.patch("urllib.request.urlopen", return_value=response) as request:
+            self.assertEqual(selfhost._server_context("http://localhost:11434", "chosen"), 65536)
+            self.assertIsNone(selfhost._server_context("http://localhost:11434", "missing"))
+        self.assertEqual(request.call_args.args[0].full_url, "http://localhost:11434/api/ps")
+        self.assertEqual(request.call_args.kwargs["timeout"], 5)
 
 if __name__ == "__main__":
     unittest.main()
