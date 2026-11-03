@@ -21,6 +21,55 @@ SMALL = {"type": "object", "properties": {"value": {"type": ["string", "null"]}}
 
 
 class LiveToolStopTests(unittest.TestCase):
+    def test_absent_mcp_results_are_unknown_for_assistant_tool_use_and_started_call(self):
+        cases = [("claude", [{"type": "assistant", "message": {"content": [{"type": "text", "text": "hello"}]}}]),
+                 ("claude", [{"type": "assistant", "message": {"content": [
+                     {"type": "tool_use", "id": "pending", "name": "mcp__reverseai__export_function"}]}}]),
+                 ("codex", [{"type": "item.started", "item": {
+                     "type": "mcp_tool_call", "id": "pending", "tool": "export_function"}}])]
+        for client, events in cases:
+            with self.subTest(client=client, events=events):
+                self.assertIsNone(bees.tool_rejections(events, client=client))
+
+    def test_zero_requires_an_observed_accepted_mcp_result(self):
+        for client in ("claude", "codex"):
+            with self.subTest(client=client):
+                self.assertEqual(bees.tool_rejections(self.event(client, "accepted", False), client=client), 0)
+
+    def detached_pipe(self, *, schema_stop):
+        # Finite child in another session inherits both outputs. It must finish
+        # naturally; the controller must neither wait for it nor signal it.
+        with tempfile.TemporaryDirectory() as folder:
+            completed = Path(folder) / "detached-completed"
+            child = "import time; from pathlib import Path; time.sleep(2.5); Path(" + repr(str(completed)) + ").write_text('completed')"
+            before = f"subprocess.Popen([sys.executable, '-c', {child!r}], start_new_session=True); "
+            events = self.event("codex", "one") if schema_stop else []
+            start = time.monotonic()
+            try:
+                if schema_stop:
+                    done = self.transport(events, client="codex", before=before,
+                                          after="time.sleep(20)", timeout=.3, limit=1)
+                    self.assertEqual(done.tool_schema_stop["consecutive_tool_rejections"], 1)
+                else:
+                    with self.assertRaises(subprocess.TimeoutExpired) as error:
+                        self.transport(events, client="codex", before=before,
+                                       after="time.sleep(20)", timeout=.3, limit=1)
+                    self.assertIsNone(error.exception.tool_rejections)
+                self.assertLess(time.monotonic() - start, 1.5,
+                                "Stop/timeout must not await another session's inherited pipe")
+            finally:
+                # No signals to the detached session, including during cleanup.
+                deadline = time.monotonic() + 4
+                while not completed.exists() and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertEqual(completed.read_text(), "completed")
+
+    def test_schema_stop_bounds_drain_when_another_session_holds_pipes(self):
+        self.detached_pipe(schema_stop=True)
+
+    def test_timeout_bounds_drain_when_another_session_holds_pipes(self):
+        self.detached_pipe(schema_stop=False)
+
     def test_limit_is_positive_for_both_runner_types(self):
         for runner in (bees.ClaudeBees, codex_bees.CodexBees):
             self.assertEqual(runner(engine=".", inputs=".", config_dir=".").max_tool_rejections, 8)

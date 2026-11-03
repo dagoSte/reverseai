@@ -404,6 +404,7 @@ class ToolRejectionMonitor:
                               r"|does not match.{0,80}schema", str(error)))
 
     def result(self, identity, name, rejected):
+        self.observed = True
         if identity is not None:
             if identity in self.seen:
                 return
@@ -417,7 +418,6 @@ class ToolRejectionMonitor:
         if self.client == "claude":
             if event.get("type") not in ("assistant", "user"):
                 return
-            self.observed = True
             for block in event.get("message", {}).get("content", []):
                 if not isinstance(block, dict):
                     continue
@@ -430,7 +430,6 @@ class ToolRejectionMonitor:
         elif event.get("type", "").startswith("item."):
             item = event.get("item", {})
             if item.get("type") == "mcp_tool_call":
-                self.observed = True
                 if event.get("type") == "item.completed":
                     self.result(item.get("id"), item.get("tool") or item.get("name"),
                                 bool(item.get("error") and self.schema_error(item["error"])))
@@ -461,6 +460,7 @@ def run_cli(argv, *, input, cwd, env, capture_output, text, timeout, check,
     process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
     deadline, stopped, timed_out = time.monotonic() + timeout, False, False
+    drain_deadline = float("inf")
 
     def stop_group():
         # Reaping only happens below, after both signals target our original group.
@@ -489,12 +489,15 @@ def run_cli(argv, *, input, cwd, env, capture_output, text, timeout, check,
                                       (process.stderr, "stderr", selectors.EVENT_READ)):
                 os.set_blocking(pipe.fileno(), False)
                 selector.register(pipe, mode, name)
-            while selector.get_map():
+            while selector.get_map() and time.monotonic() < drain_deadline:
                 if not stopped and (monitor.stop is not None or time.monotonic() >= deadline):
                     timed_out = monitor.stop is None
                     stop_group()
                     stopped = True
-                for key, _ in selector.select(0.05):
+                    # Other sessions may retain inherited pipe writers. Bound
+                    # our drain and close our read ends without signalling them.
+                    drain_deadline = time.monotonic() + .25
+                for key, _ in selector.select(min(.05, max(0, drain_deadline - time.monotonic()))):
                     pipe, name = key.fileobj, key.data
                     if name == "stdin":
                         try:
@@ -525,6 +528,7 @@ def run_cli(argv, *, input, cwd, env, capture_output, text, timeout, check,
                 if monitor.stop is not None and not stopped:
                     stop_group()
                     stopped = True
+                    drain_deadline = time.monotonic() + .25
             # A CLI may close its pipes before exiting. The deadline still applies.
             if not stopped:
                 try:
