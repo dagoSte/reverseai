@@ -264,7 +264,7 @@ an already installed model name in the Hive command, from another terminal:
 ```sh
 python3 -m hive run --inputs /path/to/approved-inputs --file program --out new-hive-run \
   --model-server http://127.0.0.1:11434 --model your-installed-model \
-  --required-context 65536 --bees 1
+  --required-context 65536 --max-tool-rejections 8 --bees 1
 ```
 
 Ollama settings and diagnostics: [context length](https://docs.ollama.com/context-length),
@@ -276,12 +276,22 @@ vLLM settings: [serve options](https://docs.vllm.ai/en/latest/cli/serve/),
 [structured outputs](https://docs.vllm.ai/en/latest/features/structured_outputs/).
 Use the documentation and help matching your installed server version.
 
-**Current vLLM/context limitation:** Hive's standard CLI reads active context only from
-Ollama-compatible `/api/ps` metadata, matched to the configured model name. A vLLM server without
-that metadata will stop as **unsupported**, even with `--max-model-len` set correctly. The Python
-`selfhost.check_model` API accepts a `context_query(server, model)` reader for other server APIs,
-but the CLI does not expose a flag to configure one. These server settings alone do not provide
-a working vLLM run through the standard CLI.
+### Active context metadata
+
+Hive reads the configured model's serving context from Ollama-compatible `/api/ps`
+(`context_length`). When that API is absent or unrecognized, it tries vLLM-compatible
+`/v1/models` (`max_model_len`). The model name or ID must match the configured name
+exactly, and the reported length must be a positive integer. Recognized metadata with
+a missing model or invalid length stays unknown; Hive does not borrow another model's
+limit or replace a loaded context with a larger limit from another API.
+
+If no recognized source provides usable metadata, `context` is `unsupported`:
+**“Active context is not verifiable on this server”**, or *non verificabile su questo
+server*. This differs from a measured context below `--required-context`, which is an
+`error`. Connection, authentication and other metadata-query failures are also errors.
+Expose the chosen model's serving metadata and verify the server's active settings.
+The Python `selfhost.check_model` API can accept a `context_query(server, model)` reader
+for another server API; the CLI has no flag to inject one.
 
 ### Automatic capability checks
 
@@ -290,26 +300,35 @@ fallback target, once per client, including fallback targets not yet activated. 
 cloud path, with no `--model-server`, keeps its existing behavior without these capability probes.
 A configured local fallback is still checked when the primary uses cloud.
 
-A short call through the actual selected CLI reads a random nonce from a private file with a
-tool and returns it under a small schema. Hive requires native events showing tool call, result
-and final answer; the model's claim that it used a tool is insufficient. It separately compares
-the server's declared **active** context with `--required-context`. It does not measure effective
-context retention, peak memory, inference speed or whether a long reconstruction will succeed.
+One short process through the actual selected CLI reads a random nonce with a tool,
+calls ReverseAI's real MCP `export_function` on a function from the input survey, and
+returns the nonce under a small output schema. It uses the same ReverseAI MCP server,
+input directory and tool configuration as the bees. `mcp_tool` is `ok` only when native
+CLI events show that the server accepted the call with arguments matching that surveyed
+file and function; the model's story or final JSON cannot establish acceptance.
+A surveyed function, configured MCP tools and an accepted native result are required.
 
-`.hive/model-checks.json` records `tool_roundtrip`, `structured_output` and `context`, each with
-status `ok`, `unsupported` or `error`, a message and a configuration suggestion. All must be `ok`:
+Read, MCP and structured output share that one capability process, counted as
+`network_probe` in the start budget. Codex may first need a separate isolation probe,
+also counted. Hive separately compares the server's declared **active** context with
+`--required-context`. These checks do not measure effective context retention, peak
+memory, inference speed or whether a long reconstruction will succeed.
+
+`.hive/model-checks.json` records `tool_roundtrip`, `mcp_tool`, `structured_output` and
+`context`, each with status `ok`, `unsupported` or `error`, a message and a configuration
+suggestion. All must be `ok`:
 
 | Result | Meaning and action |
 | --- | --- |
 | `ok` | This small capability check passed; normal compiler, council, evidence and behavior checks remain required. |
-| `unsupported` | A capability was not demonstrated. For context, **“Active context is not verifiable on this server”** means *non verificabile su questo server*, not a measured small context. Expose active metadata for the exact model; another API needs a context reader as described above. |
+| `unsupported` | A capability was not demonstrated. For `mcp_tool`, provide a surveyed function, the configured MCP tools and accepted native tool evidence. For `context`, *non verificabile su questo server* means serving metadata is unknown, not a measured small context; expose valid metadata for the exact configured model. |
 | `error` | The probe or metadata query failed, or the declared context is below the required minimum. Read the message: configure tools/schema support, increase the server's active context, or fix the metadata connection as appropriate. |
 
 An `unsupported` or `error` stops the run as `model_capability`. There is no CLI flag to skip
 these checks for configured servers. After correcting the server, resume repeats them and
 retains the already consumed budget. Raising `--required-context` raises the requirement; it
-does not enlarge the server's context. Passing the checks is a minimum compatibility result,
-not a complete local reconstruction or a curl performance result.
+does not enlarge the server's context. Passing the checks is a minimum compatibility result.
+It does not guarantee a successful reconstruction or measure curl performance.
 
 ### Read failed attempts
 
@@ -319,6 +338,7 @@ The attempt's `outcome` and `code`, saved in the report/state, distinguish cause
 | --- | --- | --- |
 | `provider_refusal` | The provider declined this logical call. | Only with explicit matching consent, for one additional local attempt. |
 | `invalid_schema` | No completed schema-conforming response; this includes returning a schema instead of its JSON instance. | No; check schema/API/client compatibility. |
+| `tool_schema_failure` | The agent was stopped after consecutive MCP argument-schema rejections reached `--max-tool-rejections`. This is not a provider refusal. | No; check tool calling, the tool arguments and active context. |
 | `context_limit` | The prompt exceeded the available context. | No; fix active context or size the work appropriately. |
 | `timeout`, `rate_limit`, `failure` | Process deadline, provider quota/rate limit, or another failure. | No; diagnose the reported cause. |
 | `failure` with `network_isolation` | The Codex isolation probe failed. A cached negative probe starts no process and creates no new attempt ID. | No; `--resume-refused` does not bypass it. |
@@ -328,6 +348,28 @@ These outcomes differ from the capability report's per-check statuses. For examp
 whose context cannot be verified is not a provider refusal. Diagnostics and observed rejected
 MCP arguments (`tool_rejections`, null when no tool trace is available) help diagnose compatibility;
 they do not establish the correctness of generated code.
+
+### Stop repeated MCP argument errors
+
+`--max-tool-rejections N` sets a positive consecutive-error limit, default **8**. The
+agent process is interrupted when the native MCP results reach that schema-rejection
+streak, rather than waiting for the ordinary process timeout. An MCP result without an
+argument-schema error resets the streak; prose and non-MCP tools do not change it.
+The outcome is `tool_schema_failure`, with `refused=false` and `output=null`. It does
+not activate fallback or contribute to the provider-refusal stop limit.
+
+`REPORT.md` shows the tool name, consecutive streak and total observed rejections;
+the result retains `tool_name`, `consecutive_tool_rejections` and `tool_rejections`.
+Check the selected model/API's tool-calling support and the server's active context.
+Choose a model/API with more reliable tool calling or configure a larger supported
+active context when appropriate. Preserve the failed workspace; after
+correcting the configuration, a fresh `--out` starts a new run. `--resume-refused` is
+for provider refusals and does not recover a tool-schema stop through local fallback.
+
+When the CLI exposes no native MCP results, the report says the rejection monitor is
+unavailable and `tool_rejections` is `null`. The consecutive-error monitor cannot
+operate on hidden results; `null` is not an observed zero. A self-hosted startup check
+also requires native accepted MCP evidence before `mcp_tool` can pass.
 
 ### Explicit local recovery after a refusal
 
