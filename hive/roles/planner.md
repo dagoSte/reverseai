@@ -22,7 +22,9 @@ Return exactly modules, skipped, declarations and unknowns:
    Respect the task's function limit. A skip has entry, a specific reason and evidence
    (finding IDs or addresses of the input): import stubs, runtime helpers or identified
    library code. Functions of another group are dependencies, never your assignments.
-2. Propose declarations as structured records with entity_id, kind, entry, owner_entry,
+2. Declare only this group's own entities. Do not redeclare prototypes for callees owned
+   by other groups: the callee's group supplies its declaration; cross-group calls remain
+   in the cut-edge evidence. Use structured records with entity_id, kind, entry, owner_entry,
    linkage, text, requires and evidence. Include every field; use null where inapplicable.
    Keys are function:0xENTRY, global:0xADDRESS, type:NAME (qualified in C++) and
    include:HEADER. requires lists other entity_id keys; evidence cites finding IDs or

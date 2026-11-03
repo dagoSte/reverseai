@@ -303,7 +303,7 @@ def _evidence(items):
                               for item in items)
 
 
-def _declaration(value, language):
+def _declaration(value, language, functions):
     _schema(value, _DECLARATION)
     value = json.loads(encode(value))
     value["text"] = _text(value["text"])
@@ -313,6 +313,8 @@ def _declaration(value, language):
     if kind in {"function", "global"}:
         _require(isinstance(entry, str) and _ADDRESS.fullmatch(entry) and _address(entry) == entry
                  and key == kind + ":" + entry, "interface_conflict", entity=key)
+        _require((entry in functions) if kind == "function" else (entry not in functions),
+                 "interface_conflict", entity=key, reason="declaration disagrees with function map")
     else:
         _require(entry is None and key.startswith(kind + ":"), "interface_conflict", entity=key)
     if kind == "include":
@@ -349,7 +351,7 @@ def _declaration(value, language):
     return value
 
 
-def _group_output(output, group, language):
+def _group_output(output, group, language, known):
     _schema(output, GROUP_SCHEMA)
     assigned, ids = [], set()
     for module in output["modules"]:
@@ -361,7 +363,7 @@ def _group_output(output, group, language):
         assigned.append(skipped["entry"])
     _require(Counter(assigned) == Counter(group["functions"]), "planning_coverage", group=group["id"])
     for declaration in output["declarations"]:
-        _declaration(declaration, language)
+        _declaration(declaration, language, known)
     return output
 
 
@@ -395,7 +397,7 @@ def _pointer_only(text, name):
 
 
 def _interfaces(declarations, modules, skipped, known, cuts, language):
-    normalized = [_declaration(d, language) for d in declarations]
+    normalized = [_declaration(d, language, known) for d in declarations]
     by_key = {d["entity_id"]: d for d in normalized}
     _require(len(by_key) == len(normalized), "interface_conflict", reason="duplicate entity")
     function_owners = {entry: module["id"] for module in modules for entry in module["functions"]}
@@ -535,11 +537,11 @@ def _invoke(invoke, name, task, folder, schema):
     return result["output"], attempts
 
 
-def _variants(proposals, language):
+def _variants(proposals, language, known):
     variants = defaultdict(dict)
     for proposal in proposals:
         for raw in proposal["declarations"]:
-            value = _declaration(raw, language)
+            value = _declaration(raw, language, known)
             semantic = {key: item for key, item in value.items() if key != "evidence"}
             bucket = variants[value["entity_id"]]
             fingerprint = _hash(semantic)
@@ -600,17 +602,17 @@ def _plan(program_map, partitioned, *, out, invoke, language, max_functions=12,
             output, ids = _invoke(invoke, "planner-" + gid, task, folder, GROUP_SCHEMA)
             for ref in protected:
                 _require(_sha(_read(out, ref["path"])) == ref["sha256"], "planning_evidence_changed", path=ref["path"])
-            _group_output(output, group, language)
+            _group_output(output, group, language, known)
             ref = _write_json(out, f"plan/proposals/{gid}.json", output)
             _require(not output["unknowns"], "interface_conflict", group=gid, unknowns=output["unknowns"])
             progress["groups"][gid] = {"proposal": ref, "attempts": ids}
             _write_json(out, "plan/progress.json", progress)
-        _group_output(output, group, language)
+        _group_output(output, group, language, known)
         _require(not output["unknowns"], "interface_conflict", group=gid, unknowns=output["unknowns"])
         proposals.append(output)
         attempts.extend(ids)
     modules, skipped = _modules(proposals, known, max_functions)
-    variants = _variants(proposals, language)
+    variants = _variants(proposals, language, known)
     declarations = []
     for key, values in variants.items():
         if len(values) == 1:

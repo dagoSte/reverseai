@@ -414,5 +414,31 @@ class PlanningTests(unittest.TestCase):
             declaration("type", "B", "struct A; struct B { struct A *a; };", requires=["type:A"])])
         self.run_plan()
 
+    def test_group_card_limits_declarations_to_owned_entities(self):
+        card = Path(planning.__file__).with_name("roles").joinpath("planner.md").read_text()
+        group = " ".join(card.split("## Group planning", 1)[1].split("## Interface conflicts", 1)[0].lower().split())
+        self.assertIn("declare only this group's own entities", group)
+        self.assertIn("do not redeclare prototypes for callees owned by other groups", group)
+        self.source = program(4)
+        self.source["calls"] = [{"from": "0x1000", "to": row["hex"]} for row in self.source["functions"][1:]]
+        self.parts = partition.partition(self.source, max_functions=1)
+        self.invoke = FakeInvoke(self.parts)
+        self.run_plan()
+        self.assertEqual(len(self.parts["cut_edges"]), 3)
+        self.assertEqual([call[1] for call in self.invoke.calls],
+                         ["planner-g0001", "planner-g0002", "planner-g0003", "planner-g0004"])
+
+    def test_function_declarations_must_reference_the_program_map(self):
+        self.invoke.outputs["planner-g0001"]["declarations"].append(
+            declaration("function", "0x9000", "int fabricated(void); /* 0x9000 */", entry="0x9000"))
+        self.assert_error("interface_conflict", self.run_plan)
+        self.assertFalse((self.out / "plan/manifest.json").exists())
+
+    def test_global_declarations_must_not_alias_function_entries(self):
+        self.invoke.outputs["planner-g0001"]["declarations"].append(
+            declaration("global", "0x1000", "extern int counter;", entry="0x1000", owner="0x1010", linkage="defined"))
+        self.assert_error("interface_conflict", self.run_plan)
+        self.assertFalse((self.out / "plan/manifest.json").exists())
+
 if __name__ == "__main__":
     unittest.main()
