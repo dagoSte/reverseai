@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from hive import bees as bees_module
 
 from hive.bees import (REFUSAL, SCHEMAS, brief, is_refusal, AttemptNotStarted, classify_result,
                        matches_schema, parse_output, json_events, tool_rejections, run_attempt,
@@ -122,7 +123,10 @@ class CodexBees:
     """One non-interactive Codex process and ReverseAI MCP server per named bee."""
 
     def __init__(self, *, engine, inputs, enabled=("ghidra",), codex="codex", model=None, effort=None,
-                 timeout=2400, python=sys.executable, config_dir, allow_network=False, env=None):
+                 timeout=2400, python=sys.executable, config_dir, allow_network=False, env=None, max_tool_rejections=8):
+        if type(max_tool_rejections) is not int or max_tool_rejections < 1:
+            raise ValueError("max_tool_rejections must be a positive integer")
+        self.max_tool_rejections = max_tool_rejections
         self.env = env  # None inherits this process's environment; hive.selfhost sets a self-hosted one
         self.engine, self.inputs = str(Path(engine).resolve()), str(Path(inputs).resolve())
         self.enabled, self.codex, self.model = tuple(enabled), codex, model
@@ -166,8 +170,9 @@ class CodexBees:
     def _execute(self, role, name, task, folder, *, schema=None):
         expected = SCHEMAS[role] if schema is None else schema
         wire_schema = strict_schema(expected) if schema is None else schema
-        completed = subprocess.run(self.argv(role, name, folder, schema=wire_schema), input=task, cwd=folder,
-                                   env=self.env, capture_output=True, text=True, timeout=self.timeout, check=False)
+        completed = bees_module.run_cli(self.argv(role, name, folder, schema=wire_schema), input=task, cwd=folder,
+                                       env=self.env, capture_output=True, text=True, timeout=self.timeout, check=False,
+                                       client="codex", max_tool_rejections=self.max_tool_rejections)
         events = json_events(completed.stdout)
         errors = failure_messages(completed.stdout)
         signals = []
@@ -197,9 +202,13 @@ class CodexBees:
             pass
         result = classify_result(terminal=terminal, assistant_text=assistant, diagnostic=native,
                                  output=output, schema=wire_schema)
+        result = bees_module.tool_schema_result(completed) or result
         result["tool_rejections"] = tool_rejections(events, client="codex")
         if hasattr(self, "_capability_nonce"):
             result["capability_tool_roundtrip"] = capability_roundtrip(events, "codex", self._capability_nonce)
+        if hasattr(self, "_capability_mcp"):
+            from hive import selfhost
+            result["capability_mcp_tool"] = selfhost.mcp_tool_accepted(events, "codex", self._capability_mcp)
         if not result["ok"]:
             raise BeeExecutionError(result)
         completed.bee_result = result
@@ -270,6 +279,9 @@ class CodexBees:
                     result["provenance"] = dict(probe["provenance"])
                     result["probe_outcome"] = probe["outcome"]
                     result["seconds"] = probe["seconds"]
+                    for field in ("tool_rejections", "tool_name", "consecutive_tool_rejections"):
+                        if field in probe:
+                            result[field] = probe[field]
                 else:
                     result["provenance"] = provenance(self, role, name)
                     result["provenance"]["context_id"] = None

@@ -14,6 +14,8 @@ import json
 import math
 import os
 import re
+import selectors
+import signal
 import shlex
 import subprocess
 import sys
@@ -357,6 +359,7 @@ def run_attempt(runner, role, name, operation, before_start=None, *, kind="bee")
     except subprocess.TimeoutExpired as error:
         result = classify_result(terminal={"timed_out": True, "error": f"no answer within {runner.timeout} s"},
                                  diagnostic=str(error.stderr or ""), schema={})
+        result["tool_rejections"] = getattr(error, "tool_rejections", None)
     except Exception as error:
         result = classify_result(terminal={"error": str(error), "returncode": 1},
                                  diagnostic=str(error), schema={})
@@ -385,38 +388,180 @@ def json_events(stdout):
     return events
 
 
-def tool_rejections(events, *, client):
-    """Count observed MCP argument/schema errors, never infer missing tool traces."""
+class ToolRejectionMonitor:
+    """Read native MCP results; prose and other tools cannot change the streak."""
+    def __init__(self, client, limit=None):
+        self.client, self.limit = client, limit
+        self.observed, self.total, self.consecutive = False, 0, 0
+        self.names, self.seen, self.stop = {}, set(), None
+
+    @staticmethod
     def schema_error(error):
         if isinstance(error, dict) and error.get("code") == -32602:
             return True
         return bool(re.search(r"(?i)invalid (?:arguments|params|parameters)|arguments must match.{0,80}schema"
                               r"|(?:input|argument|parameter) (?:schema|validation)|validation error"
                               r"|does not match.{0,80}schema", str(error)))
-    observed, rejected = False, 0
-    names = {}
-    for event in events:
-        if client == "claude":
+
+    def result(self, identity, name, rejected):
+        if identity is not None:
+            if identity in self.seen:
+                return
+            self.seen.add(identity)
+        self.total += int(rejected)
+        self.consecutive = self.consecutive + 1 if rejected else 0
+        if self.limit is not None and self.consecutive >= self.limit and self.stop is None:
+            self.stop = {"tool_name": name or None, "consecutive_tool_rejections": self.consecutive}
+
+    def feed(self, event):
+        if self.client == "claude":
             if event.get("type") not in ("assistant", "user"):
-                continue
-            observed = True
+                return
+            self.observed = True
             for block in event.get("message", {}).get("content", []):
                 if not isinstance(block, dict):
                     continue
                 if block.get("type") == "tool_use":
-                    names[block.get("id")] = block.get("name", "")
-                if (block.get("type") == "tool_result" and block.get("is_error")
-                        and names.get(block.get("tool_use_id"), "").startswith("mcp__")
-                        and schema_error(block.get("content", ""))):
-                    rejected += 1
+                    self.names[block.get("id")] = block.get("name", "")
+                name = self.names.get(block.get("tool_use_id"), "")
+                if block.get("type") == "tool_result" and name.startswith("mcp__"):
+                    self.result(block.get("tool_use_id"), name,
+                                bool(block.get("is_error") and self.schema_error(block.get("content", ""))))
         elif event.get("type", "").startswith("item."):
             item = event.get("item", {})
             if item.get("type") == "mcp_tool_call":
-                observed = True
-                if (event.get("type") == "item.completed" and item.get("error")
-                        and schema_error(item["error"])):
-                    rejected += 1
-    return rejected if observed else None
+                self.observed = True
+                if event.get("type") == "item.completed":
+                    self.result(item.get("id"), item.get("tool") or item.get("name"),
+                                bool(item.get("error") and self.schema_error(item["error"])))
+
+
+def tool_rejections(events, *, client):
+    """Count observed MCP argument/schema errors, never infer missing tool traces."""
+    monitor = ToolRejectionMonitor(client)
+    for event in events:
+        monitor.feed(event)
+    return monitor.total if monitor.observed else None
+
+
+def run_cli(argv, *, input, cwd, env, capture_output, text, timeout, check,
+            client, max_tool_rejections):
+    """Capture both pipes live and stop only the POSIX session created for this CLI.
+
+    No shell or preexec_fn: concurrent bees each own a distinct process group.
+    Keep the leader unreaped until group signalling finishes, preventing PID reuse.
+    """
+    if os.name != "posix":
+        raise OSError("live tool monitoring requires POSIX process groups")
+    if not capture_output or not text or check:
+        raise ValueError("run_cli requires text capture and check=False")
+    monitor = ToolRejectionMonitor(client, max_tool_rejections)
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    pending, payload, sent = bytearray(), input.encode("utf-8"), 0
+    process = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    deadline, stopped, timed_out = time.monotonic() + timeout, False, False
+
+    def stop_group():
+        # Reaping only happens below, after both signals target our original group.
+        for signum in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(process.pid, signum)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                # Darwin reports EPERM for a group containing only zombies.
+                # Accept it only after TERM and an unreaped, exited leader.
+                if signum != signal.SIGKILL or os.waitid(
+                        os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                    raise
+            if signum == signal.SIGTERM:
+                time.sleep(0.1)
+
+    def events(data):
+        for event in json_events(data.decode("utf-8", errors="replace")):
+            monitor.feed(event)
+
+    try:
+        with selectors.DefaultSelector() as selector:
+            for pipe, name, mode in ((process.stdin, "stdin", selectors.EVENT_WRITE),
+                                      (process.stdout, "stdout", selectors.EVENT_READ),
+                                      (process.stderr, "stderr", selectors.EVENT_READ)):
+                os.set_blocking(pipe.fileno(), False)
+                selector.register(pipe, mode, name)
+            while selector.get_map():
+                if not stopped and (monitor.stop is not None or time.monotonic() >= deadline):
+                    timed_out = monitor.stop is None
+                    stop_group()
+                    stopped = True
+                for key, _ in selector.select(0.05):
+                    pipe, name = key.fileobj, key.data
+                    if name == "stdin":
+                        try:
+                            sent += os.write(pipe.fileno(), payload[sent:sent + 65536]) if sent < len(payload) else 0
+                        except BrokenPipeError:
+                            sent = len(payload)
+                        if sent == len(payload):
+                            selector.unregister(pipe)
+                            pipe.close()
+                        continue
+                    data = os.read(pipe.fileno(), 65536)
+                    if data:
+                        captured[name].extend(data)
+                        if name == "stdout":
+                            pending.extend(data)
+                            while b"\n" in pending:
+                                line, _, rest = pending.partition(b"\n")
+                                pending[:] = rest
+                                events(line)
+                                if monitor.stop is not None:
+                                    break
+                    else:
+                        if name == "stdout" and pending:
+                            events(pending)
+                            pending.clear()
+                        selector.unregister(pipe)
+                        pipe.close()
+                if monitor.stop is not None and not stopped:
+                    stop_group()
+                    stopped = True
+            # A CLI may close its pipes before exiting. The deadline still applies.
+            if not stopped:
+                try:
+                    process.wait(timeout=max(0, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    stop_group()
+            process.wait()
+    except BaseException:
+        if process.returncode is None:
+            stop_group()
+            process.wait()
+        raise
+    finally:
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            pipe.close()
+    stdout, stderr = (captured[key].decode("utf-8", errors="replace") for key in ("stdout", "stderr"))
+    if timed_out:
+        error = subprocess.TimeoutExpired(argv, timeout, output=stdout, stderr=stderr)
+        error.tool_rejections = tool_rejections(json_events(stdout), client=client)
+        raise error
+    result = subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+    result.tool_schema_stop = monitor.stop
+    return result
+
+
+def tool_schema_result(completed):
+    """Only the live controller can issue this outcome, never assistant prose."""
+    stop = getattr(completed, "tool_schema_stop", None)
+    if not isinstance(stop, dict):
+        return None
+    name = stop["tool_name"] or "unknown MCP tool"
+    result = classify_result(terminal={"signals": ["tool_schema_failure"], "code": "tool_schema_failure",
+                                      "error": f"Stopped after {stop['consecutive_tool_rejections']} consecutive "
+                                               f"MCP argument/schema rejections ({name})"}, schema={})
+    result.update(stop)
+    return result
 
 
 def capability_roundtrip(events, client, nonce):
@@ -462,7 +607,10 @@ class ClaudeBees:
     """Run each bee as `claude -p` in its own folder with its own ReverseAI MCP server."""
 
     def __init__(self, *, engine, inputs, enabled=("ghidra",), claude="claude", model=None, effort=None,
-                 timeout=2400, python=sys.executable, config_dir, env=None):
+                 timeout=2400, python=sys.executable, config_dir, env=None, max_tool_rejections=8):
+        if type(max_tool_rejections) is not int or max_tool_rejections < 1:
+            raise ValueError("max_tool_rejections must be a positive integer")
+        self.max_tool_rejections = max_tool_rejections
         self.engine, self.inputs, self.enabled = str(engine), str(inputs), tuple(enabled)
         self.claude, self.model, self.effort, self.timeout, self.python = claude, model, effort, timeout, python
         self.config_dir = Path(config_dir)
@@ -494,9 +642,10 @@ class ClaudeBees:
     def __call__(self, role, name, task, folder, *, schema=None, before_start=None):
         expected = SCHEMAS[role] if schema is None else schema
         def execute():
-            completed = subprocess.run(self.argv(role, name, schema=schema), input=brief(role, task),
+            completed = run_cli(self.argv(role, name, schema=schema), input=brief(role, task),
                                        cwd=folder, env=self.env, capture_output=True, text=True,
-                                       timeout=self.timeout, check=False)
+                                       timeout=self.timeout, check=False, client="claude",
+                                       max_tool_rejections=self.max_tool_rejections)
             events = json_events(completed.stdout)
             finals = [e for e in events if e.get("type") == "result"]
             # Retain compatibility with a captured --output-format json result.
@@ -536,10 +685,14 @@ class ClaudeBees:
                 terminal["error"] = assistant or str(data.get("error") or data.get("subtype") or "agent failed")
             result = classify_result(terminal=terminal, assistant_text=assistant,
                                      diagnostic=native, output=output, schema=expected)
+            result = tool_schema_result(completed) or result
             result.update(turns=data.get("num_turns"), cost_usd=data.get("total_cost_usd"),
                           tool_rejections=tool_rejections(events, client="claude"))
             if hasattr(self, "_capability_nonce"):
                 result["capability_tool_roundtrip"] = capability_roundtrip(events, "claude", self._capability_nonce)
+            if hasattr(self, "_capability_mcp"):
+                from hive import selfhost
+                result["capability_mcp_tool"] = selfhost.mcp_tool_accepted(events, "claude", self._capability_mcp)
             return result
         return run_attempt(self, role, name, execute, before_start)
 

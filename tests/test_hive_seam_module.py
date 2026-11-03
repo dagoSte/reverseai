@@ -137,7 +137,7 @@ class ModuleSeamTests(unittest.TestCase):
                     "input_sha256": ["cd" * 32]}, []
         q = queen.Queen(engine=FakeEngine(self.inputs), out=self.out, bees=self.router(policy),
                         build=build, check=check, attempt_not_started=bees.AttemptNotStarted)
-        with patch("subprocess.run", side_effect=self.cli), contextlib.redirect_stdout(io.StringIO()):
+        with patch("hive.bees.run_cli", side_effect=self.cli), contextlib.redirect_stdout(io.StringIO()):
             result = q.run()
         self.assertEqual(result["verdict"], "accepted without behaviour proof", result["reason"])
         self.assertEqual(result["modules"], {"m01": "accepted"})
@@ -186,7 +186,7 @@ class ModuleSeamTests(unittest.TestCase):
         before = len(self.calls)
         resumed = queen.Queen(engine=FakeEngine(self.inputs), out=self.out, bees=self.router(policy),
                               build=build, check=check, attempt_not_started=bees.AttemptNotStarted)
-        with patch("subprocess.run", side_effect=self.cli), contextlib.redirect_stdout(io.StringIO()):
+        with patch("hive.bees.run_cli", side_effect=self.cli), contextlib.redirect_stdout(io.StringIO()):
             resumed_result = resumed.run()
         self.assertEqual(resumed_result["modules"], {"m01": "accepted"})
         self.assertEqual(len(self.calls), before)

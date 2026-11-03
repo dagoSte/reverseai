@@ -5,7 +5,10 @@ below preserves the observed 32 export_function + 1 read_bytes rejections; it do
 not pretend that the omitted arguments were recorded or valid.
 """
 import json
+import os
 import subprocess
+import sys
+import time
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +18,121 @@ from hive import bees, codex_bees
 
 SMALL = {"type": "object", "properties": {"value": {"type": ["string", "null"]}},
          "required": ["value"], "additionalProperties": False}
+
+
+class LiveToolStopTests(unittest.TestCase):
+    def test_limit_is_positive_for_both_runner_types(self):
+        for runner in (bees.ClaudeBees, codex_bees.CodexBees):
+            self.assertEqual(runner(engine=".", inputs=".", config_dir=".").max_tool_rejections, 8)
+            for value in (0, -1, True, 1.5):
+                with self.subTest(runner=runner.__name__, value=value), self.assertRaises(ValueError):
+                    runner(engine=".", inputs=".", config_dir=".", max_tool_rejections=value)
+
+    def event(self, client, identity, error=True, name="mcp__reverseai__export_function"):
+        if client == "codex":
+            return [{"type": "item.completed", "item": {"id": identity, "type": "mcp_tool_call",
+                    "tool": name, "error": {"code": -32602} if error else None}}]
+        return [{"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": identity, "name": name}]}},
+            {"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": identity, "is_error": error,
+                 "content": "Invalid arguments" if error else "accepted"}]}}]
+
+    def transport(self, events, *, client, after="", before="", timeout=2, limit=2):
+        script = ("import sys,time,os,signal,subprocess; " + before + "sys.stdin.read(); print("
+                  + repr("\n".join(map(json.dumps, events))) + ",flush=True); " + after)
+        return bees.run_cli([sys.executable, "-u", "-c", script], input="prompt", cwd=None, env=None,
+                            capture_output=True, text=True, timeout=timeout, check=False,
+                            client=client, max_tool_rejections=limit)
+
+    def test_accepted_mcp_result_resets_streak_and_non_mcp_events_do_not(self):
+        for client in ("claude", "codex"):
+            with self.subTest(client=client):
+                events = self.event(client, "1") + self.event(client, "2", False) + self.event(client, "3")
+                done = self.transport(events, client=client)
+                self.assertIsNone(done.tool_schema_stop)
+                self.assertEqual(bees.tool_rejections(bees.json_events(done.stdout), client=client), 2)
+                extra = ([{"type": "item.completed", "item": {"id": "shell", "type": "command_execution", "exit_code": 0}}]
+                         if client == "codex" else self.event(client, "shell", False, "Read"))
+                done = self.transport(self.event(client, "1") + extra + self.event(client, "2"),
+                                      client=client, after="time.sleep(30)")
+                self.assertEqual(done.tool_schema_stop["consecutive_tool_rejections"], 2)
+
+    def test_non_schema_mcp_error_resets_and_duplicate_results_count_once(self):
+        for client in ("claude", "codex"):
+            with self.subTest(client=client):
+                middle = self.event(client, "middle")
+                if client == "codex":
+                    middle[0]["item"]["error"] = {"message": "temporary database unavailable"}
+                else:
+                    middle[-1]["message"]["content"][0]["content"] = "temporary database unavailable"
+                first = self.event(client, "first")
+                done = self.transport(first + first + middle + self.event(client, "last"), client=client)
+                self.assertIsNone(done.tool_schema_stop)
+                self.assertEqual(bees.tool_rejections(bees.json_events(done.stdout), client=client), 2)
+
+    def test_missing_native_tool_results_never_invent_a_count_or_stop(self):
+        for client in ("claude", "codex"):
+            done = self.transport([{"type": "result", "result": "Invalid arguments " * 20}], client=client)
+            self.assertIsNone(done.tool_schema_stop)
+            self.assertIsNone(bees.tool_rejections(bees.json_events(done.stdout), client=client))
+
+    def test_drains_large_stderr_and_writes_large_prompt_without_deadlock(self):
+        script = "import sys; sys.stderr.write('x'*1048576); sys.stderr.flush(); print(len(sys.stdin.read()),flush=True)"
+        done = bees.run_cli([sys.executable, "-u", "-c", script], input="p" * 1048576, cwd=None, env=None,
+                            capture_output=True, text=True, timeout=3, check=False,
+                            client="claude", max_tool_rejections=8)
+        self.assertEqual(done.stdout.strip(), "1048576")
+        self.assertEqual(len(done.stderr), 1048576)
+
+    def test_timeout_without_tool_trace_keeps_timeout_and_reaps_child(self):
+        with self.assertRaises(subprocess.TimeoutExpired) as error:
+            self.transport([], client="codex", after="time.sleep(30)", timeout=.2)
+        self.assertIsNone(error.exception.tool_rejections)
+
+    def test_stops_owned_descendant_that_ignores_term_and_leaves_other_session_alive(self):
+        with tempfile.TemporaryDirectory() as folder:
+            heartbeat = Path(folder) / "heartbeat"
+            child = ("import signal,time; from pathlib import Path; signal.signal(signal.SIGTERM,signal.SIG_IGN); "
+                     f"p=Path({str(heartbeat)!r}); p.write_text('ready'); "
+                     "\nwhile True: p.write_text(str(time.monotonic())); time.sleep(.02)")
+            before = f"subprocess.Popen([sys.executable,'-u','-c',{child!r}]); time.sleep(.1); "
+            sentinel = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"], start_new_session=True)
+            try:
+                done = self.transport(self.event("codex", "1") + self.event("codex", "2"),
+                                      client="codex", before=before, after="time.sleep(30)")
+                self.assertIsNotNone(done.tool_schema_stop)
+                snapshot = heartbeat.read_bytes()
+                time.sleep(.1)
+                self.assertEqual(heartbeat.read_bytes(), snapshot)
+                self.assertIsNone(sentinel.poll())
+            finally:
+                sentinel.terminate()
+                sentinel.wait(timeout=2)
+
+    def test_claude_stops_before_timeout_after_consecutive_mcp_schema_errors(self):
+        events = []
+        for i in range(2):
+            events += [{"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": str(i), "name": "mcp__reverseai__export_function"}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": str(i), "is_error": True,
+                     "content": "Invalid arguments: input schema validation error"}]}}]
+        script = "import sys,time; sys.stdin.read(); print(" + repr("\n".join(map(json.dumps, events))) + ",flush=True); time.sleep(30)"
+        with tempfile.TemporaryDirectory() as folder:
+            runner = bees.ClaudeBees(engine=folder, inputs=folder, config_dir=Path(folder) / "config", timeout=1)
+            runner.max_tool_rejections = 2
+            hooks = Hooks()
+            with patch.object(runner, "argv", return_value=[sys.executable, "-u", "-c", script]):
+                result = runner("planner", "planner", "prompt", folder, schema=SMALL, before_start=hooks)
+        self.assertEqual(result["outcome"], "tool_schema_failure")
+        self.assertFalse(result["refused"])
+        self.assertIsNone(result["output"])
+        self.assertEqual(result["tool_rejections"], 2)
+        self.assertEqual(result["consecutive_tool_rejections"], 2)
+        self.assertEqual(result["tool_name"], "mcp__reverseai__export_function")
+        self.assertEqual(len(hooks.started), 1)
+        self.assertEqual(hooks.results[0][1], result)
 
 
 class Hooks:
@@ -123,14 +241,14 @@ class RunnerContractTests(unittest.TestCase):
 
     def claude_call(self, events, *, returncode=0, stderr="", hooks=None, schema=SMALL):
         stdout = "\n".join(json.dumps(e) for e in events)
-        with patch("hive.bees.subprocess.run", return_value=subprocess.CompletedProcess([], returncode, stdout, stderr)) as run:
+        with patch("hive.bees.run_cli", return_value=subprocess.CompletedProcess([], returncode, stdout, stderr)) as run:
             return self.claude("worker", "m01-build", "task", self.root, schema=schema, before_start=hooks), run
 
     def codex_call(self, events, output, *, hooks=None, returncode=0):
         def fake(argv, **kwargs):
             Path(argv[argv.index("-o") + 1]).write_text(output)
             return subprocess.CompletedProcess(argv, returncode, "\n".join(json.dumps(e) for e in events), "")
-        with patch("hive.codex_bees.subprocess.run", side_effect=fake) as run:
+        with patch("hive.bees.run_cli", side_effect=fake) as run:
             return self.codex("planner", "planner-g0001", "task", self.root, schema=SMALL, before_start=hooks), run
 
     def test_custom_schema_through_both_clis_and_nullable_field_preserved(self):
@@ -143,6 +261,19 @@ class RunnerContractTests(unittest.TestCase):
         self.assertEqual(json.loads(Path(argv[argv.index("--output-schema") + 1]).read_text()), SMALL)
         self.assertIn("--no-session-persistence", claude.call_args.args[0])
         self.assertIn("--ephemeral", argv)
+
+    def test_capability_mcp_observation_uses_native_events_and_injected_probe_context(self):
+        from hive import selfhost
+        expected = {"file": "greet", "entry": "0x1000"}
+        for runner, client in ((self.claude, "claude"), (self.codex, "codex")):
+            runner._capability_mcp = expected
+            events = ([{"type": "result", "structured_output": {"value": "yes"}}]
+                      if client == "claude" else [{"type": "turn.completed"}])
+            with patch.object(selfhost, "mcp_tool_accepted", create=True, return_value=False) as accepted:
+                result = (self.claude_call(events)[0] if client == "claude"
+                          else self.codex_call(events, '{"value":"yes"}')[0])
+            accepted.assert_called_once_with(events, client, expected)
+            self.assertFalse(result["capability_mcp_tool"])
 
     def test_hooks_called_once_finished_and_contexts_are_fresh(self):
         hook = Hooks()
@@ -159,13 +290,13 @@ class RunnerContractTests(unittest.TestCase):
     def test_hook_denial_does_not_spawn_or_finish_and_probe_denial_is_not_cached(self):
         for runner in (self.claude, self.codex):
             hook = Hooks("budget_exhausted")
-            with patch("subprocess.run") as run, self.assertRaises(bees.AttemptNotStarted):
+            with patch("hive.bees.run_cli") as run, self.assertRaises(bees.AttemptNotStarted):
                 runner("worker", "m01-build", "task", self.root, before_start=hook)
             run.assert_not_called()
             self.assertEqual(hook.results, [])
         self.codex.allow_network = False
         hook = Hooks("run_stopped")
-        with patch("subprocess.run") as run, self.assertRaises(bees.AttemptNotStarted):
+        with patch("hive.bees.run_cli") as run, self.assertRaises(bees.AttemptNotStarted):
             self.codex("worker", "m01-build", "task", self.root, before_start=hook)
         run.assert_not_called()
         self.assertEqual(self.codex._network_checks, {})
@@ -173,7 +304,7 @@ class RunnerContractTests(unittest.TestCase):
     def test_timeout_finishes_the_reserved_attempt_without_partial_success(self):
         for runner in (self.claude, self.codex):
             hook = Hooks()
-            with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("agent", 7, output='{"value":"yes"}')):
+            with patch("hive.bees.run_cli", side_effect=subprocess.TimeoutExpired("agent", 7, output='{"value":"yes"}')):
                 result = runner("worker", "m01-build", "task", self.root, schema=SMALL, before_start=hook)
             self.assertEqual(result["outcome"], "timeout")
             self.assertEqual(len(hook.results), 1)
@@ -244,7 +375,7 @@ class RunnerContractTests(unittest.TestCase):
             events = [{"type": "item.completed", "item": {"type": "command_execution", "command": codex_bees.NETWORK_COMMAND, "exit_code": 0}}, {"type": "turn.completed"}]
             return subprocess.CompletedProcess(argv, 0, "\n".join(json.dumps(e) for e in events), "")
         first, second = Hooks(), Hooks()
-        with patch("subprocess.run", side_effect=fake) as run:
+        with patch("hive.bees.run_cli", side_effect=fake) as run:
             fresh = self.codex("worker", "m01-build", "task", self.root, before_start=first)
             cached = self.codex("worker", "m02-build", "task", self.root, before_start=second)
         self.assertEqual(run.call_count, 1)
@@ -285,7 +416,7 @@ class RunnerContractTests(unittest.TestCase):
             events = ([{"type": "item.completed", "item": {"type": "command_execution", "command": codex_bees.NETWORK_COMMAND, "exit_code": 6}}] if probe else [])
             events.append({"type": "turn.completed"})
             return subprocess.CompletedProcess(argv, 0, "\n".join(json.dumps(e) for e in events), "")
-        with patch("subprocess.run", side_effect=fake):
+        with patch("hive.bees.run_cli", side_effect=fake):
             for name in ("one", "two"):
                 self.assertTrue(self.codex("worker", name, "task", self.root, schema=SMALL, before_start=hooks)["ok"])
             self.codex.model = "another-model"
