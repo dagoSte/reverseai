@@ -226,6 +226,11 @@ that fallback. `--resume-refused` retries unresolved refusals with the authorize
 routing, while the saved plan remains frozen. The default stop limit is three
 unresolved provider refusals. Provenance records `server_kind` as `cloud`, `local` or
 `remote`; a local endpoint alone does not prove local inference.
+Before planning, each configured self-hosted target is checked through its actual CLI
+for an accepted ReverseAI MCP tool call on a surveyed function, structured output and
+active context reported by Ollama or vLLM. `--required-context` sets the minimum
+(default 65536 tokens); unknown or insufficient context stops the run. Passing this
+small check does not guarantee that a model can finish a long reconstruction.
 The ReverseAI engine, its command line and its MCP server use no model.
 ReverseAI was built for defensive security work; rebuilding is for software whose licence
 permits it or whose copyright you hold, not for recompiling proprietary software (see the
