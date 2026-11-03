@@ -391,15 +391,14 @@ class QueenFuzzTests(unittest.TestCase):
 
     def test_cli_forwards_the_bound_and_original_permission(self):
         with patch.object(queen.bees_module,"environment_ok",return_value=True), \
-             patch.object(queen.codex_bees,"build_router",return_value=FakeRouter(lambda *a: None),create=True), \
-             patch.object(queen.bees_module,"AttemptNotStarted",queen.StartDenied,create=True), \
-             patch.object(queen.importlib,"import_module",return_value=FakePlanning()), \
              patch.object(queen,"Queen") as factory:
             factory.return_value.run.return_value={"verdict":"accepted"}
             self.assertEqual(queen.main(["run","--inputs",str(self.root),"--file",self.input.name,
                                          "--out",str(self.out),"--run-original","--fuzz","15"]),0)
         self.assertEqual(factory.call_args.kwargs["fuzz"],15)
         self.assertTrue(factory.call_args.kwargs["run_original"])
+        self.assertIs(factory.call_args.kwargs["planning"], queen.planning_module)
+        self.assertIsInstance(factory.call_args.kwargs["bees"], queen.selfhost.BeeRouter)
         for value in ("-1","501"):
             with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
                 queen.main(["run","--inputs",str(self.root),"--file",self.input.name,"--out",str(self.out),"--fuzz",value])

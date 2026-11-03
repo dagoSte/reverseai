@@ -965,6 +965,8 @@ class Queen:
                 try:
                     report = self.model_check(self.bees, client, local=local, before_start=hooks,
                                               required_context=self.required_context)
+                except (StartDenied, self.attempt_not_started) as error:
+                    raise StartDenied(getattr(error, "code", str(error))) from None
                 finally:
                     with self.lock:
                         self.reserved -= hooks.leased

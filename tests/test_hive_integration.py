@@ -266,6 +266,18 @@ class RealSeamTests(unittest.TestCase):
         self.assertEqual(q.spent["bees"], 0)
         self.assertEqual(self.calls, [])
 
+    def test_capability_hook_denial_converts_to_not_started_without_a_result(self):
+        def stopping_check(router, client, **kwargs):
+            q._stop("budget_exhausted")
+            return selfhost.check_model(router, client, **kwargs)
+        q = self.make(self.router("--model-server", "http://127.0.0.1:11434", "--model", "fixture-local"),
+                      model_check=stopping_check)
+        result = self.run_quietly(q)
+        self.assertEqual(result["stop_reason"], "budget_exhausted")
+        self.assertEqual(result["spent"]["bees"], 0)
+        self.assertEqual(result["attempts"], [])
+        self.assertEqual(self.calls, [])
+
     def test_main_checks_fallback_cli_and_rejects_invalid_required_context(self):
         common = ["run", "--inputs", str(self.inputs), "--file", "greet", "--out", str(self.out)]
         with patch.object(bees_module, "environment_ok", side_effect=[True, False]) as presence, \
