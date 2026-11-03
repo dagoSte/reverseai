@@ -392,12 +392,18 @@ class DurableAttemptTests(unittest.TestCase):
         calls = []
         q = self.make(lambda *args: calls.append(args[1]) or {"ok": True, "output": {}}, max_bees=3, slots=8)
         results = []
-        workers = [threading.Thread(target=lambda n=n: results.append(self.call(q, f"job-{n}"))) for n in range(12)]
+        def call(n):
+            # Parallel modules own separate folders, as in Queen.module; share only the budget.
+            folder = self.out / "modules" / f"m{n + 1:02d}"
+            folder.mkdir(exist_ok=True)
+            results.append(q.bee("worker", f"job-{n}", "owned fixture task", folder))
+        workers = [threading.Thread(target=call, args=(n,)) for n in range(12)]
         for worker in workers:
             worker.start()
         for worker in workers:
             worker.join(10)
             self.assertFalse(worker.is_alive())
+        self.assertEqual(len(results), 12)
         self.assertEqual(len(calls), 3)
         self.assertEqual(q.spent["bees"], 3)
         self.assertEqual(sum(r["ok"] for r in results), 3)

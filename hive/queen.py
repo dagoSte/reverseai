@@ -20,7 +20,6 @@ import contextlib
 import concurrent.futures
 import copy
 import hashlib
-import importlib
 import json
 import math
 import os
@@ -34,9 +33,10 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 from hive import bees as bees_module
-from hive import codex_bees, languages, partition, preflight
+from hive import codex_bees, languages, partition, planning as planning_module, preflight, selfhost
 from hive import fuzz as fuzz_module
 from reverseai import intake
 
@@ -261,7 +261,8 @@ class AttemptHooks:
             raise HiveError("unknown attempt kind")
         with q.lock:
             q._ensure_state()
-            if q.stopped and not (self.recovery and self.local and q.stopped in ("refusal_limit", "planner_refused")):
+            if q.stopped and not (self.recovery and (self.local or kind == "network_probe")
+                                  and q.stopped in ("refusal_limit", "planner_refused")):
                 raise q.attempt_not_started(q.stopped)
             if q.spent["bees"] + q.reserved - self.leased >= q.max_bees:
                 if q.spent["bees"] >= q.max_bees:
@@ -681,7 +682,8 @@ class Queen:
     def __init__(self, *, engine, out, bees, slots=4, max_functions=12, compile_rounds=3, council_rounds=2,
                  lenses=len(LENSES), link_rounds=3, behaviour_rounds=2, run_original=False, cases=40,
                  max_bees=None, build=None, check=None, language="c", preflight=None, allow_packed=False,
-                 refusal_limit=3, fuzz=0, planning=None, resume_refused=False, attempt_not_started=StartDenied):
+                 refusal_limit=3, fuzz=0, planning=None, resume_refused=False, attempt_not_started=StartDenied,
+                 model_check=selfhost.check_model, required_context=65536):
         self.engine, self.out, self.bees = engine, Path(out).resolve(), bees
         if any(type(value) is not int or value < 1 for value in (slots, max_functions, refusal_limit)):
             raise ValueError("slots, max_functions and refusal_limit must be positive integers")
@@ -706,7 +708,11 @@ class Queen:
         self.events = []
         self.refusals, self.refusal_limit, self.stopped = [], refusal_limit, None
         self.statuses = {}
-        self.planning, self.resume_refused, self.attempt_not_started = planning, resume_refused, attempt_not_started
+        self.planning = planning if planning is not None else planning_module
+        self.resume_refused, self.attempt_not_started = resume_refused, attempt_not_started
+        if type(required_context) is not int or required_context < 1:
+            raise ValueError("required_context must be a positive integer")
+        self.model_check, self.required_context, self.model_checks = model_check, required_context, []
         self.state, self.plan_bundle, self.forecast = None, None, None
         self.reserved = 0
         self._recovering, self._workspace_owned = set(), False
@@ -757,6 +763,9 @@ class Queen:
             self.state.append("limit", {"max_bees": chosen})
             if chosen > saved_limit and self.stopped in ("budget_exhausted", "budget_insufficient"):
                 self._stop(None)
+        if self.stopped == "model_capability":
+            # A corrected server configuration is verified again; consumed probes stay spent.
+            self._stop(None)
         policy = self.bees.policy()
         if not isinstance(policy, dict) or "fallback" not in policy:
             raise HiveError("router policy lacks fallback consent")
@@ -839,7 +848,11 @@ class Queen:
         bee_ids = [aid for aid in hooks.ids if self.state.data["attempts"][aid]["kind"] == "bee"]
         aid = answer["provenance"].get("attempt_id")
         expected_ids = bee_ids or (hooks.ids if answer.get("code") == "network_isolation" else [])
-        if answer["outcome"] != "not_started" and (not expected_ids or aid != expected_ids[-1]):
+        cached_isolation = (answer["outcome"] == "failure" and answer.get("code") == "network_isolation"
+                            and not hooks.ids and aid is None and descriptor.get("probe_key") is not None
+                            and descriptor.get("probe_required") is False)
+        if (answer["outcome"] != "not_started" and not cached_isolation
+                and (not expected_ids or aid != expected_ids[-1])):
             answer = self._answer({"outcome": "failure", "code": "unbound_result",
                                    "error": "runner result lacks its reserved bee attempt ID"})
         if bee_ids:
@@ -873,6 +886,8 @@ class Queen:
     def bee(self, role, name, task, folder, *, schema=None):
         if role not in bees_module.SCHEMAS or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
             raise HiveError("invalid bee role/name")
+        if role == "planner" and schema is None:
+            task = "Use the legacy schema (modules/skipped without structured declarations). " + task
         folder = Path(folder).resolve()
         folder.relative_to(self.out)
         folder.mkdir(parents=True, exist_ok=True)
@@ -920,6 +935,48 @@ class Queen:
             return answer
 
     # phases
+    def check_models(self):
+        if self.model_check is None:
+            return
+        policy = self.bees.policy()
+        targets = [(local, client, config) for local, configs in (
+            (False, policy.get("primary", {})), (True, policy.get("fallback_targets", {})))
+            for client, config in sorted(configs.items()) if config.get("server")]
+        if not targets:
+            return
+        # Each Codex capability process may need an isolation process first.
+        costs = [1 + int(client == "codex" and not config.get("allow_network"))
+                 for _, client, config in targets]
+        self.check_budget(Q=sum(costs))
+        for (local, client, config), cost in zip(targets, costs):
+            name = "model-check-" + ("fallback-" if local else "primary-") + client
+            target = SimpleNamespace(env=None, server=config["server"], model=config["requested_model"],
+                                     origin="fallback" if local else "primary")
+            if client == "codex":
+                target.codex = config["executable"]
+            descriptor = bees_module.provenance(target, "councillor", name)
+            logical_id = digest({"run_id": self.state.data["run_id"], "check": name,
+                                 "target": config, "required_context": self.required_context})
+            hooks = AttemptHooks(self, logical_id, "councillor", name, local, descriptor, bool(self._recovering))
+            with self.slots:
+                with self.lock:
+                    hooks.leased = cost
+                    self.reserved += cost
+                try:
+                    report = self.model_check(self.bees, client, local=local, before_start=hooks,
+                                              required_context=self.required_context)
+                finally:
+                    with self.lock:
+                        self.reserved -= hooks.leased
+                        hooks.leased = 0
+            self.model_checks.append(report)
+            write_file(self.out / ".hive/model-checks.json", canonical(self.model_checks))
+            failures = [f"{key}: {item['message']} {item.get('suggestion') or ''}".strip()
+                        for key, item in report["checks"].items() if item["status"] != "ok"]
+            if failures or not report["ok"]:
+                self._stop("model_capability")
+                raise HiveError(f"model capability check failed for {name}: " + "; ".join(failures))
+
     def plan(self, program_map):
         if self.planning is None:
             raise HiveError("planning backend is not integrated")
@@ -1462,6 +1519,7 @@ class Queen:
             self.state, self.plan_bundle, self.forecast = None, None, None
             self._recovering = set()
             self.statuses = {}
+            self.model_checks = []
             try:
                 return self._run()
             except StartDenied as error:
@@ -1509,7 +1567,7 @@ class Queen:
                   "stop_reason": reason, "refusals": list(self.refusals), "spent": dict(self.spent),
                   "unresolved_refusals": list(self.state.data["unresolved_refusals"].values()) if self.state else [],
                   "attempts": list(self.state.data["attempts"].values()) if self.state else [],
-                  "forecast": self.forecast}
+                  "forecast": self.forecast, "model_checks": self.model_checks}
         write_file(self.out / "result.json", canonical(result))
         write_file(self.out / "REPORT.md", render(result).encode())
         self.log(result["reason"])
@@ -1534,6 +1592,7 @@ class Queen:
         self.language_reasons = reasons
         self.log(f"language: {self.lang.label} ({'; '.join(reasons)})")
         self.build.ensure_confinement()
+        self.check_models()
         try:
             modules, skipped, contract = self.plan(program_map)
         except ProviderRefused as error:
@@ -1565,6 +1624,7 @@ class Queen:
         result["seconds"] = round(time.monotonic() - started)
         result["spent"] = self.spent
         result["forecast"] = self.forecast
+        result["model_checks"] = self.model_checks
         (self.out / "result.json").write_text(json.dumps(result, indent=1, ensure_ascii=False))
         (self.out / "REPORT.md").write_text(render(result), encoding="utf-8")
         self.log(f"verdict: {result['verdict']} — {result['reason']}")
@@ -1724,6 +1784,8 @@ def main(argv=None):
     run.add_argument("--max-functions", type=int, default=12, help="Functions per module (default 12)")
     run.add_argument("--council", type=int, default=3, choices=(1, 2, 3), help="Councillors per module (default 3)")
     run.add_argument("--model", help="Model for every bee (default: the agent CLI's default)")
+    run.add_argument("--required-context", type=int, default=65536,
+                     help="Minimum active context for mandatory self-hosted model checks (default 65536)")
     run.add_argument("--claude", default="claude", help="Claude Code executable")
     run.add_argument("--check-jobs", type=int, default=2, help="Questions the evidence checker runs at once")
     run.add_argument("--run-original", action="store_true",
@@ -1740,12 +1802,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not args.inputs.is_dir() or not (args.inputs / args.file).is_file():
         parser.error("--file must name a regular file inside --inputs")
-    clients = [("claude", args.claude)] if args.bee_policy == "claude" else [("codex", args.codex)]
-    if args.bee_policy == "mixed":
-        clients.append(("claude", args.claude))
-    for label, executable in clients:
-        if not bees_module.environment_ok(executable):
-            parser.error(f"cannot find the configured {label} CLI: {executable}")
+    if args.required_context < 1:
+        parser.error("--required-context must be a positive integer")
     sys.path.insert(0, str(ROOT))
     from tools import hive_check
     inputs = args.inputs.resolve()
@@ -1753,23 +1811,20 @@ def main(argv=None):
     config_dir = args.out.resolve() / ".hive" / "mcp"
     claude = bees_module.ClaudeBees(engine=ROOT, inputs=inputs, claude=args.claude, model=args.model,
                                     config_dir=config_dir)
-    factory = getattr(codex_bees, "build_router", None)
-    if factory is None:
-        print("hive: 0.9.0 model adapters are not integrated", file=sys.stderr)
-        return 2
-    try:
-        planning = importlib.import_module("hive.planning")
-    except ImportError:
-        print("hive: 0.9.0 planning is not integrated", file=sys.stderr)
-        return 2
-    bees = factory(args, claude, engine=ROOT, inputs=inputs, config_dir=config_dir.parent / "codex")
+    bees = codex_bees.build_router(args, claude, engine=ROOT, inputs=inputs, config_dir=config_dir.parent / "codex")
+    policy = bees.policy()
+    for destination in ("primary", "fallback_targets"):
+        for client, config in policy[destination].items():
+            if not bees_module.environment_ok(config["executable"]):
+                parser.error(f"cannot find the configured {destination} {client} CLI: {config['executable']}")
     def check(claims, out):
         return hive_check.check(inputs, claims, out, enabled=frozenset({"ghidra"}), jobs=args.check_jobs)
     queen = Queen(engine=engine, out=args.out, bees=bees, slots=args.bees, max_functions=args.max_functions,
                   lenses=args.council, run_original=args.run_original, cases=args.cases, max_bees=args.max_bees,
                   check=check, language=args.language, preflight=preflight.run, allow_packed=args.allow_packed,
-                  fuzz=args.fuzz, planning=planning, resume_refused=args.resume_refused,
-                  attempt_not_started=bees_module.AttemptNotStarted)
+                  fuzz=args.fuzz, planning=planning_module, resume_refused=args.resume_refused,
+                  attempt_not_started=bees_module.AttemptNotStarted,
+                  model_check=selfhost.check_model, required_context=args.required_context)
     try:
         result = queen.run()
     except HiveError as error:
