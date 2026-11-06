@@ -255,7 +255,7 @@ class QueenFuzzTests(unittest.TestCase):
         return make_queen(engine=SimpleNamespace(path=self.input,file="owned-input"), out=self.out, bees=tester,
                            run_original=permission, fuzz=total, behaviour_rounds=rounds)
 
-    def execution(self, cases, binary, folder):
+    def execution(self, cases, binary, folder, **kwargs):
         return {case["id"]:{"steps":[{"code":0,"out":"same"} for _ in case["steps"]]} for case in cases}
 
     def conformance(self, q, execution):
@@ -265,7 +265,7 @@ class QueenFuzzTests(unittest.TestCase):
     def test_fuzz_runs_after_behaviour_repairs_on_the_final_binary(self):
         q = self.make(rounds=1)
         trace = []
-        def execute(cases, binary, folder):
+        def execute(cases, binary, folder, **kwargs):
             trace.append((str(binary), [case["id"] for case in cases]))
             answer = self.execution(cases, binary, folder)
             if binary == "first-rebuild":
@@ -274,8 +274,8 @@ class QueenFuzzTests(unittest.TestCase):
         with patch.object(q, "behaviour_fix", return_value={"ok":True,"binary":"final-rebuild"}) as repair:
             result = self.conformance(q, execute)
         repair.assert_called_once()
-        self.assertEqual([binary for binary, _ in trace][-2:],
-                         [str(self.out / "tests/original/owned-input"), "final-rebuild"])
+        original = str(self.out / "tests/original/owned-input")  # original, final rebuild, original again
+        self.assertEqual([binary for binary, _ in trace][-3:], [original, "final-rebuild", original])
         self.assertEqual(result["cases"], len(CASES) + 12)
         self.assertEqual(result["identical"], result["cases"])
         self.assertEqual(result["different"], [])
@@ -285,7 +285,7 @@ class QueenFuzzTests(unittest.TestCase):
 
     def test_fuzz_differences_are_reported_without_starting_a_repair_round(self):
         q = self.make(rounds=2)
-        def execute(cases, binary, folder):
+        def execute(cases, binary, folder, **kwargs):
             answer = self.execution(cases, binary, folder)
             if binary == "first-rebuild" and cases[0]["id"].startswith("fz-"):
                 answer[cases[0]["id"]]["steps"][0]["out"] = "fuzz-only difference"
@@ -304,7 +304,7 @@ class QueenFuzzTests(unittest.TestCase):
 
     def test_missing_fuzz_execution_invalidates_conformance(self):
         q = self.make()
-        def execute(cases, binary, folder):
+        def execute(cases, binary, folder, **kwargs):
             if binary == "first-rebuild" and cases[0]["id"].startswith("fz-"):
                 return {}
             return self.execution(cases, binary, folder)
@@ -316,7 +316,7 @@ class QueenFuzzTests(unittest.TestCase):
     def test_partial_fuzz_preserves_the_plain_result_and_every_reproduction_input(self):
         q = self.make()
         mutant_ids = []
-        def execute(cases, binary, folder):
+        def execute(cases, binary, folder, **kwargs):
             answer = self.execution(cases,binary,folder)
             if not cases[0]["id"].startswith("fz-"):
                 if binary == "first-rebuild":
@@ -363,7 +363,7 @@ class QueenFuzzTests(unittest.TestCase):
     def test_plain_incomplete_conformance_never_starts_fuzzing(self):
         q = self.make()
         with patch.object(fuzz, "generate", side_effect=AssertionError("plain proof incomplete")):
-            result = self.conformance(q, lambda cases, binary, folder: {})
+            result = self.conformance(q, lambda cases, binary, folder, **kwargs: {})
         self.assertFalse(result["ran"])
         self.assertNotIn("fuzz", result)
 
@@ -383,7 +383,7 @@ class QueenFuzzTests(unittest.TestCase):
         with patch.object(queen,"run_cases",side_effect=self.execution) as execute, \
              contextlib.redirect_stdout(io.StringIO()):
             result = q.conformance("first-rebuild",[],self.root/"unused")
-        self.assertEqual(execute.call_count,2)
+        self.assertEqual(execute.call_count,3)  # original, rebuild, original again
         self.assertTrue(result["ran"])
         self.assertEqual(result["cases"],2)
         self.assertEqual(result["fuzz"]["cases"],0)

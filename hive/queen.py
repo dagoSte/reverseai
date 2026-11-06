@@ -639,11 +639,26 @@ def link_blame(log, owners, module_ids):
     return blamed
 
 
-def run_cases(cases, binary, folder, timeout=20):
-    """Run every case in a fresh folder; compare-ready results with the binary's path hidden."""
+def run_cases(cases, binary, folder, timeout=20, *, name=None):
+    """Run every case in a fresh folder; compare-ready results with the binary's path hidden.
+
+    With `name`, the binary is first staged as folder/bin/<name>, and every case runs in folder/work/<case id>, so the
+    original and the rebuild see the same program path, the same argv[0] and the same working directory."""
+    if name:
+        staged = Path(folder) / "bin" / name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.unlink(missing_ok=True)
+        shutil.copyfile(binary, staged)
+        os.chmod(staged, 0o555)
+        binary = str(staged)
     results = {}
     for case in cases:
-        work = Path(tempfile.mkdtemp(prefix=f"{case['id']}-", dir=folder))
+        if name:
+            work = Path(folder) / "work" / case["id"]
+            shutil.rmtree(work, ignore_errors=True)
+            work.mkdir(parents=True)
+        else:
+            work = Path(tempfile.mkdtemp(prefix=f"{case['id']}-", dir=folder))
         for item in case.get("files", []):
             target = (work / item["name"]).resolve()
             if work.resolve() not in target.parents:
@@ -674,6 +689,59 @@ def compare(original, rebuilt):
     for case_id, expected in original.items():
         (same if rebuilt.get(case_id) == expected else different).append(case_id)
     return same, different
+
+
+def _fields(row):
+    """One comparable value per field of a case result: each step's exit code, stdout and stderr, and each file."""
+    fields = {}
+    for index, step in enumerate((row or {}).get("steps", [])):
+        fields[f"step{index}.code"] = step.get("code")
+        fields[f"step{index}.out"] = (step.get("out"), step.get("out_head"))
+        fields[f"step{index}.err"] = step.get("err")
+    return fields
+
+
+def _file_fields(first, second, candidate):
+    """Files as comparable fields: stable names by name and content; files whose names change between the original's
+    runs (temporary names) by their contents only; the contents of such files are noise if they change too."""
+    a, b, c = ((row or {}).get("files", {}) for row in (first, second, candidate))
+    stable = {name for name in a if name in b}
+    fields = [{f"file:{name}": a.get(name) for name in stable | set(c)} for _ in range(3)]
+    fields[1].update({f"file:{name}": b.get(name) for name in stable | set(c)})
+    fields[2] = {f"file:{name}": c.get(name) for name in stable | set(c)}
+    for name in set(c) - stable:  # a name the original never wrote twice: compared through the contents below
+        for view in fields:
+            view.pop(f"file:{name}", None)
+    unnamed = [sorted(d for n, d in files.items() if n not in stable) for files in (a, b, c)]
+    for view, contents in zip(fields, unnamed):
+        view["files:unnamed"] = contents
+    return fields
+
+
+def compare_stable(original, rebuilt, reference):
+    """Compare on the fields the original reproduces: `reference` is a second run of the original.
+
+    A field that differs between the original's two runs (a timestamp, an address, a temporary name) is noise and is
+    not compared; the masked fields are reported. A case with no stable field proves nothing: it is unstable, never
+    identical. Returns (same, different, unstable, masked)."""
+    same, different, unstable, masked = [], [], [], {}
+    for case_id, row in original.items():
+        first, second, candidate = _fields(row), _fields(reference.get(case_id)), _fields(rebuilt.get(case_id))
+        for view, files in zip((first, second, candidate), _file_fields(row, reference.get(case_id),
+                                                                       rebuilt.get(case_id))):
+            view.update(files)
+        noise = {key for key in set(first) | set(second) if first.get(key) != second.get(key)}
+        compared = (set(first) | set(candidate)) - noise
+        if noise:
+            masked[case_id] = sorted(noise)
+        evidence = compared - ({"files:unnamed"} if not first.get("files:unnamed") else set())
+        if not evidence:  # agreeing that no file was written proves nothing on its own
+            unstable.append(case_id)
+        elif all(first.get(key) == candidate.get(key) for key in compared):
+            same.append(case_id)
+        else:
+            different.append(case_id)
+    return same, different, unstable, masked
 
 
 # --- The hive --------------------------------------------------------------------------------------
@@ -1407,11 +1475,15 @@ class Queen:
         stage = folder / "original" / self.engine.file
         stage.parent.mkdir(parents=True, exist_ok=True)
         write_file(stage, intake.snapshot(self.engine.path)[0], 0o555)
-        original = run_cases(cases, str(stage), runs)
+        name = self.engine.file  # both programs run as the same path, name and working directory
+        original = run_cases(cases, str(stage), runs, name=name)
+        reference = None
         rebuilt_binary = binary
         for round_number in range(self.behaviour_rounds + 1):
-            rebuilt = run_cases(cases, rebuilt_binary, runs)
-            same, different = compare(original, rebuilt)
+            rebuilt = run_cases(cases, rebuilt_binary, runs, name=name)
+            if reference is None:  # the original's second run comes after the rebuild's, so time-bound noise moves
+                reference = run_cases(cases, str(stage), runs, name=name)
+            same, different, unstable, masked = compare_stable(original, rebuilt, reference)
             self.log(f"conformance round {round_number}: {len(same)}/{len(cases)} identical")
             if not different or round_number == self.behaviour_rounds:
                 break
@@ -1421,21 +1493,43 @@ class Queen:
             if not link["ok"]:
                 return {"ran": False, "reason": "the current objects failed to relink after a behaviour fix"}
             rebuilt_binary = link["binary"]
-        (folder / "results.json").write_text(json.dumps({"original": original, "rebuilt": rebuilt}, indent=1))
+        (folder / "results.json").write_text(json.dumps({"original": original, "rebuilt": rebuilt,
+                                                         "original_again": reference}, indent=1))
         expected = {c["id"] for c in cases}
-        complete = set(original) == set(rebuilt) == expected and all(
+        complete = set(original) == set(rebuilt) == set(reference) == expected and all(
             len(results[c["id"]].get("steps", [])) == len(c["steps"])
             and all(type(step.get("code")) is int for step in results[c["id"]]["steps"])
-            for results in (original, rebuilt) for c in cases if c["id"] in results)
+            for results in (original, rebuilt, reference) for c in cases if c["id"] in results)
         if not complete:
             return {"ran": False, "reason": "conformance execution is incomplete or timed out"}
-        result = {"ran": True, "cases": len(cases), "identical": len(same), "different": different}
+        if unstable:
+            return {"ran": False, "masked": masked, "unstable": unstable,
+                    "reason": f"{len(unstable)} case(s) give a different result on every field when the original runs "
+                              "twice, so they prove nothing: " + ", ".join(unstable[:10])}
+        result = {"ran": True, "cases": len(cases), "identical": len(same), "different": different,
+                  **({"masked": masked} if masked else {})}
         if self.fuzz and self.run_original:
             seed = sha256(stage)
             mutants = fuzz_module.generate(cases, seed, self.fuzz, MAX_CASE_FILE)
-            fuzz_original = run_cases(mutants, str(stage), runs) if mutants else {}
-            fuzz_rebuilt = run_cases(mutants, rebuilt_binary, runs) if mutants else {}
-            summary = fuzz_module.summarise(mutants, fuzz_original, fuzz_rebuilt, seed, compare)
+            fuzz_original = run_cases(mutants, str(stage), runs, name=name) if mutants else {}
+            fuzz_rebuilt = run_cases(mutants, rebuilt_binary, runs, name=name) if mutants else {}
+            fuzz_reference = run_cases(mutants, str(stage), runs, name=name) if mutants else {}
+            fuzz_unstable, fuzz_masked = [], {}
+
+            def compare_fuzz(first, candidate):
+                same_f, different_f, unstable_f, masked_f = compare_stable(first, candidate, fuzz_reference)
+                fuzz_unstable.extend(unstable_f)
+                fuzz_masked.update(masked_f)
+                return same_f, different_f
+            summary = fuzz_module.summarise(mutants, fuzz_original, fuzz_rebuilt, seed, compare_fuzz)
+            if fuzz_masked:
+                summary["masked"] = len(fuzz_masked)
+            if fuzz_unstable:  # a mutant whose every field moves between two runs of the original proves nothing
+                summary["unstable"] = list(fuzz_unstable)
+                summary["incomplete"] = list(summary["incomplete"]) + list(fuzz_unstable)
+                summary["ran"] = False
+                summary["reason"] = (f"{len(summary['incomplete'])} fuzz mutant(s) incomplete, timed out or unstable "
+                                     "on the original: " + ", ".join(summary["incomplete"][:10]))
             fuzz_module.write_report(folder / "fuzz.json", summary, mutants)
             result["plain"] = dict(result, different=list(result["different"]))
             result["fuzz"] = summary
@@ -1745,6 +1839,9 @@ def render(result):
                  f"{len(extra['incomplete'])} incomplete")
     if "fuzz" in conformance:
         proof += f" ({conformance['fuzz']['cases']} fuzz)"
+    if conformance.get("masked"):
+        proof += (f"; {len(conformance['masked'])} case(s) compared on their stable fields only (the original varies "
+                  "between two runs elsewhere)")
     lines.append("- Conformance: " + proof)
     spent = result.get("spent", {})
     if result.get("refusals"):

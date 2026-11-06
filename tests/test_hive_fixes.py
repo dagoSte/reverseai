@@ -118,7 +118,7 @@ class QueenFixTests(unittest.TestCase):
         fake = RecordedBees(sources={"m01": GOOD["m01"], "m02": WRONG_EXIT},
                             repaired={"m02": GOOD["m02"]}, cases=cases)
         q, _ = self.make(fake, run_original=True)
-        def execute(cases, binary, folder, timeout=20):
+        def execute(cases, binary, folder, timeout=20, **kwargs):
             original = "/original/" in str(binary)
             correct = (q.out / "modules/m02/m02.c").read_text() == GOOD["m02"]
             return {c["id"]: {"steps": [{"code": 0 if original or correct else 1}], "files": {}} for c in cases}
@@ -137,7 +137,7 @@ class QueenFixTests(unittest.TestCase):
         cases = [{"id": "a", "steps": [{"args": []}]}, {"id": "b", "steps": [{"args": ["x"]}]}]
         q, _ = self.make(RecordedBees(repaired={"m02": duplicate}, cases=cases), run_original=True)
         rebuilt_runs = []
-        def execute(cases, binary, folder, timeout=20):
+        def execute(cases, binary, folder, timeout=20, **kwargs):
             original = "/original/" in str(binary)
             if not original:
                 rebuilt_runs.append(binary)
