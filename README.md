@@ -26,7 +26,8 @@ https://github.com/user-attachments/assets/884cff5d-e37e-49c3-9bb7-8fbcf118e2ee
   <a href="#the-secure-container-infrastructure">Secure containers</a> ·
   <a href="#ai-analyst-team-the-hive">AI analyst team</a> ·
   <a href="#quick-start">Quick start</a> ·
-  <a href="#roadmap">Roadmap</a>
+  <a href="#roadmap">Roadmap</a> ·
+  <a href="#support">Sponsor</a>
 </p>
 
 **ReverseAI is an open-source engine for static reverse engineering of untrusted
@@ -547,5 +548,14 @@ enterprise mode adds hosting and integration on top of the same open core.
 Third-party tools keep their own licenses, listed in the
 [third-party notices](THIRD_PARTY_NOTICES.md). Release history is in the
 [changelog](CHANGELOG.md).
+
+<a id="support"></a>
+## Support development
+
+If ReverseAI helps you, [leave a star on GitHub](https://github.com/dagoSte/reverseai) ⭐ and support my work with a contribution on Ko-fi.
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/J3K52ADG60)
+
+I welcome sponsorships from individuals and organizations that want to support ReverseAI's development. You can contribute on [Ko-fi](https://ko-fi.com/J3K52ADG60) or [open an issue](https://github.com/dagoSte/reverseai/issues) to discuss a collaboration.
 
 Created by **Stefano D'Agostino**.
